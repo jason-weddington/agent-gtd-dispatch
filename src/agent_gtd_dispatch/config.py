@@ -28,7 +28,7 @@ ANTHROPIC_API_KEY: str = ""
 WORKSPACE_ROOT: Path = Path.home() / "workspace"
 
 # Claude Code limits
-MAX_TURNS: int = 20
+MAX_TURNS: int = 50
 TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
 
 # Env vars the Claude subprocess is allowed to inherit
