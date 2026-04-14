@@ -141,7 +141,7 @@ if [ -d "$REPO_PATH" ]; then
     exit 0
 fi
 
-git init --bare "$REPO_PATH"
+git init --bare --initial-branch=main "$REPO_PATH"
 echo "Created bare repository: repos/$REPO"
 SCRIPT
 

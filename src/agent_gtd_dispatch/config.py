@@ -40,6 +40,7 @@ SAFE_ENV_KEYS: set[str] = {
     "TERM",
     "SHELL",
     "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "SSH_AUTH_SOCK",
     "GIT_SSH_COMMAND",
 }
@@ -53,7 +54,7 @@ def load() -> None:
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
     AGENT_GTD_API_KEY = _require("AGENT_GTD_API_KEY")
-    ANTHROPIC_API_KEY = _require("ANTHROPIC_API_KEY")
+    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
     WORKSPACE_ROOT = Path(
         os.environ.get("DISPATCH_WORKSPACE_ROOT", str(Path.home() / "workspace"))

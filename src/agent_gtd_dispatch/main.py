@@ -89,7 +89,10 @@ async def _dispatch_worker(run: Run, max_turns: int) -> None:
                 exit_code=result.returncode,
             )
         else:
+            # Capture stderr, falling back to stdout tail for diagnostics
             error_msg = result.stderr[-500:] if result.stderr else None
+            if not error_msg and result.stdout:
+                error_msg = result.stdout[-500:]
             await db.update_run(
                 run.id,
                 status=RunStatus.failed,

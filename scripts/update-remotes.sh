@@ -63,9 +63,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Remove non-existent directories from scan list
+VALID_DIRS=()
 for dir in "${SCAN_DIRS[@]}"; do
-    [[ ! -d "$dir" ]] && { echo "Error: Scan directory not found: $dir" >&2; exit 1; }
+    if [[ -d "$dir" ]]; then
+        VALID_DIRS+=("$dir")
+    fi
 done
+SCAN_DIRS=("${VALID_DIRS[@]}")
 
 # --- Helper: rewrite a URL if it matches the old pattern ---
 # Returns the new URL on stdout, or nothing if no match.
