@@ -1,0 +1,50 @@
+[project]
+name = "agent-gtd-dispatch"
+version = "0.1.0"
+description = "Dispatch worker API for Agent GTD — runs headless Claude Code agents on isolated infrastructure"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "uvicorn[standard]>=0.32",
+    "aiosqlite>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_gtd_dispatch"]
+
+[tool.ruff]
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "S"]
+ignore = ["S603", "S607"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["agent_gtd_dispatch"]
+
+[tool.coverage.report]
+fail_under = 0

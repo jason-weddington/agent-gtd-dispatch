@@ -1,0 +1,62 @@
+"""Configuration from environment variables."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+
+def _require(name: str) -> str:
+    val = os.environ.get(name, "")
+    if not val:
+        msg = f"Required environment variable {name} is not set"
+        raise RuntimeError(msg)
+    return val
+
+
+# Dispatch API auth
+DISPATCH_API_KEY: str = ""
+
+# Agent GTD API
+AGENT_GTD_URL: str = ""
+AGENT_GTD_API_KEY: str = ""
+
+# Anthropic
+ANTHROPIC_API_KEY: str = ""
+
+# Workspace
+WORKSPACE_ROOT: Path = Path.home() / "workspace"
+
+# Claude Code limits
+MAX_TURNS: int = 20
+TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
+
+# Env vars the Claude subprocess is allowed to inherit
+SAFE_ENV_KEYS: set[str] = {
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
+    "TERM",
+    "SHELL",
+    "ANTHROPIC_API_KEY",
+    "SSH_AUTH_SOCK",
+    "GIT_SSH_COMMAND",
+}
+
+
+def load() -> None:
+    """Load configuration from environment. Call once at startup."""
+    global DISPATCH_API_KEY, AGENT_GTD_URL, AGENT_GTD_API_KEY  # noqa: PLW0603
+    global ANTHROPIC_API_KEY, WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS  # noqa: PLW0603
+
+    DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
+    AGENT_GTD_URL = _require("AGENT_GTD_URL")
+    AGENT_GTD_API_KEY = _require("AGENT_GTD_API_KEY")
+    ANTHROPIC_API_KEY = _require("ANTHROPIC_API_KEY")
+
+    WORKSPACE_ROOT = Path(
+        os.environ.get("DISPATCH_WORKSPACE_ROOT", str(Path.home() / "workspace"))
+    )
+    MAX_TURNS = int(os.environ.get("DISPATCH_MAX_TURNS", "20"))
+    TIMEOUT_SECONDS = int(os.environ.get("DISPATCH_TIMEOUT_SECONDS", "1800"))

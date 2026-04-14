@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# clone — Clone a repo from the git server.
+#
+# Usage: clone <repo-name> [destination]
+
+GIT_HOST="${GIT_HOST:-ubuntu-vm01}"
+GIT_USER="${GIT_USER:-git}"
+
+if [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    echo "Usage: clone <repo-name> [destination]"
+    echo ""
+    echo "Clones ${GIT_USER}@${GIT_HOST}:repos/<repo-name>"
+    echo ""
+    echo "Environment:"
+    echo "  GIT_HOST  Override server hostname (default: ubuntu-vm01)"
+    echo "  GIT_USER  Override server user (default: git)"
+    exit 0
+fi
+
+REPO_NAME="$1"
+DEST="${2:-}"
+
+# shellcheck disable=SC2086
+git clone "${GIT_USER}@${GIT_HOST}:repos/${REPO_NAME}" $DEST
