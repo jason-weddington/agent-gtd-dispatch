@@ -35,7 +35,7 @@ class Run(BaseModel):
 
 class DispatchRequest(BaseModel):
     item_id: str
-    max_turns: int | None = None
+    max_turns: int
 
 
 class RunResponse(BaseModel):

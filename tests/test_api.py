@@ -72,7 +72,7 @@ class TestDispatch:
         )
         resp = client.post(
             "/dispatch",
-            json={"item_id": "abc123"},
+            json={"item_id": "abc123", "max_turns": 50},
             headers=auth_headers,
         )
         assert resp.status_code == 400
@@ -88,7 +88,7 @@ class TestDispatch:
         )
         resp = client.post(
             "/dispatch",
-            json={"item_id": "abc123"},
+            json={"item_id": "abc123", "max_turns": 50},
             headers=auth_headers,
         )
         assert resp.status_code == 400
@@ -112,7 +112,7 @@ class TestDispatch:
 
         resp = client.post(
             "/dispatch",
-            json={"item_id": "abc12345-6789"},
+            json={"item_id": "abc12345-6789", "max_turns": 50},
             headers=auth_headers,
         )
         assert resp.status_code == 200

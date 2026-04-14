@@ -173,7 +173,7 @@ async def dispatch_item(
         )
 
     branch_name = dispatch.branch_name_for_item(body.item_id, item["title"])
-    max_turns = body.max_turns or config.MAX_TURNS
+    max_turns = body.max_turns
 
     run = Run(
         item_id=body.item_id,
