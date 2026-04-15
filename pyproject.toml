@@ -1,6 +1,6 @@
 [project]
 name = "agent-gtd-dispatch"
-version = "1.3.0"
+version = "1.4.0"
 description = "Dispatch worker API for Agent GTD — runs headless Claude Code agents on isolated infrastructure"
 requires-python = ">=3.12"
 dependencies = [

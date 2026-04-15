@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.4.0 (2026-04-15)
+
+### Features
+
+- Add progress comment milestones to dispatch system prompt
+  ([`2511538`](https://github.com/repos/agent-gtd-dispatch/commit/25115380e93c7670b801b8ee09f14aa5ad5ea7b1))
+
+
 ## v1.3.0 (2026-04-15)
 
 ### Features
