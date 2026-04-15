@@ -80,7 +80,6 @@ def build_system_prompt(
 
         ## Rules
 
-        0. **Authenticate.** Call the Agent GTD MCP `login` tool with agent_name="claude-dispatch" before posting any comments.
         1. **Understand first.** Read the codebase, understand the patterns, then act.
         2. **Branch.** Create and work on the branch `{branch_name}`. Never commit to main.
         3. **Test.** Run the project's test suite before committing. Fix failures.

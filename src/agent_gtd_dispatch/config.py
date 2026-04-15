@@ -41,6 +41,8 @@ SAFE_ENV_KEYS: set[str] = {
     "SHELL",
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "AGENT_GTD_URL",
+    "AGENT_GTD_API_KEY",
     "SSH_AUTH_SOCK",
     "GIT_SSH_COMMAND",
 }
