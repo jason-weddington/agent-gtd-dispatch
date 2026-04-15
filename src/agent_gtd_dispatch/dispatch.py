@@ -98,11 +98,16 @@ def build_system_prompt(
 
         ## Reporting
 
-        When you finish (success or blocked), post a comment to the GTD item.
-        The Agent GTD MCP server is available — use `add_comment` with item_id="{item_id}".
+        Post progress comments to the GTD item as you work. Use `add_comment`
+        with item_id="{item_id}". Keep comments terse — one line is fine.
+
+        Post a comment at each milestone:
+        - When starting research/exploration: "Researching codebase..."
+        - When starting implementation: "Implementing..."
+        - When running tests: "Running tests..."
 
         **On success:**
-        1. Post a comment with: what you did, the branch name (`{branch_name}`), notes for the reviewer
+        1. Post a final comment with: what you did, the branch name (`{branch_name}`), notes for the reviewer
         2. Set the item status to `review` using `update_item` with the item's current version
 
         **On failure/blocked**, your comment should include:
