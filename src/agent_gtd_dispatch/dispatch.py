@@ -35,27 +35,33 @@ def branch_name_for_item(item_id: str, title: str) -> str:
     return f"feat/{short_id}-{slug}"
 
 
-def prepare_workspace(origin: str, item_id: str) -> Path:
-    """Clone or update the repo into a workspace directory."""
-    short_id = item_id[:8]
+def prepare_workspace(origin: str, run_id: str, branch_name: str) -> Path:
+    """Clone the repo and check out a feature branch for this run."""
     name = repo_name_from_origin(origin)
-    workspace = config.WORKSPACE_ROOT / f"{name}-{short_id}"
+    workspace = config.WORKSPACE_ROOT / f"{name}-{run_id}"
 
-    if workspace.exists():
-        subprocess.run(
-            ["git", "pull", "--ff-only"],
-            cwd=workspace,
-            check=False,
-            capture_output=True,
-        )
-    else:
-        config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "clone", origin, str(workspace)],
-            check=True,
-        )
+    config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "clone", origin, str(workspace)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "-b", branch_name],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+    )
 
     return workspace
+
+
+def cleanup_workspace(workspace: Path) -> None:
+    """Remove a workspace directory after a run completes."""
+    import shutil
+
+    if workspace.exists() and config.WORKSPACE_ROOT in workspace.parents:
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def build_system_prompt(
@@ -82,7 +88,7 @@ def build_system_prompt(
         ## Rules
 
         1. **Understand first.** Read the codebase, understand the patterns, then act.
-        2. **Branch.** Create and work on the branch `{branch_name}`. Never commit to main.
+        2. **Branch.** You are already on branch `{branch_name}`. Stay on it. Never commit to main.
         3. **Test.** Run the project's test suite before committing. Fix failures.
         4. **Commit.** Use conventional commit messages. Small, focused commits.
         5. **Push.** When done, push `{branch_name}` to origin.

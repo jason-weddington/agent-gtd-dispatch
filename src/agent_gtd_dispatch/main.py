@@ -53,6 +53,7 @@ async def _dispatch_worker(run: Run, max_turns: int) -> None:
     now = datetime.now(UTC).isoformat()
     await db.update_run(run.id, status=RunStatus.running, started_at=now)
 
+    workspace = None
     try:
         # Fetch item and project
         item = await gtd_client.get_item(run.item_id)
@@ -65,8 +66,8 @@ async def _dispatch_worker(run: Run, max_turns: int) -> None:
         if not git_origin:
             raise ValueError(f"Project '{project['name']}' has no git_origin")
 
-        # Prepare workspace
-        workspace = dispatch.prepare_workspace(git_origin, run.item_id)
+        # Prepare workspace (fresh clone on feature branch)
+        workspace = dispatch.prepare_workspace(git_origin, run.id, run.branch_name)
 
         # Build prompt and run
         system_prompt = dispatch.build_system_prompt(
@@ -137,6 +138,8 @@ async def _dispatch_worker(run: Run, max_turns: int) -> None:
         )
     finally:
         _active_processes.pop(run.id, None)
+        if workspace is not None:
+            dispatch.cleanup_workspace(workspace)
 
 
 # --- Endpoints ---
