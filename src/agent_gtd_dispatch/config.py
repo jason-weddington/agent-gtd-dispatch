@@ -21,43 +21,22 @@ DISPATCH_API_KEY: str = ""
 AGENT_GTD_URL: str = ""
 AGENT_GTD_API_KEY: str = ""
 
-# Anthropic
-ANTHROPIC_API_KEY: str = ""
-
 # Workspace
 WORKSPACE_ROOT: Path = Path.home() / "workspace"
 
-# Claude Code limits
+# Agent limits
 MAX_TURNS: int = 50
 TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
-
-# Env vars the Claude subprocess is allowed to inherit
-SAFE_ENV_KEYS: set[str] = {
-    "PATH",
-    "HOME",
-    "USER",
-    "LANG",
-    "TERM",
-    "SHELL",
-    "ANTHROPIC_API_KEY",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "AGENT_GTD_URL",
-    "AGENT_GTD_API_KEY",
-    "KB_DATABASE_URL",
-    "SSH_AUTH_SOCK",
-    "GIT_SSH_COMMAND",
-}
 
 
 def load() -> None:
     """Load configuration from environment. Call once at startup."""
     global DISPATCH_API_KEY, AGENT_GTD_URL, AGENT_GTD_API_KEY
-    global ANTHROPIC_API_KEY, WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS
+    global WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
     AGENT_GTD_API_KEY = _require("AGENT_GTD_API_KEY")
-    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
     WORKSPACE_ROOT = Path(
         os.environ.get("DISPATCH_WORKSPACE_ROOT", str(Path.home() / "workspace"))

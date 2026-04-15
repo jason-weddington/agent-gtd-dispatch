@@ -1,4 +1,4 @@
-"""Core dispatch logic — workspace prep, prompt building, Claude invocation."""
+"""Core dispatch logic — workspace prep, prompt building, agent invocation."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import config
+from .engines import Engine, build_env
 
 
 def repo_name_from_origin(origin: str) -> str:
@@ -74,7 +75,7 @@ def build_system_prompt(
     project_name = project["name"]
 
     return textwrap.dedent(f"""\
-        You are a headless Claude Code agent dispatched by Agent GTD.
+        You are a headless coding agent dispatched by Agent GTD.
         No human is available for questions — you must work autonomously.
 
         ## Your Task
@@ -119,28 +120,17 @@ def build_system_prompt(
     """)
 
 
-async def run_claude(
+async def run_agent(
+    engine: Engine,
     workspace: Path,
     system_prompt: str,
     title: str,
     max_turns: int,
+    agent_name: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run Claude Code as a subprocess. Returns the CompletedProcess."""
-    cmd = [
-        "claude",
-        "--dangerously-skip-permissions",
-        "--max-turns",
-        str(max_turns),
-        "--system-prompt",
-        system_prompt,
-        "--print",
-        title,
-    ]
-
-    env = {
-        k: v for k, v in __import__("os").environ.items() if k in config.SAFE_ENV_KEYS
-    }
-    env["HOME"] = str(Path.home())
+    """Run a headless agent CLI as a subprocess."""
+    cmd = engine.build_command(system_prompt, title, max_turns, agent_name)
+    env = build_env(engine)
 
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(

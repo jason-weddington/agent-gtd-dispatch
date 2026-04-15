@@ -1,4 +1,4 @@
-"""Dispatch worker API — runs headless Claude Code agents."""
+"""Dispatch worker API — runs headless coding agents."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import config, db, dispatch, gtd_client
+from .engines import Engine, get_engine
 from .models import DispatchRequest, Run, RunResponse, RunStatus
 
 # Track running subprocesses for cancellation
@@ -48,7 +49,7 @@ app = FastAPI(title="Agent GTD Dispatch", lifespan=lifespan)
 # --- Background dispatch worker ---
 
 
-async def _dispatch_worker(run: Run, max_turns: int) -> None:
+async def _dispatch_worker(run: Run, max_turns: int, engine: Engine) -> None:
     """Background task that executes a dispatch run."""
     now = datetime.now(UTC).isoformat()
     await db.update_run(run.id, status=RunStatus.running, started_at=now)
@@ -76,12 +77,17 @@ async def _dispatch_worker(run: Run, max_turns: int) -> None:
 
         await gtd_client.post_comment(
             run.item_id,
-            f"Agent dispatched (run `{run.id}`). "
+            f"Agent dispatched (run `{run.id}`, engine: {engine.name}). "
             f"Working on branch `{run.branch_name}` in `{project['name']}`.",
         )
 
-        result = await dispatch.run_claude(
-            workspace, system_prompt, item["title"], max_turns
+        result = await dispatch.run_agent(
+            engine,
+            workspace,
+            system_prompt,
+            item["title"],
+            max_turns,
+            run.agent_name,
         )
 
         completed = datetime.now(UTC).isoformat()
@@ -158,6 +164,11 @@ async def dispatch_item(
     _: str = Depends(_verify_api_key),
 ) -> RunResponse:
     """Start a new dispatch run for a GTD item."""
+    try:
+        engine = get_engine(body.engine)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
     # Fetch item to validate and get project info
     try:
         item = await gtd_client.get_item(body.item_id)
@@ -186,11 +197,13 @@ async def dispatch_item(
         item_id=body.item_id,
         project_name=project["name"],
         branch_name=branch_name,
+        engine=body.engine,
+        agent_name=body.agent_name,
     )
     await db.insert_run(run)
 
     # Start background task
-    task = asyncio.create_task(_dispatch_worker(run, max_turns))
+    task = asyncio.create_task(_dispatch_worker(run, max_turns, engine))
     _active_processes[run.id] = task
 
     return RunResponse(**run.model_dump())

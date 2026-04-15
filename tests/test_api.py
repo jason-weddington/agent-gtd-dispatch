@@ -16,7 +16,6 @@ def _env(tmp_path):
         "DISPATCH_API_KEY": "test-key",
         "AGENT_GTD_URL": "http://localhost:9999",
         "AGENT_GTD_API_KEY": "test-gtd-key",
-        "ANTHROPIC_API_KEY": "test-anthropic-key",
         "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
     }
     with patch.dict(os.environ, env):
@@ -124,7 +123,63 @@ class TestDispatch:
         assert data["item_id"] == "abc12345-6789"
         assert data["status"] == "pending"
         assert data["branch_name"] == "feat/abc12345-fix-bug"
+        assert data["engine"] == "claude"
+        assert data["agent_name"] is None
         assert data["id"]  # has a run ID
+
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_dispatch_with_engine_and_agent(
+        self, mock_client, mock_dispatch, client, auth_headers
+    ):
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_client.post_comment = AsyncMock()
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={
+                "item_id": "abc12345-6789",
+                "max_turns": 50,
+                "engine": "kiro",
+                "agent_name": "my-agent",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["engine"] == "kiro"
+        assert data["agent_name"] == "my-agent"
+
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_dispatch_unknown_engine(self, mock_client, client, auth_headers):
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc123",
+                "title": "Test",
+                "project_id": "proj1",
+            }
+        )
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc123", "max_turns": 50, "engine": "gpt-5"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+        assert "Unknown engine" in resp.json()["detail"]
 
 
 class TestListRuns:

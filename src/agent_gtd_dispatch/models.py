@@ -27,6 +27,8 @@ class Run(BaseModel):
     item_id: str
     project_name: str
     branch_name: str
+    engine: str = "claude"
+    agent_name: str | None = None
     status: RunStatus = RunStatus.pending
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -40,6 +42,8 @@ class DispatchRequest(BaseModel):
 
     item_id: str
     max_turns: int
+    engine: str = "claude"
+    agent_name: str | None = None
 
 
 class RunResponse(BaseModel):
@@ -49,6 +53,8 @@ class RunResponse(BaseModel):
     item_id: str
     project_name: str
     branch_name: str
+    engine: str
+    agent_name: str | None
     status: RunStatus
     started_at: datetime | None
     completed_at: datetime | None

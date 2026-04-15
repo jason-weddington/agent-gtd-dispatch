@@ -1,11 +1,14 @@
-"""Tests for core dispatch logic."""
+"""Tests for core dispatch logic and engine definitions."""
 
 from __future__ import annotations
+
+import pytest
 
 from agent_gtd_dispatch.dispatch import (
     branch_name_for_item,
     repo_name_from_origin,
 )
+from agent_gtd_dispatch.engines import CLAUDE, KIRO, build_env, get_engine
 
 
 class TestRepoNameFromOrigin:
@@ -55,3 +58,75 @@ class TestBranchName:
     def test_trailing_hyphens_stripped(self) -> None:
         result = branch_name_for_item("abcd1234", "Fix ---")
         assert not result.endswith("-")
+
+
+class TestGetEngine:
+    def test_claude(self) -> None:
+        assert get_engine("claude") is CLAUDE
+
+    def test_kiro(self) -> None:
+        assert get_engine("kiro") is KIRO
+
+    def test_unknown_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown engine"):
+            get_engine("gpt-5")
+
+
+class TestClaudeCommand:
+    def test_basic(self) -> None:
+        cmd = CLAUDE.build_command("sys prompt", "Fix bug", 20, None)
+        assert cmd[0] == "claude"
+        assert "--dangerously-skip-permissions" in cmd
+        assert "--system-prompt" in cmd
+        assert "--max-turns" in cmd
+        assert "20" in cmd
+        assert "--print" in cmd
+        assert cmd[-1] == "Fix bug"
+        assert "--agent" not in cmd
+
+    def test_with_agent(self) -> None:
+        cmd = CLAUDE.build_command("sys prompt", "Fix bug", 20, "my-agent")
+        idx = cmd.index("--agent")
+        assert cmd[idx + 1] == "my-agent"
+
+
+class TestKiroCommand:
+    def test_basic(self) -> None:
+        cmd = KIRO.build_command("sys prompt", "Fix bug", 20, None)
+        assert cmd[0] == "kiro-cli"
+        assert "chat" in cmd
+        assert "--no-interactive" in cmd
+        assert "--trust-all-tools" in cmd
+        assert "--agent" not in cmd
+        # System prompt baked into user prompt (last arg)
+        assert "sys prompt" in cmd[-1]
+        assert "Fix bug" in cmd[-1]
+
+    def test_with_agent(self) -> None:
+        cmd = KIRO.build_command("sys prompt", "Fix bug", 20, "my-agent")
+        idx = cmd.index("--agent")
+        assert cmd[idx + 1] == "my-agent"
+
+
+class TestBuildEnv:
+    def test_includes_common_keys(self, monkeypatch) -> None:
+        monkeypatch.setenv("PATH", "/usr/bin")
+        monkeypatch.setenv("AGENT_GTD_URL", "http://localhost")
+        env = build_env(CLAUDE)
+        assert "PATH" in env
+        assert "AGENT_GTD_URL" in env
+
+    def test_includes_engine_specific(self, monkeypatch) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        env = build_env(CLAUDE)
+        assert env["ANTHROPIC_API_KEY"] == "sk-test"
+
+    def test_excludes_other_engine_keys(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIRO_API_KEY", "kiro-test")
+        env = build_env(CLAUDE)
+        assert "KIRO_API_KEY" not in env
+
+    def test_kiro_includes_own_key(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIRO_API_KEY", "kiro-test")
+        env = build_env(KIRO)
+        assert env["KIRO_API_KEY"] == "kiro-test"

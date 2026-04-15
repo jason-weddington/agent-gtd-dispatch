@@ -35,6 +35,21 @@ async def init_db() -> None:
             )
         """)
         await db.commit()
+        await _migrate_db(db)
+
+
+async def _migrate_db(db: aiosqlite.Connection) -> None:
+    """Add columns introduced after v1.1.0."""
+    cursor = await db.execute("PRAGMA table_info(runs)")
+    existing = {row[1] for row in await cursor.fetchall()}
+
+    if "engine" not in existing:
+        await db.execute(
+            "ALTER TABLE runs ADD COLUMN engine TEXT NOT NULL DEFAULT 'claude'"
+        )
+    if "agent_name" not in existing:
+        await db.execute("ALTER TABLE runs ADD COLUMN agent_name TEXT")
+    await db.commit()
 
 
 async def insert_run(run: Run) -> None:
@@ -42,14 +57,16 @@ async def insert_run(run: Run) -> None:
     async with aiosqlite.connect(db_path()) as db:
         await db.execute(
             """INSERT INTO runs
-               (id, item_id, project_name, branch_name, status,
-                started_at, completed_at, exit_code, error, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, item_id, project_name, branch_name, engine, agent_name,
+                status, started_at, completed_at, exit_code, error, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run.id,
                 run.item_id,
                 run.project_name,
                 run.branch_name,
+                run.engine,
+                run.agent_name,
                 run.status.value,
                 run.started_at.isoformat() if run.started_at else None,
                 run.completed_at.isoformat() if run.completed_at else None,
@@ -149,6 +166,8 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         item_id=row["item_id"],
         project_name=row["project_name"],
         branch_name=row["branch_name"],
+        engine=row["engine"],
+        agent_name=row["agent_name"],
         status=RunStatus(row["status"]),
         started_at=_parse_dt(row["started_at"]),
         completed_at=_parse_dt(row["completed_at"]),
