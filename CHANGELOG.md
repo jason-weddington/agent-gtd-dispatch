@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.2.0 (2026-04-15)
+
+### Features
+
+- Multi-engine dispatch with Claude and Kiro CLI support
+  ([`3c6fb0d`](https://github.com/repos/agent-gtd-dispatch/commit/3c6fb0d0263dd05b58f927794aee56a09f398451))
+
+
 ## v1.1.0 (2026-04-15)
 
 ### Documentation
