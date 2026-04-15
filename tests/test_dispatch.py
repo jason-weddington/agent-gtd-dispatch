@@ -10,7 +10,8 @@ from agent_gtd_dispatch.dispatch import (
 
 class TestRepoNameFromOrigin:
     def test_scp_style(self) -> None:
-        assert repo_name_from_origin("git@ubuntu-vm01:repos/agent_gtd") == "repos-agent_gtd"
+        origin = "git@ubuntu-vm01:repos/agent_gtd"
+        assert repo_name_from_origin(origin) == "repos-agent_gtd"
 
     def test_ssh_url(self) -> None:
         assert (

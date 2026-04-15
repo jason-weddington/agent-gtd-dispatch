@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 
 from . import config
 
 
-async def _request(method: str, path: str, **kwargs: object) -> dict:
+async def _request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
     """Make an authenticated request to the GTD API."""
     url = f"{config.AGENT_GTD_URL}/api{path}"
     headers = {"Authorization": f"Bearer {config.AGENT_GTD_API_KEY}"}
@@ -17,15 +19,18 @@ async def _request(method: str, path: str, **kwargs: object) -> dict:
         return resp.json() if resp.content else {}
 
 
-async def get_item(item_id: str) -> dict:
+async def get_item(item_id: str) -> dict[str, Any]:
+    """Fetch a GTD item by ID."""
     return await _request("GET", f"/items/{item_id}")
 
 
-async def get_project(project_id: str) -> dict:
+async def get_project(project_id: str) -> dict[str, Any]:
+    """Fetch a GTD project by ID."""
     return await _request("GET", f"/projects/{project_id}")
 
 
 async def post_comment(item_id: str, content: str) -> None:
+    """Post a comment on a GTD item."""
     await _request(
         "POST",
         f"/items/{item_id}/comments",

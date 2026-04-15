@@ -1,0 +1,55 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.3
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.7
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run --frozen mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+        args: [src/]
+
+      - id: conventional-commit
+        name: Conventional Commit (main only)
+        entry: scripts/check-conventional-commit.sh
+        language: script
+        stages: [commit-msg]
+        always_run: true
+
+      - id: semantic-release
+        name: semantic-release
+        entry: bash -c 'branch=$(git rev-parse --abbrev-ref HEAD); msg=$(git log -1 --format=%s); if [ "$branch" = "main" ] && [[ "$msg" != chore\(release\):* ]]; then uv run semantic-release version --no-push --no-vcs-release; fi'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [post-commit]
+
+      - id: coverage
+        name: test coverage
+        entry: bash -c 'uv run --frozen pytest --cov --cov-report=term-missing'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

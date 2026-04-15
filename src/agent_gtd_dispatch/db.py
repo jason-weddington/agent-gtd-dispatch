@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC
+
 import aiosqlite
 
 from . import config
@@ -11,6 +13,7 @@ _DB_PATH = "dispatch.db"
 
 
 def db_path() -> str:
+    """Return the absolute path to the SQLite database."""
     return str(config.WORKSPACE_ROOT / _DB_PATH)
 
 
@@ -35,6 +38,7 @@ async def init_db() -> None:
 
 
 async def insert_run(run: Run) -> None:
+    """Insert a new run into the database."""
     async with aiosqlite.connect(db_path()) as db:
         await db.execute(
             """INSERT INTO runs
@@ -66,6 +70,7 @@ async def update_run(
     exit_code: int | None = None,
     error: str | None = None,
 ) -> None:
+    """Update fields on an existing run."""
     parts: list[str] = []
     values: list[object] = []
     if status is not None:
@@ -95,6 +100,7 @@ async def update_run(
 
 
 async def get_run(run_id: str) -> Run | None:
+    """Fetch a single run by ID, or None if not found."""
     async with aiosqlite.connect(db_path()) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM runs WHERE id = ?", (run_id,)) as cursor:
@@ -109,6 +115,7 @@ async def list_runs(
     status: RunStatus | None = None,
     limit: int = 50,
 ) -> list[Run]:
+    """List runs with optional filtering."""
     clauses: list[str] = []
     values: list[object] = []
     if item_id:
@@ -130,12 +137,12 @@ async def list_runs(
 
 
 def _row_to_run(row: aiosqlite.Row) -> Run:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     def _parse_dt(val: str | None) -> datetime | None:
         if val is None:
             return None
-        return datetime.fromisoformat(val).replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(val).replace(tzinfo=UTC)
 
     return Run(
         id=row["id"],
@@ -147,5 +154,5 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         completed_at=_parse_dt(row["completed_at"]),
         exit_code=row["exit_code"],
         error=row["error"],
-        created_at=_parse_dt(row["created_at"]) or datetime.now(timezone.utc),
+        created_at=_parse_dt(row["created_at"]) or datetime.now(UTC),
     )

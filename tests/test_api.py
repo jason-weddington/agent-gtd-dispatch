@@ -98,7 +98,11 @@ class TestDispatch:
     @patch("agent_gtd_dispatch.main.gtd_client")
     def test_dispatch_success(self, mock_client, mock_dispatch, client, auth_headers):
         mock_client.get_item = AsyncMock(
-            return_value={"id": "abc12345-6789", "title": "Fix bug", "project_id": "proj1"}
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
         )
         mock_client.get_project = AsyncMock(
             return_value={

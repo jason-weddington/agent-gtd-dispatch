@@ -7,6 +7,7 @@ import re
 import subprocess
 import textwrap
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from . import config
@@ -58,7 +59,7 @@ def prepare_workspace(origin: str, item_id: str) -> Path:
 
 
 def build_system_prompt(
-    item: dict, project: dict, branch_name: str, max_turns: int
+    item: dict[str, Any], project: dict[str, Any], branch_name: str, max_turns: int
 ) -> str:
     """Build the headless agent system prompt."""
     item_id = item["id"]
@@ -130,7 +131,9 @@ async def run_claude(
         title,
     ]
 
-    env = {k: v for k, v in __import__("os").environ.items() if k in config.SAFE_ENV_KEYS}
+    env = {
+        k: v for k, v in __import__("os").environ.items() if k in config.SAFE_ENV_KEYS
+    }
     env["HOME"] = str(Path.home())
 
     loop = asyncio.get_event_loop()

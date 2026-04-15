@@ -43,7 +43,6 @@ SAFE_ENV_KEYS: set[str] = {
     "CLAUDE_CODE_OAUTH_TOKEN",
     "AGENT_GTD_URL",
     "AGENT_GTD_API_KEY",
-    "ANTHROPIC_API_KEY",
     "KB_DATABASE_URL",
     "SSH_AUTH_SOCK",
     "GIT_SSH_COMMAND",
@@ -52,8 +51,8 @@ SAFE_ENV_KEYS: set[str] = {
 
 def load() -> None:
     """Load configuration from environment. Call once at startup."""
-    global DISPATCH_API_KEY, AGENT_GTD_URL, AGENT_GTD_API_KEY  # noqa: PLW0603
-    global ANTHROPIC_API_KEY, WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS  # noqa: PLW0603
+    global DISPATCH_API_KEY, AGENT_GTD_URL, AGENT_GTD_API_KEY
+    global ANTHROPIC_API_KEY, WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import signal
 import subprocess
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import AsyncGenerator
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Security
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import config, db, dispatch, gtd_client
@@ -31,6 +33,7 @@ def _verify_api_key(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    """Initialize config and DB on startup, cancel tasks on shutdown."""
     config.load()
     await db.init_db()
     yield
@@ -47,7 +50,7 @@ app = FastAPI(title="Agent GTD Dispatch", lifespan=lifespan)
 
 async def _dispatch_worker(run: Run, max_turns: int) -> None:
     """Background task that executes a dispatch run."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     await db.update_run(run.id, status=RunStatus.running, started_at=now)
 
     try:
@@ -80,7 +83,7 @@ async def _dispatch_worker(run: Run, max_turns: int) -> None:
             workspace, system_prompt, item["title"], max_turns
         )
 
-        completed = datetime.now(timezone.utc).isoformat()
+        completed = datetime.now(UTC).isoformat()
         if result.returncode == 0:
             await db.update_run(
                 run.id,
@@ -111,7 +114,7 @@ async def _dispatch_worker(run: Run, max_turns: int) -> None:
         await db.update_run(
             run.id,
             status=RunStatus.timed_out,
-            completed_at=datetime.now(timezone.utc).isoformat(),
+            completed_at=datetime.now(UTC).isoformat(),
             error=f"Timed out after {config.TIMEOUT_SECONDS}s",
         )
         await gtd_client.post_comment(
@@ -123,13 +126,13 @@ async def _dispatch_worker(run: Run, max_turns: int) -> None:
         await db.update_run(
             run.id,
             status=RunStatus.cancelled,
-            completed_at=datetime.now(timezone.utc).isoformat(),
+            completed_at=datetime.now(UTC).isoformat(),
         )
     except Exception as exc:
         await db.update_run(
             run.id,
             status=RunStatus.failed,
-            completed_at=datetime.now(timezone.utc).isoformat(),
+            completed_at=datetime.now(UTC).isoformat(),
             error=str(exc)[:500],
         )
     finally:
@@ -140,7 +143,8 @@ async def _dispatch_worker(run: Run, max_turns: int) -> None:
 
 
 @app.get("/health")
-async def health() -> dict:
+async def health() -> dict[str, object]:
+    """Return service health and active run count."""
     active = len(_active_processes)
     return {"status": "ok", "active_runs": active}
 
@@ -234,9 +238,10 @@ async def cancel_run(
     await db.update_run(
         run_id,
         status=RunStatus.cancelled,
-        completed_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=datetime.now(UTC).isoformat(),
     )
 
     run = await db.get_run(run_id)
-    assert run is not None
+    if run is None:  # pragma: no cover
+        raise HTTPException(status_code=404, detail="Run not found")
     return RunResponse(**run.model_dump())

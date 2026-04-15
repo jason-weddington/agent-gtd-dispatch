@@ -10,13 +10,16 @@ dependencies = [
     "aiosqlite>=0.20",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
+    "ruff>=0.9",
+    "mypy>=1.14",
     "pytest>=8",
-    "pytest-asyncio>=0.24",
     "pytest-cov>=6",
-    "ruff>=0.8",
-    "mypy>=1.13",
+    "pytest-asyncio>=0.25",
+    "hypothesis>=6.100",
+    "pre-commit>=4",
+    "python-semantic-release>=9",
 ]
 
 [build-system]
@@ -27,24 +30,74 @@ build-backend = "hatchling.build"
 packages = ["src/agent_gtd_dispatch"]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py313"
+line-length = 88
 src = ["src", "tests"]
+extend-exclude = ["scripts/"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "S"]
-ignore = ["S603", "S607"]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "N",     # pep8-naming
+    "D",     # pydocstyle
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "S",     # flake8-bandit
+    "A",     # flake8-builtins
+    "C4",    # flake8-comprehensions
+    "SIM",   # flake8-simplify
+    "TCH",   # flake8-type-checking
+    "RUF",   # ruff-specific rules
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S106", "D"]
+"src/agent_gtd_dispatch/dispatch.py" = ["S603", "S607", "E501"]
+"src/agent_gtd_dispatch/main.py" = ["B008", "E501"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.13"
 strict = true
-warn_return_any = true
+plugins = []
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "aiosqlite.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = "--strict-markers -v"
+filterwarnings = [
+    "error::DeprecationWarning",
+]
 
 [tool.coverage.run]
 source = ["agent_gtd_dispatch"]
+omit = [
+    "src/agent_gtd_dispatch/dispatch.py",
+    "src/agent_gtd_dispatch/gtd_client.py",
+]
 
 [tool.coverage.report]
-fail_under = 0
+fail_under = 73
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+commit_parser = "conventional"
+changelog_file = "CHANGELOG.md"
+commit_message = "chore(release): {version}"
+build_command = "uv lock && git add uv.lock && uv build"
+
+[tool.semantic_release.publish]
+upload_to_vcs_release = false
