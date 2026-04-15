@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.3.0 (2026-04-15)
+
+### Features
+
+- Update dispatch prompt to set item status to review on success
+  ([`1865a71`](https://github.com/repos/agent-gtd-dispatch/commit/1865a710aed34a1678566d5db573aa63bf9532ef))
+
+
 ## v1.2.0 (2026-04-15)
 
 ### Features
