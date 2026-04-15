@@ -101,10 +101,9 @@ def build_system_prompt(
         When you finish (success or blocked), post a comment to the GTD item.
         The Agent GTD MCP server is available — use `add_comment` with item_id="{item_id}".
 
-        **On success**, your comment should include:
-        - What you did (1-3 sentences)
-        - The branch name: `{branch_name}`
-        - Any notes for the reviewer
+        **On success:**
+        1. Post a comment with: what you did, the branch name (`{branch_name}`), notes for the reviewer
+        2. Set the item status to `review` using `update_item` with the item's current version
 
         **On failure/blocked**, your comment should include:
         - Why you stopped
