@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v1.1.0 (2026-04-15)
+
+### Documentation
+
+- Add CLAUDE.md and README.md for agent bootstrapping
+  ([`b2de999`](https://github.com/repos/agent-gtd-dispatch/commit/b2de9994af959413782740d0b8dd8f1455434a74))
+
+### Features
+
+- Per-run workspace isolation with branch checkout and cleanup
+  ([`aeb598c`](https://github.com/repos/agent-gtd-dispatch/commit/aeb598c8889915a39029596293ee344da0ea0840))
+
+
 ## v1.0.0 (2026-04-15)
 
 - Initial Release
