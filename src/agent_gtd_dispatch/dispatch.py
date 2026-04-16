@@ -66,9 +66,88 @@ def cleanup_workspace(workspace: Path) -> None:
 
 
 def build_system_prompt(
-    item: dict[str, Any], project: dict[str, Any], branch_name: str, max_turns: int
+    item: dict[str, Any],
+    project: dict[str, Any],
+    branch_name: str,
+    max_turns: int,
+    mode: str = "build",
 ) -> str:
     """Build the headless agent system prompt."""
+    if mode == "plan":
+        return _build_plan_prompt(item, project, max_turns)
+    return _build_build_prompt(item, project, branch_name, max_turns)
+
+
+def _build_plan_prompt(
+    item: dict[str, Any], project: dict[str, Any], max_turns: int
+) -> str:
+    """System prompt for plan mode — groom a task, don't build it."""
+    item_id = item["id"]
+    title = item["title"]
+    description = item.get("description", "")
+    project_name = project["name"]
+
+    return textwrap.dedent(
+        f"""\
+        You are a headless planning agent dispatched by Agent GTD.
+        No human is available for questions — you must work autonomously.
+
+        ## Your Task
+
+        **Mode: PLAN** — You are grooming this task, NOT implementing it.
+
+        **Project:** {project_name}
+        **Item:** {title}
+        **Item ID:** {item_id}
+
+        {f"**Description:**{chr(10)}{description}" if description else "No description provided — work from the title only."}
+
+        ## What to do
+
+        1. **Read the codebase.** Understand existing patterns, architecture, and conventions.
+        2. **Write acceptance criteria.** Update the item description with clear, testable AC.
+        3. **Identify files to modify.** List specific file paths and what changes in each.
+        4. **Add patterns to follow.** Reference existing code the implementer should copy.
+        5. **Define scope boundaries.** Explicitly state what NOT to touch.
+        6. **Add verification steps.** How to test the changes (commands, expected output).
+        7. **Ask questions if unclear.** If the intent is ambiguous, post a comment asking
+           for clarification and stop. Do NOT guess.
+
+        ## Rules
+
+        - Do NOT write code, create branches, or push anything.
+        - Do NOT modify any files in the repo.
+        - Use `update_item` (with the item's current version) to update the description.
+        - Use `add_comment` with item_id="{item_id}" for questions or notes.
+        - When grooming is complete, set item status to `ready` using `update_item`.
+
+        ## Reporting
+
+        Post a comment when you start: "Planning..."
+
+        **On success:**
+        1. Post a comment summarizing what you added to the description
+        2. Set item status to `ready`
+
+        **On failure/blocked:**
+        1. Post a comment explaining what's unclear
+        2. Leave status unchanged
+
+        ## Important
+
+        - You have max {max_turns} turns. Budget them wisely.
+        - Focus only on this task. Don't groom other items you notice.
+    """
+    )
+
+
+def _build_build_prompt(
+    item: dict[str, Any],
+    project: dict[str, Any],
+    branch_name: str,
+    max_turns: int,
+) -> str:
+    """System prompt for build mode — implement and push a branch."""
     item_id = item["id"]
     title = item["title"]
     description = item.get("description", "")

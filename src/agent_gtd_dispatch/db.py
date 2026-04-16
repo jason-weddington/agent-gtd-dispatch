@@ -49,6 +49,10 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
         )
     if "agent_name" not in existing:
         await db.execute("ALTER TABLE runs ADD COLUMN agent_name TEXT")
+    if "mode" not in existing:
+        await db.execute(
+            "ALTER TABLE runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'build'"
+        )
     await db.commit()
 
 
@@ -58,8 +62,8 @@ async def insert_run(run: Run) -> None:
         await db.execute(
             """INSERT INTO runs
                (id, item_id, project_name, branch_name, engine, agent_name,
-                status, started_at, completed_at, exit_code, error, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                mode, status, started_at, completed_at, exit_code, error, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run.id,
                 run.item_id,
@@ -67,6 +71,7 @@ async def insert_run(run: Run) -> None:
                 run.branch_name,
                 run.engine,
                 run.agent_name,
+                run.mode,
                 run.status.value,
                 run.started_at.isoformat() if run.started_at else None,
                 run.completed_at.isoformat() if run.completed_at else None,

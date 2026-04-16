@@ -71,8 +71,9 @@ async def _dispatch_worker(run: Run, max_turns: int, engine: Engine) -> None:
         workspace = dispatch.prepare_workspace(git_origin, run.id, run.branch_name)
 
         # Build prompt and run
+        mode = getattr(run, "mode", "build") or "build"
         system_prompt = dispatch.build_system_prompt(
-            item, project, run.branch_name, max_turns
+            item, project, run.branch_name, max_turns, mode=mode
         )
 
         await gtd_client.post_comment(
@@ -199,6 +200,7 @@ async def dispatch_item(
         branch_name=branch_name,
         engine=body.engine,
         agent_name=body.agent_name,
+        mode=body.mode,
     )
     await db.insert_run(run)
 
