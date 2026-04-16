@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v1.6.0 (2026-04-16)
+
+### Chores
+
+- Gitignore .coverage file
+  ([`4b2a49d`](https://github.com/repos/agent-gtd-dispatch/commit/4b2a49d3558a4120729bb0fdcb605f3d07e25eed))
+
+### Features
+
+- Reconcile orphaned runs on startup
+  ([`2a64eb7`](https://github.com/repos/agent-gtd-dispatch/commit/2a64eb7930c26987d3a0d55eac51ae4633490be6))
+
+
 ## v1.5.0 (2026-04-16)
 
 ### Chores
