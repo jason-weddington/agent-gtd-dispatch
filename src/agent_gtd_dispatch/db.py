@@ -56,6 +56,21 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def reconcile_orphans() -> int:
+    """Mark any runs stuck in pending/running as failed (service restart).
+
+    Returns the number of rows updated.
+    """
+    async with aiosqlite.connect(db_path()) as db:
+        cursor = await db.execute(
+            "UPDATE runs SET status = 'failed',"
+            " error = 'Service restarted while run was active'"
+            " WHERE status IN ('pending', 'running')"
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
 async def insert_run(run: Run) -> None:
     """Insert a new run into the database."""
     async with aiosqlite.connect(db_path()) as db:

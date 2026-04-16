@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import subprocess
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -17,6 +18,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from . import config, db, dispatch, gtd_client
 from .engines import Engine, get_engine
 from .models import DispatchRequest, Run, RunResponse, RunStatus
+
+logger = logging.getLogger(__name__)
 
 # Track running subprocesses for cancellation
 _active_processes: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
@@ -37,6 +40,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Initialize config and DB on startup, cancel tasks on shutdown."""
     config.load()
     await db.init_db()
+    orphan_count = await db.reconcile_orphans()
+    if orphan_count > 0:
+        logger.warning("Reconciled %d orphaned run(s) on startup", orphan_count)
+    else:
+        logger.info("No orphaned runs found on startup")
     yield
     # Cancel any active dispatch tasks on shutdown
     for task in _active_processes.values():

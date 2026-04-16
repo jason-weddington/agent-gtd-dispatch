@@ -199,3 +199,24 @@ class TestCancelRun:
     def test_cancel_not_found(self, client, auth_headers):
         resp = client.post("/runs/nonexistent/cancel", headers=auth_headers)
         assert resp.status_code == 404
+
+
+class TestStartupReconciliation:
+    async def test_orphaned_runs_marked_failed_on_startup(self, auth_headers) -> None:
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.main import app
+        from agent_gtd_dispatch.models import Run, RunStatus
+
+        # Seed the DB with an orphaned "running" run before starting the app
+        await db.init_db()
+        run = Run(item_id="item1", project_name="proj", branch_name="feat/x")
+        await db.insert_run(run)
+        await db.update_run(run.id, status=RunStatus.running)
+
+        # Starting the TestClient triggers the lifespan (reconcile_orphans)
+        with TestClient(app) as c:
+            resp = c.get(f"/runs/{run.id}", headers=auth_headers)
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["status"] == "failed"
+            assert data["error"] == "Service restarted while run was active"
