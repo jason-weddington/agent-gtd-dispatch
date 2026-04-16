@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v1.5.0 (2026-04-16)
+
+### Chores
+
+- Bump default max_turns from 50/20 to 100
+  ([`ccc4057`](https://github.com/repos/agent-gtd-dispatch/commit/ccc4057f7447aa9b3e13e99355bc843a0f2e7309))
+
+### Features
+
+- Add plan mode system prompt and mode parameter support
+  ([`08e0ac0`](https://github.com/repos/agent-gtd-dispatch/commit/08e0ac0aea4b18ae5acfb00dd92af1d51501f062))
+
+
 ## v1.4.0 (2026-04-15)
 
 ### Features
