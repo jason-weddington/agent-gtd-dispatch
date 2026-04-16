@@ -25,7 +25,7 @@ AGENT_GTD_API_KEY: str = ""
 WORKSPACE_ROOT: Path = Path.home() / "workspace"
 
 # Agent limits
-MAX_TURNS: int = 50
+MAX_TURNS: int = 100
 TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
 
 
@@ -41,5 +41,5 @@ def load() -> None:
     WORKSPACE_ROOT = Path(
         os.environ.get("DISPATCH_WORKSPACE_ROOT", str(Path.home() / "workspace"))
     )
-    MAX_TURNS = int(os.environ.get("DISPATCH_MAX_TURNS", "20"))
+    MAX_TURNS = int(os.environ.get("DISPATCH_MAX_TURNS", "100"))
     TIMEOUT_SECONDS = int(os.environ.get("DISPATCH_TIMEOUT_SECONDS", "1800"))
