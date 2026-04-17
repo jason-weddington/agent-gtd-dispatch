@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
+from agent_gtd_dispatch import config
 from agent_gtd_dispatch.dispatch import (
     branch_name_for_item,
+    build_system_prompt,
+    cleanup_workspace,
     repo_name_from_origin,
 )
 from agent_gtd_dispatch.engines import CLAUDE, KIRO, build_env, get_engine
@@ -130,3 +135,81 @@ class TestBuildEnv:
         monkeypatch.setenv("KIRO_API_KEY", "kiro-test")
         env = build_env(KIRO)
         assert env["KIRO_API_KEY"] == "kiro-test"
+
+
+class TestBuildSystemPrompt:
+    _item: ClassVar[dict] = {
+        "id": "abc12345-0000-0000-0000-000000000000",
+        "title": "Fix the login bug",
+        "description": "Users cannot log in with OAuth.",
+    }
+    _project: ClassVar[dict] = {"name": "my-cool-project"}
+    _branch = "feat/abc12345-fix-the-login-bug"
+    _max_turns = 42
+
+    def _prompt(self, item=None, project=None, branch=None, max_turns=None) -> str:
+        return build_system_prompt(
+            item or self._item,
+            project or self._project,
+            branch or self._branch,
+            max_turns if max_turns is not None else self._max_turns,
+        )
+
+    def test_includes_project_and_item_fields(self) -> None:
+        prompt = self._prompt()
+        assert "my-cool-project" in prompt
+        assert "Fix the login bug" in prompt
+        assert "abc12345-0000-0000-0000-000000000000" in prompt
+        assert self._branch in prompt
+        assert "42" in prompt
+
+    def test_includes_description_when_present(self) -> None:
+        prompt = self._prompt()
+        assert "Users cannot log in with OAuth." in prompt
+
+    def test_fallback_when_no_description(self) -> None:
+        item_no_desc = {
+            "id": "abc12345-0000-0000-0000-000000000000",
+            "title": "Fix the login bug",
+        }
+        prompt = self._prompt(item=item_no_desc)
+        assert "No description provided" in prompt
+
+    def test_says_already_on_branch(self) -> None:
+        prompt = self._prompt()
+        assert "already on branch" in prompt
+
+    def test_is_engine_agnostic(self) -> None:
+        prompt = self._prompt()
+        assert "headless coding agent" in prompt
+        assert "Claude Code" not in prompt
+
+
+@pytest.fixture
+def workspace_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+    return tmp_path
+
+
+class TestCleanupWorkspace:
+    def test_removes_existing_workspace(self, workspace_root) -> None:
+        ws = workspace_root / "my-run-abc123"
+        ws.mkdir()
+        assert ws.exists()
+        cleanup_workspace(ws)
+        assert not ws.exists()
+
+    def test_noop_when_missing(self, workspace_root) -> None:
+        ws = workspace_root / "nonexistent-run"
+        assert not ws.exists()
+        # Should not raise
+        cleanup_workspace(ws)
+
+    def test_safety_check_refuses_outside_workspace_root(self, workspace_root) -> None:
+        outside = workspace_root.parent / "outside-dir"
+        outside.mkdir()
+        try:
+            cleanup_workspace(outside)
+            assert outside.exists()
+        finally:
+            outside.rmdir()
