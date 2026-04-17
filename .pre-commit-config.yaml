@@ -38,14 +38,6 @@ repos:
         stages: [commit-msg]
         always_run: true
 
-      - id: semantic-release
-        name: semantic-release
-        entry: bash -c 'branch=$(git rev-parse --abbrev-ref HEAD); msg=$(git log -1 --format=%s); if [ "$branch" = "main" ] && [[ "$msg" != chore\(release\):* ]]; then uv run semantic-release version --no-push --no-vcs-release; fi'
-        language: system
-        pass_filenames: false
-        always_run: true
-        stages: [post-commit]
-
       - id: coverage
         name: test coverage
         entry: bash -c 'uv run --frozen pytest --cov --cov-report=term-missing'
