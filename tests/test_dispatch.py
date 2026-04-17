@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import ClassVar
+from unittest.mock import call, patch
 
 import pytest
 
@@ -11,6 +12,7 @@ from agent_gtd_dispatch.dispatch import (
     branch_name_for_item,
     build_system_prompt,
     cleanup_workspace,
+    prepare_workspace,
     repo_name_from_origin,
 )
 from agent_gtd_dispatch.engines import CLAUDE, KIRO, build_env, get_engine
@@ -63,6 +65,60 @@ class TestBranchName:
     def test_trailing_hyphens_stripped(self) -> None:
         result = branch_name_for_item("abcd1234", "Fix ---")
         assert not result.endswith("-")
+
+
+class TestPrepareWorkspace:
+    @pytest.fixture
+    def workspace_root(self, tmp_path, monkeypatch) -> object:
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+        return tmp_path
+
+    def test_workspace_path_uses_run_id(self, workspace_root, tmp_path) -> None:
+        origin = "git@host:repos/myrepo"
+        run_id = "abc123"
+        branch = "feat/abc123-fix-bug"
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess"):
+            result = prepare_workspace(origin, run_id, branch)
+
+        expected = tmp_path / f"repos-myrepo-{run_id}"
+        assert result == expected
+
+    def test_calls_git_clone_then_checkout(self, workspace_root, tmp_path) -> None:
+        origin = "git@host:repos/myrepo"
+        run_id = "abc123"
+        branch = "feat/abc123-fix-bug"
+        expected_workspace = tmp_path / f"repos-myrepo-{run_id}"
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub:
+            prepare_workspace(origin, run_id, branch)
+
+        assert mock_sub.run.call_count == 2
+        clone_call, checkout_call = mock_sub.run.call_args_list
+        assert clone_call == call(
+            ["git", "clone", origin, str(expected_workspace)],
+            check=True,
+            capture_output=True,
+        )
+        assert checkout_call == call(
+            ["git", "checkout", "-b", branch],
+            cwd=expected_workspace,
+            check=True,
+            capture_output=True,
+        )
+
+    def test_creates_workspace_root_if_missing(self, tmp_path, monkeypatch) -> None:
+        nested_root = tmp_path / "nonexistent" / "workspace"
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", nested_root)
+
+        origin = "git@host:repos/myrepo"
+        run_id = "abc123"
+        branch = "feat/abc123-fix-bug"
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess"):
+            prepare_workspace(origin, run_id, branch)
+
+        assert nested_root.exists()
 
 
 class TestGetEngine:
