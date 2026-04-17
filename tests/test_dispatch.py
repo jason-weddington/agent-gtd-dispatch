@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from typing import ClassVar
 from unittest.mock import call, patch
 
@@ -14,6 +15,7 @@ from agent_gtd_dispatch.dispatch import (
     cleanup_workspace,
     prepare_workspace,
     repo_name_from_origin,
+    run_agent,
 )
 from agent_gtd_dispatch.engines import CLAUDE, KIRO, build_env, get_engine
 
@@ -269,3 +271,75 @@ class TestCleanupWorkspace:
             assert outside.exists()
         finally:
             outside.rmdir()
+
+
+class TestRunAgent:
+    async def test_calls_subprocess_with_engine_command(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            args, _kwargs = mock_run.call_args
+            assert args[0][0] == "claude"
+            assert "--dangerously-skip-permissions" in args[0]
+
+    async def test_passes_workspace_as_cwd(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            _, kwargs = mock_run.call_args
+            assert kwargs["cwd"] == tmp_path
+
+    async def test_passes_timeout_from_config(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 42)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            _, kwargs = mock_run.call_args
+            assert kwargs["timeout"] == 42
+
+    async def test_env_filtered_by_engine(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        monkeypatch.setenv("KIRO_API_KEY", "kiro-secret")
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            _, kwargs = mock_run.call_args
+            assert kwargs["env"]["ANTHROPIC_API_KEY"] == "sk-test"
+            assert "KIRO_API_KEY" not in kwargs["env"]
+
+    async def test_agent_name_passes_through_to_command(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20, agent_name="my-agent")
+            args, _kwargs = mock_run.call_args
+            cmd = args[0]
+            idx = cmd.index("--agent")
+            assert cmd[idx + 1] == "my-agent"
+
+    async def test_returns_completed_process(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="done", stderr=""
+            )
+            result = await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            assert result.returncode == 0
+            assert result.stdout == "done"
