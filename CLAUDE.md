@@ -6,7 +6,7 @@ Dispatch worker API that runs headless Claude Code agents on isolated infrastruc
 
 ```bash
 uv sync                  # install all deps including dev group
-uv run pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type post-commit --hook-type pre-push
+uv run pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type pre-push
 ```
 
 ## Commands
@@ -27,13 +27,15 @@ src/agent_gtd_dispatch/
   main.py          # FastAPI app — endpoints, lifespan, background dispatch worker
   models.py        # Pydantic models: Run, RunStatus, DispatchRequest, RunResponse
   db.py            # SQLite persistence (aiosqlite) for dispatch runs
-  dispatch.py      # Core logic: workspace prep, prompt building, Claude subprocess
+  dispatch.py      # Core logic: workspace prep, prompt building, agent invocation
+  engines.py       # Per-engine CLI command builders + env filtering (claude, kiro, ...)
   gtd_client.py    # HTTP client for the Agent GTD API (items, projects, comments)
-  config.py        # Env-var config with load() and SAFE_ENV_KEYS for subprocess env
+  config.py        # Env-var config with load() — shared service config only
 
 tests/
-  test_api.py      # API endpoint tests via FastAPI TestClient with mocked gtd_client
-  test_dispatch.py # Unit tests for repo_name_from_origin, branch_name_for_item
+  test_api.py        # API endpoint tests via FastAPI TestClient with mocked gtd_client
+  test_dispatch.py   # Unit tests for dispatch logic + engine command/env builders
+  test_gtd_client.py # HTTP client tests with mocked httpx
 ```
 
 ## Key patterns
@@ -48,11 +50,12 @@ tests/
 - Branch from main: `git checkout -b feat/description` (or `fix/`, `chore/`)
 - Conventional commits enforced on main (hook). Feature branches are free-form.
 - Squash merge to main: `git checkout main && git merge --squash feat/x && git commit`
-- Post-commit hook auto-runs semantic-release on main.
-- Pre-push hook runs full test suite with coverage (fail_under = 73%).
+- Push to origin freely; `./deploy.sh` deploys current main to pironman01.
+- `./release.sh` cuts a version (semantic-release), pushes main + tags to origin and github, then deploys.
+- Pre-push hook runs full test suite with coverage (threshold from `[tool.coverage.report]` in `pyproject.toml`).
 - All `uv run` in hooks uses `--frozen` to avoid rebuilding mid-hook.
 
 ## Coverage
 
-- `dispatch.py` and `gtd_client.py` are omitted from the coverage threshold (they call subprocesses and external HTTP).
-- Threshold is 73%. Ratchet it up when you add tests.
+- See `[tool.coverage.run] omit` in `pyproject.toml` for files excluded from the threshold.
+- Threshold lives in `[tool.coverage.report] fail_under` — ratchet it up when you add tests.
