@@ -60,6 +60,7 @@ convention = "google"
 "tests/**" = ["S101", "S106", "D"]
 "src/agent_gtd_dispatch/dispatch.py" = ["S603", "S607", "S608", "E501"]
 "src/agent_gtd_dispatch/main.py" = ["B008", "E501"]
+"src/agent_gtd_dispatch/agent_discovery.py" = ["S603", "S607"]
 
 [tool.mypy]
 python_version = "3.13"
@@ -90,7 +91,7 @@ omit = [
 ]
 
 [tool.coverage.report]
-fail_under = 81
+fail_under = 83
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]

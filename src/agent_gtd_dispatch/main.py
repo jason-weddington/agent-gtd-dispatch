@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import config, db, dispatch, gtd_client
+from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
 from .engines import Engine, get_engine
 from .models import DispatchRequest, Run, RunResponse, RunStatus
 
@@ -165,6 +166,25 @@ async def health() -> dict[str, object]:
     """Return service health and active run count."""
     active = len(_active_processes)
     return {"status": "ok", "active_runs": active}
+
+
+@app.get("/info")
+async def info() -> dict[str, str]:
+    """Return engine identity and service version. No auth required."""
+    return {"engine": ENGINE_NAME, "version": SERVICE_VERSION}
+
+
+@app.get("/agents")
+async def list_agents(
+    _: str = Depends(_verify_api_key),
+) -> dict[str, object]:
+    """Return available agents by executing list_agents.sh.
+
+    Always returns 200. Returns an empty list if the script is missing,
+    non-executable, exits non-zero, or times out.
+    """
+    agents = await run_list_agents_script()
+    return {"agents": agents}
 
 
 @app.post("/dispatch", response_model=RunResponse)
