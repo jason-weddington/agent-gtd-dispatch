@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.7.1 (2026-04-22)
+
+### Bug Fixes
+
+- Attribute dispatch comments to the actual engine
+  ([`46793ab`](https://github.com/repos/agent-gtd-dispatch/commit/46793ab4f99daf53525b43cd85a066c194e6e2d0))
+
+
 ## v1.7.0 (2026-04-22)
 
 ### Chores
