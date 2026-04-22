@@ -212,6 +212,10 @@ async def run_agent(
     agent_name: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a headless agent CLI as a subprocess."""
+    if engine.name == "kiro":
+        (workspace / "system_prompt.md").write_text(
+            f"{system_prompt}\n\n---\n\n## Task\n\n{title}"
+        )
     cmd = engine.build_command(system_prompt, title, max_turns, agent_name)
     env = build_env(engine)
 

@@ -161,9 +161,11 @@ class TestKiroCommand:
         assert "--no-interactive" in cmd
         assert "--trust-all-tools" in cmd
         assert "--agent" not in cmd
-        # System prompt baked into user prompt (last arg)
-        assert "sys prompt" in cmd[-1]
-        assert "Fix bug" in cmd[-1]
+        # Short prompt referencing system_prompt.md (written by run_agent)
+        assert cmd[-1] == (
+            "Use the read tool to open system_prompt.md in this directory, "
+            "then follow every instruction inside it."
+        )
 
     def test_with_agent(self) -> None:
         cmd = KIRO.build_command("sys prompt", "Fix bug", 20, "my-agent")
@@ -343,3 +345,25 @@ class TestRunAgent:
             result = await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
             assert result.returncode == 0
             assert result.stdout == "done"
+
+    async def test_kiro_writes_system_prompt_md(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            await run_agent(KIRO, tmp_path, "sys prompt", "Fix bug", 20)
+            md = (tmp_path / "system_prompt.md").read_text()
+            assert "sys prompt" in md
+            assert "Fix bug" in md
+
+    async def test_claude_does_not_write_system_prompt_md(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            assert not (tmp_path / "system_prompt.md").exists()
