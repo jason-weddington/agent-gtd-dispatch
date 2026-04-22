@@ -103,7 +103,9 @@ class TestPostComment:
         mock_client, _ = _make_client_mock(content=b"")
         mock_cls.return_value.__aenter__.return_value = mock_client
 
-        result = await post_comment("item1", "Hello world")
+        result = await post_comment(
+            "item1", "Hello world", created_by="claude-dispatch"
+        )
 
         assert result is None
         mock_client.request.assert_called_once_with(
@@ -114,13 +116,31 @@ class TestPostComment:
         )
 
     @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_kiro_created_by_propagates(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import post_comment
+
+        mock_client, _ = _make_client_mock(content=b"")
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await post_comment("item1", "Hello world", created_by="kiro-dispatch")
+
+        mock_client.request.assert_called_once_with(
+            "POST",
+            "http://localhost:9999/api/items/item1/comments",
+            headers={"Authorization": "Bearer test-gtd-key"},
+            json={"content_markdown": "Hello world", "created_by": "kiro-dispatch"},
+        )
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
     async def test_empty_response_returns_none(self, mock_cls) -> None:
         from agent_gtd_dispatch.gtd_client import post_comment
 
         mock_client, _ = _make_client_mock(content=b"")
         mock_cls.return_value.__aenter__.return_value = mock_client
 
-        result = await post_comment("item1", "Test comment")
+        result = await post_comment(
+            "item1", "Test comment", created_by="claude-dispatch"
+        )
 
         assert result is None
 

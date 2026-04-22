@@ -89,6 +89,7 @@ async def _dispatch_worker(run: Run, max_turns: int, engine: Engine) -> None:
             run.item_id,
             f"Agent dispatched (run `{run.id}`, engine: {engine.name}). "
             f"Working on branch `{run.branch_name}` in `{project['name']}`.",
+            created_by=f"{engine.name}-dispatch",
         )
 
         result = await dispatch.run_agent(
@@ -125,6 +126,7 @@ async def _dispatch_worker(run: Run, max_turns: int, engine: Engine) -> None:
                     run.item_id,
                     f"Agent exited with code {result.returncode} (run `{run.id}`)."
                     f"\n\n```\n{error_msg}\n```",
+                    created_by=f"{engine.name}-dispatch",
                 )
 
     except subprocess.TimeoutExpired:
@@ -138,6 +140,7 @@ async def _dispatch_worker(run: Run, max_turns: int, engine: Engine) -> None:
             run.item_id,
             f"Agent timed out after {config.TIMEOUT_SECONDS // 60} minutes (run `{run.id}`). "
             "The task may need to be broken down into smaller pieces.",
+            created_by=f"{engine.name}-dispatch",
         )
     except asyncio.CancelledError:
         await db.update_run(

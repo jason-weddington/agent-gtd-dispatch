@@ -29,13 +29,13 @@ async def get_project(project_id: str) -> dict[str, Any]:
     return await _request("GET", f"/projects/{project_id}")
 
 
-async def post_comment(item_id: str, content: str) -> None:
+async def post_comment(item_id: str, content: str, created_by: str) -> None:
     """Post a comment on a GTD item."""
     await _request(
         "POST",
         f"/items/{item_id}/comments",
         json={
             "content_markdown": content,
-            "created_by": "claude-dispatch",
+            "created_by": created_by,
         },
     )
