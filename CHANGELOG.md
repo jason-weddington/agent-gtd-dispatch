@@ -2,6 +2,41 @@
 
 <!-- version list -->
 
+## v1.7.0 (2026-04-22)
+
+### Chores
+
+- Decouple release from deploy
+  ([`b5821d1`](https://github.com/repos/agent-gtd-dispatch/commit/b5821d1b262d0e6306badf1c5aa4bfb7f64afd45))
+
+- Gitignore .claude/ session state
+  ([`8228a19`](https://github.com/repos/agent-gtd-dispatch/commit/8228a194d963d78bc5488febe28b02afc7e21cf6))
+
+### Documentation
+
+- Refresh CLAUDE.md after release decoupling and multi-engine refactor
+  ([`e0c5072`](https://github.com/repos/agent-gtd-dispatch/commit/e0c5072263d8591e449c5cbca9b24f07fe842867))
+
+### Features
+
+- Advertise engine identity and agent list via /info and /agents
+  ([`c8a24c9`](https://github.com/repos/agent-gtd-dispatch/commit/c8a24c9a8a77dffd2a5ed3e804972210819f1c56))
+
+### Testing
+
+- Add coverage for build_system_prompt and cleanup_workspace
+  ([`844d66d`](https://github.com/repos/agent-gtd-dispatch/commit/844d66dfba9b5e13a0c279df632fc7e7bc81d37a))
+
+- Add coverage for gtd_client.py HTTP client functions
+  ([`88295fa`](https://github.com/repos/agent-gtd-dispatch/commit/88295faf7e45332987e06c1c825057d3d279f25e))
+
+- Add coverage for prepare_workspace
+  ([`57642cd`](https://github.com/repos/agent-gtd-dispatch/commit/57642cdcad133e4613e047410712884ddddc7c07))
+
+- Add coverage for run_agent async subprocess
+  ([`e641693`](https://github.com/repos/agent-gtd-dispatch/commit/e6416930ea47c3b1a672e40e4b9fc1191a476521))
+
+
 ## v1.6.0 (2026-04-16)
 
 ### Chores
