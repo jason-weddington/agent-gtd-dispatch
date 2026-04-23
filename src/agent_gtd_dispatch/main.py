@@ -79,10 +79,19 @@ async def _dispatch_worker(run: Run, max_turns: int, engine: Engine) -> None:
         # Prepare workspace (fresh clone on feature branch)
         workspace = dispatch.prepare_workspace(git_origin, run.id, run.branch_name)
 
+        # Stage any attachments into {run_id}-attachments/ inside the workspace
+        attachments = await dispatch.stage_attachments(workspace, run.id, run.item_id)
+
         # Build prompt and run
         mode = getattr(run, "mode", "build") or "build"
         system_prompt = dispatch.build_system_prompt(
-            item, project, run.branch_name, max_turns, mode=mode
+            item,
+            project,
+            run.branch_name,
+            max_turns,
+            mode=mode,
+            attachments=attachments,
+            run_id=run.id,
         )
 
         await gtd_client.post_comment(

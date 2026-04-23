@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import subprocess
 import textwrap
@@ -10,8 +11,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from . import config
+from . import config, gtd_client
 from .engines import Engine, build_env
+
+logger = logging.getLogger(__name__)
 
 
 def repo_name_from_origin(origin: str) -> str:
@@ -65,21 +68,109 @@ def cleanup_workspace(workspace: Path) -> None:
         shutil.rmtree(workspace, ignore_errors=True)
 
 
+def _sanitize_filename(filename: str) -> str:
+    """Sanitize a filename for safe filesystem use.
+
+    Strips path separators to prevent directory traversal, keeps only
+    safe characters [A-Za-z0-9._-], and truncates to 200 chars.
+    """
+    # Strip path separators to prevent directory traversal
+    name = re.sub(r"[/\\]", "", filename)
+    # Keep only safe characters
+    name = re.sub(r"[^A-Za-z0-9._\-]", "", name)
+    # Truncate to 200 chars; fall back to "attachment" if nothing survives
+    return name[:200] or "attachment"
+
+
+async def stage_attachments(
+    workspace: Path, run_id: str, item_id: str
+) -> list[dict[str, Any]]:
+    """Fetch attachments for the item, write them into {run_id}-attachments/.
+
+    Returns the list of staged attachments (metadata only; for use in the prompt).
+    Empty list if the item has no attachments.
+    Individual download failures are logged but don't abort the run — the failed
+    entry is omitted from the returned list.
+    """
+    try:
+        attachments = await gtd_client.list_attachments(item_id)
+    except Exception as exc:
+        logger.warning("Failed to list attachments for item %s: %s", item_id, exc)
+        return []
+
+    if not attachments:
+        return []
+
+    attach_dir = workspace / f"{run_id}-attachments"
+    attach_dir.mkdir(mode=0o700, exist_ok=True)
+
+    staged: list[dict[str, Any]] = []
+    for attachment in attachments:
+        att_id = attachment["id"]
+        raw_filename = attachment.get("filename", "attachment")
+        filename = _sanitize_filename(raw_filename)
+        try:
+            data = await gtd_client.download_attachment(att_id)
+            (attach_dir / filename).write_bytes(data)
+            staged.append(attachment)
+        except Exception as exc:
+            logger.warning(
+                "Failed to download attachment %s: %s — skipping", att_id, exc
+            )
+
+    return staged
+
+
+def _build_supporting_files_section(
+    attachments: list[dict[str, Any]] | None, run_id: str
+) -> str:
+    """Build the Supporting Files prompt section, or empty string if not applicable."""
+    if not attachments or not run_id:
+        return ""
+
+    att_lines = []
+    for att in attachments:
+        filename = att.get("filename", "attachment")
+        mime_type = att.get("mime_type", "application/octet-stream")
+        size_kb = round(att.get("size_bytes", 0) / 1024, 1)
+        att_lines.append(f"- `{filename}` ({mime_type}, {size_kb} KB)")
+
+    file_list = "\n".join(att_lines)
+    return (
+        "## Supporting Files\n\n"
+        "The human attached these files to this item. They're available in the\n"
+        f"`{run_id}-attachments/` directory of your workspace:\n\n"
+        f"{file_list}\n\n"
+        "Read them when relevant to your task. **DO NOT** commit the\n"
+        f"`{run_id}-attachments/` directory — it exists only for this run."
+    )
+
+
 def build_system_prompt(
     item: dict[str, Any],
     project: dict[str, Any],
     branch_name: str,
     max_turns: int,
     mode: str = "build",
+    attachments: list[dict[str, Any]] | None = None,
+    run_id: str = "",
 ) -> str:
     """Build the headless agent system prompt."""
     if mode == "plan":
-        return _build_plan_prompt(item, project, max_turns)
-    return _build_build_prompt(item, project, branch_name, max_turns)
+        return _build_plan_prompt(
+            item, project, max_turns, attachments=attachments, run_id=run_id
+        )
+    return _build_build_prompt(
+        item, project, branch_name, max_turns, attachments=attachments, run_id=run_id
+    )
 
 
 def _build_plan_prompt(
-    item: dict[str, Any], project: dict[str, Any], max_turns: int
+    item: dict[str, Any],
+    project: dict[str, Any],
+    max_turns: int,
+    attachments: list[dict[str, Any]] | None = None,
+    run_id: str = "",
 ) -> str:
     """System prompt for plan mode — groom a task, don't build it."""
     item_id = item["id"]
@@ -87,7 +178,15 @@ def _build_plan_prompt(
     description = item.get("description", "")
     project_name = project["name"]
 
-    return textwrap.dedent(
+    desc_block = (
+        f"**Description:**\n{description}"
+        if description
+        else "No description provided — work from the title only."
+    )
+
+    files_section = _build_supporting_files_section(attachments, run_id)
+
+    prompt = textwrap.dedent(
         f"""\
         You are a headless planning agent dispatched by Agent GTD.
         No human is available for questions — you must work autonomously.
@@ -100,7 +199,15 @@ def _build_plan_prompt(
         **Item:** {title}
         **Item ID:** {item_id}
 
-        {f"**Description:**{chr(10)}{description}" if description else "No description provided — work from the title only."}
+        {desc_block}
+        """
+    )
+
+    if files_section:
+        prompt += "\n" + files_section + "\n"
+
+    prompt += textwrap.dedent(
+        f"""\
 
         ## What to do
 
@@ -140,12 +247,16 @@ def _build_plan_prompt(
     """
     )
 
+    return prompt
+
 
 def _build_build_prompt(
     item: dict[str, Any],
     project: dict[str, Any],
     branch_name: str,
     max_turns: int,
+    attachments: list[dict[str, Any]] | None = None,
+    run_id: str = "",
 ) -> str:
     """System prompt for build mode — implement and push a branch."""
     item_id = item["id"]
@@ -153,7 +264,24 @@ def _build_build_prompt(
     description = item.get("description", "")
     project_name = project["name"]
 
-    return textwrap.dedent(f"""\
+    desc_block = (
+        f"**Description:**\n{description}"
+        if description
+        else "No description provided — work from the title only."
+    )
+
+    files_section = _build_supporting_files_section(attachments, run_id)
+
+    att_rule = ""
+    if files_section and run_id:
+        att_rule = (
+            f"\n7. **Ignore the `{run_id}-attachments/` directory.** "
+            "It is run-scoped context, not part of the repo. "
+            "Do not `git add` it, do not reference it in commit messages."
+        )
+
+    prompt = textwrap.dedent(
+        f"""\
         You are a headless coding agent dispatched by Agent GTD.
         No human is available for questions — you must work autonomously.
 
@@ -163,7 +291,15 @@ def _build_build_prompt(
         **Item:** {title}
         **Item ID:** {item_id}
 
-        {f"**Description:**{chr(10)}{description}" if description else "No description provided — work from the title only."}
+        {desc_block}
+        """
+    )
+
+    if files_section:
+        prompt += "\n" + files_section + "\n"
+
+    prompt += textwrap.dedent(
+        f"""\
 
         ## Rules
 
@@ -173,7 +309,7 @@ def _build_build_prompt(
         4. **Commit.** Use conventional commit messages. Small, focused commits.
         5. **Push.** When done, push `{branch_name}` to origin.
         6. **Stop if stuck.** If the task is too ambiguous, you lack information, or
-           you cannot complete it cleanly — STOP. Do not guess or produce low-quality work.
+           you cannot complete it cleanly — STOP. Do not guess or produce low-quality work.{att_rule}
 
         ## Reporting
 
@@ -200,7 +336,10 @@ def _build_build_prompt(
         - Never force-push, never push to main, never delete branches you didn't create.
         - Never modify CI/CD configs, deployment scripts, or secrets.
         - Focus only on this task. Don't fix unrelated issues you notice.
-    """)
+    """
+    )
+
+    return prompt
 
 
 async def run_agent(

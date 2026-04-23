@@ -201,3 +201,98 @@ class TestRequestEmptyBody:
         result = await get_item("abc")
 
         assert result == {}
+
+
+class TestListAttachments:
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_returns_list(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import list_attachments
+
+        attachments = [
+            {"id": "att-1", "filename": "spec.md", "size_bytes": 1024},
+            {"id": "att-2", "filename": "photo.png", "size_bytes": 8192},
+        ]
+        mock_client, _ = _make_client_mock(json_data=attachments)  # type: ignore[arg-type]
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        result = await list_attachments("item1")
+
+        assert result == attachments
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_url_and_auth_header(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import list_attachments
+
+        mock_client, _ = _make_client_mock(json_data=[])
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await list_attachments("item1")
+
+        mock_client.request.assert_called_once_with(
+            "GET",
+            "http://localhost:9999/api/items/item1/attachments",
+            headers={"Authorization": "Bearer test-gtd-key"},
+        )
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_error_propagates(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import list_attachments
+
+        mock_client = AsyncMock()
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        mock_response = MagicMock()
+        mock_response.content = b"Not Found"
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "404 Not Found", request=MagicMock(), response=MagicMock()
+        )
+        mock_client.request.return_value = mock_response
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await list_attachments("missing-item")
+
+
+class TestDownloadAttachment:
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_returns_raw_bytes(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import download_attachment
+
+        file_bytes = b"\x89PNG\r\n\x1a\n..."
+        mock_client, _ = _make_client_mock(content=file_bytes)
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        result = await download_attachment("att-1")
+
+        assert result == file_bytes
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_url_and_auth_header(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import download_attachment
+
+        mock_client, _ = _make_client_mock(content=b"bytes")
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await download_attachment("att-99")
+
+        mock_client.request.assert_called_once_with(
+            "GET",
+            "http://localhost:9999/api/attachments/att-99",
+            headers={"Authorization": "Bearer test-gtd-key"},
+        )
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_error_propagates(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import download_attachment
+
+        mock_client = AsyncMock()
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        mock_response = MagicMock()
+        mock_response.content = b"Not Found"
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "404 Not Found", request=MagicMock(), response=MagicMock()
+        )
+        mock_client.request.return_value = mock_response
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await download_attachment("missing-att")
