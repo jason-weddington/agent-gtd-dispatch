@@ -349,8 +349,11 @@ async def run_agent(
     title: str,
     max_turns: int,
     agent_name: str | None = None,
+    timeout_seconds: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a headless agent CLI as a subprocess."""
+    if timeout_seconds is None:
+        timeout_seconds = config.TIMEOUT_SECONDS
     cmd = engine.build_command(system_prompt, title, max_turns, agent_name)
     env = build_env(engine)
 
@@ -361,7 +364,7 @@ async def run_agent(
             cmd,
             cwd=workspace,
             env=env,
-            timeout=config.TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
             capture_output=True,
             text=True,
         ),

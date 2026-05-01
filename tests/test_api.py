@@ -181,6 +181,77 @@ class TestDispatch:
         assert resp.status_code == 400
         assert "Unknown engine" in resp.json()["detail"]
 
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_dispatch_timeout_minutes_passes_computed_seconds(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ):
+        from agent_gtd_dispatch import config
+
+        config.TIMEOUT_SECONDS = 3600  # global default — should NOT be used
+
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc12345-6789", "max_turns": 50, "timeout_minutes": 30},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        # _dispatch_worker must have been called with timeout_seconds=1800 (30*60)
+        _run, _max_turns, _engine, timeout_seconds = mock_worker.call_args.args
+        assert timeout_seconds == 1800
+
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_dispatch_without_timeout_minutes_uses_config_default(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ):
+        from agent_gtd_dispatch import config
+
+        config.TIMEOUT_SECONDS = 7200  # arbitrary global default
+
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc12345-6789", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        _run, _max_turns, _engine, timeout_seconds = mock_worker.call_args.args
+        assert timeout_seconds == 7200
+
 
 class TestListRuns:
     def test_empty_list(self, client, auth_headers):

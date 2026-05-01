@@ -46,6 +46,7 @@ class DispatchRequest(BaseModel):
     engine: str = "claude"
     agent_name: str | None = None
     mode: str = "build"
+    timeout_minutes: int | None = None
 
 
 class RunResponse(BaseModel):

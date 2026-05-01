@@ -58,7 +58,9 @@ app = FastAPI(title="Agent GTD Dispatch", lifespan=lifespan)
 # --- Background dispatch worker ---
 
 
-async def _dispatch_worker(run: Run, max_turns: int, engine: Engine) -> None:
+async def _dispatch_worker(
+    run: Run, max_turns: int, engine: Engine, timeout_seconds: int
+) -> None:
     """Background task that executes a dispatch run."""
     now = datetime.now(UTC).isoformat()
     await db.update_run(run.id, status=RunStatus.running, started_at=now)
@@ -108,6 +110,7 @@ async def _dispatch_worker(run: Run, max_turns: int, engine: Engine) -> None:
             item["title"],
             max_turns,
             run.agent_name,
+            timeout_seconds,
         )
 
         completed = datetime.now(UTC).isoformat()
@@ -143,11 +146,11 @@ async def _dispatch_worker(run: Run, max_turns: int, engine: Engine) -> None:
             run.id,
             status=RunStatus.timed_out,
             completed_at=datetime.now(UTC).isoformat(),
-            error=f"Timed out after {config.TIMEOUT_SECONDS}s",
+            error=f"Timed out after {timeout_seconds}s",
         )
         await gtd_client.post_comment(
             run.item_id,
-            f"Agent timed out after {config.TIMEOUT_SECONDS // 60} minutes (run `{run.id}`). "
+            f"Agent timed out after {timeout_seconds // 60} minutes (run `{run.id}`). "
             "The task may need to be broken down into smaller pieces.",
             created_by=f"{engine.name}-dispatch",
         )
@@ -233,6 +236,9 @@ async def dispatch_item(
 
     branch_name = dispatch.branch_name_for_item(body.item_id, item["title"])
     max_turns = body.max_turns
+    timeout_seconds = (
+        body.timeout_minutes * 60 if body.timeout_minutes else config.TIMEOUT_SECONDS
+    )
 
     run = Run(
         item_id=body.item_id,
@@ -245,7 +251,9 @@ async def dispatch_item(
     await db.insert_run(run)
 
     # Start background task
-    task = asyncio.create_task(_dispatch_worker(run, max_turns, engine))
+    task = asyncio.create_task(
+        _dispatch_worker(run, max_turns, engine, timeout_seconds)
+    )
     _active_processes[run.id] = task
 
     return RunResponse(**run.model_dump())

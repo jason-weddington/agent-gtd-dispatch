@@ -343,3 +343,27 @@ class TestRunAgent:
             result = await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
             assert result.returncode == 0
             assert result.stdout == "done"
+
+    async def test_explicit_timeout_seconds_overrides_config(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 999)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20, timeout_seconds=120)
+            _, kwargs = mock_run.call_args
+            assert kwargs["timeout"] == 120
+
+    async def test_no_timeout_seconds_falls_back_to_config(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 300)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            _, kwargs = mock_run.call_args
+            assert kwargs["timeout"] == 300
