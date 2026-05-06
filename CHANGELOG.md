@@ -2,6 +2,30 @@
 
 <!-- version list -->
 
+## v1.8.0 (2026-05-06)
+
+### Chores
+
+- Gitignore .kiro/ workspace state
+  ([`aaf12e5`](https://github.com/repos/agent-gtd-dispatch/commit/aaf12e5758008df54f2efb7769c3a952742c8bc4))
+
+### Documentation
+
+- Add "Steering your Tech Lead Agent" section to README
+  ([`42239d1`](https://github.com/repos/agent-gtd-dispatch/commit/42239d10a5eaad54399361ce75918f8393af1a02))
+
+### Features
+
+- Honour per-run timeout_minutes from DispatchRequest
+  ([`fce1eec`](https://github.com/repos/agent-gtd-dispatch/commit/fce1eec652e8c438e6d7eb73f436dcab5c745908))
+
+- Stage item attachments into {run_id}-attachments/ and surface them in the system prompt
+  ([`fcf49d6`](https://github.com/repos/agent-gtd-dispatch/commit/fcf49d658090345893bac612b11f46122e197e82))
+
+- Write system_prompt.md to workspace for kiro engine
+  ([`010aa78`](https://github.com/repos/agent-gtd-dispatch/commit/010aa780053d2794672138b857732e711d4e958e))
+
+
 ## v1.7.1 (2026-04-22)
 
 ### Bug Fixes
