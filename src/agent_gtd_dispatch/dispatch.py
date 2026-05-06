@@ -354,6 +354,10 @@ async def run_agent(
     """Run a headless agent CLI as a subprocess."""
     if timeout_seconds is None:
         timeout_seconds = config.TIMEOUT_SECONDS
+    if engine.name == "kiro":
+        (workspace / "system_prompt.md").write_text(
+            f"{system_prompt}\n\n---\n\n## Task\n\n{title}"
+        )
     cmd = engine.build_command(system_prompt, title, max_turns, agent_name)
     env = build_env(engine)
 

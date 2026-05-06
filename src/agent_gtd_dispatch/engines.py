@@ -77,12 +77,14 @@ def _build_kiro_command(
     max_turns: int,  # Kiro has no --max-turns flag
     agent_name: str | None,
 ) -> list[str]:
-    # Kiro has no --system-prompt or --max-turns; bake into the user prompt
-    full_prompt = f"{system_prompt}\n\n---\n\n## Task\n\n{title}"
+    # system_prompt.md is written to workspace by run_agent before this runs
     cmd = ["kiro-cli", "chat", "--no-interactive", "--trust-all-tools"]
     if agent_name:
         cmd.extend(["--agent", agent_name])
-    cmd.append(full_prompt)
+    cmd.append(
+        "Use the read tool to open system_prompt.md in this directory, "
+        "then follow every instruction inside it."
+    )
     return cmd
 
 
