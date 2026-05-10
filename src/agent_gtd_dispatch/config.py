@@ -28,11 +28,15 @@ WORKSPACE_ROOT: Path = Path.home() / "workspace"
 MAX_TURNS: int = 100
 TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
 
+# Wave manager
+WAVE_MANAGER_ALLOWLIST_PATH: Path = Path("wave_manager/allowlist.yaml")
+
 
 def load() -> None:
     """Load configuration from environment. Call once at startup."""
     global DISPATCH_API_KEY, AGENT_GTD_URL, AGENT_GTD_API_KEY
     global WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS
+    global WAVE_MANAGER_ALLOWLIST_PATH
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
@@ -43,3 +47,6 @@ def load() -> None:
     )
     MAX_TURNS = int(os.environ.get("DISPATCH_MAX_TURNS", "100"))
     TIMEOUT_SECONDS = int(os.environ.get("DISPATCH_TIMEOUT_SECONDS", "1800"))
+    WAVE_MANAGER_ALLOWLIST_PATH = Path(
+        os.environ.get("WAVE_MANAGER_ALLOWLIST_PATH", "wave_manager/allowlist.yaml")
+    )
