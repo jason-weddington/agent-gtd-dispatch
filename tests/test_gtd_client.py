@@ -312,8 +312,8 @@ class TestWaveRunMethods:
 
         assert result == payload
         mock_client.request.assert_called_once_with(
-            "POST",
-            "http://localhost:9999/api/wave_runs/wr-123/advance",
+            "GET",
+            "http://localhost:9999/api/wave-runs/wr-123/advance",
             headers={"Authorization": "Bearer test-gtd-key"},
         )
 
@@ -353,7 +353,7 @@ class TestWaveRunMethods:
 
         mock_client.request.assert_called_once_with(
             "POST",
-            "http://localhost:9999/api/wave_runs/wr-123/complete_item",
+            "http://localhost:9999/api/wave-runs/wr-123/complete-item",
             headers={"Authorization": "Bearer test-gtd-key"},
             json={
                 "item_id": "item-1",
@@ -374,7 +374,7 @@ class TestWaveRunMethods:
 
         mock_client.request.assert_called_once_with(
             "POST",
-            "http://localhost:9999/api/wave_runs/wr-123/halt",
+            "http://localhost:9999/api/wave-runs/wr-123/halt",
             headers={"Authorization": "Bearer test-gtd-key"},
             json={"reason": "CI failure on feat/x"},
         )

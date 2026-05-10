@@ -67,12 +67,12 @@ async def download_attachment(attachment_id: str) -> bytes:
 
 
 async def advance_wave(wave_run_id: str) -> dict[str, Any]:
-    """POST /wave_runs/{wave_run_id}/advance.
+    """GET /api/wave-runs/{wave_run_id}/advance.
 
     Returns {next_ready, in_progress, blocked, graph_complete}.
     """
     result: dict[str, Any] = await _request(
-        "POST", f"/wave_runs/{wave_run_id}/advance"
+        "GET", f"/wave-runs/{wave_run_id}/advance"
     )
     return result
 
@@ -84,10 +84,10 @@ async def complete_in_wave(
     merge_actor: str = "manager-allowlist",
     decision_rule: str = "",
 ) -> None:
-    """POST /wave_runs/{wave_run_id}/complete_item."""
+    """POST /api/wave-runs/{wave_run_id}/complete-item."""
     await _request(
         "POST",
-        f"/wave_runs/{wave_run_id}/complete_item",
+        f"/wave-runs/{wave_run_id}/complete-item",
         json={
             "item_id": item_id,
             "outcome": outcome,
@@ -98,10 +98,10 @@ async def complete_in_wave(
 
 
 async def halt_wave(wave_run_id: str, reason: str) -> None:
-    """POST /wave_runs/{wave_run_id}/halt."""
+    """POST /api/wave-runs/{wave_run_id}/halt."""
     await _request(
         "POST",
-        f"/wave_runs/{wave_run_id}/halt",
+        f"/wave-runs/{wave_run_id}/halt",
         json={"reason": reason},
     )
 
