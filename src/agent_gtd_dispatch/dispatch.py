@@ -158,6 +158,8 @@ _MANAGE_ALLOWED_TOOLS: tuple[str, ...] = (
     "mcp__agent-gtd__list_items",
     "mcp__agent-gtd__get_run_status",
     "mcp__agent-gtd__list_runs",
+    "mcp__agent-gtd__dispatch_item",    # dispatch child build runs
+    "mcp__agent-gtd__list_comments",    # read final agent comment
     "Bash",
     "Read",
     "Write",
@@ -308,6 +310,7 @@ def _build_manage_prompt(
 ) -> str:
     """System prompt for manage mode — run the wave-manager executor loop."""
     project_name = project["name"]
+    git_origin = project.get("git_origin", "")
 
     prompt = textwrap.dedent(
         f"""\
@@ -319,59 +322,84 @@ def _build_manage_prompt(
         **Mode: MANAGE** — You are orchestrating a wave execution, NOT writing code.
 
         **Project:** {project_name}
+        **Git Origin:** {git_origin}
         **Wave Run ID:** {wave_run_id}
+        **Turns remaining:** {max_turns}
 
-        This is your primary anchor. Every action you take is scoped to this wave run.
+        This wave run ID is your primary anchor. Every action you take is scoped to it.
 
-        ## Stateless Executor Loop
-
-        Repeat the following cycle until the wave graph is complete or a halt condition fires:
-
-        1. Call `mcp__agent-gtd__advance_wave` with the wave_run_id to move ready items forward.
-        2. For each item returned as ready, dispatch a child run (use `Bash` to call the dispatch
-           API, or use the appropriate dispatch tool).
-        3. Monitor dispatched child runs via `mcp__agent-gtd__get_run_status` or
-           `mcp__agent-gtd__list_runs`.
-        4. When a child run completes, call `mcp__agent-gtd__complete_in_wave` to mark it done
-           in the wave graph.
-        5. Loop back to step 1.
-        6. When `advance_wave` signals the graph is complete, stop.
-
-        The wave graph (DAG) lives in the agent_gtd database — you carry no in-memory state
-        between turns. Each turn reads current state from agent_gtd and acts on it.
-
-        ## Tools Available
-
-        - `mcp__agent-gtd__advance_wave` — advance the wave, get next ready items
-        - `mcp__agent-gtd__complete_in_wave` — mark a completed item done in the wave
-        - `mcp__agent-gtd__halt_wave` — halt the wave on unrecoverable error
-        - `mcp__agent-gtd__add_comment` — post progress notes to items or the project
-        - `mcp__agent-gtd__get_item` — inspect a specific item
-        - `mcp__agent-gtd__list_items` — list items in the project
-        - `mcp__agent-gtd__get_run_status` — check the status of a dispatch run
-        - `mcp__agent-gtd__list_runs` — list runs (for monitoring)
-        - `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep` — filesystem and shell access
-
-        Do NOT use git, push, or any branch-writing tools. This executor never writes code.
-
-        The detailed dispatch playbook lives in `~/.claude/CLAUDE.md` — your agent reads it
+        Check `~/.claude/CLAUDE.md` for the project dispatch playbook — it is read
         automatically at startup. Follow any relevant procedures described there.
 
-        ## Halt Conditions
+        This executor never writes code, pushes branches, or takes ownership of any repository.
 
-        Stop immediately and call `mcp__agent-gtd__halt_wave` if:
-        - An item in the wave fails and cannot be retried
-        - `advance_wave` or `complete_in_wave` returns an unexpected error
-        - Any event outside the expected flow occurs (unknown tool errors, missing items, etc.)
+        ## Executor Loop
 
-        Post a comment explaining why you halted before stopping.
+        Repeat until advance_wave reports graph_complete=true:
 
-        ## Important
+        STEP 1 — ADVANCE
+          Call: mcp__agent-gtd__advance_wave(wave_run_id="{wave_run_id}")
+          → {{next_ready: [...], in_progress: [...], graph_complete: bool}}
+          If advance_wave fails: retry up to 3 times with 30 s sleep. After 3 failures:
+            call halt_wave(wave_run_id, reason="advance_wave failed 3 times"); EXIT.
+          If graph_complete=true and next_ready=[]: EXIT SUCCESS.
 
+        STEP 2 — DISPATCH READY ITEMS
+          For each item_id in next_ready:
+            call mcp__agent-gtd__dispatch_item(item_id=item_id, mode="build")
+            record the returned run_id alongside item_id
+
+        STEP 3 — MONITOR TO COMPLETION
+          For each dispatched (item_id, run_id):
+            Poll mcp__agent-gtd__get_run_status(run_id) every 30 s until status in
+            {{succeeded, failed, timed_out, cancelled}}.
+            Process each item as it lands (don't wait for all to finish before processing any).
+
+        STEP 4 — CLASSIFY
+          For each completed item:
+            a. List comments: mcp__agent-gtd__list_comments(item_id=item_id)
+               Take the last comment whose created_by starts with "claude-" (the build agent).
+               If no such comment found, treat as HALT with reason "no final agent comment".
+            b. Get branch_name: mcp__agent-gtd__list_runs(item_id=item_id)
+               The most recent run's branch_name field.
+            c. Run classifier (Bash):
+                 python -m agent_gtd_dispatch.wave_manager.classifier \\
+                   --comment "<final_comment_text>" \\
+                   --wave-run-id "{wave_run_id}"
+               Outputs DECIDE:<rule_name> or HALT:<reason> on stdout.
+               If the classifier command fails to run or is not importable,
+               treat every completion as HALT with reason "classifier unavailable".
+            d. If run status is failed/timed_out/cancelled: treat as HALT
+               with reason "build agent <status>: <run_id>".
+
+        STEP 5a — DECIDE PATH (auto-merge)
+          Call (Bash):
+            python -m agent_gtd_dispatch.wave_manager.squash_merge \\
+              --origin {git_origin or "<project.git_origin>"} \\
+              --branch <branch_name> \\
+              --item-id <item_id> \\
+              --wave-run-id {wave_run_id} \\
+              --decision-rule <rule_name>
+          Exit code 0 → success:
+            call mcp__agent-gtd__complete_in_wave(
+              wave_run_id, item_id, outcome="completed",
+              merge_actor="manager-allowlist", decision_rule=<rule_name>)
+          Exit code non-zero → treat as HALT with stderr as reason.
+
+        STEP 5b — HALT PATH
+          call mcp__agent-gtd__add_comment(
+            item_id=item_id,
+            content="Wave halted: <reason>")
+          call mcp__agent-gtd__halt_wave(wave_run_id, reason=<reason>)
+          EXIT.
+
+        ## Rules
+
+        - Never commit code, push branches, or modify any repository directly.
+        - Never touch waves or items outside wave_run_id={wave_run_id}.
+        - The squash_merge helper handles all git operations; if CI gate (item 7e2753ec)
+          is not yet available, squash_merge.py stubs it as always-pass with a logged warning.
         - You have max {max_turns} turns. Budget them wisely.
-        - Never commit code, push branches, or modify any repository.
-        - Stay scoped to wave_run_id={wave_run_id}. Do not touch other waves.
-        - Focus only on this wave. Don't groom or dispatch unrelated items.
     """
     )
 

@@ -490,6 +490,41 @@ class TestBuildManagePrompt:
         assert "mcp__agent-gtd__complete_in_wave" in _MANAGE_ALLOWED_TOOLS
         assert "mcp__agent-gtd__halt_wave" in _MANAGE_ALLOWED_TOOLS
 
+    def test_dispatch_item_in_allowed_tools(self) -> None:
+        assert "mcp__agent-gtd__dispatch_item" in _MANAGE_ALLOWED_TOOLS
+
+    def test_list_comments_in_allowed_tools(self) -> None:
+        assert "mcp__agent-gtd__list_comments" in _MANAGE_ALLOWED_TOOLS
+
+    def test_all_five_loop_steps_present(self) -> None:
+        prompt = self._prompt()
+        assert "STEP 1" in prompt
+        assert "STEP 2" in prompt
+        assert "STEP 3" in prompt
+        assert "STEP 4" in prompt
+        assert "STEP 5" in prompt
+
+    def test_advance_wave_retry_logic_present(self) -> None:
+        prompt = self._prompt()
+        assert "retry" in prompt.lower()
+        assert "3 times" in prompt or "3" in prompt
+
+    def test_classifier_module_path_present(self) -> None:
+        prompt = self._prompt()
+        assert "wave_manager.classifier" in prompt
+
+    def test_squash_merge_invocation_present(self) -> None:
+        prompt = self._prompt()
+        assert "squash_merge" in prompt
+
+    def test_classifier_unavailable_fallback_present(self) -> None:
+        prompt = self._prompt()
+        assert "classifier unavailable" in prompt or "not importable" in prompt
+
+    def test_max_turns_embedded(self) -> None:
+        prompt = self._prompt(max_turns=42)
+        assert "42" in prompt
+
 
 # ---------------------------------------------------------------------------
 # AC-1.1 — wave_run_id schema tests
@@ -569,6 +604,24 @@ class TestDbWaveRunId:
         fetched = await db.get_run(run.id)
         assert fetched is not None
         assert fetched.wave_run_id == "wr-persist"
+
+    async def test_branch_name_nullable_in_schema(self) -> None:
+        await db.init_db()
+        async with aiosqlite.connect(db.db_path()) as conn:
+            cursor = await conn.execute("PRAGMA table_info(runs)")
+            cols = await cursor.fetchall()
+        branch_col = next(c for c in cols if c[1] == "branch_name")
+        assert branch_col[3] == 0, (
+            f"branch_name should be nullable (notnull=0), got {branch_col[3]}"
+        )
+
+    async def test_insert_run_with_null_branch_name(self) -> None:
+        await db.init_db()
+        run = Run(item_id="i1", project_name="p", branch_name=None, mode="manage")
+        await db.insert_run(run)
+        fetched = await db.get_run(run.id)
+        assert fetched is not None
+        assert fetched.branch_name is None
 
 
 # ---------------------------------------------------------------------------

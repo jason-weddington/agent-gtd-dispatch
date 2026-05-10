@@ -64,3 +64,51 @@ async def list_attachments(item_id: str) -> list[dict[str, Any]]:
 async def download_attachment(attachment_id: str) -> bytes:
     """GET /api/attachments/{attachment_id} — returns raw file bytes."""
     return await _request_raw("GET", f"/attachments/{attachment_id}")
+
+
+async def advance_wave(wave_run_id: str) -> dict[str, Any]:
+    """POST /wave_runs/{wave_run_id}/advance.
+
+    Returns {next_ready, in_progress, blocked, graph_complete}.
+    """
+    result: dict[str, Any] = await _request(
+        "POST", f"/wave_runs/{wave_run_id}/advance"
+    )
+    return result
+
+
+async def complete_in_wave(
+    wave_run_id: str,
+    item_id: str,
+    outcome: str,
+    merge_actor: str = "manager-allowlist",
+    decision_rule: str = "",
+) -> None:
+    """POST /wave_runs/{wave_run_id}/complete_item."""
+    await _request(
+        "POST",
+        f"/wave_runs/{wave_run_id}/complete_item",
+        json={
+            "item_id": item_id,
+            "outcome": outcome,
+            "merge_actor": merge_actor,
+            "decision_rule": decision_rule,
+        },
+    )
+
+
+async def halt_wave(wave_run_id: str, reason: str) -> None:
+    """POST /wave_runs/{wave_run_id}/halt."""
+    await _request(
+        "POST",
+        f"/wave_runs/{wave_run_id}/halt",
+        json={"reason": reason},
+    )
+
+
+async def list_comments(item_id: str) -> list[dict[str, Any]]:
+    """GET /items/{item_id}/comments → list of comment dicts."""
+    result: list[dict[str, Any]] = await _request(
+        "GET", f"/items/{item_id}/comments"
+    )
+    return result

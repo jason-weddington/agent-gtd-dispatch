@@ -64,6 +64,7 @@ convention = "google"
 "src/agent_gtd_dispatch/dispatch.py" = ["S603", "S607", "S608", "E501"]
 "src/agent_gtd_dispatch/main.py" = ["B008", "E501"]
 "src/agent_gtd_dispatch/agent_discovery.py" = ["S603", "S607"]
+"src/agent_gtd_dispatch/wave_manager/squash_merge.py" = ["S603", "S607"]
 
 [tool.mypy]
 python_version = "3.13"
@@ -94,7 +95,7 @@ filterwarnings = [
 source = ["agent_gtd_dispatch"]
 
 [tool.coverage.report]
-fail_under = 85
+fail_under = 87
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]

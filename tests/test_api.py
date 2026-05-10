@@ -286,11 +286,10 @@ class TestDispatchManageMode:
         assert resp.status_code == 400
         assert "wave_run_id" in resp.json()["detail"]
 
-    @patch("agent_gtd_dispatch.main.db.insert_run", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.dispatch")
     @patch("agent_gtd_dispatch.main.gtd_client")
     def test_manage_with_wave_run_id_accepted(
-        self, mock_client, mock_dispatch, mock_insert, client, auth_headers
+        self, mock_client, mock_dispatch, client, auth_headers
     ):
         mock_client.get_item = AsyncMock(
             return_value={
@@ -309,7 +308,6 @@ class TestDispatchManageMode:
         mock_client.post_comment = AsyncMock()
         mock_dispatch.build_system_prompt.return_value = "manage prompt"
         mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-run-wave"
-        mock_insert.return_value = None
 
         resp = client.post(
             "/dispatch",

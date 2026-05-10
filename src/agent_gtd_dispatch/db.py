@@ -25,7 +25,7 @@ async def init_db() -> None:
                 id TEXT PRIMARY KEY,
                 item_id TEXT NOT NULL,
                 project_name TEXT NOT NULL,
-                branch_name TEXT NOT NULL,
+                branch_name TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 started_at TEXT,
                 completed_at TEXT,
@@ -38,10 +38,56 @@ async def init_db() -> None:
         await _migrate_db(db)
 
 
-async def _migrate_db(db: aiosqlite.Connection) -> None:
-    """Add columns introduced after v1.1.0."""
+async def _make_branch_name_nullable(db: aiosqlite.Connection) -> None:
+    """Recreate runs table to make branch_name nullable.
+
+    SQLite does not support ALTER COLUMN, so we use the rename-copy pattern.
+    """
     cursor = await db.execute("PRAGMA table_info(runs)")
-    existing = {row[1] for row in await cursor.fetchall()}
+    existing_cols = [row[1] for row in await cursor.fetchall()]
+    cols_csv = ", ".join(existing_cols)
+
+    await db.execute("""
+        CREATE TABLE runs_new (
+            id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            branch_name TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            started_at TEXT,
+            completed_at TEXT,
+            exit_code INTEGER,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            engine TEXT NOT NULL DEFAULT 'claude',
+            agent_name TEXT,
+            mode TEXT NOT NULL DEFAULT 'build',
+            wave_run_id TEXT
+        )
+    """)
+    # Copy only columns that exist in the current (old) table
+    await db.execute(
+        f"INSERT INTO runs_new ({cols_csv}) SELECT {cols_csv} FROM runs"  # noqa: S608
+    )
+    await db.execute("DROP TABLE runs")
+    await db.execute("ALTER TABLE runs_new RENAME TO runs")
+    await db.commit()
+
+
+async def _migrate_db(db: aiosqlite.Connection) -> None:
+    """Add columns introduced after v1.1.0 and fix schema constraints."""
+    cursor = await db.execute("PRAGMA table_info(runs)")
+    cols_info = await cursor.fetchall()
+
+    # Migration: make branch_name nullable (was NOT NULL in v1.0)
+    branch_col = next((row for row in cols_info if row[1] == "branch_name"), None)
+    if branch_col is not None and branch_col[3] == 1:  # notnull=1 → needs fix
+        await _make_branch_name_nullable(db)
+        # Re-read column info after table recreation
+        cursor2 = await db.execute("PRAGMA table_info(runs)")
+        cols_info = await cursor2.fetchall()
+
+    existing = {row[1] for row in cols_info}
 
     if "engine" not in existing:
         await db.execute(
