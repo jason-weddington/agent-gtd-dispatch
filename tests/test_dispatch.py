@@ -10,6 +10,7 @@ import pytest
 
 from agent_gtd_dispatch import config
 from agent_gtd_dispatch.dispatch import (
+    _MANAGE_ALLOWED_TOOLS,
     branch_name_for_item,
     build_system_prompt,
     cleanup_workspace,
@@ -391,3 +392,94 @@ class TestRunAgent:
             )
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
             assert not (tmp_path / "system_prompt.md").exists()
+
+    async def test_allowed_tools_appended_to_claude_command(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        tools = ["mcp__agent-gtd__advance_wave", "Read"]
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            await run_agent(
+                CLAUDE, tmp_path, "sys", "Title", 20, allowed_tools=tools
+            )
+            args, _kwargs = mock_run.call_args
+            cmd = args[0]
+            assert "--allowedTools" in cmd
+            idx = cmd.index("--allowedTools")
+            assert cmd[idx + 1] == "mcp__agent-gtd__advance_wave,Read"
+            # Title remains the final argument
+            assert cmd[-1] == "Title"
+
+    async def test_non_claude_engine_ignores_allowed_tools(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        tools = ["mcp__agent-gtd__advance_wave", "Read"]
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            await run_agent(
+                KIRO, tmp_path, "sys", "Title", 20, allowed_tools=tools
+            )
+            args, _kwargs = mock_run.call_args
+            cmd = args[0]
+            assert "--allowedTools" not in cmd
+
+
+class TestBuildManagePrompt:
+    _project: ClassVar[dict] = {"name": "wave-project"}
+    _wave_run_id = "wr-abc123"
+    _max_turns = 100
+
+    def _prompt(
+        self,
+        wave_run_id: str | None = None,
+        project: dict | None = None,
+        max_turns: int | None = None,
+    ) -> str:
+        return build_system_prompt(
+            item={"id": "item-1", "title": "ignored for manage mode"},
+            project=project or self._project,
+            branch_name=None,
+            max_turns=max_turns if max_turns is not None else self._max_turns,
+            mode="manage",
+            wave_run_id=wave_run_id if wave_run_id is not None else self._wave_run_id,
+        )
+
+    def test_includes_wave_run_id(self) -> None:
+        prompt = self._prompt()
+        assert self._wave_run_id in prompt
+
+    def test_includes_project_name(self) -> None:
+        prompt = self._prompt()
+        assert "wave-project" in prompt
+
+    def test_identifies_executor_role(self) -> None:
+        prompt = self._prompt()
+        assert "wave-manager" in prompt or "executor" in prompt
+
+    def test_does_not_include_branch_rules(self) -> None:
+        prompt = self._prompt()
+        assert "push" not in prompt.lower() or "never" in prompt.lower()
+        assert "already on branch" not in prompt
+
+    def test_routed_by_build_system_prompt(self) -> None:
+        prompt = build_system_prompt(
+            item={"id": "item-1", "title": "ignored"},
+            project={"name": "my-project"},
+            branch_name=None,
+            max_turns=50,
+            mode="manage",
+            wave_run_id="wr-123",
+        )
+        assert "wave-manager" in prompt or "executor" in prompt
+
+    def test_manage_allowed_tools_constant_is_not_empty(self) -> None:
+        assert len(_MANAGE_ALLOWED_TOOLS) > 0
+        assert "mcp__agent-gtd__advance_wave" in _MANAGE_ALLOWED_TOOLS
+        assert "mcp__agent-gtd__complete_in_wave" in _MANAGE_ALLOWED_TOOLS
+        assert "mcp__agent-gtd__halt_wave" in _MANAGE_ALLOWED_TOOLS

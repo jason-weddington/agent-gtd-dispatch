@@ -17,6 +17,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import config, db, dispatch, gtd_client
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
+from .dispatch import _MANAGE_ALLOWED_TOOLS
 from .engines import Engine, get_engine
 from .models import DispatchRequest, Run, RunResponse, RunStatus
 
@@ -74,18 +75,28 @@ async def _dispatch_worker(
             raise ValueError("Item has no project assigned")
 
         project = await gtd_client.get_project(project_id)
-        git_origin = project.get("git_origin", "")
-        if not git_origin:
-            raise ValueError(f"Project '{project['name']}' has no git_origin")
-
-        # Prepare workspace (fresh clone on feature branch)
-        workspace = dispatch.prepare_workspace(git_origin, run.id, run.branch_name)
-
-        # Stage any attachments into {run_id}-attachments/ inside the workspace
-        attachments = await dispatch.stage_attachments(workspace, run.id, run.item_id)
 
         # Build prompt and run
         mode = getattr(run, "mode", "build") or "build"
+
+        if mode == "manage":
+            # Wave manager: no git clone, bare working directory only
+            workspace = config.WORKSPACE_ROOT / f"wave-manager-{run.id}"
+            workspace.mkdir(parents=True, exist_ok=True)
+            attachments = []
+        else:
+            git_origin = project.get("git_origin", "")
+            if not git_origin:
+                raise ValueError(f"Project '{project['name']}' has no git_origin")
+
+            # Prepare workspace (fresh clone on feature branch)
+            if run.branch_name is None:  # pragma: no cover
+                raise ValueError("branch_name must be set for non-manage mode runs")
+            workspace = dispatch.prepare_workspace(git_origin, run.id, run.branch_name)
+
+            # Stage any attachments into {run_id}-attachments/ inside the workspace
+            attachments = await dispatch.stage_attachments(workspace, run.id, run.item_id)
+
         system_prompt = dispatch.build_system_prompt(
             item,
             project,
@@ -94,15 +105,27 @@ async def _dispatch_worker(
             mode=mode,
             attachments=attachments,
             run_id=run.id,
+            wave_run_id=run.wave_run_id,
         )
+
+        if mode == "manage":
+            dispatch_comment = (
+                f"Wave manager dispatched (run `{run.id}`, engine: {engine.name}). "
+                f"Managing wave `{run.wave_run_id}` in `{project['name']}`."
+            )
+        else:
+            dispatch_comment = (
+                f"Agent dispatched (run `{run.id}`, engine: {engine.name}). "
+                f"Working on branch `{run.branch_name}` in `{project['name']}`."
+            )
 
         await gtd_client.post_comment(
             run.item_id,
-            f"Agent dispatched (run `{run.id}`, engine: {engine.name}). "
-            f"Working on branch `{run.branch_name}` in `{project['name']}`.",
+            dispatch_comment,
             created_by=f"{engine.name}-dispatch",
         )
 
+        agent_allowed_tools = list(_MANAGE_ALLOWED_TOOLS) if mode == "manage" else None
         result = await dispatch.run_agent(
             engine,
             workspace,
@@ -111,6 +134,7 @@ async def _dispatch_worker(
             max_turns,
             run.agent_name,
             timeout_seconds,
+            allowed_tools=agent_allowed_tools,
         )
 
         completed = datetime.now(UTC).isoformat()
@@ -213,6 +237,13 @@ async def dispatch_item(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
+    # Validate mode-specific requirements
+    if body.mode == "manage" and not body.wave_run_id:
+        raise HTTPException(
+            status_code=400,
+            detail="wave_run_id required for mode=manage",
+        )
+
     # Fetch item to validate and get project info
     try:
         item = await gtd_client.get_item(body.item_id)
@@ -228,13 +259,16 @@ async def dispatch_item(
     except Exception:
         raise HTTPException(status_code=404, detail="Project not found") from None
 
-    if not project.get("git_origin"):
+    if body.mode != "manage" and not project.get("git_origin"):
         raise HTTPException(
             status_code=400,
             detail=f"Project '{project['name']}' has no git_origin configured",
         )
 
-    branch_name = dispatch.branch_name_for_item(body.item_id, item["title"])
+    if body.mode == "manage":
+        branch_name = None
+    else:
+        branch_name = dispatch.branch_name_for_item(body.item_id, item["title"])
     max_turns = body.max_turns
     timeout_seconds = (
         body.timeout_minutes * 60 if body.timeout_minutes else config.TIMEOUT_SECONDS
@@ -247,6 +281,7 @@ async def dispatch_item(
         engine=body.engine,
         agent_name=body.agent_name,
         mode=body.mode,
+        wave_run_id=body.wave_run_id,
     )
     await db.insert_run(run)
 

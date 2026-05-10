@@ -146,22 +146,44 @@ def _build_supporting_files_section(
     )
 
 
+_MANAGE_ALLOWED_TOOLS: tuple[str, ...] = (
+    "mcp__agent-gtd__advance_wave",
+    "mcp__agent-gtd__complete_in_wave",
+    "mcp__agent-gtd__halt_wave",
+    "mcp__agent-gtd__replan_wave",
+    "mcp__agent-gtd__add_comment",
+    "mcp__agent-gtd__get_item",
+    "mcp__agent-gtd__list_items",
+    "mcp__agent-gtd__get_run_status",
+    "mcp__agent-gtd__list_runs",
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+)
+
+
 def build_system_prompt(
     item: dict[str, Any],
     project: dict[str, Any],
-    branch_name: str,
+    branch_name: str | None,
     max_turns: int,
     mode: str = "build",
     attachments: list[dict[str, Any]] | None = None,
     run_id: str = "",
+    wave_run_id: str | None = None,
 ) -> str:
     """Build the headless agent system prompt."""
     if mode == "plan":
         return _build_plan_prompt(
             item, project, max_turns, attachments=attachments, run_id=run_id
         )
+    if mode == "manage":
+        return _build_manage_prompt(wave_run_id or "", project, max_turns)
     return _build_build_prompt(
-        item, project, branch_name, max_turns, attachments=attachments, run_id=run_id
+        item, project, branch_name or "", max_turns, attachments=attachments, run_id=run_id
     )
 
 
@@ -244,6 +266,83 @@ def _build_plan_prompt(
 
         - You have max {max_turns} turns. Budget them wisely.
         - Focus only on this task. Don't groom other items you notice.
+    """
+    )
+
+    return prompt
+
+
+def _build_manage_prompt(
+    wave_run_id: str,
+    project: dict[str, Any],
+    max_turns: int,
+) -> str:
+    """System prompt for manage mode — run the wave-manager executor loop."""
+    project_name = project["name"]
+
+    prompt = textwrap.dedent(
+        f"""\
+        You are a headless wave-manager executor dispatched by Agent GTD.
+        No human is available for questions — you must work autonomously.
+
+        ## Your Task
+
+        **Mode: MANAGE** — You are orchestrating a wave execution, NOT writing code.
+
+        **Project:** {project_name}
+        **Wave Run ID:** {wave_run_id}
+
+        This is your primary anchor. Every action you take is scoped to this wave run.
+
+        ## Stateless Executor Loop
+
+        Repeat the following cycle until the wave graph is complete or a halt condition fires:
+
+        1. Call `mcp__agent-gtd__advance_wave` with the wave_run_id to move ready items forward.
+        2. For each item returned as ready, dispatch a child run (use `Bash` to call the dispatch
+           API, or use the appropriate dispatch tool).
+        3. Monitor dispatched child runs via `mcp__agent-gtd__get_run_status` or
+           `mcp__agent-gtd__list_runs`.
+        4. When a child run completes, call `mcp__agent-gtd__complete_in_wave` to mark it done
+           in the wave graph.
+        5. Loop back to step 1.
+        6. When `advance_wave` signals the graph is complete, stop.
+
+        The wave graph (DAG) lives in the agent_gtd database — you carry no in-memory state
+        between turns. Each turn reads current state from agent_gtd and acts on it.
+
+        ## Tools Available
+
+        - `mcp__agent-gtd__advance_wave` — advance the wave, get next ready items
+        - `mcp__agent-gtd__complete_in_wave` — mark a completed item done in the wave
+        - `mcp__agent-gtd__halt_wave` — halt the wave on unrecoverable error
+        - `mcp__agent-gtd__add_comment` — post progress notes to items or the project
+        - `mcp__agent-gtd__get_item` — inspect a specific item
+        - `mcp__agent-gtd__list_items` — list items in the project
+        - `mcp__agent-gtd__get_run_status` — check the status of a dispatch run
+        - `mcp__agent-gtd__list_runs` — list runs (for monitoring)
+        - `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep` — filesystem and shell access
+
+        Do NOT use git, push, or any branch-writing tools. This executor never writes code.
+
+        The detailed dispatch playbook lives in `~/.claude/CLAUDE.md` — your agent reads it
+        automatically at startup. Follow any relevant procedures described there.
+
+        ## Halt Conditions
+
+        Stop immediately and call `mcp__agent-gtd__halt_wave` if:
+        - An item in the wave fails and cannot be retried
+        - `advance_wave` or `complete_in_wave` returns an unexpected error
+        - Any event outside the expected flow occurs (unknown tool errors, missing items, etc.)
+
+        Post a comment explaining why you halted before stopping.
+
+        ## Important
+
+        - You have max {max_turns} turns. Budget them wisely.
+        - Never commit code, push branches, or modify any repository.
+        - Stay scoped to wave_run_id={wave_run_id}. Do not touch other waves.
+        - Focus only on this wave. Don't groom or dispatch unrelated items.
     """
     )
 
@@ -350,6 +449,7 @@ async def run_agent(
     max_turns: int,
     agent_name: str | None = None,
     timeout_seconds: int | None = None,
+    allowed_tools: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a headless agent CLI as a subprocess."""
     if timeout_seconds is None:
@@ -359,6 +459,10 @@ async def run_agent(
             f"{system_prompt}\n\n---\n\n## Task\n\n{title}"
         )
     cmd = engine.build_command(system_prompt, title, max_turns, agent_name)
+    if allowed_tools is not None and engine.name == "claude":
+        # Insert --allowedTools before the final title argument
+        title_arg = cmd[-1]
+        cmd = [*cmd[:-1], "--allowedTools", ",".join(allowed_tools), title_arg]
     env = build_env(engine)
 
     loop = asyncio.get_event_loop()

@@ -272,6 +272,61 @@ class TestCancelRun:
         assert resp.status_code == 404
 
 
+class TestDispatchManageMode:
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_manage_without_wave_run_id_returns_400(
+        self, mock_client, client, auth_headers
+    ):
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc123", "max_turns": 50, "mode": "manage"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+        assert "wave_run_id" in resp.json()["detail"]
+
+    @patch("agent_gtd_dispatch.main.db.insert_run", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_manage_with_wave_run_id_accepted(
+        self, mock_client, mock_dispatch, mock_insert, client, auth_headers
+    ):
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Run wave",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "WaveProject",
+                "git_origin": "",  # no git_origin needed for manage mode
+            }
+        )
+        mock_client.post_comment = AsyncMock()
+        mock_dispatch.build_system_prompt.return_value = "manage prompt"
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-run-wave"
+        mock_insert.return_value = None
+
+        resp = client.post(
+            "/dispatch",
+            json={
+                "item_id": "abc12345-6789",
+                "max_turns": 200,
+                "mode": "manage",
+                "wave_run_id": "wr-abc",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["mode"] == "manage"
+        assert data["wave_run_id"] == "wr-abc"
+        assert data["branch_name"] is None
+
+
 class TestStartupReconciliation:
     async def test_orphaned_runs_marked_failed_on_startup(self, auth_headers) -> None:
         from agent_gtd_dispatch import db

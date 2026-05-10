@@ -26,10 +26,11 @@ class Run(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
     item_id: str
     project_name: str
-    branch_name: str
+    branch_name: str | None = None
     engine: str = "claude"
     agent_name: str | None = None
     mode: str = "build"
+    wave_run_id: str | None = None
     status: RunStatus = RunStatus.pending
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -47,6 +48,7 @@ class DispatchRequest(BaseModel):
     agent_name: str | None = None
     mode: str = "build"
     timeout_minutes: int | None = None
+    wave_run_id: str | None = None
 
 
 class RunResponse(BaseModel):
@@ -55,9 +57,11 @@ class RunResponse(BaseModel):
     id: str
     item_id: str
     project_name: str
-    branch_name: str
+    branch_name: str | None
     engine: str
     agent_name: str | None
+    mode: str
+    wave_run_id: str | None
     status: RunStatus
     started_at: datetime | None
     completed_at: datetime | None
