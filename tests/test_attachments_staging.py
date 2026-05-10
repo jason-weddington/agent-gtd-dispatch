@@ -23,6 +23,7 @@ def _env(tmp_path: Path) -> object:
         "DISPATCH_API_KEY": "test-key",
         "AGENT_GTD_URL": "http://localhost:9999",
         "AGENT_GTD_API_KEY": "test-gtd-key",
+        "ANTHROPIC_API_KEY": "sk-ant-test",
         "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
     }
     with patch.dict(os.environ, env):

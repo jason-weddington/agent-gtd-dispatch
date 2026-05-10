@@ -15,11 +15,11 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from . import config, db, dispatch, gtd_client
+from . import config, db, dispatch, gtd_client, wave_planner
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
 from .dispatch import _MANAGE_ALLOWED_TOOLS
 from .engines import Engine, get_engine
-from .models import DispatchRequest, Run, RunResponse, RunStatus
+from .models import DispatchRequest, PlanRequest, Run, RunResponse, RunStatus, WavePlan
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +224,18 @@ async def list_agents(
     """
     agents = await run_list_agents_script()
     return {"agents": agents}
+
+
+@app.post("/plan", response_model=WavePlan)
+async def plan_wave_endpoint(
+    body: PlanRequest,
+    _: str = Depends(_verify_api_key),
+) -> WavePlan:
+    """Produce a dependency DAG for a set of items (called by plan_wave on agent_gtd)."""
+    try:
+        return await wave_planner.plan_wave(body.item_ids)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/dispatch", response_model=RunResponse)

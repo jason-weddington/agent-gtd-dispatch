@@ -4,6 +4,7 @@ version = "1.8.0"
 description = "Dispatch worker API for Agent GTD — runs headless Claude Code agents on isolated infrastructure"
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic>=0.40",
     "fastapi>=0.115",
     "httpx>=0.27",
     "uvicorn[standard]>=0.32",

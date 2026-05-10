@@ -16,6 +16,7 @@ def _env(tmp_path):
         "DISPATCH_API_KEY": "test-key",
         "AGENT_GTD_URL": "http://localhost:9999",
         "AGENT_GTD_API_KEY": "test-gtd-key",
+        "ANTHROPIC_API_KEY": "sk-ant-test",
         "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
     }
     with patch.dict(os.environ, env):
@@ -325,6 +326,49 @@ class TestDispatchManageMode:
         assert data["mode"] == "manage"
         assert data["wave_run_id"] == "wr-abc"
         assert data["branch_name"] is None
+
+
+class TestPlan:
+    @patch("agent_gtd_dispatch.main.wave_planner")
+    def test_no_auth_returns_401(self, mock_planner, client):
+        resp = client.post("/plan", json={"item_ids": ["id1"]})
+        assert resp.status_code == 401
+
+    @patch("agent_gtd_dispatch.main.wave_planner")
+    def test_valid_request_returns_wave_plan(self, mock_planner, client, auth_headers):
+        from agent_gtd_dispatch.models import DagEdge, WavePlan
+
+        mock_planner.plan_wave = AsyncMock(
+            return_value=WavePlan(
+                nodes=["id1", "id2"],
+                edges=[DagEdge(from_item_id="id1", to_item_id="id2")],
+                planner_model="claude-sonnet-4-6",
+            )
+        )
+        resp = client.post(
+            "/plan", json={"item_ids": ["id1", "id2"]}, headers=auth_headers
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["nodes"] == ["id1", "id2"]
+        assert len(data["edges"]) == 1
+        assert data["edges"][0]["from_item_id"] == "id1"
+        assert data["edges"][0]["to_item_id"] == "id2"
+        assert data["planner_model"] == "claude-sonnet-4-6"
+
+    @patch("agent_gtd_dispatch.main.wave_planner")
+    def test_plan_wave_raises_returns_502(self, mock_planner, client, auth_headers):
+        mock_planner.plan_wave = AsyncMock(side_effect=Exception("GTD API down"))
+        resp = client.post(
+            "/plan", json={"item_ids": ["id1"]}, headers=auth_headers
+        )
+        assert resp.status_code == 502
+        assert "GTD API down" in resp.json()["detail"]
+
+    @patch("agent_gtd_dispatch.main.wave_planner")
+    def test_empty_item_ids_returns_422(self, mock_planner, client, auth_headers):
+        resp = client.post("/plan", json={"item_ids": []}, headers=auth_headers)
+        assert resp.status_code == 422
 
 
 class TestStartupReconciliation:

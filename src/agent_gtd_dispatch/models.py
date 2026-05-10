@@ -68,3 +68,24 @@ class RunResponse(BaseModel):
     exit_code: int | None
     error: str | None
     created_at: datetime
+
+
+class PlanRequest(BaseModel):
+    """Request body for the /plan endpoint."""
+
+    item_ids: list[str] = Field(min_length=1)
+
+
+class DagEdge(BaseModel):
+    """A directed dependency edge: from_item_id must complete before to_item_id."""
+
+    from_item_id: str
+    to_item_id: str
+
+
+class WavePlan(BaseModel):
+    """Result of the planner: a dependency DAG for a set of items."""
+
+    nodes: list[str]
+    edges: list[DagEdge]
+    planner_model: str

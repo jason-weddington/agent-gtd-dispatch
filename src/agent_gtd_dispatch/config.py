@@ -31,16 +31,22 @@ TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
 # Wave manager
 WAVE_MANAGER_ALLOWLIST_PATH: Path = Path("wave_manager/allowlist.yaml")
 
+# Planner (wave DAG)
+ANTHROPIC_API_KEY: str = ""
+PLANNER_MODEL: str = "claude-sonnet-4-6"
+
 
 def load() -> None:
     """Load configuration from environment. Call once at startup."""
     global DISPATCH_API_KEY, AGENT_GTD_URL, AGENT_GTD_API_KEY
     global WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS
     global WAVE_MANAGER_ALLOWLIST_PATH
+    global ANTHROPIC_API_KEY, PLANNER_MODEL
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
     AGENT_GTD_API_KEY = _require("AGENT_GTD_API_KEY")
+    ANTHROPIC_API_KEY = _require("ANTHROPIC_API_KEY")
 
     WORKSPACE_ROOT = Path(
         os.environ.get("DISPATCH_WORKSPACE_ROOT", str(Path.home() / "workspace"))
@@ -50,3 +56,4 @@ def load() -> None:
     WAVE_MANAGER_ALLOWLIST_PATH = Path(
         os.environ.get("WAVE_MANAGER_ALLOWLIST_PATH", "wave_manager/allowlist.yaml")
     )
+    PLANNER_MODEL = os.environ.get("DISPATCH_PLANNER_MODEL", "claude-sonnet-4-6")
