@@ -39,9 +39,18 @@ class Engine:
     build_command: Callable[[str, str, int, str | None], list[str]]
 
 
-def build_env(engine: Engine) -> dict[str, str]:
+# Manage-mode env exposure
+# DISPATCH_LOCAL_URL and DISPATCH_API_KEY are passed to manage-mode claude executors
+# so they can call back to the dispatch worker's /ci-gate endpoint.
+_MANAGE_EXECUTOR_ENV_KEYS: tuple[str, ...] = ("DISPATCH_LOCAL_URL", "DISPATCH_API_KEY")
+
+
+def build_env(engine: Engine, mode: str = "build") -> dict[str, str]:
     """Build a filtered env dict for the engine's subprocess."""
     allowed = COMMON_ENV_KEYS | engine.env_keys
+    # Manage-mode env exposure: add dispatch URL + key for claude manage-mode executors
+    if engine.name == "claude" and mode == "manage":
+        allowed = allowed | frozenset(_MANAGE_EXECUTOR_ENV_KEYS)
     env = {k: v for k, v in os.environ.items() if k in allowed}
     env["HOME"] = str(Path.home())
     return env

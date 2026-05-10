@@ -10,16 +10,25 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import config, db, dispatch, gtd_client, wave_planner
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
 from .dispatch import _MANAGE_ALLOWED_TOOLS
 from .engines import Engine, get_engine
-from .models import DispatchRequest, PlanRequest, Run, RunResponse, RunStatus, WavePlan
+from .models import (
+    CIGateRequest,
+    CIGateResult,
+    DispatchRequest,
+    PlanRequest,
+    Run,
+    RunResponse,
+    RunStatus,
+    WavePlan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +144,7 @@ async def _dispatch_worker(
             run.agent_name,
             timeout_seconds,
             allowed_tools=agent_allowed_tools,
+            mode=mode,
         )
 
         completed = datetime.now(UTC).isoformat()
@@ -358,3 +368,22 @@ async def cancel_run(
     if run is None:  # pragma: no cover
         raise HTTPException(status_code=404, detail="Run not found")
     return RunResponse(**run.model_dump())
+
+
+@app.post("/ci-gate", response_model=CIGateResult)
+async def ci_gate(
+    body: CIGateRequest,
+    _: str = Depends(_verify_api_key),
+) -> CIGateResult:
+    """Run the CI suite on a branch before merge.
+
+    Always returns HTTP 200. CI failure is expressed as passed=False in the response
+    body — never as a 4xx/5xx error. This allows callers to always deserialize
+    CIGateResult regardless of outcome.
+    """
+    return await dispatch.run_ci_gate(
+        body.repo_url,
+        body.branch_name,
+        body.project_type,
+        config.ci_timeout_seconds,
+    )

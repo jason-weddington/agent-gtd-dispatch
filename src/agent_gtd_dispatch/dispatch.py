@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import subprocess
 import textwrap
@@ -12,7 +13,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import config, gtd_client
-from .engines import Engine, build_env
+from .engines import COMMON_ENV_KEYS, Engine, build_env
+from .models import CIGateResult
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +274,33 @@ def _build_plan_prompt(
     return prompt
 
 
+def _heartbeat_prompt_addendum() -> str:
+    """Addendum instructing the manage-mode executor to ping_wave for liveness."""
+    return textwrap.dedent("""\
+        ## Liveness (Heartbeat)
+
+        During any idle wait (between dispatches, while monitoring child runs, while merging)
+        call the `mcp__agent-gtd__ping_wave(wave_run_id, phase=<current_phase>,
+        waiting_on=<current_item_id_or_empty_string>)` MCP tool at least every 90 seconds.
+        Valid `phase` values: `"planning"`, `"dispatching"`, `"monitoring"`, `"merging"`,
+        `"halted"`. This proves liveness so the reaper does not mark the wave crashed.
+        The reaper threshold is 300 seconds; 90s gives margin.
+    """)
+
+
+def _ci_gate_prompt_addendum() -> str:
+    """Addendum instructing the manage-mode executor to run CI gate before marking items complete."""
+    return textwrap.dedent("""\
+        ## Pre-merge CI Gate
+
+        Before calling `complete_in_wave(item_id, outcome=success)` for any item, POST to the
+        dispatch worker's `/ci-gate` endpoint with
+        `{"repo_url": "<repo>", "branch_name": "<branch>"}`. If the response has
+        `"passed": false`, call
+        `halt_wave(wave_run_id, reason="CI failure on <branch>: <failed_step>")` and STOP.
+    """)
+
+
 def _build_manage_prompt(
     wave_run_id: str,
     project: dict[str, Any],
@@ -346,6 +375,8 @@ def _build_manage_prompt(
     """
     )
 
+    prompt += "\n" + _heartbeat_prompt_addendum()
+    prompt += "\n" + _ci_gate_prompt_addendum()
     return prompt
 
 
@@ -441,6 +472,151 @@ def _build_build_prompt(
     return prompt
 
 
+def _detect_project_type(workspace: Path) -> str:
+    """Auto-detect project type from the workspace filesystem.
+
+    Checks for pyproject.toml → "python", package.json → "frontend", else "unknown".
+    """
+    if (workspace / "pyproject.toml").exists():
+        return "python"
+    if (workspace / "package.json").exists():
+        return "frontend"
+    return "unknown"
+
+
+def _ci_steps_for_project_type(project_type: str) -> list[tuple[str, list[str]]]:
+    """Return ordered CI steps (command_string, command_list) for the given project type."""
+    if project_type == "python":
+        return [
+            ("uv run pytest", ["uv", "run", "pytest"]),
+            ("uv run ruff check", ["uv", "run", "ruff", "check"]),
+            ("uv run mypy src/", ["uv", "run", "mypy", "src/"]),
+        ]
+    if project_type == "frontend":
+        return [
+            ("npm run build", ["npm", "run", "build"]),
+            ("npm run test", ["npm", "run", "test"]),
+        ]
+    return []  # "unknown" — nothing to run
+
+
+def _ci_env() -> dict[str, str]:
+    """Build a filtered env dict for CI subprocesses (COMMON_ENV_KEYS only)."""
+    return {k: v for k, v in os.environ.items() if k in COMMON_ENV_KEYS}
+
+
+async def run_ci_gate(
+    repo_url: str,
+    branch_name: str,
+    project_type: str | None,
+    timeout_s: int,
+) -> CIGateResult:
+    """Clone a branch and run the CI suite against it.
+
+    Always returns a CIGateResult — never raises. CI failure is expressed as
+    passed=False in the result body, not as an exception.
+
+    The CI subprocess inherits only COMMON_ENV_KEYS (same allow-list used for agent
+    subprocesses), so secrets like ANTHROPIC_API_KEY are never forwarded.
+    """
+    from uuid import uuid4
+
+    run_id = f"ci-{uuid4().hex[:10]}"
+    workspace: Path | None = None
+    resolved_type = project_type or "unknown"
+
+    try:
+        # Clone and check out the existing branch
+        name = repo_name_from_origin(repo_url)
+        workspace = config.WORKSPACE_ROOT / f"{name}-{run_id}"
+        config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                ["git", "clone", repo_url, str(workspace)],
+                check=True,
+                capture_output=True,
+            ),
+        )
+        await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                ["git", "checkout", branch_name],
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+            ),
+        )
+
+        # Auto-detect project type if not provided
+        if project_type is None:
+            resolved_type = _detect_project_type(workspace)
+
+        steps = _ci_steps_for_project_type(resolved_type)
+        env = _ci_env()
+
+        for step_str, step_cmd in steps:
+            cmd_to_run = step_cmd
+            try:
+
+                def _run_step(
+                    _cmd: list[str] = cmd_to_run,
+                ) -> subprocess.CompletedProcess[str]:
+                    return subprocess.run(
+                        _cmd,
+                        cwd=workspace,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_s,
+                    )
+
+                result = await loop.run_in_executor(None, _run_step)
+                if result.returncode != 0:
+                    return CIGateResult(
+                        passed=False,
+                        project_type=resolved_type,
+                        failed_step=step_str,
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                        returncode=result.returncode,
+                    )
+            except subprocess.TimeoutExpired:
+                return CIGateResult(
+                    passed=False,
+                    project_type=resolved_type,
+                    failed_step="timeout",
+                    stdout="",
+                    stderr=f"CI step timed out after {timeout_s}s",
+                    returncode=None,
+                )
+
+        return CIGateResult(
+            passed=True,
+            project_type=resolved_type,
+            failed_step=None,
+            stdout="",
+            stderr="",
+            returncode=0,
+        )
+
+    except Exception as exc:
+        logger.exception("CI gate error: %s", exc)
+        return CIGateResult(
+            passed=False,
+            project_type=resolved_type,
+            failed_step=str(exc),
+            stdout="",
+            stderr=str(exc),
+            returncode=None,
+        )
+    finally:
+        if workspace is not None:
+            cleanup_workspace(workspace)
+
+
 async def run_agent(
     engine: Engine,
     workspace: Path,
@@ -450,6 +626,7 @@ async def run_agent(
     agent_name: str | None = None,
     timeout_seconds: int | None = None,
     allowed_tools: list[str] | None = None,
+    mode: str = "build",
 ) -> subprocess.CompletedProcess[str]:
     """Run a headless agent CLI as a subprocess."""
     if timeout_seconds is None:
@@ -463,7 +640,7 @@ async def run_agent(
         # Insert --allowedTools before the final title argument
         title_arg = cmd[-1]
         cmd = [*cmd[:-1], "--allowedTools", ",".join(allowed_tools), title_arg]
-    env = build_env(engine)
+    env = build_env(engine, mode=mode)
 
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(

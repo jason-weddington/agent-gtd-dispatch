@@ -53,6 +53,8 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
         await db.execute(
             "ALTER TABLE runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'build'"
         )
+    if "wave_run_id" not in existing:
+        await db.execute("ALTER TABLE runs ADD COLUMN wave_run_id TEXT")
     await db.commit()
 
 
@@ -77,8 +79,9 @@ async def insert_run(run: Run) -> None:
         await db.execute(
             """INSERT INTO runs
                (id, item_id, project_name, branch_name, engine, agent_name,
-                mode, status, started_at, completed_at, exit_code, error, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                mode, wave_run_id, status, started_at, completed_at,
+                exit_code, error, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run.id,
                 run.item_id,
@@ -87,6 +90,7 @@ async def insert_run(run: Run) -> None:
                 run.engine,
                 run.agent_name,
                 run.mode,
+                run.wave_run_id,
                 run.status.value,
                 run.started_at.isoformat() if run.started_at else None,
                 run.completed_at.isoformat() if run.completed_at else None,
@@ -147,6 +151,18 @@ async def get_run(run_id: str) -> Run | None:
             return _row_to_run(row)
 
 
+async def list_runs_by_wave(wave_run_id: str) -> list[Run]:
+    """List all runs belonging to a specific wave run."""
+    async with aiosqlite.connect(db_path()) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM runs WHERE wave_run_id = ? ORDER BY created_at DESC",
+            (wave_run_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [_row_to_run(r) for r in rows]
+
+
 async def list_runs(
     item_id: str | None = None,
     status: RunStatus | None = None,
@@ -188,6 +204,8 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         branch_name=row["branch_name"],
         engine=row["engine"],
         agent_name=row["agent_name"],
+        mode=row["mode"],
+        wave_run_id=row["wave_run_id"],
         status=RunStatus(row["status"]),
         started_at=_parse_dt(row["started_at"]),
         completed_at=_parse_dt(row["completed_at"]),
