@@ -188,10 +188,20 @@ class TestBuildEnv:
         assert "PATH" in env
         assert "AGENT_GTD_URL" in env
 
-    def test_includes_engine_specific(self, monkeypatch) -> None:
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    def test_claude_includes_oauth_token(self, monkeypatch) -> None:
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test")
         env = build_env(CLAUDE)
-        assert env["ANTHROPIC_API_KEY"] == "sk-test"
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-test"  # noqa: S105
+
+    def test_claude_excludes_anthropic_api_key(self, monkeypatch) -> None:
+        # Regression guard for kb-01512: ANTHROPIC_API_KEY in the subprocess
+        # env makes Claude Code prefer API billing over the user's Max
+        # subscription, surprising-to-the-tune-of-$300/month.  The planner
+        # subroutine must read the key via config.ANTHROPIC_API_KEY in-process
+        # and never via the subprocess env.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        env = build_env(CLAUDE)
+        assert "ANTHROPIC_API_KEY" not in env
 
     def test_excludes_other_engine_keys(self, monkeypatch) -> None:
         monkeypatch.setenv("KIRO_API_KEY", "kiro-test")
@@ -202,6 +212,23 @@ class TestBuildEnv:
         monkeypatch.setenv("KIRO_API_KEY", "kiro-test")
         env = build_env(KIRO)
         assert env["KIRO_API_KEY"] == "kiro-test"
+
+    def test_kiro_excludes_anthropic_api_key(self, monkeypatch) -> None:
+        # Regression guard for kb-01512 (Kiro should never see it either)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        env = build_env(KIRO)
+        assert "ANTHROPIC_API_KEY" not in env
+
+    def test_claude_manage_mode_excludes_anthropic_api_key(self, monkeypatch) -> None:
+        # Regression guard for kb-01512: even when manage-mode adds dispatch
+        # URL/key to the executor's env, ANTHROPIC_API_KEY must still be
+        # filtered out — the executor itself spawns Claude Code subprocesses.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        monkeypatch.setenv("DISPATCH_LOCAL_URL", "http://localhost:8100")
+        monkeypatch.setenv("DISPATCH_API_KEY", "dispatch-test")
+        env = build_env(CLAUDE, mode="manage")
+        assert "ANTHROPIC_API_KEY" not in env
+        assert env["DISPATCH_LOCAL_URL"] == "http://localhost:8100"
 
 
 class TestBuildSystemPrompt:
@@ -318,7 +345,8 @@ class TestRunAgent:
 
     async def test_env_filtered_by_engine(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")  # must be filtered
         monkeypatch.setenv("KIRO_API_KEY", "kiro-secret")
         with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
@@ -326,7 +354,8 @@ class TestRunAgent:
             )
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
             _, kwargs = mock_run.call_args
-            assert kwargs["env"]["ANTHROPIC_API_KEY"] == "sk-test"
+            assert kwargs["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-test"  # noqa: S105
+            assert "ANTHROPIC_API_KEY" not in kwargs["env"]  # kb-01512
             assert "KIRO_API_KEY" not in kwargs["env"]
 
     async def test_agent_name_passes_through_to_command(
