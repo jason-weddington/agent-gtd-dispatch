@@ -447,6 +447,11 @@ class TestRunAgent:
             assert cmd[idx + 1] == "mcp__agent-gtd__advance_wave,Read"
             # Title remains the final argument
             assert cmd[-1] == "Title"
+            # --allowedTools must come BEFORE --print, otherwise claude's
+            # argparser swallows the positional prompt and errors with
+            # "Input must be provided ... when using --print".  This is a
+            # regression guard for that specific failure mode.
+            assert idx < cmd.index("--print")
 
     async def test_non_claude_engine_ignores_allowed_tools(
         self, tmp_path, monkeypatch

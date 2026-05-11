@@ -665,9 +665,12 @@ async def run_agent(
         )
     cmd = engine.build_command(system_prompt, title, max_turns, agent_name)
     if allowed_tools is not None and engine.name == "claude":
-        # Insert --allowedTools before the final title argument
-        title_arg = cmd[-1]
-        cmd = [*cmd[:-1], "--allowedTools", ",".join(allowed_tools), title_arg]
+        # Insert --allowedTools BEFORE --print.  claude's argparser breaks
+        # when --allowedTools sits between --print and the positional prompt
+        # ("Error: Input must be provided ... when using --print"); --print
+        # must be the last flag before the prompt.
+        print_idx = cmd.index("--print")
+        cmd[print_idx:print_idx] = ["--allowedTools", ",".join(allowed_tools)]
     env = build_env(engine, mode=mode)
 
     loop = asyncio.get_event_loop()
