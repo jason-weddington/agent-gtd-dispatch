@@ -333,6 +333,17 @@ def _build_manage_prompt(
 
         This executor never writes code, pushes branches, or takes ownership of any repository.
 
+        ## Launch item_id — Ignore It
+
+        The `item_id` you received as the dispatch trigger is a positional placeholder, not a
+        wave item to act on. **Ignore it.** Your sole source of truth for which items to dispatch
+        is the wave plan — read it via
+        `mcp__agent-gtd__advance_wave(wave_run_id="{wave_run_id}")` and dispatch every item in
+        `next_ready` in build mode.
+        Do NOT add comments to the launch item_id.
+        Do NOT mark it complete.
+        Do NOT treat it as a gate.
+
         ## Executor Loop
 
         Repeat until advance_wave reports graph_complete=true:
@@ -346,8 +357,13 @@ def _build_manage_prompt(
 
         STEP 2 — DISPATCH READY ITEMS
           For each item_id in next_ready:
-            call mcp__agent-gtd__dispatch_item(item_id=item_id, mode="build")
+            call mcp__agent-gtd__dispatch_item(
+                item_id=item_id,
+                mode="build",
+                wave_run_id="{wave_run_id}",
+            )
             record the returned run_id alongside item_id
+          NOTE: wave_run_id is REQUIRED on every child dispatch — the reaper depends on it.
 
         STEP 3 — MONITOR TO COMPLETION
           For each dispatched (item_id, run_id):
@@ -387,9 +403,17 @@ def _build_manage_prompt(
           Exit code non-zero → treat as HALT with stderr as reason.
 
         STEP 5b — HALT PATH
+          Post the halt comment to the OFFENDING WAVE ITEM (the item whose build run
+          triggered the halt), NOT to the launch placeholder item_id.
+          If there is no specific offending item (e.g. advance_wave failed 3 times),
+          post to the project instead.
           call mcp__agent-gtd__add_comment(
-            item_id=item_id,
+            item_id=<offending_wave_item_id>,  ← NOT the launch placeholder
             content="Wave halted: <reason>")
+          # OR if no specific offending item:
+          # call mcp__agent-gtd__add_comment(
+          #   project_id=<project_id>,
+          #   content="Wave halted: <reason>")
           call mcp__agent-gtd__halt_wave(wave_run_id, reason=<reason>)
           EXIT.
 

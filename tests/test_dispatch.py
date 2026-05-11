@@ -559,6 +559,42 @@ class TestBuildManagePrompt:
         prompt = self._prompt(max_turns=42)
         assert "42" in prompt
 
+    def test_manage_prompt_says_ignore_launch_item_id(self) -> None:
+        prompt = self._prompt()
+        lower = prompt.lower()
+        assert any(
+            phrase in lower
+            for phrase in [
+                "placeholder",
+                "ignore",
+                "do not act on",
+                "do not mark complete",
+            ]
+        ), "Prompt must instruct executor to ignore the launch item_id placeholder"
+
+    def test_manage_prompt_dispatch_step_includes_wave_run_id(self) -> None:
+        prompt = self._prompt()
+        # The f-string interpolates wave_run_id into the dispatch_item example call
+        assert f'wave_run_id="{self._wave_run_id}"' in prompt, (
+            "Step 2 dispatch_item call must include wave_run_id "
+            "interpolated with the actual value"
+        )
+        assert "REQUIRED" in prompt or "required" in prompt.lower(), (
+            "Prompt must state that wave_run_id is required on every child dispatch"
+        )
+
+    def test_manage_prompt_halt_does_not_target_launch_item(self) -> None:
+        prompt = self._prompt()
+        halt_idx = prompt.find("STEP 5b")
+        assert halt_idx != -1, "STEP 5b must be present in the prompt"
+        halt_section = prompt[halt_idx:]
+        # The halt comment must target the offending wave item or project,
+        # not the launch placeholder
+        assert "offending" in halt_section.lower() or "project_id" in halt_section, (
+            "STEP 5b halt comment must target the offending wave item or project_id, "
+            "not the launch placeholder item_id"
+        )
+
 
 # ---------------------------------------------------------------------------
 # AC-1.1 — wave_run_id schema tests
