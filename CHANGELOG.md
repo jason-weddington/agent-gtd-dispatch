@@ -2,6 +2,40 @@
 
 <!-- version list -->
 
+## v1.9.0 (2026-05-12)
+
+### Bug Fixes
+
+- **dispatch**: --allowedTools must precede --print on claude command
+  ([`a18f356`](https://github.com/repos/agent-gtd-dispatch/commit/a18f356c9de39424e7a52f1eb683f73920c3fad6))
+
+- **engines**: Never leak ANTHROPIC_API_KEY to Claude Code subprocesses
+  ([`b7cae4b`](https://github.com/repos/agent-gtd-dispatch/commit/b7cae4b9663405420058327528e6bde697d50574))
+
+- **gtd-client**: Align wave-run paths with agent_gtd's actual routes
+  ([`c9d65db`](https://github.com/repos/agent-gtd-dispatch/commit/c9d65db9dd2b3297d8300fdf6d5eae3a339f795d))
+
+- **wave-manager**: Executor prompt — ignore launch item_id, pass wave_run_id
+  ([`706dd72`](https://github.com/repos/agent-gtd-dispatch/commit/706dd7206cdf2d23d74f68c7bc07fd4d735b215b))
+
+### Features
+
+- **wave-manager**: Add allowlist YAML + comment classifier
+  ([`0d0a387`](https://github.com/repos/agent-gtd-dispatch/commit/0d0a3875c42b63dd9b335876596243018e32d104))
+
+- **wave-manager**: Add mode=manage route + executor scaffold
+  ([`525f432`](https://github.com/repos/agent-gtd-dispatch/commit/525f432290c5600c3d0cc2bbeaf81b0c7abd78c2))
+
+- **wave-manager**: Executor loop + squash_merge helper + branch_name nullable
+  ([`23db1ae`](https://github.com/repos/agent-gtd-dispatch/commit/23db1ae0b8da445653e7e564f4be2a7420960010))
+
+- **wave-manager**: Heartbeat prompt addendum + pre-merge CI gate
+  ([`47dbfc9`](https://github.com/repos/agent-gtd-dispatch/commit/47dbfc9b9ba2c34103174237a9147190493d9b5a))
+
+- **wave-manager**: Planner subroutine — POST /plan with anthropic SDK
+  ([`dac56f4`](https://github.com/repos/agent-gtd-dispatch/commit/dac56f43202014e0e147ec4ab3738f4ea034dde6))
+
+
 ## v1.8.0 (2026-05-06)
 
 ### Chores
