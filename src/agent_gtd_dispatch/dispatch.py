@@ -378,14 +378,25 @@ def _build_manage_prompt(
                If no such comment found, treat as HALT with reason "no final agent comment".
             b. Get branch_name: mcp__agent-gtd__list_runs(item_id=item_id)
                The most recent run's branch_name field.
-            c. Run classifier (Bash):
+            c. Get unified diff (Bash):
+                 cd /tmp && git clone --depth=50 {git_origin or "<project.git_origin>"} _diff_clone_<item_id>
+                 cd _diff_clone_<item_id> && git fetch origin <branch_name> && git checkout <branch_name>
+                 git diff origin/main...<branch_name> > /tmp/diff_<item_id>.txt
+               (Or equivalent — any method that produces the unified diff of the branch vs main.)
+            d. Get declared files: mcp__agent-gtd__get_item(item_id=item_id)
+               Parse the "## Files to Modify" section of the item description to extract
+               the declared file paths (one per line, strip leading "- " bullets and backticks).
+               Collect into a comma-separated list: declared_files_csv.
+            e. Run classifier (Bash):
                  python -m agent_gtd_dispatch.wave_manager.classifier \\
                    --comment "<final_comment_text>" \\
+                   --diff @/tmp/diff_<item_id>.txt \\
+                   --declared-files "<declared_files_csv>" \\
                    --wave-run-id "{wave_run_id}"
-               Outputs DECIDE:<rule_name> or HALT:<reason> on stdout.
+               Outputs ALLOW or HALT:<reason> on stdout.
                If the classifier command fails to run or is not importable,
                treat every completion as HALT with reason "classifier unavailable".
-            d. If run status is failed/timed_out/cancelled: treat as HALT
+            f. If run status is failed/timed_out/cancelled: treat as HALT
                with reason "build agent <status>: <run_id>".
 
         STEP 5a — DECIDE PATH (auto-merge)
@@ -395,11 +406,11 @@ def _build_manage_prompt(
               --branch <branch_name> \\
               --item-id <item_id> \\
               --wave-run-id {wave_run_id} \\
-              --decision-rule <rule_name>
+              --decision-rule auto-merge
           Exit code 0 → success:
             call mcp__agent-gtd__complete_in_wave(
               wave_run_id, item_id, outcome="completed",
-              merge_actor="manager-allowlist", decision_rule=<rule_name>)
+              merge_actor="manager-halt-list", decision_rule="auto-merge")
           Exit code non-zero → treat as HALT with stderr as reason.
 
         STEP 5b — HALT PATH
