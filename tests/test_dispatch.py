@@ -469,6 +469,22 @@ class TestRunAgent:
             cmd = args[0]
             assert "--allowedTools" not in cmd
 
+    async def test_writes_transcript_after_successful_run(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="agent reasoning here", stderr="a warning"
+            )
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+
+        transcript_path = tmp_path / "transcript.txt"
+        assert transcript_path.exists(), "transcript.txt must be written on success"
+        content = transcript_path.read_text()
+        assert "agent reasoning here" in content
+        assert "a warning" in content
+
 
 class TestBuildManagePrompt:
     _project: ClassVar[dict] = {"name": "wave-project"}

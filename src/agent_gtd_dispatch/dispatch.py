@@ -70,6 +70,27 @@ def cleanup_workspace(workspace: Path) -> None:
         shutil.rmtree(workspace, ignore_errors=True)
 
 
+def write_transcript(workspace: Path, result: subprocess.CompletedProcess[str]) -> None:
+    """Write agent stdout and stderr to transcript.txt in the workspace.
+
+    Called after every agent subprocess run (success or failure) so operators
+    can inspect the full agent reasoning chain without waiting for a failure.
+    The file is deleted with the workspace by cleanup_workspace().
+
+    For build/plan runs the workspace is a git clone; transcript.txt is added
+    to .git/info/exclude so it cannot be accidentally committed.
+    For manage-mode runs the workspace is a bare directory with no .git.
+    """
+    transcript = "=== stdout ===\n" + result.stdout + "\n=== stderr ===\n" + result.stderr
+    (workspace / "transcript.txt").write_text(transcript)
+
+    # Gitignore for build/plan workspaces (bare manage workspace has no .git dir)
+    git_exclude = workspace / ".git" / "info" / "exclude"
+    if git_exclude.exists():
+        with git_exclude.open("a") as f:
+            f.write("\ntranscript.txt\n")
+
+
 def _sanitize_filename(filename: str) -> str:
     """Sanitize a filename for safe filesystem use.
 
@@ -709,7 +730,7 @@ async def run_agent(
     env = build_env(engine, mode=mode)
 
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
+    result = await loop.run_in_executor(
         None,
         lambda: subprocess.run(
             cmd,
@@ -720,3 +741,7 @@ async def run_agent(
             text=True,
         ),
     )
+    # Write full stdout+stderr to workspace/transcript.txt on every run
+    # (success or failure) for operator debugging.  Deleted by cleanup_workspace().
+    write_transcript(workspace, result)
+    return result
