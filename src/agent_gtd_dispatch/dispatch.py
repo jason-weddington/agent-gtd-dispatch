@@ -391,6 +391,11 @@ def _build_manage_prompt(
         )
         ```
 
+        NOTE on `update_wave_state`: each call REPLACES all four state fields
+        (phase, current_item_id, current_step, last_updated). Fields you omit
+        are reset to None. If you want to preserve `current_item_id` across a
+        phase change, pass it in every subsequent call.
+
         **1. Install dependencies** (Bash):
         ```bash
         # If pyproject.toml exists:
@@ -457,23 +462,43 @@ def _build_manage_prompt(
         NOTE: `wave_run_id` is REQUIRED on every child dispatch — include it always.
         Record the returned `run_id` alongside `item_id`.
 
-        **Step 3 — Poll to completion**
+        **Step 3 — Poll to completion (use a background poller per run)**
 
-        Publish polling state, then poll:
+        Publish polling state:
         ```
         mcp__agent-gtd__update_wave_state(
             wave_run_id="{wave_run_id}",
             phase="polling",
-            current_step=f"Waiting for build runs to complete",
+            current_step="Waiting for build runs to complete",
         )
-        mcp__agent-gtd__list_runs(wave_run_id="{wave_run_id}")
         ```
-        plus `Bash sleep 30` between polls. Wait until all dispatched runs reach a
-        terminal status (succeeded, failed, timed_out, cancelled). Process each item
-        as it completes — don't wait for all before acting on any.
 
-        If a run ended with status `failed`, `timed_out`, or `cancelled`: treat it as
-        a halt candidate (see Halt path below) with reason
+        For each dispatched run_id, arm ONE background Bash poller. The harness
+        will deliver a `<task-notification>` event when each poller exits, so you
+        don't burn turns on a foreground sleep loop:
+
+        ```bash
+        # Run with run_in_background: true
+        until s=$(agent-gtd run-status <run_id> | jq -r .status 2>/dev/null) \\
+              && [ -n "$s" ] && [ "$s" != "running" ] && [ "$s" != "pending" ]; do
+          sleep 30
+        done
+        echo "DONE <run_id> status=$s"
+        ```
+
+        IMPORTANT details:
+        - Use `[ -n "$s" ]` so transient empty-status responses (e.g. during a
+          service bounce) don't trigger a false-DONE.
+        - One poller per run_id. Each `<task-notification>` is the wake-up to
+          process THAT run.
+        - When a notification arrives: confirm status via
+          `mcp__agent-gtd__get_run_status(<run_id>)` (the CLI relies on auth env
+          inherited at session start — if it errors, fall back to the MCP tool),
+          then continue with Step 4 (AC reconciliation) and onward for that run.
+
+        Process each item as it completes — don't wait for all before acting on any.
+        If a run ended with `failed`, `timed_out`, or `cancelled`: treat as a halt
+        candidate (see Halt path) with reason
         `"build agent <status>: run <run_id> for item <item_id>"`.
 
         **Step 4 — AC reconciliation**
@@ -519,11 +544,24 @@ def _build_manage_prompt(
         git checkout <branch_name>
         # run test + lint commands from warm-up
         ```
-        If gates pass: proceed to Step 6 (squash merge).
+
+        Also inspect the diff for **unrelated manifest changes**. If the diff
+        includes additions to `package.json` / `package-lock.json` /
+        `pyproject.toml` / `uv.lock` that are NOT directly tied to the item's
+        stated scope, treat them as suspect — they're usually defensive
+        workarounds for warnings on the build agent's host (e.g. silencing a
+        peer-dep warning). Revert those specific changes via
+        `git checkout HEAD -- <file>` and re-run gates. Production manifests
+        should only change when the actual feature requires it.
+
+        If gates pass (and no unrelated manifest changes remain):
+        proceed to Step 6 (squash merge).
+
         If gates fail:
         - Attempt an inline fix if it is small: formatting, single missing import,
-          one-line change, coverage ratchet bump — use `Edit`/`Bash` to fix.
-          If the fix succeeds, re-run gates.
+          one-line change, coverage ratchet bump, stale test assertion that the
+          current change makes correct — use `Edit`/`Bash` to fix. If the fix
+          succeeds, re-run gates.
         - If the fix fails or is non-trivial, halt:
           ```
           mcp__agent-gtd__halt_wave(
