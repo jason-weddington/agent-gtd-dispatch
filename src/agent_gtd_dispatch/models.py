@@ -50,6 +50,7 @@ class DispatchRequest(BaseModel):
     mode: str = "build"
     timeout_minutes: int | None = None
     wave_run_id: str | None = None
+    attribution: str | None = None
 
 
 class RunResponse(BaseModel):
@@ -90,5 +91,3 @@ class WavePlan(BaseModel):
     nodes: list[str]
     edges: list[DagEdge]
     planner_model: str
-
-

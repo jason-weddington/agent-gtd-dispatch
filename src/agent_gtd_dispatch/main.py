@@ -68,7 +68,12 @@ app = FastAPI(title="Agent GTD Dispatch", lifespan=lifespan)
 
 
 async def _dispatch_worker(
-    run: Run, max_turns: int, engine: Engine, timeout_seconds: int
+    run: Run,
+    max_turns: int,
+    engine: Engine,
+    timeout_seconds: int,
+    *,
+    attribution: str | None = None,
 ) -> None:
     """Background task that executes a dispatch run."""
     now = datetime.now(UTC).isoformat()
@@ -107,7 +112,9 @@ async def _dispatch_worker(
             await db.update_run(run.id, workspace_path=str(workspace))
 
             # Stage any attachments into {run_id}-attachments/ inside the workspace
-            attachments = await dispatch.stage_attachments(workspace, run.id, run.item_id)
+            attachments = await dispatch.stage_attachments(
+                workspace, run.id, run.item_id
+            )
 
         system_prompt = dispatch.build_system_prompt(
             item,
@@ -148,6 +155,7 @@ async def _dispatch_worker(
             timeout_seconds,
             allowed_tools=agent_allowed_tools,
             mode=mode,
+            attribution=attribution,
         )
 
         completed = datetime.now(UTC).isoformat()
@@ -325,7 +333,9 @@ async def dispatch_item(
 
     # Start background task
     task = asyncio.create_task(
-        _dispatch_worker(run, max_turns, engine, timeout_seconds)
+        _dispatch_worker(
+            run, max_turns, engine, timeout_seconds, attribution=body.attribution
+        )
     )
     _active_processes[run.id] = task
 
@@ -414,5 +424,3 @@ async def cancel_run(
     if run is None:  # pragma: no cover
         raise HTTPException(status_code=404, detail="Run not found")
     return RunResponse(**run.model_dump())
-
-

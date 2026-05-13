@@ -44,6 +44,7 @@ tests/
 - **Mocking**: Tests use `unittest.mock.patch` and `AsyncMock`. API tests patch `agent_gtd_dispatch.main.gtd_client` and `agent_gtd_dispatch.main.dispatch` modules.
 - **Async tests**: `asyncio_mode = "auto"` in pyproject.toml — no need for `@pytest.mark.asyncio`.
 - **Test style**: `from __future__ import annotations`, test classes with `Test` prefix, `-> None` on methods, docstrings on source but not tests (D rules suppressed for `tests/**`).
+- **Attribution**: `POST /dispatch` accepts `attribution: str | None`. When set, the spawned agent subprocess gets `AGENT_GTD_AGENT_NAME=<attribution>` in its env, so it posts GTD comments under that identity (e.g. `claude-build-abc12345`) rather than the default lead.
 
 ## Git workflow
 

@@ -739,6 +739,7 @@ async def run_agent(
     timeout_seconds: int | None = None,
     allowed_tools: list[str] | None = None,
     mode: str = "build",
+    attribution: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a headless agent CLI as a subprocess."""
     if timeout_seconds is None:
@@ -756,6 +757,8 @@ async def run_agent(
         print_idx = cmd.index("--print")
         cmd[print_idx:print_idx] = ["--allowedTools", ",".join(allowed_tools)]
     env = build_env(engine, mode=mode)
+    if attribution:
+        env["AGENT_GTD_AGENT_NAME"] = attribution
 
     transcript_path = workspace / "transcript.txt"
     _setup_git_exclude(workspace)  # exclude transcript.txt BEFORE subprocess starts

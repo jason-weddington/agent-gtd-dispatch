@@ -295,6 +295,41 @@ class TestDispatch:
         _run, _max_turns, _engine, timeout_seconds = mock_worker.call_args.args
         assert timeout_seconds == 14400
 
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_dispatch_attribution_passed_to_worker(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ):
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={
+                "item_id": "abc12345-6789",
+                "max_turns": 50,
+                "attribution": "claude-build-abc12345",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        # _dispatch_worker must have been called with attribution kwarg
+        assert mock_worker.call_args.kwargs["attribution"] == "claude-build-abc12345"
+
 
 class TestListRuns:
     def test_empty_list(self, client, auth_headers):
@@ -400,9 +435,7 @@ class TestPlan:
     @patch("agent_gtd_dispatch.main.wave_planner")
     def test_plan_wave_raises_returns_502(self, mock_planner, client, auth_headers):
         mock_planner.plan_wave = AsyncMock(side_effect=Exception("GTD API down"))
-        resp = client.post(
-            "/plan", json={"item_ids": ["id1"]}, headers=auth_headers
-        )
+        resp = client.post("/plan", json={"item_ids": ["id1"]}, headers=auth_headers)
         assert resp.status_code == 502
         assert "GTD API down" in resp.json()["detail"]
 
@@ -438,9 +471,7 @@ class TestTranscriptEndpoint:
         assert data["last_modified"] is None
         assert data["total_lines"] == 0
 
-    async def test_returns_last_n_lines(
-        self, client, auth_headers, tmp_path
-    ) -> None:
+    async def test_returns_last_n_lines(self, client, auth_headers, tmp_path) -> None:
         from agent_gtd_dispatch import db
         from agent_gtd_dispatch.models import Run
 
@@ -457,9 +488,7 @@ class TestTranscriptEndpoint:
         transcript = tmp_path / "transcript.txt"
         transcript.write_text("\n".join(f"line {i}" for i in range(10)))
 
-        resp = client.get(
-            f"/runs/{run.id}/transcript?lines=3", headers=auth_headers
-        )
+        resp = client.get(f"/runs/{run.id}/transcript?lines=3", headers=auth_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert data["total_lines"] == 10
@@ -505,5 +534,3 @@ class TestStartupReconciliation:
             data = resp.json()
             assert data["status"] == "failed"
             assert data["error"] == "Service restarted while run was active"
-
-

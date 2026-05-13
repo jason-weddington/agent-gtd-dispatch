@@ -489,6 +489,33 @@ class TestRunAgent:
         transcript_path = tmp_path / "transcript.txt"
         assert transcript_path.exists(), "transcript.txt must be created on run start"
 
+    async def test_attribution_sets_agent_name_env(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(
+                CLAUDE,
+                tmp_path,
+                "sys",
+                "Title",
+                20,
+                attribution="claude-build-abc12345",
+            )
+            _, kwargs = mock_popen.call_args
+            assert kwargs["env"]["AGENT_GTD_AGENT_NAME"] == "claude-build-abc12345"
+
+    async def test_no_attribution_does_not_set_agent_name_env(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            _, kwargs = mock_popen.call_args
+            assert "AGENT_GTD_AGENT_NAME" not in kwargs["env"]
+
 
 class TestBuildManagePrompt:
     _project: ClassVar[dict] = {
