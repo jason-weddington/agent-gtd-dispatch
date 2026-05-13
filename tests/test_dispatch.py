@@ -432,9 +432,7 @@ class TestRunAgent:
         mock_proc = _make_mock_proc(0)
         with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
             mock_popen.return_value = mock_proc
-            await run_agent(
-                CLAUDE, tmp_path, "sys", "Title", 20, allowed_tools=tools
-            )
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20, allowed_tools=tools)
             args, _kwargs = mock_popen.call_args
             cmd = args[0]
             assert "--allowedTools" in cmd
@@ -456,9 +454,7 @@ class TestRunAgent:
         mock_proc = _make_mock_proc(0)
         with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
             mock_popen.return_value = mock_proc
-            await run_agent(
-                KIRO, tmp_path, "sys", "Title", 20, allowed_tools=tools
-            )
+            await run_agent(KIRO, tmp_path, "sys", "Title", 20, allowed_tools=tools)
             args, _kwargs = mock_popen.call_args
             cmd = args[0]
             assert "--allowedTools" not in cmd
@@ -495,7 +491,10 @@ class TestRunAgent:
 
 
 class TestBuildManagePrompt:
-    _project: ClassVar[dict] = {"name": "wave-project", "git_origin": "git@host:repos/wp"}
+    _project: ClassVar[dict] = {
+        "name": "wave-project",
+        "git_origin": "git@host:repos/wp",
+    }
     _wave_run_id = "wr-abc123"
     _max_turns = 100
 
@@ -767,10 +766,10 @@ class TestDbWorkspacePath:
         await db.init_db()
         run = Run(item_id="i1", project_name="p", branch_name="b")
         await db.insert_run(run)
-        await db.update_run(run.id, workspace_path="/tmp/ws-abc")
+        await db.update_run(run.id, workspace_path="/tmp/ws-abc")  # noqa: S108
         fetched = await db.get_run(run.id)
         assert fetched is not None
-        assert fetched.workspace_path == "/tmp/ws-abc"
+        assert fetched.workspace_path == "/tmp/ws-abc"  # noqa: S108
 
     async def test_workspace_path_set_on_insert(self) -> None:
         await db.init_db()
@@ -778,12 +777,12 @@ class TestDbWorkspacePath:
             item_id="i1",
             project_name="p",
             branch_name="b",
-            workspace_path="/tmp/ws-xyz",
+            workspace_path="/tmp/ws-xyz",  # noqa: S108
         )
         await db.insert_run(run)
         fetched = await db.get_run(run.id)
         assert fetched is not None
-        assert fetched.workspace_path == "/tmp/ws-xyz"
+        assert fetched.workspace_path == "/tmp/ws-xyz"  # noqa: S108
 
     async def test_update_run_with_exit_code_and_error(self) -> None:
         await db.init_db()
@@ -838,7 +837,9 @@ class TestManageEnvKeys:
         env = build_env(KIRO, mode="manage")
         assert "DISPATCH_LOCAL_URL" not in env
 
-    async def test_manage_mode_passed_to_run_agent_env(self, tmp_path, monkeypatch) -> None:
+    async def test_manage_mode_passed_to_run_agent_env(
+        self, tmp_path, monkeypatch
+    ) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
         monkeypatch.setenv("DISPATCH_LOCAL_URL", "http://localhost:8080")
         monkeypatch.setenv("DISPATCH_API_KEY", "mgr-key")
@@ -867,7 +868,9 @@ class TestPrepareManageWorkspace:
                 return _completed(0, stdout="origin/main\n")
             return _completed(0)
 
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run", side_effect=side_effect):
+        with patch(
+            "agent_gtd_dispatch.dispatch.subprocess.run", side_effect=side_effect
+        ):
             result = prepare_manage_workspace(origin, run_id)
 
         expected = tmp_path / f"repos-{run_id}"
@@ -954,7 +957,9 @@ class TestPrepareManageWorkspace:
                 return _completed(0, stdout="origin/main\n")
             return _completed(0)
 
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run", side_effect=side_effect):
+        with patch(
+            "agent_gtd_dispatch.dispatch.subprocess.run", side_effect=side_effect
+        ):
             prepare_manage_workspace("git@host:repos/myrepo", "abc123")
 
         assert nested_root.exists()
