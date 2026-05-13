@@ -377,6 +377,15 @@ def _build_manage_prompt(
         warm-up steps while waiting for those builds to complete. Warm-up happens
         concurrently with wave-1 builds — not before them.
 
+        At the start of warm-up, publish your state:
+        ```
+        mcp__agent-gtd__update_wave_state(
+            wave_run_id="{wave_run_id}",
+            phase="warm_up",
+            current_step="Verifying main is green",
+        )
+        ```
+
         **1. Install dependencies** (Bash):
         ```bash
         # If pyproject.toml exists:
@@ -426,8 +435,14 @@ def _build_manage_prompt(
 
         **Step 2 — Dispatch ready items**
 
-        For each `item_id` in `next_ready`:
+        For each `item_id` in `next_ready`, publish state then dispatch:
         ```
+        mcp__agent-gtd__update_wave_state(
+            wave_run_id="{wave_run_id}",
+            phase="dispatching",
+            current_item_id=item_id,
+            current_step=f"Dispatching {{item_id}}",
+        )
         mcp__agent-gtd__dispatch_item(
             item_id=item_id,
             mode="build",
@@ -439,8 +454,13 @@ def _build_manage_prompt(
 
         **Step 3 — Poll to completion**
 
-        Poll with:
+        Publish polling state, then poll:
         ```
+        mcp__agent-gtd__update_wave_state(
+            wave_run_id="{wave_run_id}",
+            phase="polling",
+            current_step=f"Waiting for build runs to complete",
+        )
         mcp__agent-gtd__list_runs(wave_run_id="{wave_run_id}")
         ```
         plus `Bash sleep 30` between polls. Wait until all dispatched runs reach a
@@ -452,6 +472,15 @@ def _build_manage_prompt(
         `"build agent <status>: run <run_id> for item <item_id>"`.
 
         **Step 4 — AC reconciliation**
+
+        Publish reconciliation state:
+        ```
+        mcp__agent-gtd__update_wave_state(
+            wave_run_id="{wave_run_id}",
+            phase="reconciling_ac",
+            current_step="Checking downstream AC impact",
+        )
+        ```
 
         After each run completes, call `get_item` on items in later waves that share
         a module or interface with the just-merged work. Check whether the just-merged
@@ -467,6 +496,16 @@ def _build_manage_prompt(
         ```
 
         **Step 5 — Quality gates**
+
+        Publish reviewing state:
+        ```
+        mcp__agent-gtd__update_wave_state(
+            wave_run_id="{wave_run_id}",
+            phase="reviewing",
+            current_item_id=item_id,
+            current_step=f"Running quality gates on <branch_name>",
+        )
+        ```
 
         Check out the build branch in your workspace and run the test + lint commands
         recorded in warm-up:
@@ -489,6 +528,16 @@ def _build_manage_prompt(
           ```
 
         **Step 6 — Squash merge**
+
+        Publish merging state:
+        ```
+        mcp__agent-gtd__update_wave_state(
+            wave_run_id="{wave_run_id}",
+            phase="merging",
+            current_item_id=item_id,
+            current_step=f"Merging <branch_name> → main",
+        )
+        ```
 
         ```bash
         git checkout <default_branch>
@@ -517,6 +566,15 @@ def _build_manage_prompt(
         Then go back to Step 1 (advance) for the next wave.
 
         **Halt path**
+
+        Before halting, publish halted state:
+        ```
+        mcp__agent-gtd__update_wave_state(
+            wave_run_id="{wave_run_id}",
+            phase="halted",
+            current_step=<reason>,
+        )
+        ```
 
         On any non-recoverable failure, post a comment to the offending wave item
         (NOT the launch placeholder item_id):
@@ -562,7 +620,7 @@ def _build_manage_prompt(
 
         `advance_wave`, `complete_in_wave`, `halt_wave`, `replan_wave`, `dispatch_item`,
         `add_comment`, `get_item`, `update_item`, `list_items`, `get_run_status`,
-        `list_runs`, `list_comments`
+        `list_runs`, `list_comments`, `update_wave_state`
 
         ## Rules
 
