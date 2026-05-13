@@ -597,7 +597,7 @@ def _build_manage_prompt(
         **Step 7 — Complete in wave**
 
         ```
-        mcp__agent-gtd__complete_in_wave(
+        result = mcp__agent-gtd__complete_in_wave(
             wave_run_id="{wave_run_id}",
             item_id=item_id,
             outcome="completed",
@@ -606,7 +606,18 @@ def _build_manage_prompt(
         )
         ```
 
-        Then go back to Step 1 (advance) for the next wave.
+        `complete_in_wave` does two things for you on `outcome="completed"`:
+        1. Cascades the item's GTD status to `done` (no need to call
+           `complete_item` separately).
+        2. Closes the wave automatically if this was the last terminal item,
+           and signals that via `result["graph_complete"]`.
+
+        Check the response:
+        - If `result["graph_complete"]` is `true`: the wave is closed. Publish a
+          final state if desired (optional), then EXIT with success — do NOT
+          call `advance_wave` again (it will reject the now-completed wave).
+        - Otherwise: go back to Step 1 (advance) for the next wave / next
+          unblocked items.
 
         **Halt path**
 
