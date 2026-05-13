@@ -112,21 +112,15 @@ def cleanup_workspace(workspace: Path) -> None:
 
 
 def write_transcript(workspace: Path, result: subprocess.CompletedProcess[str]) -> None:
-    """Write agent stdout and stderr to transcript.txt in the workspace.
+    """No-op: transcript is now streamed continuously during the run by run_agent().
 
-    Called after every agent subprocess run (success or failure) so operators
-    can inspect the full agent reasoning chain without waiting for a failure.
-    The file is deleted with the workspace by cleanup_workspace().
-
-    For build/plan runs the workspace is a git clone; transcript.txt is added
-    to .git/info/exclude so it cannot be accidentally committed.
-    For manage-mode runs the workspace is a git clone of the default branch;
-    the exclude file is populated the same way.
+    Kept to avoid breaking any external callers. The file is written by run_agent()
+    via subprocess.Popen; this function does nothing.
     """
-    transcript = "=== stdout ===\n" + result.stdout + "\n=== stderr ===\n" + result.stderr
-    (workspace / "transcript.txt").write_text(transcript)
 
-    # Gitignore for workspaces that have a .git dir
+
+def _setup_git_exclude(workspace: Path) -> None:
+    """Exclude transcript.txt from git before the subprocess starts."""
     git_exclude = workspace / ".git" / "info" / "exclude"
     if git_exclude.exists():
         with git_exclude.open("a") as f:
@@ -700,19 +694,25 @@ async def run_agent(
         cmd[print_idx:print_idx] = ["--allowedTools", ",".join(allowed_tools)]
     env = build_env(engine, mode=mode)
 
+    transcript_path = workspace / "transcript.txt"
+    _setup_git_exclude(workspace)  # exclude transcript.txt BEFORE subprocess starts
+
+    def _stream() -> subprocess.CompletedProcess[str]:
+        with transcript_path.open("wb") as f:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=workspace,
+                env=env,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                proc.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout="", stderr="")
+
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: subprocess.run(
-            cmd,
-            cwd=workspace,
-            env=env,
-            timeout=timeout_seconds,
-            capture_output=True,
-            text=True,
-        ),
-    )
-    # Write full stdout+stderr to workspace/transcript.txt on every run
-    # (success or failure) for operator debugging.  Deleted by cleanup_workspace().
-    write_transcript(workspace, result)
-    return result
+    return await loop.run_in_executor(None, _stream)

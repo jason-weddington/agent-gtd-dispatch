@@ -31,6 +31,7 @@ class Run(BaseModel):
     agent_name: str | None = None
     mode: str = "build"
     wave_run_id: str | None = None
+    workspace_path: str | None = None
     status: RunStatus = RunStatus.pending
     started_at: datetime | None = None
     completed_at: datetime | None = None

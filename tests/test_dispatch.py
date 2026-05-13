@@ -306,51 +306,56 @@ class TestCleanupWorkspace:
             outside.rmdir()
 
 
+def _make_mock_proc(returncode: int = 0) -> object:
+    """Create a mock subprocess.Popen process."""
+    from unittest.mock import MagicMock
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = returncode
+    mock_proc.wait.return_value = returncode
+    return mock_proc
+
+
 class TestRunAgent:
     async def test_calls_subprocess_with_engine_command(
         self, tmp_path, monkeypatch
     ) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
-            args, _kwargs = mock_run.call_args
+            args, _kwargs = mock_popen.call_args
             assert args[0][0] == "claude"
             assert "--dangerously-skip-permissions" in args[0]
 
     async def test_passes_workspace_as_cwd(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
-            _, kwargs = mock_run.call_args
+            _, kwargs = mock_popen.call_args
             assert kwargs["cwd"] == tmp_path
 
     async def test_passes_timeout_from_config(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 42)
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
-            _, kwargs = mock_run.call_args
-            assert kwargs["timeout"] == 42
+            mock_proc.wait.assert_called_once_with(timeout=42)
 
     async def test_env_filtered_by_engine(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")  # must be filtered
         monkeypatch.setenv("KIRO_API_KEY", "kiro-secret")
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
-            _, kwargs = mock_run.call_args
+            _, kwargs = mock_popen.call_args
             assert kwargs["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-test"  # noqa: S105
             assert "ANTHROPIC_API_KEY" not in kwargs["env"]  # kb-01512
             assert "KIRO_API_KEY" not in kwargs["env"]
@@ -359,56 +364,51 @@ class TestRunAgent:
         self, tmp_path, monkeypatch
     ) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20, agent_name="my-agent")
-            args, _kwargs = mock_run.call_args
+            args, _kwargs = mock_popen.call_args
             cmd = args[0]
             idx = cmd.index("--agent")
             assert cmd[idx + 1] == "my-agent"
 
     async def test_returns_completed_process(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="done", stderr=""
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             result = await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
             assert result.returncode == 0
-            assert result.stdout == "done"
+            # stdout/stderr are always "" with Popen streaming to file
+            assert result.stdout == ""
+            assert result.stderr == ""
 
     async def test_explicit_timeout_seconds_overrides_config(
         self, tmp_path, monkeypatch
     ) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 999)
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20, timeout_seconds=120)
-            _, kwargs = mock_run.call_args
-            assert kwargs["timeout"] == 120
+            mock_proc.wait.assert_called_once_with(timeout=120)
 
     async def test_no_timeout_seconds_falls_back_to_config(
         self, tmp_path, monkeypatch
     ) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 300)
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
-            _, kwargs = mock_run.call_args
-            assert kwargs["timeout"] == 300
+            mock_proc.wait.assert_called_once_with(timeout=300)
 
     async def test_kiro_writes_system_prompt_md(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             await run_agent(KIRO, tmp_path, "sys prompt", "Fix bug", 20)
             md = (tmp_path / "system_prompt.md").read_text()
             assert "sys prompt" in md
@@ -418,10 +418,9 @@ class TestRunAgent:
         self, tmp_path, monkeypatch
     ) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
             assert not (tmp_path / "system_prompt.md").exists()
 
@@ -430,14 +429,13 @@ class TestRunAgent:
     ) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
         tools = ["mcp__agent-gtd__advance_wave", "Read"]
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             await run_agent(
                 CLAUDE, tmp_path, "sys", "Title", 20, allowed_tools=tools
             )
-            args, _kwargs = mock_run.call_args
+            args, _kwargs = mock_popen.call_args
             cmd = args[0]
             assert "--allowedTools" in cmd
             idx = cmd.index("--allowedTools")
@@ -455,32 +453,45 @@ class TestRunAgent:
     ) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
         tools = ["mcp__agent-gtd__advance_wave", "Read"]
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             await run_agent(
                 KIRO, tmp_path, "sys", "Title", 20, allowed_tools=tools
             )
-            args, _kwargs = mock_run.call_args
+            args, _kwargs = mock_popen.call_args
             cmd = args[0]
             assert "--allowedTools" not in cmd
+
+    async def test_popen_streams_to_transcript_file(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Verify transcript.txt is opened for writing and Popen receives it as stdout."""
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            _, kwargs = mock_popen.call_args
+            # stdout= must be a file object (not PIPE/STDOUT)
+            assert hasattr(kwargs["stdout"], "write")
+            assert kwargs["stderr"] == subprocess.STDOUT
+
+        # transcript.txt is opened in "wb" mode — file exists even though mock wrote nothing
+        assert (tmp_path / "transcript.txt").exists()
 
     async def test_writes_transcript_after_successful_run(
         self, tmp_path, monkeypatch
     ) -> None:
+        """transcript.txt is created (opened in wb mode) during the run."""
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="agent reasoning here", stderr="a warning"
-            )
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
 
         transcript_path = tmp_path / "transcript.txt"
-        assert transcript_path.exists(), "transcript.txt must be written on success"
-        content = transcript_path.read_text()
-        assert "agent reasoning here" in content
-        assert "a warning" in content
+        assert transcript_path.exists(), "transcript.txt must be created on run start"
 
 
 class TestBuildManagePrompt:
@@ -732,6 +743,69 @@ class TestDbWaveRunId:
         assert fetched.branch_name is None
 
 
+class TestDbWorkspacePath:
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+
+    async def test_workspace_path_column_exists(self) -> None:
+        await db.init_db()
+        async with aiosqlite.connect(db.db_path()) as conn:
+            cursor = await conn.execute("PRAGMA table_info(runs)")
+            cols = {row[1] for row in await cursor.fetchall()}
+        assert "workspace_path" in cols
+
+    async def test_workspace_path_none_by_default(self) -> None:
+        await db.init_db()
+        run = Run(item_id="i1", project_name="p", branch_name="b")
+        await db.insert_run(run)
+        fetched = await db.get_run(run.id)
+        assert fetched is not None
+        assert fetched.workspace_path is None
+
+    async def test_workspace_path_persisted_via_update(self) -> None:
+        await db.init_db()
+        run = Run(item_id="i1", project_name="p", branch_name="b")
+        await db.insert_run(run)
+        await db.update_run(run.id, workspace_path="/tmp/ws-abc")
+        fetched = await db.get_run(run.id)
+        assert fetched is not None
+        assert fetched.workspace_path == "/tmp/ws-abc"
+
+    async def test_workspace_path_set_on_insert(self) -> None:
+        await db.init_db()
+        run = Run(
+            item_id="i1",
+            project_name="p",
+            branch_name="b",
+            workspace_path="/tmp/ws-xyz",
+        )
+        await db.insert_run(run)
+        fetched = await db.get_run(run.id)
+        assert fetched is not None
+        assert fetched.workspace_path == "/tmp/ws-xyz"
+
+    async def test_update_run_with_exit_code_and_error(self) -> None:
+        await db.init_db()
+        run = Run(item_id="i1", project_name="p", branch_name="b")
+        await db.insert_run(run)
+        await db.update_run(run.id, exit_code=1, error="something went wrong")
+        fetched = await db.get_run(run.id)
+        assert fetched is not None
+        assert fetched.exit_code == 1
+        assert fetched.error == "something went wrong"
+
+    async def test_update_run_noop_when_no_fields(self) -> None:
+        await db.init_db()
+        run = Run(item_id="i1", project_name="p", branch_name="b")
+        await db.insert_run(run)
+        # Should not raise when called with no keyword args
+        await db.update_run(run.id)
+        fetched = await db.get_run(run.id)
+        assert fetched is not None
+        assert fetched.status.value == "pending"
+
+
 def _completed(
     returncode: int = 0, stdout: str = "", stderr: str = ""
 ) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
@@ -764,21 +838,16 @@ class TestManageEnvKeys:
         env = build_env(KIRO, mode="manage")
         assert "DISPATCH_LOCAL_URL" not in env
 
-    def test_manage_mode_passed_to_run_agent_env(self, tmp_path, monkeypatch) -> None:
+    async def test_manage_mode_passed_to_run_agent_env(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
         monkeypatch.setenv("DISPATCH_LOCAL_URL", "http://localhost:8080")
         monkeypatch.setenv("DISPATCH_API_KEY", "mgr-key")
+        mock_proc = _make_mock_proc(0)
 
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = _completed(0)
-
-            async def _run() -> None:
-                await run_agent(CLAUDE, tmp_path, "sys", "Title", 20, mode="manage")
-
-            import asyncio
-
-            asyncio.get_event_loop().run_until_complete(_run())
-            _, kwargs = mock_run.call_args
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20, mode="manage")
+            _, kwargs = mock_popen.call_args
             assert kwargs["env"].get("DISPATCH_LOCAL_URL") == "http://localhost:8080"
 
 

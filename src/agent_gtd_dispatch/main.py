@@ -7,6 +7,7 @@ import logging
 import subprocess
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Security
@@ -96,12 +97,14 @@ async def _dispatch_worker(
         if mode == "manage":
             # Clone the project's default branch for quality gates + git operations
             workspace = dispatch.prepare_manage_workspace(git_origin, run.id)
+            await db.update_run(run.id, workspace_path=str(workspace))
             attachments = []
         else:
             # Prepare workspace (fresh clone on feature branch)
             if run.branch_name is None:  # pragma: no cover
                 raise ValueError("branch_name must be set for non-manage mode runs")
             workspace = dispatch.prepare_workspace(git_origin, run.id, run.branch_name)
+            await db.update_run(run.id, workspace_path=str(workspace))
 
             # Stage any attachments into {run_id}-attachments/ inside the workspace
             attachments = await dispatch.stage_attachments(workspace, run.id, run.item_id)
@@ -156,10 +159,14 @@ async def _dispatch_worker(
                 exit_code=result.returncode,
             )
         else:
-            # Capture stderr, falling back to stdout tail for diagnostics
-            error_msg = result.stderr[-500:] if result.stderr else None
-            if not error_msg and result.stdout:
-                error_msg = result.stdout[-500:]
+            # Derive error snippet from transcript (stdout/stderr are always "" with Popen streaming)
+            error_msg = None
+            if workspace is not None:
+                transcript_path = workspace / "transcript.txt"
+                if transcript_path.exists():
+                    raw = transcript_path.read_bytes()
+                    if raw:
+                        error_msg = raw[-500:].decode("utf-8", errors="replace")
             await db.update_run(
                 run.id,
                 status=RunStatus.failed,
@@ -347,6 +354,36 @@ async def get_run(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return RunResponse(**run.model_dump())
+
+
+@app.get("/runs/{run_id}/transcript")
+async def get_run_transcript(
+    run_id: str,
+    lines: int = Query(200, ge=1, le=5000),
+    _: str = Depends(_verify_api_key),
+) -> dict[str, object]:
+    """Return last N lines of the run transcript (streamed during execution)."""
+    run = await db.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if not run.workspace_path:
+        return {"text": "no transcript yet", "last_modified": None, "total_lines": 0}
+
+    transcript_path = Path(run.workspace_path) / "transcript.txt"
+    if not transcript_path.exists():
+        return {"text": "no transcript yet", "last_modified": None, "total_lines": 0}
+
+    stat = transcript_path.stat()
+    last_modified = datetime.fromtimestamp(stat.st_mtime, UTC).isoformat()
+    content = transcript_path.read_text(errors="replace")
+    all_lines = content.splitlines()
+    tail_lines = all_lines[-lines:]
+    return {
+        "text": "\n".join(tail_lines),
+        "last_modified": last_modified,
+        "total_lines": len(all_lines),
+    }
 
 
 @app.post("/runs/{run_id}/cancel", response_model=RunResponse)

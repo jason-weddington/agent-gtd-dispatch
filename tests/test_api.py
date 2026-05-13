@@ -412,6 +412,80 @@ class TestPlan:
         assert resp.status_code == 422
 
 
+class TestTranscriptEndpoint:
+    def test_not_found(self, client, auth_headers) -> None:
+        resp = client.get("/runs/nonexistent/transcript", headers=auth_headers)
+        assert resp.status_code == 404
+
+    def test_requires_auth(self, client) -> None:
+        resp = client.get("/runs/xxx/transcript")
+        assert resp.status_code == 401
+
+    async def test_no_workspace_returns_no_transcript(
+        self, client, auth_headers
+    ) -> None:
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import Run
+
+        await db.init_db()
+        run = Run(item_id="i1", project_name="p", branch_name="b")
+        await db.insert_run(run)
+
+        resp = client.get(f"/runs/{run.id}/transcript", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["text"] == "no transcript yet"
+        assert data["last_modified"] is None
+        assert data["total_lines"] == 0
+
+    async def test_returns_last_n_lines(
+        self, client, auth_headers, tmp_path
+    ) -> None:
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import Run
+
+        await db.init_db()
+        run = Run(
+            item_id="i1",
+            project_name="p",
+            branch_name="b",
+            workspace_path=str(tmp_path),
+        )
+        await db.insert_run(run)
+
+        # Write a transcript with 10 lines
+        transcript = tmp_path / "transcript.txt"
+        transcript.write_text("\n".join(f"line {i}" for i in range(10)))
+
+        resp = client.get(
+            f"/runs/{run.id}/transcript?lines=3", headers=auth_headers
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total_lines"] == 10
+        assert data["text"] == "line 7\nline 8\nline 9"
+        assert data["last_modified"] is not None
+
+    async def test_missing_transcript_file_returns_no_transcript(
+        self, client, auth_headers, tmp_path
+    ) -> None:
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import Run
+
+        await db.init_db()
+        run = Run(
+            item_id="i1",
+            project_name="p",
+            branch_name="b",
+            workspace_path=str(tmp_path),  # dir exists but no transcript.txt
+        )
+        await db.insert_run(run)
+
+        resp = client.get(f"/runs/{run.id}/transcript", headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.json()["text"] == "no transcript yet"
+
+
 class TestStartupReconciliation:
     async def test_orphaned_runs_marked_failed_on_startup(self, auth_headers) -> None:
         from agent_gtd_dispatch import db

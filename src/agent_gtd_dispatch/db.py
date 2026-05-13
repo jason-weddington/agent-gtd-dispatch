@@ -101,6 +101,8 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
         )
     if "wave_run_id" not in existing:
         await db.execute("ALTER TABLE runs ADD COLUMN wave_run_id TEXT")
+    if "workspace_path" not in existing:
+        await db.execute("ALTER TABLE runs ADD COLUMN workspace_path TEXT")
     await db.commit()
 
 
@@ -125,9 +127,9 @@ async def insert_run(run: Run) -> None:
         await db.execute(
             """INSERT INTO runs
                (id, item_id, project_name, branch_name, engine, agent_name,
-                mode, wave_run_id, status, started_at, completed_at,
+                mode, wave_run_id, workspace_path, status, started_at, completed_at,
                 exit_code, error, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run.id,
                 run.item_id,
@@ -137,6 +139,7 @@ async def insert_run(run: Run) -> None:
                 run.agent_name,
                 run.mode,
                 run.wave_run_id,
+                run.workspace_path,
                 run.status.value,
                 run.started_at.isoformat() if run.started_at else None,
                 run.completed_at.isoformat() if run.completed_at else None,
@@ -156,6 +159,7 @@ async def update_run(
     completed_at: str | None = None,
     exit_code: int | None = None,
     error: str | None = None,
+    workspace_path: str | None = None,
 ) -> None:
     """Update fields on an existing run."""
     parts: list[str] = []
@@ -175,6 +179,9 @@ async def update_run(
     if error is not None:
         parts.append("error = ?")
         values.append(error)
+    if workspace_path is not None:
+        parts.append("workspace_path = ?")
+        values.append(workspace_path)
 
     if not parts:
         return
@@ -252,6 +259,7 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         agent_name=row["agent_name"],
         mode=row["mode"],
         wave_run_id=row["wave_run_id"],
+        workspace_path=row["workspace_path"],
         status=RunStatus(row["status"]),
         started_at=_parse_dt(row["started_at"]),
         completed_at=_parse_dt(row["completed_at"]),
