@@ -20,8 +20,6 @@ from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_scrip
 from .dispatch import _MANAGE_ALLOWED_TOOLS
 from .engines import Engine, get_engine
 from .models import (
-    CIGateRequest,
-    CIGateResult,
     DispatchRequest,
     PlanRequest,
     Run,
@@ -75,7 +73,12 @@ async def _dispatch_worker(
     now = datetime.now(UTC).isoformat()
     await db.update_run(run.id, status=RunStatus.running, started_at=now)
 
+    mode = run.mode or "build"
     workspace = None
+    # For manage mode: preserve workspace on failure for debugging.
+    # For build/plan mode: always clean up.
+    should_cleanup = True
+
     try:
         # Fetch item and project
         item = await gtd_client.get_item(run.item_id)
@@ -85,19 +88,16 @@ async def _dispatch_worker(
 
         project = await gtd_client.get_project(project_id)
 
-        # Build prompt and run
-        mode = getattr(run, "mode", "build") or "build"
+        # Build workspace
+        git_origin = project.get("git_origin", "")
+        if not git_origin:
+            raise ValueError(f"Project '{project['name']}' has no git_origin")
 
         if mode == "manage":
-            # Wave manager: no git clone, bare working directory only
-            workspace = config.WORKSPACE_ROOT / f"wave-manager-{run.id}"
-            workspace.mkdir(parents=True, exist_ok=True)
+            # Clone the project's default branch for quality gates + git operations
+            workspace = dispatch.prepare_manage_workspace(git_origin, run.id)
             attachments = []
         else:
-            git_origin = project.get("git_origin", "")
-            if not git_origin:
-                raise ValueError(f"Project '{project['name']}' has no git_origin")
-
             # Prepare workspace (fresh clone on feature branch)
             if run.branch_name is None:  # pragma: no cover
                 raise ValueError("branch_name must be set for non-manage mode runs")
@@ -167,6 +167,8 @@ async def _dispatch_worker(
                 exit_code=result.returncode,
                 error=error_msg,
             )
+            if mode == "manage":
+                should_cleanup = False  # preserve workspace for debugging
             if error_msg:
                 await gtd_client.post_comment(
                     run.item_id,
@@ -188,6 +190,8 @@ async def _dispatch_worker(
             "The task may need to be broken down into smaller pieces.",
             created_by=f"{engine.name}-dispatch",
         )
+        if mode == "manage":
+            should_cleanup = False
     except asyncio.CancelledError:
         await db.update_run(
             run.id,
@@ -201,9 +205,11 @@ async def _dispatch_worker(
             completed_at=datetime.now(UTC).isoformat(),
             error=str(exc)[:500],
         )
+        if mode == "manage":
+            should_cleanup = False
     finally:
         _active_processes.pop(run.id, None)
-        if workspace is not None:
+        if workspace is not None and should_cleanup:
             dispatch.cleanup_workspace(workspace)
 
 
@@ -281,7 +287,7 @@ async def dispatch_item(
     except Exception:
         raise HTTPException(status_code=404, detail="Project not found") from None
 
-    if body.mode != "manage" and not project.get("git_origin"):
+    if not project.get("git_origin"):
         raise HTTPException(
             status_code=400,
             detail=f"Project '{project['name']}' has no git_origin configured",
@@ -292,9 +298,12 @@ async def dispatch_item(
     else:
         branch_name = dispatch.branch_name_for_item(body.item_id, item["title"])
     max_turns = body.max_turns
-    timeout_seconds = (
-        body.timeout_minutes * 60 if body.timeout_minutes else config.TIMEOUT_SECONDS
-    )
+    if body.timeout_minutes:
+        timeout_seconds = body.timeout_minutes * 60
+    elif body.mode == "manage":
+        timeout_seconds = config.MANAGE_TIMEOUT_SECONDS
+    else:
+        timeout_seconds = config.TIMEOUT_SECONDS
 
     run = Run(
         item_id=body.item_id,
@@ -370,20 +379,3 @@ async def cancel_run(
     return RunResponse(**run.model_dump())
 
 
-@app.post("/ci-gate", response_model=CIGateResult)
-async def ci_gate(
-    body: CIGateRequest,
-    _: str = Depends(_verify_api_key),
-) -> CIGateResult:
-    """Run the CI suite on a branch before merge.
-
-    Always returns HTTP 200. CI failure is expressed as passed=False in the response
-    body — never as a 4xx/5xx error. This allows callers to always deserialize
-    CIGateResult regardless of outcome.
-    """
-    return await dispatch.run_ci_gate(
-        body.repo_url,
-        body.branch_name,
-        body.project_type,
-        config.ci_timeout_seconds,
-    )

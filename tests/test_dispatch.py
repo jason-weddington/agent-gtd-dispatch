@@ -12,16 +12,13 @@ import pytest
 from agent_gtd_dispatch import config, db
 from agent_gtd_dispatch.dispatch import (
     _MANAGE_ALLOWED_TOOLS,
-    _ci_gate_prompt_addendum,
-    _detect_project_type,
-    _heartbeat_prompt_addendum,
     branch_name_for_item,
     build_system_prompt,
     cleanup_workspace,
+    prepare_manage_workspace,
     prepare_workspace,
     repo_name_from_origin,
     run_agent,
-    run_ci_gate,
 )
 from agent_gtd_dispatch.engines import CLAUDE, KIRO, build_env, get_engine
 from agent_gtd_dispatch.models import DispatchRequest, Run
@@ -487,7 +484,7 @@ class TestRunAgent:
 
 
 class TestBuildManagePrompt:
-    _project: ClassVar[dict] = {"name": "wave-project"}
+    _project: ClassVar[dict] = {"name": "wave-project", "git_origin": "git@host:repos/wp"}
     _wave_run_id = "wr-abc123"
     _max_turns = 100
 
@@ -526,7 +523,7 @@ class TestBuildManagePrompt:
     def test_routed_by_build_system_prompt(self) -> None:
         prompt = build_system_prompt(
             item={"id": "item-1", "title": "ignored"},
-            project={"name": "my-project"},
+            project={"name": "my-project", "git_origin": "git@host:repos/mp"},
             branch_name=None,
             max_turns=50,
             mode="manage",
@@ -546,30 +543,32 @@ class TestBuildManagePrompt:
     def test_list_comments_in_allowed_tools(self) -> None:
         assert "mcp__agent-gtd__list_comments" in _MANAGE_ALLOWED_TOOLS
 
-    def test_all_five_loop_steps_present(self) -> None:
+    def test_update_item_in_allowed_tools(self) -> None:
+        assert "mcp__agent-gtd__update_item" in _MANAGE_ALLOWED_TOOLS
+
+    def test_ping_wave_not_in_allowed_tools(self) -> None:
+        assert "mcp__agent-gtd__ping_wave" not in _MANAGE_ALLOWED_TOOLS
+
+    def test_all_wave_loop_steps_present(self) -> None:
         prompt = self._prompt()
-        assert "STEP 1" in prompt
-        assert "STEP 2" in prompt
-        assert "STEP 3" in prompt
-        assert "STEP 4" in prompt
-        assert "STEP 5" in prompt
+        # Phase 2 has numbered steps
+        assert "Step 1" in prompt
+        assert "Step 2" in prompt
+        assert "Step 3" in prompt
+        assert "Step 4" in prompt
+        assert "Step 5" in prompt
 
     def test_advance_wave_retry_logic_present(self) -> None:
         prompt = self._prompt()
         assert "retry" in prompt.lower()
         assert "3 times" in prompt or "3" in prompt
 
-    def test_classifier_module_path_present(self) -> None:
+    def test_no_classifier_references(self) -> None:
         prompt = self._prompt()
-        assert "wave_manager.classifier" in prompt
-
-    def test_squash_merge_invocation_present(self) -> None:
-        prompt = self._prompt()
-        assert "squash_merge" in prompt
-
-    def test_classifier_unavailable_fallback_present(self) -> None:
-        prompt = self._prompt()
-        assert "classifier unavailable" in prompt or "not importable" in prompt
+        assert "classifier" not in prompt
+        assert "squash_merge" not in prompt
+        assert "halt_list" not in prompt
+        assert "/ci-gate" not in prompt
 
     def test_max_turns_embedded(self) -> None:
         prompt = self._prompt(max_turns=42)
@@ -599,17 +598,40 @@ class TestBuildManagePrompt:
             "Prompt must state that wave_run_id is required on every child dispatch"
         )
 
-    def test_manage_prompt_halt_does_not_target_launch_item(self) -> None:
+    def test_manage_prompt_halt_targets_offending_item(self) -> None:
         prompt = self._prompt()
-        halt_idx = prompt.find("STEP 5b")
-        assert halt_idx != -1, "STEP 5b must be present in the prompt"
-        halt_section = prompt[halt_idx:]
-        # The halt comment must target the offending wave item or project,
-        # not the launch placeholder
+        halt_section_idx = prompt.find("Halt path")
+        assert halt_section_idx != -1, "Halt path section must be present in the prompt"
+        halt_section = prompt[halt_section_idx:]
         assert "offending" in halt_section.lower() or "project_id" in halt_section, (
-            "STEP 5b halt comment must target the offending wave item or project_id, "
+            "Halt path must target the offending wave item or project_id, "
             "not the launch placeholder item_id"
         )
+
+    def test_warm_up_phase_present(self) -> None:
+        prompt = self._prompt()
+        assert "uv sync" in prompt
+        assert "npm install" in prompt
+        assert "pre-commit install" in prompt
+
+    def test_sensitive_area_guidance_present(self) -> None:
+        prompt = self._prompt()
+        assert "auth" in prompt.lower()
+        assert "deploy.sh" in prompt or "release.sh" in prompt
+        assert ".github" in prompt
+        assert "Dockerfile" in prompt or "*.service" in prompt
+        assert ".env" in prompt
+
+    def test_squash_merge_instructions_present(self) -> None:
+        prompt = self._prompt()
+        assert "git merge --squash" in prompt
+
+    def test_complete_in_wave_actor_and_rule(self) -> None:
+        prompt = self._prompt()
+        assert "merge_actor" in prompt
+        assert "manager-autonomous" in prompt
+        assert "decision_rule" in prompt
+        assert "agent-judgment" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -710,214 +732,12 @@ class TestDbWaveRunId:
         assert fetched.branch_name is None
 
 
-# ---------------------------------------------------------------------------
-# AC-1.2 — Heartbeat prompt addendum
-# ---------------------------------------------------------------------------
-
-
-class TestHeartbeatPromptAddendum:
-    def test_mentions_ping_wave_tool(self) -> None:
-        text = _heartbeat_prompt_addendum()
-        assert "mcp__agent-gtd__ping_wave" in text
-
-    def test_mentions_90_second_cadence(self) -> None:
-        text = _heartbeat_prompt_addendum()
-        assert "90" in text
-
-    def test_included_in_manage_system_prompt(self) -> None:
-        prompt = build_system_prompt(
-            item={"id": "item-1", "title": "ignored"},
-            project={"name": "wave-project"},
-            branch_name=None,
-            max_turns=50,
-            mode="manage",
-            wave_run_id="wr-test",
-        )
-        assert "mcp__agent-gtd__ping_wave" in prompt
-        assert "90" in prompt
-
-
-# ---------------------------------------------------------------------------
-# AC-2 — CI gate
-# ---------------------------------------------------------------------------
-
-
-class TestDetectProjectType:
-    def test_python_when_pyproject_toml_exists(self, tmp_path) -> None:
-        (tmp_path / "pyproject.toml").write_text("[tool.poetry]")
-        assert _detect_project_type(tmp_path) == "python"
-
-    def test_frontend_when_package_json_exists(self, tmp_path) -> None:
-        (tmp_path / "package.json").write_text('{"name": "test"}')
-        assert _detect_project_type(tmp_path) == "frontend"
-
-    def test_unknown_when_no_known_files(self, tmp_path) -> None:
-        assert _detect_project_type(tmp_path) == "unknown"
-
-    def test_python_takes_priority_over_frontend(self, tmp_path) -> None:
-        (tmp_path / "pyproject.toml").write_text("[tool.poetry]")
-        (tmp_path / "package.json").write_text('{"name": "test"}')
-        assert _detect_project_type(tmp_path) == "python"
-
-
 def _completed(
     returncode: int = 0, stdout: str = "", stderr: str = ""
 ) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
     return subprocess.CompletedProcess(
         args=[], returncode=returncode, stdout=stdout, stderr=stderr
     )
-
-
-class TestRunCIGate:
-    @pytest.fixture(autouse=True)
-    def _setup(self, tmp_path, monkeypatch) -> None:
-        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
-
-    async def test_python_all_steps_pass(self) -> None:
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = _completed(0)
-            result = await run_ci_gate(
-                "git@host:repos/test", "feat/abc", "python", 300
-            )
-
-        assert result.passed is True
-        assert result.project_type == "python"
-        assert result.failed_step is None
-        assert result.returncode == 0
-
-    async def test_python_fails_at_pytest(self) -> None:
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                _completed(0),  # git clone
-                _completed(0),  # git checkout
-                _completed(1, stderr="FAILED test_foo.py"),  # pytest fails
-            ]
-            result = await run_ci_gate(
-                "git@host:repos/test", "feat/abc", "python", 300
-            )
-
-        assert result.passed is False
-        assert result.failed_step == "uv run pytest"
-        assert result.returncode == 1
-
-    async def test_python_fails_at_ruff(self) -> None:
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                _completed(0),  # git clone
-                _completed(0),  # git checkout
-                _completed(0),  # pytest passes
-                _completed(1, stderr="E501 line too long"),  # ruff fails
-            ]
-            result = await run_ci_gate(
-                "git@host:repos/test", "feat/abc", "python", 300
-            )
-
-        assert result.passed is False
-        assert result.failed_step == "uv run ruff check"
-
-    async def test_python_fails_at_mypy(self) -> None:
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                _completed(0),  # git clone
-                _completed(0),  # git checkout
-                _completed(0),  # pytest passes
-                _completed(0),  # ruff passes
-                _completed(1, stderr="error: incompatible types"),  # mypy fails
-            ]
-            result = await run_ci_gate(
-                "git@host:repos/test", "feat/abc", "python", 300
-            )
-
-        assert result.passed is False
-        assert result.failed_step == "uv run mypy src/"
-
-    async def test_frontend_all_steps_pass(self) -> None:
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = _completed(0)
-            result = await run_ci_gate(
-                "git@host:repos/test", "feat/abc", "frontend", 300
-            )
-
-        assert result.passed is True
-        assert result.project_type == "frontend"
-
-    async def test_frontend_fails_at_build(self) -> None:
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                _completed(0),  # git clone
-                _completed(0),  # git checkout
-                _completed(1, stderr="Build failed"),  # npm run build fails
-            ]
-            result = await run_ci_gate(
-                "git@host:repos/test", "feat/abc", "frontend", 300
-            )
-
-        assert result.passed is False
-        assert result.failed_step == "npm run build"
-
-    async def test_unknown_type_passes_immediately(self) -> None:
-        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
-            mock_run.return_value = _completed(0)
-            result = await run_ci_gate(
-                "git@host:repos/test", "feat/abc", "unknown", 300
-            )
-
-        assert result.passed is True
-        assert result.project_type == "unknown"
-
-    async def test_auto_detect_delegates_to_detect_function(self) -> None:
-        with (
-            patch(
-                "agent_gtd_dispatch.dispatch._detect_project_type",
-                return_value="python",
-            ),
-            patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run,
-        ):
-            mock_run.return_value = _completed(0)
-            result = await run_ci_gate(
-                "git@host:repos/test", "feat/abc", None, 300
-            )
-
-        assert result.project_type == "python"
-
-    async def test_timeout_returns_failed_result(self) -> None:
-        def raise_timeout(*args, **kwargs):
-            cmd = args[0] if args else kwargs.get("args", [])
-            if "uv" in cmd or "npm" in cmd:
-                raise subprocess.TimeoutExpired(cmd, 300)
-            return _completed(0)
-
-        with patch(
-            "agent_gtd_dispatch.dispatch.subprocess.run", side_effect=raise_timeout
-        ):
-            result = await run_ci_gate(
-                "git@host:repos/test", "feat/abc", "python", 300
-            )
-
-        assert result.passed is False
-        assert result.failed_step == "timeout"
-        assert result.returncode is None
-
-    async def test_ci_env_excludes_secrets(self, monkeypatch) -> None:
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
-        captured_envs: list[dict] = []
-
-        def capture_env(*args, **kwargs):
-            env = kwargs.get("env")
-            if env is not None:
-                captured_envs.append(dict(env))
-            return _completed(0)
-
-        with patch(
-            "agent_gtd_dispatch.dispatch.subprocess.run", side_effect=capture_env
-        ):
-            await run_ci_gate("git@host:repos/test", "feat/abc", "python", 300)
-
-        # CI steps (not git steps) should not have ANTHROPIC_API_KEY
-        # git clone/checkout calls don't pass env= explicitly, so captured_envs
-        # contains only CI step envs
-        for env in captured_envs:
-            assert "ANTHROPIC_API_KEY" not in env
 
 
 class TestManageEnvKeys:
@@ -962,22 +782,110 @@ class TestManageEnvKeys:
             assert kwargs["env"].get("DISPATCH_LOCAL_URL") == "http://localhost:8080"
 
 
-class TestCIGatePromptAddendum:
-    def test_mentions_ci_gate_endpoint(self) -> None:
-        text = _ci_gate_prompt_addendum()
-        assert "/ci-gate" in text
+class TestPrepareManageWorkspace:
+    @pytest.fixture
+    def workspace_root(self, tmp_path, monkeypatch) -> object:
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+        return tmp_path
 
-    def test_mentions_halt_on_failure(self) -> None:
-        text = _ci_gate_prompt_addendum()
-        assert "halt_wave" in text
+    def test_workspace_path_uses_run_id(self, workspace_root, tmp_path) -> None:
+        origin = "git@host:repos/myrepo"
+        run_id = "abc123"
 
-    def test_included_in_manage_system_prompt(self) -> None:
-        prompt = build_system_prompt(
-            item={"id": "item-1", "title": "ignored"},
-            project={"name": "wave-project"},
-            branch_name=None,
-            max_turns=50,
-            mode="manage",
-            wave_run_id="wr-test",
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "symbolic-ref" in cmd:
+                return _completed(0, stdout="origin/main\n")
+            return _completed(0)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run", side_effect=side_effect):
+            result = prepare_manage_workspace(origin, run_id)
+
+        expected = tmp_path / f"repos-{run_id}"
+        assert result == expected
+
+    def test_calls_correct_git_commands(self, workspace_root, tmp_path) -> None:
+        origin = "git@host:repos/myrepo"
+        run_id = "abc123"
+        expected_workspace = tmp_path / f"repos-{run_id}"
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "symbolic-ref" in cmd:
+                return _completed(0, stdout="origin/main\n")
+            return _completed(0)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub:
+            mock_sub.side_effect = side_effect
+            prepare_manage_workspace(origin, run_id)
+
+        assert mock_sub.call_count == 4
+        calls = mock_sub.call_args_list
+
+        # 1. git clone --depth=50
+        assert calls[0] == call(
+            ["git", "clone", "--depth=50", origin, str(expected_workspace)],
+            check=True,
+            capture_output=True,
         )
-        assert "/ci-gate" in prompt
+        # 2. git remote set-head origin --auto
+        assert calls[1] == call(
+            ["git", "remote", "set-head", "origin", "--auto"],
+            cwd=expected_workspace,
+            check=True,
+            capture_output=True,
+        )
+        # 3. git symbolic-ref (with text=True)
+        assert calls[2] == call(
+            ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            cwd=expected_workspace,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        # 4. git checkout <default_branch>
+        assert calls[3] == call(
+            ["git", "checkout", "main"],
+            cwd=expected_workspace,
+            check=True,
+            capture_output=True,
+        )
+
+    def test_strips_origin_prefix_from_branch(self, workspace_root, tmp_path) -> None:
+        """Verify 'origin/main' stdout → checks out 'main'."""
+        origin = "git@host:repos/myrepo"
+        run_id = "xyz789"
+        expected_workspace = tmp_path / f"repos-{run_id}"
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "symbolic-ref" in cmd:
+                return _completed(0, stdout="origin/master\n")
+            return _completed(0)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub:
+            mock_sub.side_effect = side_effect
+            prepare_manage_workspace(origin, run_id)
+
+        checkout_call = mock_sub.call_args_list[3]
+        assert checkout_call == call(
+            ["git", "checkout", "master"],
+            cwd=expected_workspace,
+            check=True,
+            capture_output=True,
+        )
+
+    def test_creates_workspace_root_if_missing(self, tmp_path, monkeypatch) -> None:
+        nested_root = tmp_path / "nonexistent" / "workspace"
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", nested_root)
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "symbolic-ref" in cmd:
+                return _completed(0, stdout="origin/main\n")
+            return _completed(0)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run", side_effect=side_effect):
+            prepare_manage_workspace("git@host:repos/myrepo", "abc123")
+
+        assert nested_root.exists()

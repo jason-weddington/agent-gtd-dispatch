@@ -253,6 +253,48 @@ class TestDispatch:
         _run, _max_turns, _engine, timeout_seconds = mock_worker.call_args.args
         assert timeout_seconds == 7200
 
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_manage_mode_uses_manage_timeout_seconds(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ):
+        from agent_gtd_dispatch import config
+
+        config.MANAGE_TIMEOUT_SECONDS = 14400
+        config.TIMEOUT_SECONDS = 1800  # should NOT be used for manage mode
+
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Run wave",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "WaveProject",
+                "git_origin": "git@ubuntu-vm01:repos/wave-project",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-run-wave"
+        mock_dispatch.prepare_manage_workspace.return_value = None
+
+        resp = client.post(
+            "/dispatch",
+            json={
+                "item_id": "abc12345-6789",
+                "max_turns": 200,
+                "mode": "manage",
+                "wave_run_id": "wr-abc",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        _run, _max_turns, _engine, timeout_seconds = mock_worker.call_args.args
+        assert timeout_seconds == 14400
+
 
 class TestListRuns:
     def test_empty_list(self, client, auth_headers):
@@ -302,12 +344,13 @@ class TestDispatchManageMode:
             return_value={
                 "id": "proj1",
                 "name": "WaveProject",
-                "git_origin": "",  # no git_origin needed for manage mode
+                "git_origin": "git@ubuntu-vm01:repos/wave-project",
             }
         )
         mock_client.post_comment = AsyncMock()
         mock_dispatch.build_system_prompt.return_value = "manage prompt"
         mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-run-wave"
+        mock_dispatch.prepare_manage_workspace.return_value = None
 
         resp = client.post(
             "/dispatch",
@@ -390,152 +433,3 @@ class TestStartupReconciliation:
             assert data["error"] == "Service restarted while run was active"
 
 
-class TestCIGateEndpoint:
-    def test_ci_gate_requires_auth(self, client) -> None:
-        resp = client.post(
-            "/ci-gate",
-            json={"repo_url": "git@host:repos/test", "branch_name": "feat/abc"},
-        )
-        assert resp.status_code == 401
-
-    @patch("agent_gtd_dispatch.dispatch.run_ci_gate")
-    def test_ci_gate_pass(self, mock_run_ci_gate, client, auth_headers) -> None:
-        from unittest.mock import AsyncMock
-
-        from agent_gtd_dispatch.models import CIGateResult
-
-        mock_run_ci_gate.return_value = CIGateResult(
-            passed=True,
-            project_type="python",
-            failed_step=None,
-            stdout="all good",
-            stderr="",
-            returncode=0,
-        )
-        # Make the patch work when called with await
-        mock_run_ci_gate.side_effect = None
-        mock_run_ci_gate.return_value = CIGateResult(
-            passed=True,
-            project_type="python",
-            failed_step=None,
-            stdout="all good",
-            stderr="",
-            returncode=0,
-        )
-
-        with patch(
-            "agent_gtd_dispatch.main.dispatch.run_ci_gate",
-            new_callable=AsyncMock,
-            return_value=CIGateResult(
-                passed=True,
-                project_type="python",
-                failed_step=None,
-                stdout="all good",
-                stderr="",
-                returncode=0,
-            ),
-        ):
-            resp = client.post(
-                "/ci-gate",
-                json={"repo_url": "git@host:repos/test", "branch_name": "feat/abc"},
-                headers=auth_headers,
-            )
-
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["passed"] is True
-        assert data["project_type"] == "python"
-        assert data["failed_step"] is None
-
-    def test_ci_gate_fail_returns_200(self, client, auth_headers) -> None:
-        from unittest.mock import AsyncMock
-
-        from agent_gtd_dispatch.models import CIGateResult
-
-        with patch(
-            "agent_gtd_dispatch.main.dispatch.run_ci_gate",
-            new_callable=AsyncMock,
-            return_value=CIGateResult(
-                passed=False,
-                project_type="python",
-                failed_step="uv run pytest",
-                stdout="",
-                stderr="1 failed",
-                returncode=1,
-            ),
-        ):
-            resp = client.post(
-                "/ci-gate",
-                json={"repo_url": "git@host:repos/test", "branch_name": "feat/abc"},
-                headers=auth_headers,
-            )
-
-        # Always 200 — CI failure is in the body
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["passed"] is False
-        assert data["failed_step"] == "uv run pytest"
-        assert data["returncode"] == 1
-
-    def test_ci_gate_with_project_type(self, client, auth_headers) -> None:
-        from unittest.mock import AsyncMock
-
-        from agent_gtd_dispatch.models import CIGateResult
-
-        with patch(
-            "agent_gtd_dispatch.main.dispatch.run_ci_gate",
-            new_callable=AsyncMock,
-            return_value=CIGateResult(
-                passed=True,
-                project_type="frontend",
-                failed_step=None,
-                stdout="",
-                stderr="",
-                returncode=0,
-            ),
-        ) as mock_gate:
-            resp = client.post(
-                "/ci-gate",
-                json={
-                    "repo_url": "git@host:repos/test",
-                    "branch_name": "feat/abc",
-                    "project_type": "frontend",
-                },
-                headers=auth_headers,
-            )
-            assert resp.status_code == 200
-            # Verify project_type was passed through
-            call_kwargs = mock_gate.call_args
-            assert call_kwargs is not None
-            assert "frontend" in call_kwargs.args or (
-                "frontend" in call_kwargs.kwargs.values()
-            )
-
-    def test_ci_gate_timeout_result(self, client, auth_headers) -> None:
-        from unittest.mock import AsyncMock
-
-        from agent_gtd_dispatch.models import CIGateResult
-
-        with patch(
-            "agent_gtd_dispatch.main.dispatch.run_ci_gate",
-            new_callable=AsyncMock,
-            return_value=CIGateResult(
-                passed=False,
-                project_type="python",
-                failed_step="timeout",
-                stdout="",
-                stderr="CI step timed out after 300s",
-                returncode=None,
-            ),
-        ):
-            resp = client.post(
-                "/ci-gate",
-                json={"repo_url": "git@host:repos/test", "branch_name": "feat/abc"},
-                headers=auth_headers,
-            )
-
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["passed"] is False
-        assert data["failed_step"] == "timeout"
-        assert data["returncode"] is None

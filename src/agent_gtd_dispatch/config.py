@@ -27,24 +27,18 @@ WORKSPACE_ROOT: Path = Path.home() / "workspace"
 # Agent limits
 MAX_TURNS: int = 100
 TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
-
-# Wave manager
-WAVE_MANAGER_HALT_LIST_PATH: Path = Path("wave_manager/halt_list.yaml")
+MANAGE_TIMEOUT_SECONDS: int = 4 * 60 * 60  # 4 hours for multi-wave manage runs
 
 # Planner (wave DAG)
 ANTHROPIC_API_KEY: str = ""
 PLANNER_MODEL: str = "claude-sonnet-4-6"
 
-# CI gate
-ci_timeout_seconds: int = 300
-
 
 def load() -> None:
     """Load configuration from environment. Call once at startup."""
     global DISPATCH_API_KEY, AGENT_GTD_URL, AGENT_GTD_API_KEY
-    global WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS
-    global WAVE_MANAGER_HALT_LIST_PATH
-    global ANTHROPIC_API_KEY, PLANNER_MODEL, ci_timeout_seconds
+    global WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS, MANAGE_TIMEOUT_SECONDS
+    global ANTHROPIC_API_KEY, PLANNER_MODEL
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
@@ -56,8 +50,7 @@ def load() -> None:
     )
     MAX_TURNS = int(os.environ.get("DISPATCH_MAX_TURNS", "100"))
     TIMEOUT_SECONDS = int(os.environ.get("DISPATCH_TIMEOUT_SECONDS", "1800"))
-    WAVE_MANAGER_HALT_LIST_PATH = Path(
-        os.environ.get("WAVE_MANAGER_HALT_LIST_PATH", "wave_manager/halt_list.yaml")
+    MANAGE_TIMEOUT_SECONDS = int(
+        os.environ.get("DISPATCH_MANAGE_TIMEOUT_SECONDS", "14400")
     )
     PLANNER_MODEL = os.environ.get("DISPATCH_PLANNER_MODEL", "claude-sonnet-4-6")
-    ci_timeout_seconds = int(os.environ.get("DISPATCH_CI_TIMEOUT_SECONDS", "300"))

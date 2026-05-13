@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import subprocess
 import textwrap
@@ -13,8 +12,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import config, gtd_client
-from .engines import COMMON_ENV_KEYS, Engine, build_env
-from .models import CIGateResult
+from .engines import Engine, build_env
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +60,49 @@ def prepare_workspace(origin: str, run_id: str, branch_name: str) -> Path:
     return workspace
 
 
+def prepare_manage_workspace(git_origin: str, run_id: str) -> Path:
+    """Clone the repo for manage mode and detect the default branch.
+
+    Steps:
+    1. git clone --depth=50 {git_origin} {workspace}
+    2. git remote set-head origin --auto  (populate HEAD ref)
+    3. git symbolic-ref --short refs/remotes/origin/HEAD  → detect default branch
+    4. git checkout {default_branch}  (explicit, stays on default branch)
+
+    Returns the workspace path.
+    """
+    workspace = config.WORKSPACE_ROOT / f"repos-{run_id}"
+
+    config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "clone", "--depth=50", git_origin, str(workspace)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "remote", "set-head", "origin", "--auto"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+    )
+    result = subprocess.run(
+        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    default_branch = result.stdout.strip().removeprefix("origin/")
+    subprocess.run(
+        ["git", "checkout", default_branch],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+    )
+
+    return workspace
+
+
 def cleanup_workspace(workspace: Path) -> None:
     """Remove a workspace directory after a run completes."""
     import shutil
@@ -79,12 +120,13 @@ def write_transcript(workspace: Path, result: subprocess.CompletedProcess[str]) 
 
     For build/plan runs the workspace is a git clone; transcript.txt is added
     to .git/info/exclude so it cannot be accidentally committed.
-    For manage-mode runs the workspace is a bare directory with no .git.
+    For manage-mode runs the workspace is a git clone of the default branch;
+    the exclude file is populated the same way.
     """
     transcript = "=== stdout ===\n" + result.stdout + "\n=== stderr ===\n" + result.stderr
     (workspace / "transcript.txt").write_text(transcript)
 
-    # Gitignore for build/plan workspaces (bare manage workspace has no .git dir)
+    # Gitignore for workspaces that have a .git dir
     git_exclude = workspace / ".git" / "info" / "exclude"
     if git_exclude.exists():
         with git_exclude.open("a") as f:
@@ -174,12 +216,13 @@ _MANAGE_ALLOWED_TOOLS: tuple[str, ...] = (
     "mcp__agent-gtd__complete_in_wave",
     "mcp__agent-gtd__halt_wave",
     "mcp__agent-gtd__replan_wave",
+    "mcp__agent-gtd__dispatch_item",    # dispatch child build runs
     "mcp__agent-gtd__add_comment",
     "mcp__agent-gtd__get_item",
+    "mcp__agent-gtd__update_item",      # AC reconciliation
     "mcp__agent-gtd__list_items",
     "mcp__agent-gtd__get_run_status",
     "mcp__agent-gtd__list_runs",
-    "mcp__agent-gtd__dispatch_item",    # dispatch child build runs
     "mcp__agent-gtd__list_comments",    # read final agent comment
     "Bash",
     "Read",
@@ -297,33 +340,6 @@ def _build_plan_prompt(
     return prompt
 
 
-def _heartbeat_prompt_addendum() -> str:
-    """Addendum instructing the manage-mode executor to ping_wave for liveness."""
-    return textwrap.dedent("""\
-        ## Liveness (Heartbeat)
-
-        During any idle wait (between dispatches, while monitoring child runs, while merging)
-        call the `mcp__agent-gtd__ping_wave(wave_run_id, phase=<current_phase>,
-        waiting_on=<current_item_id_or_empty_string>)` MCP tool at least every 90 seconds.
-        Valid `phase` values: `"planning"`, `"dispatching"`, `"monitoring"`, `"merging"`,
-        `"halted"`. This proves liveness so the reaper does not mark the wave crashed.
-        The reaper threshold is 300 seconds; 90s gives margin.
-    """)
-
-
-def _ci_gate_prompt_addendum() -> str:
-    """Addendum instructing the manage-mode executor to run CI gate before marking items complete."""
-    return textwrap.dedent("""\
-        ## Pre-merge CI Gate
-
-        Before calling `complete_in_wave(item_id, outcome=success)` for any item, POST to the
-        dispatch worker's `/ci-gate` endpoint with
-        `{"repo_url": "<repo>", "branch_name": "<branch>"}`. If the response has
-        `"passed": false`, call
-        `halt_wave(wave_run_id, reason="CI failure on <branch>: <failed_step>")` and STOP.
-    """)
-
-
 def _build_manage_prompt(
     wave_run_id: str,
     project: dict[str, Any],
@@ -332,136 +348,236 @@ def _build_manage_prompt(
     """System prompt for manage mode — run the wave-manager executor loop."""
     project_name = project["name"]
     git_origin = project.get("git_origin", "")
+    project_id = project.get("id", "")
 
-    prompt = textwrap.dedent(
+    return textwrap.dedent(
         f"""\
         You are a headless wave-manager executor dispatched by Agent GTD.
         No human is available for questions — you must work autonomously.
 
         ## Your Task
 
-        **Mode: MANAGE** — You are orchestrating a wave execution, NOT writing code.
+        **Mode: MANAGE** — You are orchestrating a wave execution and merging build results.
 
         **Project:** {project_name}
         **Git Origin:** {git_origin}
         **Wave Run ID:** {wave_run_id}
+        **Project ID:** {project_id}
         **Turns remaining:** {max_turns}
 
         This wave run ID is your primary anchor. Every action you take is scoped to it.
-
-        Check `~/.claude/CLAUDE.md` for the project dispatch playbook — it is read
-        automatically at startup. Follow any relevant procedures described there.
-
-        This executor never writes code, pushes branches, or takes ownership of any repository.
+        Your workspace is a git clone of the project's default branch (auto-detected).
 
         ## Launch item_id — Ignore It
 
-        The `item_id` you received as the dispatch trigger is a positional placeholder, not a
-        wave item to act on. **Ignore it.** Your sole source of truth for which items to dispatch
-        is the wave plan — read it via
-        `mcp__agent-gtd__advance_wave(wave_run_id="{wave_run_id}")` and dispatch every item in
-        `next_ready` in build mode.
+        The `item_id` you received as the dispatch trigger is a positional placeholder,
+        not a wave item to act on. **Ignore it entirely.** Your sole source of truth for
+        which items to dispatch is the wave plan — read it via `advance_wave`.
         Do NOT add comments to the launch item_id.
         Do NOT mark it complete.
         Do NOT treat it as a gate.
 
-        ## Executor Loop
+        ## Phase 1 — Warm-up (run once at start, concurrently with wave-1 builds)
 
-        Repeat until advance_wave reports graph_complete=true:
+        IMPORTANT: Dispatch all wave-1 items first (Phase 2 Step 1 below), THEN run
+        warm-up steps while waiting for those builds to complete. Warm-up happens
+        concurrently with wave-1 builds — not before them.
 
-        STEP 1 — ADVANCE
-          Call: mcp__agent-gtd__advance_wave(wave_run_id="{wave_run_id}")
-          → {{next_ready: [...], in_progress: [...], graph_complete: bool}}
-          If advance_wave fails: retry up to 3 times with 30 s sleep. After 3 failures:
-            call halt_wave(wave_run_id, reason="advance_wave failed 3 times"); EXIT.
-          If graph_complete=true and next_ready=[]: EXIT SUCCESS.
+        **1. Install dependencies** (Bash):
+        ```bash
+        # If pyproject.toml exists:
+        [ -f pyproject.toml ] && uv sync
+        # If package.json exists:
+        [ -f package.json ] && npm install
+        ```
 
-        STEP 2 — DISPATCH READY ITEMS
-          For each item_id in next_ready:
-            call mcp__agent-gtd__dispatch_item(
-                item_id=item_id,
-                mode="build",
-                wave_run_id="{wave_run_id}",
-            )
-            record the returned run_id alongside item_id
-          NOTE: wave_run_id is REQUIRED on every child dispatch — the reaper depends on it.
+        **2. Install pre-commit hooks** (if `.pre-commit-config.yaml` exists):
+        ```bash
+        [ -f .pre-commit-config.yaml ] && pre-commit install \\
+          --hook-type pre-commit --hook-type commit-msg \\
+          --hook-type post-commit --hook-type pre-push
+        ```
 
-        STEP 3 — MONITOR TO COMPLETION
-          For each dispatched (item_id, run_id):
-            Poll mcp__agent-gtd__get_run_status(run_id) every 30 s until status in
-            {{succeeded, failed, timed_out, cancelled}}.
-            Process each item as it lands (don't wait for all to finish before processing any).
+        **3. Record the merge bar** — read `CLAUDE.md` and/or `README.md` and store in
+        your working memory:
+        - Test command (e.g. `uv run pytest`, `npm test`)
+        - Lint command (e.g. `uv run ruff check src/ tests/`, `npm run lint`)
+        - Coverage threshold (if any)
+        - Any project-specific merge conventions
 
-        STEP 4 — CLASSIFY
-          For each completed item:
-            a. List comments: mcp__agent-gtd__list_comments(item_id=item_id)
-               Take the last comment whose created_by starts with "claude-" (the build agent).
-               If no such comment found, treat as HALT with reason "no final agent comment".
-            b. Get branch_name: mcp__agent-gtd__list_runs(item_id=item_id)
-               The most recent run's branch_name field.
-            c. Get unified diff (Bash):
-                 cd /tmp && git clone --depth=50 {git_origin or "<project.git_origin>"} _diff_clone_<item_id>
-                 cd _diff_clone_<item_id> && git fetch origin <branch_name> && git checkout <branch_name>
-                 git diff origin/main...<branch_name> > /tmp/diff_<item_id>.txt
-               (Or equivalent — any method that produces the unified diff of the branch vs main.)
-            d. Get declared files: mcp__agent-gtd__get_item(item_id=item_id)
-               Parse the "## Files to Modify" section of the item description to extract
-               the declared file paths (one per line, strip leading "- " bullets and backticks).
-               Collect into a comma-separated list: declared_files_csv.
-            e. Run classifier (Bash):
-                 python -m agent_gtd_dispatch.wave_manager.classifier \\
-                   --comment "<final_comment_text>" \\
-                   --diff @/tmp/diff_<item_id>.txt \\
-                   --declared-files "<declared_files_csv>" \\
-                   --wave-run-id "{wave_run_id}"
-               Outputs ALLOW or HALT:<reason> on stdout.
-               If the classifier command fails to run or is not importable,
-               treat every completion as HALT with reason "classifier unavailable".
-            f. If run status is failed/timed_out/cancelled: treat as HALT
-               with reason "build agent <status>: <run_id>".
+        **4. Verify `main` is green** — run the test + lint commands you just recorded.
+        If they fail, call:
+        ```
+        mcp__agent-gtd__halt_wave(
+            wave_run_id="{wave_run_id}",
+            reason="<exact failure: command + error snippet>"
+        )
+        ```
+        and STOP. The project is not in a mergeable state — a human must intervene.
 
-        STEP 5a — DECIDE PATH (auto-merge)
-          Call (Bash):
-            python -m agent_gtd_dispatch.wave_manager.squash_merge \\
-              --origin {git_origin or "<project.git_origin>"} \\
-              --branch <branch_name> \\
-              --item-id <item_id> \\
-              --wave-run-id {wave_run_id} \\
-              --decision-rule auto-merge
-          Exit code 0 → success:
-            call mcp__agent-gtd__complete_in_wave(
-              wave_run_id, item_id, outcome="completed",
-              merge_actor="manager-halt-list", decision_rule="auto-merge")
-          Exit code non-zero → treat as HALT with stderr as reason.
+        ## Phase 2 — Wave Loop
 
-        STEP 5b — HALT PATH
-          Post the halt comment to the OFFENDING WAVE ITEM (the item whose build run
-          triggered the halt), NOT to the launch placeholder item_id.
-          If there is no specific offending item (e.g. advance_wave failed 3 times),
-          post to the project instead.
-          call mcp__agent-gtd__add_comment(
-            item_id=<offending_wave_item_id>,  ← NOT the launch placeholder
-            content="Wave halted: <reason>")
-          # OR if no specific offending item:
-          # call mcp__agent-gtd__add_comment(
-          #   project_id=<project_id>,
-          #   content="Wave halted: <reason>")
-          call mcp__agent-gtd__halt_wave(wave_run_id, reason=<reason>)
-          EXIT.
+        Repeat until `advance_wave` reports `graph_complete=true`:
+
+        **Step 1 — Advance**
+        ```
+        mcp__agent-gtd__advance_wave(wave_run_id="{wave_run_id}")
+        ```
+        Returns: `{{next_ready: [...], in_progress: [...], graph_complete: bool}}`
+
+        If `advance_wave` fails: retry up to 3 times with 30 s sleep between attempts.
+        After 3 failures: call `halt_wave(wave_run_id="{wave_run_id}",
+        reason="advance_wave failed 3 times")` and EXIT.
+        If `graph_complete=true` and `next_ready=[]`: EXIT with success (all done).
+
+        **Step 2 — Dispatch ready items**
+
+        For each `item_id` in `next_ready`:
+        ```
+        mcp__agent-gtd__dispatch_item(
+            item_id=item_id,
+            mode="build",
+            wave_run_id="{wave_run_id}",
+        )
+        ```
+        NOTE: `wave_run_id` is REQUIRED on every child dispatch — include it always.
+        Record the returned `run_id` alongside `item_id`.
+
+        **Step 3 — Poll to completion**
+
+        Poll with:
+        ```
+        mcp__agent-gtd__list_runs(wave_run_id="{wave_run_id}")
+        ```
+        plus `Bash sleep 30` between polls. Wait until all dispatched runs reach a
+        terminal status (succeeded, failed, timed_out, cancelled). Process each item
+        as it completes — don't wait for all before acting on any.
+
+        If a run ended with status `failed`, `timed_out`, or `cancelled`: treat it as
+        a halt candidate (see Halt path below) with reason
+        `"build agent <status>: run <run_id> for item <item_id>"`.
+
+        **Step 4 — AC reconciliation**
+
+        After each run completes, call `get_item` on items in later waves that share
+        a module or interface with the just-merged work. Check whether the just-merged
+        code introduced changes (new function signatures, renamed classes, changed
+        config keys) that would cause a later item's AC or spec to be wrong.
+        If so, call `update_item` to patch that item's description and post a comment
+        explaining the change:
+        ```
+        mcp__agent-gtd__add_comment(
+            item_id=<later_item_id>,
+            content_markdown="AC updated: <what changed and why>"
+        )
+        ```
+
+        **Step 5 — Quality gates**
+
+        Check out the build branch in your workspace and run the test + lint commands
+        recorded in warm-up:
+        ```bash
+        git fetch origin <branch_name>
+        git checkout <branch_name>
+        # run test + lint commands from warm-up
+        ```
+        If gates pass: proceed to Step 6 (squash merge).
+        If gates fail:
+        - Attempt an inline fix if it is small: formatting, single missing import,
+          one-line change, coverage ratchet bump — use `Edit`/`Bash` to fix.
+          If the fix succeeds, re-run gates.
+        - If the fix fails or is non-trivial, halt:
+          ```
+          mcp__agent-gtd__halt_wave(
+              wave_run_id="{wave_run_id}",
+              reason="quality gate failure on <branch>: <command>: <error snippet> in <file>"
+          )
+          ```
+
+        **Step 6 — Squash merge**
+
+        ```bash
+        git checkout <default_branch>
+        git merge --squash <branch_name>
+        git commit -F - <<'COMMITEOF'
+        feat(<item_id short>): <item title>
+
+        Wave: {wave_run_id}
+        Item: <item_id>
+        COMMITEOF
+        git push origin <default_branch>
+        ```
+
+        **Step 7 — Complete in wave**
+
+        ```
+        mcp__agent-gtd__complete_in_wave(
+            wave_run_id="{wave_run_id}",
+            item_id=item_id,
+            outcome="completed",
+            merge_actor="manager-autonomous",
+            decision_rule="agent-judgment",
+        )
+        ```
+
+        Then go back to Step 1 (advance) for the next wave.
+
+        **Halt path**
+
+        On any non-recoverable failure, post a comment to the offending wave item
+        (NOT the launch placeholder item_id):
+        ```
+        mcp__agent-gtd__add_comment(
+            item_id=<offending_wave_item_id>,
+            content_markdown="Wave halted: <reason>"
+        )
+        ```
+        If there is no specific offending item (e.g. `advance_wave` failed 3 times),
+        post to the project instead:
+        ```
+        mcp__agent-gtd__add_comment(
+            project_id="{project_id}",
+            content_markdown="Wave halted: <reason>"
+        )
+        ```
+        Then call:
+        ```
+        mcp__agent-gtd__halt_wave(wave_run_id="{wave_run_id}", reason=<reason>)
+        ```
+        And STOP.
+
+        ## Phase 3 — Sensitive-area guidance
+
+        Before auto-merging, inspect the diff. If the build touches any of the following
+        patterns, **halt rather than auto-merge** — post a comment explaining why, then
+        call `halt_wave`. This is judgment guidance, not a hard predicate: use your
+        discretion about whether the change is routine (e.g. a tiny doc fix in a Dockerfile)
+        or substantively risky.
+
+        Patterns that warrant a halt:
+        - **Auth code**: `**/auth.py`, `**/auth_routes.py`, route authentication modules
+        - **Deploy/release scripts**: `deploy.sh`, `release.sh`, `start.sh`
+        - **CI/hooks**: `.github/**`, `.pre-commit-config.yaml`
+        - **Infrastructure units**: `*.service`, `Dockerfile*`, `nginx*.conf`
+        - **Env/secrets**: `.env*`, `.envrc*`
+
+        If the diff touches any of these areas, call `halt_wave` and post a comment on
+        the offending item explaining why — don't attempt to auto-merge.
+
+        ## MCP Tools Available
+
+        `advance_wave`, `complete_in_wave`, `halt_wave`, `replan_wave`, `dispatch_item`,
+        `add_comment`, `get_item`, `update_item`, `list_items`, `get_run_status`,
+        `list_runs`, `list_comments`
 
         ## Rules
 
-        - Never commit code, push branches, or modify any repository directly.
-        - Never touch waves or items outside wave_run_id={wave_run_id}.
-        - The squash_merge helper handles all git operations; if CI gate (item 7e2753ec)
-          is not yet available, squash_merge.py stubs it as always-pass with a logged warning.
         - You have max {max_turns} turns. Budget them wisely.
+        - Never touch waves or items outside `wave_run_id={wave_run_id}`.
+        - Never force-push. Push only via the squash merge sequence above.
+        - If you are uncertain whether a merge is safe, halt — halting is always safe.
     """
     )
-
-    prompt += "\n" + _heartbeat_prompt_addendum()
-    prompt += "\n" + _ci_gate_prompt_addendum()
-    return prompt
 
 
 def _build_build_prompt(
@@ -554,151 +670,6 @@ def _build_build_prompt(
     )
 
     return prompt
-
-
-def _detect_project_type(workspace: Path) -> str:
-    """Auto-detect project type from the workspace filesystem.
-
-    Checks for pyproject.toml → "python", package.json → "frontend", else "unknown".
-    """
-    if (workspace / "pyproject.toml").exists():
-        return "python"
-    if (workspace / "package.json").exists():
-        return "frontend"
-    return "unknown"
-
-
-def _ci_steps_for_project_type(project_type: str) -> list[tuple[str, list[str]]]:
-    """Return ordered CI steps (command_string, command_list) for the given project type."""
-    if project_type == "python":
-        return [
-            ("uv run pytest", ["uv", "run", "pytest"]),
-            ("uv run ruff check", ["uv", "run", "ruff", "check"]),
-            ("uv run mypy src/", ["uv", "run", "mypy", "src/"]),
-        ]
-    if project_type == "frontend":
-        return [
-            ("npm run build", ["npm", "run", "build"]),
-            ("npm run test", ["npm", "run", "test"]),
-        ]
-    return []  # "unknown" — nothing to run
-
-
-def _ci_env() -> dict[str, str]:
-    """Build a filtered env dict for CI subprocesses (COMMON_ENV_KEYS only)."""
-    return {k: v for k, v in os.environ.items() if k in COMMON_ENV_KEYS}
-
-
-async def run_ci_gate(
-    repo_url: str,
-    branch_name: str,
-    project_type: str | None,
-    timeout_s: int,
-) -> CIGateResult:
-    """Clone a branch and run the CI suite against it.
-
-    Always returns a CIGateResult — never raises. CI failure is expressed as
-    passed=False in the result body, not as an exception.
-
-    The CI subprocess inherits only COMMON_ENV_KEYS (same allow-list used for agent
-    subprocesses), so secrets like ANTHROPIC_API_KEY are never forwarded.
-    """
-    from uuid import uuid4
-
-    run_id = f"ci-{uuid4().hex[:10]}"
-    workspace: Path | None = None
-    resolved_type = project_type or "unknown"
-
-    try:
-        # Clone and check out the existing branch
-        name = repo_name_from_origin(repo_url)
-        workspace = config.WORKSPACE_ROOT / f"{name}-{run_id}"
-        config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: subprocess.run(
-                ["git", "clone", repo_url, str(workspace)],
-                check=True,
-                capture_output=True,
-            ),
-        )
-        await loop.run_in_executor(
-            None,
-            lambda: subprocess.run(
-                ["git", "checkout", branch_name],
-                cwd=workspace,
-                check=True,
-                capture_output=True,
-            ),
-        )
-
-        # Auto-detect project type if not provided
-        if project_type is None:
-            resolved_type = _detect_project_type(workspace)
-
-        steps = _ci_steps_for_project_type(resolved_type)
-        env = _ci_env()
-
-        for step_str, step_cmd in steps:
-            cmd_to_run = step_cmd
-            try:
-
-                def _run_step(
-                    _cmd: list[str] = cmd_to_run,
-                ) -> subprocess.CompletedProcess[str]:
-                    return subprocess.run(
-                        _cmd,
-                        cwd=workspace,
-                        env=env,
-                        capture_output=True,
-                        text=True,
-                        timeout=timeout_s,
-                    )
-
-                result = await loop.run_in_executor(None, _run_step)
-                if result.returncode != 0:
-                    return CIGateResult(
-                        passed=False,
-                        project_type=resolved_type,
-                        failed_step=step_str,
-                        stdout=result.stdout,
-                        stderr=result.stderr,
-                        returncode=result.returncode,
-                    )
-            except subprocess.TimeoutExpired:
-                return CIGateResult(
-                    passed=False,
-                    project_type=resolved_type,
-                    failed_step="timeout",
-                    stdout="",
-                    stderr=f"CI step timed out after {timeout_s}s",
-                    returncode=None,
-                )
-
-        return CIGateResult(
-            passed=True,
-            project_type=resolved_type,
-            failed_step=None,
-            stdout="",
-            stderr="",
-            returncode=0,
-        )
-
-    except Exception as exc:
-        logger.exception("CI gate error: %s", exc)
-        return CIGateResult(
-            passed=False,
-            project_type=resolved_type,
-            failed_step=str(exc),
-            stdout="",
-            stderr=str(exc),
-            returncode=None,
-        )
-    finally:
-        if workspace is not None:
-            cleanup_workspace(workspace)
 
 
 async def run_agent(

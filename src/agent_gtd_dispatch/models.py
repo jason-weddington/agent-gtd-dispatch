@@ -91,20 +91,3 @@ class WavePlan(BaseModel):
     planner_model: str
 
 
-class CIGateRequest(BaseModel):
-    """Request body for the /ci-gate endpoint."""
-
-    repo_url: str
-    branch_name: str
-    project_type: str | None = None
-
-
-class CIGateResult(BaseModel):
-    """Result of a CI gate run."""
-
-    passed: bool
-    project_type: str  # "python" | "frontend" | "unknown"
-    failed_step: str | None  # exact command string or "timeout", None on pass
-    stdout: str
-    stderr: str
-    returncode: int | None
