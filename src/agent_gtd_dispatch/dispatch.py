@@ -210,14 +210,14 @@ _MANAGE_ALLOWED_TOOLS: tuple[str, ...] = (
     "mcp__agent-gtd__complete_in_wave",
     "mcp__agent-gtd__halt_wave",
     "mcp__agent-gtd__replan_wave",
-    "mcp__agent-gtd__dispatch_item",    # dispatch child build runs
+    "mcp__agent-gtd__dispatch_item",  # dispatch child build runs
     "mcp__agent-gtd__add_comment",
     "mcp__agent-gtd__get_item",
-    "mcp__agent-gtd__update_item",      # AC reconciliation
+    "mcp__agent-gtd__update_item",  # AC reconciliation
     "mcp__agent-gtd__list_items",
     "mcp__agent-gtd__get_run_status",
     "mcp__agent-gtd__list_runs",
-    "mcp__agent-gtd__list_comments",    # read final agent comment
+    "mcp__agent-gtd__list_comments",  # read final agent comment
     "Bash",
     "Read",
     "Write",
@@ -245,7 +245,12 @@ def build_system_prompt(
     if mode == "manage":
         return _build_manage_prompt(wave_run_id or "", project, max_turns)
     return _build_build_prompt(
-        item, project, branch_name or "", max_turns, attachments=attachments, run_id=run_id
+        item,
+        project,
+        branch_name or "",
+        max_turns,
+        attachments=attachments,
+        run_id=run_id,
     )
 
 
