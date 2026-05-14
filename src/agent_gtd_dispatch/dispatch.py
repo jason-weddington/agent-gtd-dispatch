@@ -237,6 +237,7 @@ def build_system_prompt(
     attachments: list[dict[str, Any]] | None = None,
     run_id: str = "",
     rollout_id: str | None = None,
+    manage_retry_count: int = 0,
 ) -> str:
     """Build the headless agent system prompt."""
     if mode == "plan":
@@ -244,7 +245,9 @@ def build_system_prompt(
             item, project, max_turns, attachments=attachments, run_id=run_id
         )
     if mode == "manage":
-        return _build_manage_prompt(rollout_id or "", project, max_turns)
+        return _build_manage_prompt(
+            rollout_id or "", project, max_turns, manage_retry_count=manage_retry_count
+        )
     return _build_build_prompt(
         item,
         project,
@@ -340,17 +343,35 @@ def _build_plan_prompt(
     return prompt
 
 
+_MAX_MANAGE_RETRIES_FOR_PROMPT = 2  # mirrors MAX_MANAGE_RETRIES in main.py
+
+
 def _build_manage_prompt(
     rollout_id: str,
     project: dict[str, Any],
     max_turns: int,
+    manage_retry_count: int = 0,
 ) -> str:
     """System prompt for manage mode — run the rollout-manager executor loop."""
     project_name = project["name"]
     git_origin = project.get("git_origin", "")
     project_id = project.get("id", "")
 
-    return textwrap.dedent(
+    recovery_block = ""
+    if manage_retry_count > 0:
+        recovery_block = textwrap.dedent(
+            f"""\
+            ## ⚠️ Recovery Context
+
+            You are a *recovery* manage agent — a previous manager for this rollout exited unexpectedly
+            (retry attempt {manage_retry_count} of {_MAX_MANAGE_RETRIES_FOR_PROMPT}). The rollout is already in `running`
+            state. Read its current state via `advance_rollout` and continue normally. Items already terminal
+            may have unmerged work waiting; process those first before dispatching new ones.
+
+            """
+        )
+
+    main_prompt = textwrap.dedent(
         f"""\
         You are a headless rollout-manager executor dispatched by Agent GTD.
         No human is available for questions — you must work autonomously.
@@ -685,6 +706,8 @@ def _build_manage_prompt(
         - If you are uncertain whether a merge is safe, halt — halting is always safe.
     """
     )
+
+    return recovery_block + main_prompt
 
 
 def _build_build_prompt(

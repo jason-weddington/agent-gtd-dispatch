@@ -34,6 +34,15 @@ logger = logging.getLogger(__name__)
 # Track running subprocesses for cancellation
 _active_processes: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
 
+# Manage subprocess auto-recovery settings
+MAX_MANAGE_RETRIES = 2
+MANAGE_RETRY_BACKOFF_SECONDS = 30
+
+# Frozenset of rollout statuses that indicate a clean/terminal manage exit
+_CLEAN_EXIT_STATUSES: frozenset[str] = frozenset(
+    {"completed", "halted", "cancelled", "crashed"}
+)
+
 security = HTTPBearer()
 
 
@@ -67,6 +76,94 @@ app = FastAPI(title="Agent GTD Dispatch", lifespan=lifespan)
 # --- Background dispatch worker ---
 
 
+async def _maybe_relaunch_manage(
+    run: Run,
+    max_turns: int,
+    engine: Engine,
+    timeout_seconds: int,
+    attribution: str | None,
+) -> None:
+    """Check rollout status on manage exit and relaunch or halt as appropriate.
+
+    Called from _dispatch_worker's finally block (skipped when human-cancelled).
+    - If rollout is in a clean terminal state: do nothing.
+    - If rollout is still running/pending (unexpected exit): increment retry count.
+      - If count <= MAX_MANAGE_RETRIES: sleep and spawn a fresh _dispatch_worker.
+      - If count > MAX_MANAGE_RETRIES: halt the rollout with reason
+        'manage_relaunch_cap_exceeded'.
+    """
+    assert run.rollout_id is not None  # noqa: S101 — caller guarantees this
+    try:
+        rollout = await gtd_client.get_rollout(run.rollout_id)
+    except Exception:
+        logger.exception(
+            "Failed to fetch rollout %s for relaunch check — skipping recovery",
+            run.rollout_id,
+        )
+        return
+
+    if rollout["status"] in _CLEAN_EXIT_STATUSES:
+        return  # clean exit — nothing to do
+
+    # Unexpected exit: rollout still running or pending
+    try:
+        updated = await gtd_client.relaunch_manage_rollout(run.rollout_id)
+    except Exception:
+        logger.exception(
+            "Failed to increment manage_retry_count for rollout %s — skipping recovery",
+            run.rollout_id,
+        )
+        return
+
+    retry_count = int(updated["manage_retry_count"])
+
+    if retry_count > MAX_MANAGE_RETRIES:
+        logger.warning(
+            "Manage retry cap exceeded for rollout %s (count=%d) — halting",
+            run.rollout_id,
+            retry_count,
+        )
+        try:
+            await gtd_client.halt_rollout(
+                run.rollout_id, reason="manage_relaunch_cap_exceeded"
+            )
+        except Exception:
+            logger.exception(
+                "Failed to halt rollout %s after cap exceeded", run.rollout_id
+            )
+        return
+
+    logger.info(
+        "Relaunching manage agent for rollout %s (retry %d/%d) after %ds",
+        run.rollout_id,
+        retry_count,
+        MAX_MANAGE_RETRIES,
+        MANAGE_RETRY_BACKOFF_SECONDS,
+    )
+    await asyncio.sleep(MANAGE_RETRY_BACKOFF_SECONDS)
+
+    new_run = Run(
+        item_id=run.item_id,
+        project_name=run.project_name,
+        mode="manage",
+        rollout_id=run.rollout_id,
+        engine=run.engine,
+        agent_name=run.agent_name,
+    )
+    await db.insert_run(new_run)
+    task = asyncio.create_task(
+        _dispatch_worker(
+            new_run,
+            max_turns,
+            engine,
+            timeout_seconds,
+            attribution=attribution,
+            manage_retry_count=retry_count,
+        )
+    )
+    _active_processes[new_run.id] = task
+
+
 async def _dispatch_worker(
     run: Run,
     max_turns: int,
@@ -74,6 +171,7 @@ async def _dispatch_worker(
     timeout_seconds: int,
     *,
     attribution: str | None = None,
+    manage_retry_count: int = 0,
 ) -> None:
     """Background task that executes a dispatch run."""
     now = datetime.now(UTC).isoformat()
@@ -84,6 +182,7 @@ async def _dispatch_worker(
     # For manage mode: preserve workspace on failure for debugging.
     # For build/plan mode: always clean up.
     should_cleanup = True
+    _human_cancelled = False
 
     try:
         # Fetch item and project
@@ -125,6 +224,7 @@ async def _dispatch_worker(
             attachments=attachments,
             run_id=run.id,
             rollout_id=run.rollout_id,
+            manage_retry_count=manage_retry_count,
         )
 
         if mode == "manage":
@@ -208,6 +308,7 @@ async def _dispatch_worker(
         if mode == "manage":
             should_cleanup = False
     except asyncio.CancelledError:
+        _human_cancelled = True
         await db.update_run(
             run.id,
             status=RunStatus.cancelled,
@@ -226,6 +327,10 @@ async def _dispatch_worker(
         _active_processes.pop(run.id, None)
         if workspace is not None and should_cleanup:
             dispatch.cleanup_workspace(workspace)
+        if run.mode == "manage" and run.rollout_id and not _human_cancelled:
+            await _maybe_relaunch_manage(
+                run, max_turns, engine, timeout_seconds, attribution
+            )
 
 
 # --- Endpoints ---

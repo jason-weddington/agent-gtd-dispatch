@@ -95,6 +95,26 @@ async def complete_in_rollout(
     )
 
 
+async def get_rollout(rollout_id: str) -> dict[str, Any]:
+    """GET /api/rollouts/{rollout_id}.
+
+    Returns rollout dict including status and manage_retry_count.
+    """
+    result: dict[str, Any] = await _request("GET", f"/rollouts/{rollout_id}")
+    return result
+
+
+async def relaunch_manage_rollout(rollout_id: str) -> dict[str, Any]:
+    """POST /api/rollouts/{rollout_id}/relaunch-manage.
+
+    Atomically increments manage_retry_count and returns the updated rollout.
+    """
+    result: dict[str, Any] = await _request(
+        "POST", f"/rollouts/{rollout_id}/relaunch-manage"
+    )
+    return result
+
+
 async def halt_rollout(rollout_id: str, reason: str) -> None:
     """POST /api/rollouts/{rollout_id}/halt."""
     await _request(

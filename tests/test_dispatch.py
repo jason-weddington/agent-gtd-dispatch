@@ -670,6 +670,72 @@ class TestBuildManagePrompt:
         assert "decision_rule" in prompt
         assert "agent-judgment" in prompt
 
+    # -----------------------------------------------------------------------
+    # Recovery prompt rendering
+    # -----------------------------------------------------------------------
+
+    def test_no_recovery_block_at_count_zero(self) -> None:
+        """manage_retry_count=0 (default) must NOT inject recovery context."""
+        prompt = build_system_prompt(
+            item={"id": "item-1", "title": "ignored"},
+            project=self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="manage",
+            rollout_id=self._rollout_id,
+            manage_retry_count=0,
+        )
+        assert "Recovery Context" not in prompt
+        assert "recovery" not in prompt.lower() or "non-recoverable" in prompt.lower()
+
+    def test_recovery_block_at_count_one(self) -> None:
+        """manage_retry_count=1 should prepend the recovery context block."""
+        prompt = build_system_prompt(
+            item={"id": "item-1", "title": "ignored"},
+            project=self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="manage",
+            rollout_id=self._rollout_id,
+            manage_retry_count=1,
+        )
+        assert "Recovery Context" in prompt
+        assert "retry attempt 1 of 2" in prompt
+        assert "recovery" in prompt.lower()
+
+    def test_recovery_block_at_count_two(self) -> None:
+        """manage_retry_count=2 (max) should show 'attempt 2 of 2'."""
+        prompt = build_system_prompt(
+            item={"id": "item-1", "title": "ignored"},
+            project=self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="manage",
+            rollout_id=self._rollout_id,
+            manage_retry_count=2,
+        )
+        assert "Recovery Context" in prompt
+        assert "retry attempt 2 of 2" in prompt
+
+    def test_recovery_block_appears_before_main_prompt(self) -> None:
+        """Recovery context must appear before Phase 1 content."""
+        prompt = build_system_prompt(
+            item={"id": "item-1", "title": "ignored"},
+            project=self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="manage",
+            rollout_id=self._rollout_id,
+            manage_retry_count=1,
+        )
+        recovery_idx = prompt.find("Recovery Context")
+        phase1_idx = prompt.find("Phase 1")
+        assert recovery_idx != -1
+        assert phase1_idx != -1
+        assert recovery_idx < phase1_idx, (
+            "Recovery Context block must appear before Phase 1 content"
+        )
+
 
 # ---------------------------------------------------------------------------
 # AC-1.1 — rollout_id schema tests
