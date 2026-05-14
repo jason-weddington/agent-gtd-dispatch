@@ -30,7 +30,7 @@ class Run(BaseModel):
     engine: str = "claude"
     agent_name: str | None = None
     mode: str = "build"
-    wave_run_id: str | None = None
+    rollout_id: str | None = None
     workspace_path: str | None = None
     status: RunStatus = RunStatus.pending
     started_at: datetime | None = None
@@ -49,7 +49,7 @@ class DispatchRequest(BaseModel):
     agent_name: str | None = None
     mode: str = "build"
     timeout_minutes: int | None = None
-    wave_run_id: str | None = None
+    rollout_id: str | None = None
     attribution: str | None = None
 
 
@@ -63,7 +63,7 @@ class RunResponse(BaseModel):
     engine: str
     agent_name: str | None
     mode: str
-    wave_run_id: str | None
+    rollout_id: str | None
     status: RunStatus
     started_at: datetime | None
     completed_at: datetime | None
@@ -85,7 +85,7 @@ class DagEdge(BaseModel):
     to_item_id: str
 
 
-class WavePlan(BaseModel):
+class RolloutPlan(BaseModel):
     """Result of the planner: a dependency DAG for a set of items."""
 
     nodes: list[str]

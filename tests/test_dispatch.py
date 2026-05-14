@@ -428,7 +428,7 @@ class TestRunAgent:
         self, tmp_path, monkeypatch
     ) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
-        tools = ["mcp__agent-gtd__advance_wave", "Read"]
+        tools = ["mcp__agent-gtd__advance_rollout", "Read"]
         mock_proc = _make_mock_proc(0)
         with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
             mock_popen.return_value = mock_proc
@@ -437,7 +437,7 @@ class TestRunAgent:
             cmd = args[0]
             assert "--allowedTools" in cmd
             idx = cmd.index("--allowedTools")
-            assert cmd[idx + 1] == "mcp__agent-gtd__advance_wave,Read"
+            assert cmd[idx + 1] == "mcp__agent-gtd__advance_rollout,Read"
             # Title remains the final argument
             assert cmd[-1] == "Title"
             # --allowedTools must come BEFORE --print, otherwise claude's
@@ -450,7 +450,7 @@ class TestRunAgent:
         self, tmp_path, monkeypatch
     ) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
-        tools = ["mcp__agent-gtd__advance_wave", "Read"]
+        tools = ["mcp__agent-gtd__advance_rollout", "Read"]
         mock_proc = _make_mock_proc(0)
         with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
             mock_popen.return_value = mock_proc
@@ -522,12 +522,12 @@ class TestBuildManagePrompt:
         "name": "wave-project",
         "git_origin": "git@host:repos/wp",
     }
-    _wave_run_id = "wr-abc123"
+    _rollout_id = "wr-abc123"
     _max_turns = 100
 
     def _prompt(
         self,
-        wave_run_id: str | None = None,
+        rollout_id: str | None = None,
         project: dict | None = None,
         max_turns: int | None = None,
     ) -> str:
@@ -537,12 +537,12 @@ class TestBuildManagePrompt:
             branch_name=None,
             max_turns=max_turns if max_turns is not None else self._max_turns,
             mode="manage",
-            wave_run_id=wave_run_id if wave_run_id is not None else self._wave_run_id,
+            rollout_id=rollout_id if rollout_id is not None else self._rollout_id,
         )
 
-    def test_includes_wave_run_id(self) -> None:
+    def test_includes_rollout_id(self) -> None:
         prompt = self._prompt()
-        assert self._wave_run_id in prompt
+        assert self._rollout_id in prompt
 
     def test_includes_project_name(self) -> None:
         prompt = self._prompt()
@@ -550,7 +550,7 @@ class TestBuildManagePrompt:
 
     def test_identifies_executor_role(self) -> None:
         prompt = self._prompt()
-        assert "wave-manager" in prompt or "executor" in prompt
+        assert "rollout-manager" in prompt or "executor" in prompt
 
     def test_does_not_include_branch_rules(self) -> None:
         prompt = self._prompt()
@@ -564,15 +564,15 @@ class TestBuildManagePrompt:
             branch_name=None,
             max_turns=50,
             mode="manage",
-            wave_run_id="wr-123",
+            rollout_id="wr-123",
         )
-        assert "wave-manager" in prompt or "executor" in prompt
+        assert "rollout-manager" in prompt or "executor" in prompt
 
     def test_manage_allowed_tools_constant_is_not_empty(self) -> None:
         assert len(_MANAGE_ALLOWED_TOOLS) > 0
-        assert "mcp__agent-gtd__advance_wave" in _MANAGE_ALLOWED_TOOLS
-        assert "mcp__agent-gtd__complete_in_wave" in _MANAGE_ALLOWED_TOOLS
-        assert "mcp__agent-gtd__halt_wave" in _MANAGE_ALLOWED_TOOLS
+        assert "mcp__agent-gtd__advance_rollout" in _MANAGE_ALLOWED_TOOLS
+        assert "mcp__agent-gtd__complete_item_in_rollout" in _MANAGE_ALLOWED_TOOLS
+        assert "mcp__agent-gtd__halt_rollout" in _MANAGE_ALLOWED_TOOLS
 
     def test_dispatch_item_in_allowed_tools(self) -> None:
         assert "mcp__agent-gtd__dispatch_item" in _MANAGE_ALLOWED_TOOLS
@@ -583,8 +583,8 @@ class TestBuildManagePrompt:
     def test_update_item_in_allowed_tools(self) -> None:
         assert "mcp__agent-gtd__update_item" in _MANAGE_ALLOWED_TOOLS
 
-    def test_ping_wave_not_in_allowed_tools(self) -> None:
-        assert "mcp__agent-gtd__ping_wave" not in _MANAGE_ALLOWED_TOOLS
+    def test_ping_rollout_not_in_allowed_tools(self) -> None:
+        assert "mcp__agent-gtd__ping_rollout" not in _MANAGE_ALLOWED_TOOLS
 
     def test_all_wave_loop_steps_present(self) -> None:
         prompt = self._prompt()
@@ -595,7 +595,7 @@ class TestBuildManagePrompt:
         assert "Step 4" in prompt
         assert "Step 5" in prompt
 
-    def test_advance_wave_retry_logic_present(self) -> None:
+    def test_advance_rollout_retry_logic_present(self) -> None:
         prompt = self._prompt()
         assert "retry" in prompt.lower()
         assert "3 times" in prompt or "3" in prompt
@@ -624,15 +624,15 @@ class TestBuildManagePrompt:
             ]
         ), "Prompt must instruct executor to ignore the launch item_id placeholder"
 
-    def test_manage_prompt_dispatch_step_includes_wave_run_id(self) -> None:
+    def test_manage_prompt_dispatch_step_includes_rollout_id(self) -> None:
         prompt = self._prompt()
-        # The f-string interpolates wave_run_id into the dispatch_item example call
-        assert f'wave_run_id="{self._wave_run_id}"' in prompt, (
-            "Step 2 dispatch_item call must include wave_run_id "
+        # The f-string interpolates rollout_id into the dispatch_item example call
+        assert f'rollout_id="{self._rollout_id}"' in prompt, (
+            "Step 2 dispatch_item call must include rollout_id "
             "interpolated with the actual value"
         )
         assert "REQUIRED" in prompt or "required" in prompt.lower(), (
-            "Prompt must state that wave_run_id is required on every child dispatch"
+            "Prompt must state that rollout_id is required on every child dispatch"
         )
 
     def test_manage_prompt_halt_targets_offending_item(self) -> None:
@@ -641,7 +641,7 @@ class TestBuildManagePrompt:
         assert halt_section_idx != -1, "Halt path section must be present in the prompt"
         halt_section = prompt[halt_section_idx:]
         assert "offending" in halt_section.lower() or "project_id" in halt_section, (
-            "Halt path must target the offending wave item or project_id, "
+            "Halt path must target the offending rollout item or project_id, "
             "not the launch placeholder item_id"
         )
 
@@ -663,7 +663,7 @@ class TestBuildManagePrompt:
         prompt = self._prompt()
         assert "git merge --squash" in prompt
 
-    def test_complete_in_wave_actor_and_rule(self) -> None:
+    def test_complete_in_rollout_actor_and_rule(self) -> None:
         prompt = self._prompt()
         assert "merge_actor" in prompt
         assert "manager-autonomous" in prompt
@@ -672,83 +672,77 @@ class TestBuildManagePrompt:
 
 
 # ---------------------------------------------------------------------------
-# AC-1.1 — wave_run_id schema tests
+# AC-1.1 — rollout_id schema tests
 # ---------------------------------------------------------------------------
 
 
-class TestWaveRunIdSchema:
-    def test_dispatch_request_accepts_wave_run_id(self) -> None:
-        req = DispatchRequest(item_id="abc", max_turns=50, wave_run_id="wr-123")
-        assert req.wave_run_id == "wr-123"
+class TestRolloutIdSchema:
+    def test_dispatch_request_accepts_rollout_id(self) -> None:
+        req = DispatchRequest(item_id="abc", max_turns=50, rollout_id="wr-123")
+        assert req.rollout_id == "wr-123"
 
-    def test_dispatch_request_wave_run_id_defaults_none(self) -> None:
+    def test_dispatch_request_rollout_id_defaults_none(self) -> None:
         req = DispatchRequest(item_id="abc", max_turns=50)
-        assert req.wave_run_id is None
+        assert req.rollout_id is None
 
-    def test_run_model_accepts_wave_run_id(self) -> None:
+    def test_run_model_accepts_rollout_id(self) -> None:
         run = Run(
             item_id="abc",
             project_name="proj",
             branch_name="feat/x",
-            wave_run_id="wr-xyz",
+            rollout_id="wr-xyz",
         )
-        assert run.wave_run_id == "wr-xyz"
+        assert run.rollout_id == "wr-xyz"
 
-    def test_run_model_wave_run_id_defaults_none(self) -> None:
+    def test_run_model_rollout_id_defaults_none(self) -> None:
         run = Run(item_id="abc", project_name="proj", branch_name="feat/x")
-        assert run.wave_run_id is None
+        assert run.rollout_id is None
 
 
-class TestDbWaveRunId:
+class TestDbRolloutId:
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
 
-    async def test_runs_table_has_wave_run_id_column(self) -> None:
+    async def test_runs_table_has_rollout_id_column(self) -> None:
         await db.init_db()
         async with aiosqlite.connect(db.db_path()) as conn:
             cursor = await conn.execute("PRAGMA table_info(runs)")
             cols = {row[1] for row in await cursor.fetchall()}
-        assert "wave_run_id" in cols
+        assert "rollout_id" in cols
 
-    async def test_list_runs_by_wave_returns_correct_runs(self) -> None:
+    async def test_list_runs_by_rollout_returns_correct_runs(self) -> None:
         await db.init_db()
 
-        run1 = Run(
-            item_id="i1", project_name="p", branch_name="b", wave_run_id="wr-abc"
-        )
-        run2 = Run(
-            item_id="i2", project_name="p", branch_name="b", wave_run_id="wr-abc"
-        )
-        run3 = Run(
-            item_id="i3", project_name="p", branch_name="b", wave_run_id="wr-xyz"
-        )
+        run1 = Run(item_id="i1", project_name="p", branch_name="b", rollout_id="wr-abc")
+        run2 = Run(item_id="i2", project_name="p", branch_name="b", rollout_id="wr-abc")
+        run3 = Run(item_id="i3", project_name="p", branch_name="b", rollout_id="wr-xyz")
 
         await db.insert_run(run1)
         await db.insert_run(run2)
         await db.insert_run(run3)
 
-        results = await db.list_runs_by_wave("wr-abc")
+        results = await db.list_runs_by_rollout("wr-abc")
         assert len(results) == 2
         result_ids = {r.id for r in results}
         assert run1.id in result_ids
         assert run2.id in result_ids
         assert run3.id not in result_ids
 
-    async def test_list_runs_by_wave_returns_empty_for_unknown_wave(self) -> None:
+    async def test_list_runs_by_rollout_returns_empty_for_unknown_rollout(self) -> None:
         await db.init_db()
-        results = await db.list_runs_by_wave("wr-nonexistent")
+        results = await db.list_runs_by_rollout("wr-nonexistent")
         assert results == []
 
-    async def test_wave_run_id_persisted_and_retrieved(self) -> None:
+    async def test_rollout_id_persisted_and_retrieved(self) -> None:
         await db.init_db()
         run = Run(
-            item_id="i1", project_name="p", branch_name="b", wave_run_id="wr-persist"
+            item_id="i1", project_name="p", branch_name="b", rollout_id="wr-persist"
         )
         await db.insert_run(run)
         fetched = await db.get_run(run.id)
         assert fetched is not None
-        assert fetched.wave_run_id == "wr-persist"
+        assert fetched.rollout_id == "wr-persist"
 
     async def test_branch_name_nullable_in_schema(self) -> None:
         await db.init_db()

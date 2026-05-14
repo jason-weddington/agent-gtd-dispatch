@@ -299,27 +299,27 @@ class TestDownloadAttachment:
             await download_attachment("missing-att")
 
 
-class TestWaveRunMethods:
+class TestRolloutMethods:
     @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
-    async def test_advance_wave_calls_correct_endpoint(self, mock_cls) -> None:
-        from agent_gtd_dispatch.gtd_client import advance_wave
+    async def test_advance_rollout_calls_correct_endpoint(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import advance_rollout
 
         payload = {"next_ready": ["item-1"], "in_progress": [], "graph_complete": False}
         mock_client, _ = _make_client_mock(json_data=payload)
         mock_cls.return_value.__aenter__.return_value = mock_client
 
-        result = await advance_wave("wr-123")
+        result = await advance_rollout("wr-123")
 
         assert result == payload
         mock_client.request.assert_called_once_with(
             "GET",
-            "http://localhost:9999/api/wave-runs/wr-123/advance",
+            "http://localhost:9999/api/rollouts/wr-123/advance",
             headers={"Authorization": "Bearer test-gtd-key"},
         )
 
     @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
-    async def test_advance_wave_raises_on_http_error(self, mock_cls) -> None:
-        from agent_gtd_dispatch.gtd_client import advance_wave
+    async def test_advance_rollout_raises_on_http_error(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import advance_rollout
 
         mock_client = AsyncMock()
         mock_cls.return_value.__aenter__.return_value = mock_client
@@ -334,16 +334,16 @@ class TestWaveRunMethods:
         mock_client.request.return_value = mock_response
 
         with pytest.raises(httpx.HTTPStatusError):
-            await advance_wave("wr-123")
+            await advance_rollout("wr-123")
 
     @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
-    async def test_complete_in_wave_sends_merge_actor(self, mock_cls) -> None:
-        from agent_gtd_dispatch.gtd_client import complete_in_wave
+    async def test_complete_in_rollout_sends_merge_actor(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import complete_in_rollout
 
         mock_client, _ = _make_client_mock(content=b"")
         mock_cls.return_value.__aenter__.return_value = mock_client
 
-        await complete_in_wave(
+        await complete_in_rollout(
             "wr-123",
             "item-1",
             outcome="completed",
@@ -353,7 +353,7 @@ class TestWaveRunMethods:
 
         mock_client.request.assert_called_once_with(
             "POST",
-            "http://localhost:9999/api/wave-runs/wr-123/complete-item",
+            "http://localhost:9999/api/rollouts/wr-123/complete-item",
             headers={"Authorization": "Bearer test-gtd-key"},
             json={
                 "item_id": "item-1",
@@ -364,17 +364,17 @@ class TestWaveRunMethods:
         )
 
     @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
-    async def test_halt_wave_sends_reason(self, mock_cls) -> None:
-        from agent_gtd_dispatch.gtd_client import halt_wave
+    async def test_halt_rollout_sends_reason(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import halt_rollout
 
         mock_client, _ = _make_client_mock(content=b"")
         mock_cls.return_value.__aenter__.return_value = mock_client
 
-        await halt_wave("wr-123", reason="CI failure on feat/x")
+        await halt_rollout("wr-123", reason="CI failure on feat/x")
 
         mock_client.request.assert_called_once_with(
             "POST",
-            "http://localhost:9999/api/wave-runs/wr-123/halt",
+            "http://localhost:9999/api/rollouts/wr-123/halt",
             headers={"Authorization": "Bearer test-gtd-key"},
             json={"reason": "CI failure on feat/x"},
         )

@@ -1,4 +1,4 @@
-"""Tests for wave_planner module."""
+"""Tests for rollout_planner module."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def _make_anthropic_module(mock_response: MagicMock) -> MagicMock:
     return mock_module
 
 
-class TestPlanWave:
+class TestPlanRollout:
     async def test_two_items_with_blocker_returns_edge(self) -> None:
         items = [
             {"id": "id1", "title": "Item 1", "description": "", "blockers": []},
@@ -65,12 +65,12 @@ class TestPlanWave:
         mock_anthropic = _make_anthropic_module(mock_response)
 
         with (
-            patch("agent_gtd_dispatch.wave_planner.gtd_client", mock_gtd),
-            patch("agent_gtd_dispatch.wave_planner.anthropic", mock_anthropic),
+            patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+            patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
         ):
-            from agent_gtd_dispatch.wave_planner import plan_wave
+            from agent_gtd_dispatch.rollout_planner import plan_rollout
 
-            result = await plan_wave(["id1", "id2"])
+            result = await plan_rollout(["id1", "id2"])
 
         assert result.nodes == ["id1", "id2"]
         assert len(result.edges) == 1
@@ -88,12 +88,12 @@ class TestPlanWave:
         mock_anthropic = _make_anthropic_module(mock_response)
 
         with (
-            patch("agent_gtd_dispatch.wave_planner.gtd_client", mock_gtd),
-            patch("agent_gtd_dispatch.wave_planner.anthropic", mock_anthropic),
+            patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+            patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
         ):
-            from agent_gtd_dispatch.wave_planner import plan_wave
+            from agent_gtd_dispatch.rollout_planner import plan_rollout
 
-            result = await plan_wave(["id1", "id2"])
+            result = await plan_rollout(["id1", "id2"])
 
         assert sorted(result.nodes) == ["id1", "id2"]
         assert result.edges == []
@@ -110,12 +110,12 @@ class TestPlanWave:
         mock_anthropic = _make_anthropic_module(mock_response)
 
         with (
-            patch("agent_gtd_dispatch.wave_planner.gtd_client", mock_gtd),
-            patch("agent_gtd_dispatch.wave_planner.anthropic", mock_anthropic),
+            patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+            patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
         ):
-            from agent_gtd_dispatch.wave_planner import plan_wave
+            from agent_gtd_dispatch.rollout_planner import plan_rollout
 
-            result = await plan_wave(["id1", "id2"])
+            result = await plan_rollout(["id1", "id2"])
 
         assert result.edges == []
         assert sorted(result.nodes) == ["id1", "id2"]
@@ -126,18 +126,18 @@ class TestPlanWave:
         mock_anthropic = MagicMock()
 
         with (
-            patch("agent_gtd_dispatch.wave_planner.gtd_client", mock_gtd),
-            patch("agent_gtd_dispatch.wave_planner.anthropic", mock_anthropic),
+            patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+            patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
         ):
-            from agent_gtd_dispatch.wave_planner import plan_wave
+            from agent_gtd_dispatch.rollout_planner import plan_rollout
 
             with pytest.raises(RuntimeError, match="GTD API down"):
-                await plan_wave(["id1"])
+                await plan_rollout(["id1"])
 
 
 class TestBuildContext:
     def test_formats_item_with_blockers(self) -> None:
-        from agent_gtd_dispatch.wave_planner import _build_context
+        from agent_gtd_dispatch.rollout_planner import _build_context
 
         items = [
             {
@@ -154,7 +154,7 @@ class TestBuildContext:
         assert "Do some work" in ctx
 
     def test_no_blockers_shows_none(self) -> None:
-        from agent_gtd_dispatch.wave_planner import _build_context
+        from agent_gtd_dispatch.rollout_planner import _build_context
 
         items = [{"id": "id1", "title": "T", "description": "", "blockers": []}]
         ctx = _build_context(items)
@@ -162,7 +162,7 @@ class TestBuildContext:
         assert "Blockers (must complete first): none" in ctx
 
     def test_multiple_blockers_joined(self) -> None:
-        from agent_gtd_dispatch.wave_planner import _build_context
+        from agent_gtd_dispatch.rollout_planner import _build_context
 
         items = [
             {
@@ -177,7 +177,7 @@ class TestBuildContext:
         assert "Blockers (must complete first): id1, id2" in ctx
 
     def test_empty_items_list(self) -> None:
-        from agent_gtd_dispatch.wave_planner import _build_context
+        from agent_gtd_dispatch.rollout_planner import _build_context
 
         ctx = _build_context([])
         assert "planning assistant" in ctx
@@ -185,7 +185,7 @@ class TestBuildContext:
 
 class TestExtractEdges:
     def test_valid_edges_returned(self) -> None:
-        from agent_gtd_dispatch.wave_planner import _extract_edges
+        from agent_gtd_dispatch.rollout_planner import _extract_edges
 
         tool_input = {"edges": [{"from_item_id": "a", "to_item_id": "b"}]}
         edges = _extract_edges(tool_input, {"a", "b"})
@@ -195,7 +195,7 @@ class TestExtractEdges:
         assert edges[0].to_item_id == "b"
 
     def test_unknown_to_id_filtered(self) -> None:
-        from agent_gtd_dispatch.wave_planner import _extract_edges
+        from agent_gtd_dispatch.rollout_planner import _extract_edges
 
         tool_input = {"edges": [{"from_item_id": "a", "to_item_id": "unknown"}]}
         edges = _extract_edges(tool_input, {"a", "b"})
@@ -203,7 +203,7 @@ class TestExtractEdges:
         assert edges == []
 
     def test_unknown_from_id_filtered(self) -> None:
-        from agent_gtd_dispatch.wave_planner import _extract_edges
+        from agent_gtd_dispatch.rollout_planner import _extract_edges
 
         tool_input = {"edges": [{"from_item_id": "unknown", "to_item_id": "b"}]}
         edges = _extract_edges(tool_input, {"a", "b"})
@@ -211,13 +211,13 @@ class TestExtractEdges:
         assert edges == []
 
     def test_empty_edges(self) -> None:
-        from agent_gtd_dispatch.wave_planner import _extract_edges
+        from agent_gtd_dispatch.rollout_planner import _extract_edges
 
         edges = _extract_edges({"edges": []}, {"a", "b"})
         assert edges == []
 
     def test_malformed_edges_skipped(self) -> None:
-        from agent_gtd_dispatch.wave_planner import _extract_edges
+        from agent_gtd_dispatch.rollout_planner import _extract_edges
 
         tool_input = {
             "edges": ["not-a-dict", None, {"from_item_id": "a", "to_item_id": "b"}]
@@ -227,7 +227,7 @@ class TestExtractEdges:
         assert len(edges) == 1
 
     def test_missing_edges_key(self) -> None:
-        from agent_gtd_dispatch.wave_planner import _extract_edges
+        from agent_gtd_dispatch.rollout_planner import _extract_edges
 
         edges = _extract_edges({}, {"a", "b"})
         assert edges == []

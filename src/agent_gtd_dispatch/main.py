@@ -16,17 +16,17 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-from . import config, db, dispatch, gtd_client, wave_planner
+from . import config, db, dispatch, gtd_client, rollout_planner
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
 from .dispatch import _MANAGE_ALLOWED_TOOLS
 from .engines import Engine, get_engine
 from .models import (
     DispatchRequest,
     PlanRequest,
+    RolloutPlan,
     Run,
     RunResponse,
     RunStatus,
-    WavePlan,
 )
 
 logger = logging.getLogger(__name__)
@@ -124,13 +124,13 @@ async def _dispatch_worker(
             mode=mode,
             attachments=attachments,
             run_id=run.id,
-            wave_run_id=run.wave_run_id,
+            rollout_id=run.rollout_id,
         )
 
         if mode == "manage":
             dispatch_comment = (
-                f"Wave manager dispatched (run `{run.id}`, engine: {engine.name}). "
-                f"Managing wave `{run.wave_run_id}` in `{project['name']}`."
+                f"Rollout manager dispatched (run `{run.id}`, engine: {engine.name}). "
+                f"Managing rollout `{run.rollout_id}` in `{project['name']}`."
             )
         else:
             dispatch_comment = (
@@ -257,14 +257,14 @@ async def list_agents(
     return {"agents": agents}
 
 
-@app.post("/plan", response_model=WavePlan)
-async def plan_wave_endpoint(
+@app.post("/plan", response_model=RolloutPlan)
+async def plan_rollout_endpoint(
     body: PlanRequest,
     _: str = Depends(_verify_api_key),
-) -> WavePlan:
-    """Produce a dependency DAG for a set of items (called by plan_wave on agent_gtd)."""
+) -> RolloutPlan:
+    """Produce a dependency DAG for a set of items (called by plan_rollout on agent_gtd)."""
     try:
-        return await wave_planner.plan_wave(body.item_ids)
+        return await rollout_planner.plan_rollout(body.item_ids)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -281,10 +281,10 @@ async def dispatch_item(
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
     # Validate mode-specific requirements
-    if body.mode == "manage" and not body.wave_run_id:
+    if body.mode == "manage" and not body.rollout_id:
         raise HTTPException(
             status_code=400,
-            detail="wave_run_id required for mode=manage",
+            detail="rollout_id required for mode=manage",
         )
 
     # Fetch item to validate and get project info
@@ -327,7 +327,7 @@ async def dispatch_item(
         engine=body.engine,
         agent_name=body.agent_name,
         mode=body.mode,
-        wave_run_id=body.wave_run_id,
+        rollout_id=body.rollout_id,
     )
     await db.insert_run(run)
 

@@ -105,7 +105,7 @@ CLAUDE = Engine(
     auth_env_key="CLAUDE_CODE_OAUTH_TOKEN",
     # ANTHROPIC_API_KEY is deliberately NOT exposed to Claude Code subprocesses.
     # If it leaks through, Claude Code prefers API billing over the user's Max
-    # subscription — see kb-01512.  The planner (wave_planner.py) reads the key
+    # subscription — see kb-01512.  The planner (rollout_planner.py) reads the key
     # via config.ANTHROPIC_API_KEY in-process, never via the subprocess env.
     env_keys=frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}),
     build_command=_build_claude_command,

@@ -62,7 +62,7 @@ async def _make_branch_name_nullable(db: aiosqlite.Connection) -> None:
             engine TEXT NOT NULL DEFAULT 'claude',
             agent_name TEXT,
             mode TEXT NOT NULL DEFAULT 'build',
-            wave_run_id TEXT
+            rollout_id TEXT
         )
     """)
     # Copy only columns that exist in the current (old) table
@@ -99,8 +99,12 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
         await db.execute(
             "ALTER TABLE runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'build'"
         )
-    if "wave_run_id" not in existing:
-        await db.execute("ALTER TABLE runs ADD COLUMN wave_run_id TEXT")
+    if "wave_run_id" in existing and "rollout_id" not in existing:
+        await db.execute("ALTER TABLE runs RENAME COLUMN wave_run_id TO rollout_id")
+        existing.discard("wave_run_id")
+        existing.add("rollout_id")
+    if "rollout_id" not in existing:
+        await db.execute("ALTER TABLE runs ADD COLUMN rollout_id TEXT")
     if "workspace_path" not in existing:
         await db.execute("ALTER TABLE runs ADD COLUMN workspace_path TEXT")
     await db.commit()
@@ -127,7 +131,7 @@ async def insert_run(run: Run) -> None:
         await db.execute(
             """INSERT INTO runs
                (id, item_id, project_name, branch_name, engine, agent_name,
-                mode, wave_run_id, workspace_path, status, started_at, completed_at,
+                mode, rollout_id, workspace_path, status, started_at, completed_at,
                 exit_code, error, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
@@ -138,7 +142,7 @@ async def insert_run(run: Run) -> None:
                 run.engine,
                 run.agent_name,
                 run.mode,
-                run.wave_run_id,
+                run.rollout_id,
                 run.workspace_path,
                 run.status.value,
                 run.started_at.isoformat() if run.started_at else None,
@@ -204,13 +208,13 @@ async def get_run(run_id: str) -> Run | None:
             return _row_to_run(row)
 
 
-async def list_runs_by_wave(wave_run_id: str) -> list[Run]:
-    """List all runs belonging to a specific wave run."""
+async def list_runs_by_rollout(rollout_id: str) -> list[Run]:
+    """List all runs belonging to a specific rollout."""
     async with aiosqlite.connect(db_path()) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM runs WHERE wave_run_id = ? ORDER BY created_at DESC",
-            (wave_run_id,),
+            "SELECT * FROM runs WHERE rollout_id = ? ORDER BY created_at DESC",
+            (rollout_id,),
         ) as cursor:
             rows = await cursor.fetchall()
             return [_row_to_run(r) for r in rows]
@@ -258,7 +262,7 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         engine=row["engine"],
         agent_name=row["agent_name"],
         mode=row["mode"],
-        wave_run_id=row["wave_run_id"],
+        rollout_id=row["rollout_id"],
         workspace_path=row["workspace_path"],
         status=RunStatus(row["status"]),
         started_at=_parse_dt(row["started_at"]),

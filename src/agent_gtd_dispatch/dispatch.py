@@ -206,10 +206,11 @@ def _build_supporting_files_section(
 
 
 _MANAGE_ALLOWED_TOOLS: tuple[str, ...] = (
-    "mcp__agent-gtd__advance_wave",
-    "mcp__agent-gtd__complete_in_wave",
-    "mcp__agent-gtd__halt_wave",
-    "mcp__agent-gtd__replan_wave",
+    "mcp__agent-gtd__advance_rollout",
+    "mcp__agent-gtd__complete_item_in_rollout",
+    "mcp__agent-gtd__halt_rollout",
+    "mcp__agent-gtd__replan_rollout",
+    "mcp__agent-gtd__update_rollout_state",
     "mcp__agent-gtd__dispatch_item",  # dispatch child build runs
     "mcp__agent-gtd__add_comment",
     "mcp__agent-gtd__get_item",
@@ -235,7 +236,7 @@ def build_system_prompt(
     mode: str = "build",
     attachments: list[dict[str, Any]] | None = None,
     run_id: str = "",
-    wave_run_id: str | None = None,
+    rollout_id: str | None = None,
 ) -> str:
     """Build the headless agent system prompt."""
     if mode == "plan":
@@ -243,7 +244,7 @@ def build_system_prompt(
             item, project, max_turns, attachments=attachments, run_id=run_id
         )
     if mode == "manage":
-        return _build_manage_prompt(wave_run_id or "", project, max_turns)
+        return _build_manage_prompt(rollout_id or "", project, max_turns)
     return _build_build_prompt(
         item,
         project,
@@ -340,38 +341,38 @@ def _build_plan_prompt(
 
 
 def _build_manage_prompt(
-    wave_run_id: str,
+    rollout_id: str,
     project: dict[str, Any],
     max_turns: int,
 ) -> str:
-    """System prompt for manage mode — run the wave-manager executor loop."""
+    """System prompt for manage mode — run the rollout-manager executor loop."""
     project_name = project["name"]
     git_origin = project.get("git_origin", "")
     project_id = project.get("id", "")
 
     return textwrap.dedent(
         f"""\
-        You are a headless wave-manager executor dispatched by Agent GTD.
+        You are a headless rollout-manager executor dispatched by Agent GTD.
         No human is available for questions — you must work autonomously.
 
         ## Your Task
 
-        **Mode: MANAGE** — You are orchestrating a wave execution and merging build results.
+        **Mode: MANAGE** — You are orchestrating a rollout execution and merging build results.
 
         **Project:** {project_name}
         **Git Origin:** {git_origin}
-        **Wave Run ID:** {wave_run_id}
+        **Rollout ID:** {rollout_id}
         **Project ID:** {project_id}
         **Turns remaining:** {max_turns}
 
-        This wave run ID is your primary anchor. Every action you take is scoped to it.
+        This rollout ID is your primary anchor. Every action you take is scoped to it.
         Your workspace is a git clone of the project's default branch (auto-detected).
 
         ## Launch item_id — Ignore It
 
         The `item_id` you received as the dispatch trigger is a positional placeholder,
-        not a wave item to act on. **Ignore it entirely.** Your sole source of truth for
-        which items to dispatch is the wave plan — read it via `advance_wave`.
+        not a rollout item to act on. **Ignore it entirely.** Your sole source of truth for
+        which items to dispatch is the rollout plan — read it via `advance_rollout`.
         Do NOT add comments to the launch item_id.
         Do NOT mark it complete.
         Do NOT treat it as a gate.
@@ -384,14 +385,14 @@ def _build_manage_prompt(
 
         At the start of warm-up, publish your state:
         ```
-        mcp__agent-gtd__update_wave_state(
-            wave_run_id="{wave_run_id}",
+        mcp__agent-gtd__update_rollout_state(
+            rollout_id="{rollout_id}",
             phase="warm_up",
             current_step="Verifying main is green",
         )
         ```
 
-        NOTE on `update_wave_state`: each call REPLACES all four state fields
+        NOTE on `update_rollout_state`: each call REPLACES all four state fields
         (phase, current_item_id, current_step, last_updated). Fields you omit
         are reset to None. If you want to preserve `current_item_id` across a
         phase change, pass it in every subsequent call.
@@ -421,8 +422,8 @@ def _build_manage_prompt(
         **4. Verify `main` is green** — run the test + lint commands you just recorded.
         If they fail, call:
         ```
-        mcp__agent-gtd__halt_wave(
-            wave_run_id="{wave_run_id}",
+        mcp__agent-gtd__halt_rollout(
+            rollout_id="{rollout_id}",
             reason="<exact failure: command + error snippet>"
         )
         ```
@@ -430,25 +431,25 @@ def _build_manage_prompt(
 
         ## Phase 2 — Wave Loop
 
-        Repeat until `advance_wave` reports `graph_complete=true`:
+        Repeat until `advance_rollout` reports `graph_complete=true`:
 
         **Step 1 — Advance**
         ```
-        mcp__agent-gtd__advance_wave(wave_run_id="{wave_run_id}")
+        mcp__agent-gtd__advance_rollout(rollout_id="{rollout_id}")
         ```
         Returns: `{{next_ready: [...], in_progress: [...], graph_complete: bool}}`
 
-        If `advance_wave` fails: retry up to 3 times with 30 s sleep between attempts.
-        After 3 failures: call `halt_wave(wave_run_id="{wave_run_id}",
-        reason="advance_wave failed 3 times")` and EXIT.
+        If `advance_rollout` fails: retry up to 3 times with 30 s sleep between attempts.
+        After 3 failures: call `halt_rollout(rollout_id="{rollout_id}",
+        reason="advance_rollout failed 3 times")` and EXIT.
         If `graph_complete=true` and `next_ready=[]`: EXIT with success (all done).
 
         **Step 2 — Dispatch ready items**
 
         For each `item_id` in `next_ready`, publish state then dispatch:
         ```
-        mcp__agent-gtd__update_wave_state(
-            wave_run_id="{wave_run_id}",
+        mcp__agent-gtd__update_rollout_state(
+            rollout_id="{rollout_id}",
             phase="dispatching",
             current_item_id=item_id,
             current_step=f"Dispatching {{item_id}}",
@@ -456,18 +457,18 @@ def _build_manage_prompt(
         mcp__agent-gtd__dispatch_item(
             item_id=item_id,
             mode="build",
-            wave_run_id="{wave_run_id}",
+            rollout_id="{rollout_id}",
         )
         ```
-        NOTE: `wave_run_id` is REQUIRED on every child dispatch — include it always.
+        NOTE: `rollout_id` is REQUIRED on every child dispatch — include it always.
         Record the returned `run_id` alongside `item_id`.
 
         **Step 3 — Poll to completion (use a background poller per run)**
 
         Publish polling state:
         ```
-        mcp__agent-gtd__update_wave_state(
-            wave_run_id="{wave_run_id}",
+        mcp__agent-gtd__update_rollout_state(
+            rollout_id="{rollout_id}",
             phase="polling",
             current_step="Waiting for build runs to complete",
         )
@@ -505,8 +506,8 @@ def _build_manage_prompt(
 
         Publish reconciliation state:
         ```
-        mcp__agent-gtd__update_wave_state(
-            wave_run_id="{wave_run_id}",
+        mcp__agent-gtd__update_rollout_state(
+            rollout_id="{rollout_id}",
             phase="reconciling_ac",
             current_step="Checking downstream AC impact",
         )
@@ -529,8 +530,8 @@ def _build_manage_prompt(
 
         Publish reviewing state:
         ```
-        mcp__agent-gtd__update_wave_state(
-            wave_run_id="{wave_run_id}",
+        mcp__agent-gtd__update_rollout_state(
+            rollout_id="{rollout_id}",
             phase="reviewing",
             current_item_id=item_id,
             current_step=f"Running quality gates on <branch_name>",
@@ -564,8 +565,8 @@ def _build_manage_prompt(
           succeeds, re-run gates.
         - If the fix fails or is non-trivial, halt:
           ```
-          mcp__agent-gtd__halt_wave(
-              wave_run_id="{wave_run_id}",
+          mcp__agent-gtd__halt_rollout(
+              rollout_id="{rollout_id}",
               reason="quality gate failure on <branch>: <command>: <error snippet> in <file>"
           )
           ```
@@ -574,8 +575,8 @@ def _build_manage_prompt(
 
         Publish merging state:
         ```
-        mcp__agent-gtd__update_wave_state(
-            wave_run_id="{wave_run_id}",
+        mcp__agent-gtd__update_rollout_state(
+            rollout_id="{rollout_id}",
             phase="merging",
             current_item_id=item_id,
             current_step=f"Merging <branch_name> → main",
@@ -588,17 +589,17 @@ def _build_manage_prompt(
         git commit -F - <<'COMMITEOF'
         feat(<item_id short>): <item title>
 
-        Wave: {wave_run_id}
+        Rollout: {rollout_id}
         Item: <item_id>
         COMMITEOF
         git push origin <default_branch>
         ```
 
-        **Step 7 — Complete in wave**
+        **Step 7 — Complete in rollout**
 
         ```
-        result = mcp__agent-gtd__complete_in_wave(
-            wave_run_id="{wave_run_id}",
+        result = mcp__agent-gtd__complete_item_in_rollout(
+            rollout_id="{rollout_id}",
             item_id=item_id,
             outcome="completed",
             merge_actor="manager-autonomous",
@@ -606,16 +607,16 @@ def _build_manage_prompt(
         )
         ```
 
-        `complete_in_wave` does two things for you on `outcome="completed"`:
+        `complete_item_in_rollout` does two things for you on `outcome="completed"`:
         1. Cascades the item's GTD status to `done` (no need to call
            `complete_item` separately).
-        2. Closes the wave automatically if this was the last terminal item,
+        2. Closes the rollout automatically if this was the last terminal item,
            and signals that via `result["graph_complete"]`.
 
         Check the response:
-        - If `result["graph_complete"]` is `true`: the wave is closed. Publish a
+        - If `result["graph_complete"]` is `true`: the rollout is closed. Publish a
           final state if desired (optional), then EXIT with success — do NOT
-          call `advance_wave` again (it will reject the now-completed wave).
+          call `advance_rollout` again (it will reject the now-completed rollout).
         - Otherwise: go back to Step 1 (advance) for the next wave / next
           unblocked items.
 
@@ -623,32 +624,32 @@ def _build_manage_prompt(
 
         Before halting, publish halted state:
         ```
-        mcp__agent-gtd__update_wave_state(
-            wave_run_id="{wave_run_id}",
+        mcp__agent-gtd__update_rollout_state(
+            rollout_id="{rollout_id}",
             phase="halted",
             current_step=<reason>,
         )
         ```
 
-        On any non-recoverable failure, post a comment to the offending wave item
+        On any non-recoverable failure, post a comment to the offending rollout item
         (NOT the launch placeholder item_id):
         ```
         mcp__agent-gtd__add_comment(
-            item_id=<offending_wave_item_id>,
-            content_markdown="Wave halted: <reason>"
+            item_id=<offending_rollout_item_id>,
+            content_markdown="Rollout halted: <reason>"
         )
         ```
-        If there is no specific offending item (e.g. `advance_wave` failed 3 times),
+        If there is no specific offending item (e.g. `advance_rollout` failed 3 times),
         post to the project instead:
         ```
         mcp__agent-gtd__add_comment(
             project_id="{project_id}",
-            content_markdown="Wave halted: <reason>"
+            content_markdown="Rollout halted: <reason>"
         )
         ```
         Then call:
         ```
-        mcp__agent-gtd__halt_wave(wave_run_id="{wave_run_id}", reason=<reason>)
+        mcp__agent-gtd__halt_rollout(rollout_id="{rollout_id}", reason=<reason>)
         ```
         And STOP.
 
@@ -656,7 +657,7 @@ def _build_manage_prompt(
 
         Before auto-merging, inspect the diff. If the build touches any of the following
         patterns, **halt rather than auto-merge** — post a comment explaining why, then
-        call `halt_wave`. This is judgment guidance, not a hard predicate: use your
+        call `halt_rollout`. This is judgment guidance, not a hard predicate: use your
         discretion about whether the change is routine (e.g. a tiny doc fix in a Dockerfile)
         or substantively risky.
 
@@ -667,19 +668,19 @@ def _build_manage_prompt(
         - **Infrastructure units**: `*.service`, `Dockerfile*`, `nginx*.conf`
         - **Env/secrets**: `.env*`, `.envrc*`
 
-        If the diff touches any of these areas, call `halt_wave` and post a comment on
+        If the diff touches any of these areas, call `halt_rollout` and post a comment on
         the offending item explaining why — don't attempt to auto-merge.
 
         ## MCP Tools Available
 
-        `advance_wave`, `complete_in_wave`, `halt_wave`, `replan_wave`, `dispatch_item`,
-        `add_comment`, `get_item`, `update_item`, `list_items`, `get_run_status`,
-        `list_runs`, `list_comments`, `update_wave_state`
+        `advance_rollout`, `complete_item_in_rollout`, `halt_rollout`, `replan_rollout`,
+        `dispatch_item`, `add_comment`, `get_item`, `update_item`, `list_items`,
+        `get_run_status`, `list_runs`, `list_comments`, `update_rollout_state`
 
         ## Rules
 
         - You have max {max_turns} turns. Budget them wisely.
-        - Never touch waves or items outside `wave_run_id={wave_run_id}`.
+        - Never touch rollouts or items outside `rollout_id={rollout_id}`.
         - Never force-push. Push only via the squash merge sequence above.
         - If you are uncertain whether a merge is safe, halt — halting is always safe.
     """

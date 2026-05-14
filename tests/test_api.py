@@ -287,7 +287,7 @@ class TestDispatch:
                 "item_id": "abc12345-6789",
                 "max_turns": 200,
                 "mode": "manage",
-                "wave_run_id": "wr-abc",
+                "rollout_id": "wr-abc",
             },
             headers=auth_headers,
         )
@@ -352,7 +352,7 @@ class TestCancelRun:
 
 class TestDispatchManageMode:
     @patch("agent_gtd_dispatch.main.gtd_client")
-    def test_manage_without_wave_run_id_returns_400(
+    def test_manage_without_rollout_id_returns_400(
         self, mock_client, client, auth_headers
     ):
         resp = client.post(
@@ -361,7 +361,7 @@ class TestDispatchManageMode:
             headers=auth_headers,
         )
         assert resp.status_code == 400
-        assert "wave_run_id" in resp.json()["detail"]
+        assert "rollout_id" in resp.json()["detail"]
 
     @patch("agent_gtd_dispatch.main.dispatch")
     @patch("agent_gtd_dispatch.main.gtd_client")
@@ -393,29 +393,31 @@ class TestDispatchManageMode:
                 "item_id": "abc12345-6789",
                 "max_turns": 200,
                 "mode": "manage",
-                "wave_run_id": "wr-abc",
+                "rollout_id": "wr-abc",
             },
             headers=auth_headers,
         )
         assert resp.status_code == 200
         data = resp.json()
         assert data["mode"] == "manage"
-        assert data["wave_run_id"] == "wr-abc"
+        assert data["rollout_id"] == "wr-abc"
         assert data["branch_name"] is None
 
 
 class TestPlan:
-    @patch("agent_gtd_dispatch.main.wave_planner")
+    @patch("agent_gtd_dispatch.main.rollout_planner")
     def test_no_auth_returns_401(self, mock_planner, client):
         resp = client.post("/plan", json={"item_ids": ["id1"]})
         assert resp.status_code == 401
 
-    @patch("agent_gtd_dispatch.main.wave_planner")
-    def test_valid_request_returns_wave_plan(self, mock_planner, client, auth_headers):
-        from agent_gtd_dispatch.models import DagEdge, WavePlan
+    @patch("agent_gtd_dispatch.main.rollout_planner")
+    def test_valid_request_returns_rollout_plan(
+        self, mock_planner, client, auth_headers
+    ):
+        from agent_gtd_dispatch.models import DagEdge, RolloutPlan
 
-        mock_planner.plan_wave = AsyncMock(
-            return_value=WavePlan(
+        mock_planner.plan_rollout = AsyncMock(
+            return_value=RolloutPlan(
                 nodes=["id1", "id2"],
                 edges=[DagEdge(from_item_id="id1", to_item_id="id2")],
                 planner_model="claude-sonnet-4-6",
@@ -432,14 +434,14 @@ class TestPlan:
         assert data["edges"][0]["to_item_id"] == "id2"
         assert data["planner_model"] == "claude-sonnet-4-6"
 
-    @patch("agent_gtd_dispatch.main.wave_planner")
-    def test_plan_wave_raises_returns_502(self, mock_planner, client, auth_headers):
-        mock_planner.plan_wave = AsyncMock(side_effect=Exception("GTD API down"))
+    @patch("agent_gtd_dispatch.main.rollout_planner")
+    def test_plan_rollout_raises_returns_502(self, mock_planner, client, auth_headers):
+        mock_planner.plan_rollout = AsyncMock(side_effect=Exception("GTD API down"))
         resp = client.post("/plan", json={"item_ids": ["id1"]}, headers=auth_headers)
         assert resp.status_code == 502
         assert "GTD API down" in resp.json()["detail"]
 
-    @patch("agent_gtd_dispatch.main.wave_planner")
+    @patch("agent_gtd_dispatch.main.rollout_planner")
     def test_empty_item_ids_returns_422(self, mock_planner, client, auth_headers):
         resp = client.post("/plan", json={"item_ids": []}, headers=auth_headers)
         assert resp.status_code == 422

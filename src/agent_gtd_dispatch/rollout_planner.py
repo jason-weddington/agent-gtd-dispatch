@@ -1,4 +1,4 @@
-"""Wave planner: calls Claude to produce a dependency DAG for a set of GTD items."""
+"""Rollout planner: calls Claude to produce a dependency DAG for a set of GTD items."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any, cast
 import anthropic
 
 from . import config, gtd_client
-from .models import DagEdge, WavePlan
+from .models import DagEdge, RolloutPlan
 
 logger = logging.getLogger(__name__)
 
@@ -52,14 +52,14 @@ PRODUCE_DAG_TOOL = cast(
 )
 
 
-async def plan_wave(item_ids: list[str]) -> WavePlan:
+async def plan_rollout(item_ids: list[str]) -> RolloutPlan:
     """Fetch items concurrently and call Claude to produce a dependency DAG.
 
     Args:
         item_ids: List of GTD item IDs to plan.
 
     Returns:
-        WavePlan with nodes, edges, and the model used.
+        RolloutPlan with nodes, edges, and the model used.
 
     Raises:
         Exception: If gtd_client.get_item fails for any item, the exception
@@ -78,7 +78,7 @@ async def plan_wave(item_ids: list[str]) -> WavePlan:
     tool_block = next(b for b in response.content if b.type == "tool_use")
     tool_input = cast("dict[str, Any]", tool_block.input)
     edges = _extract_edges(tool_input, set(item_ids))
-    return WavePlan(
+    return RolloutPlan(
         nodes=list(item_ids), edges=edges, planner_model=config.PLANNER_MODEL
     )
 
