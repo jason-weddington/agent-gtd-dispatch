@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 _active_processes: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
 
 # Manage subprocess auto-recovery settings
-MAX_MANAGE_RETRIES = 2
+MAX_MANAGE_RETRIES = config.MAX_MANAGE_RETRIES  # re-exported for tests
 MANAGE_RETRY_BACKOFF_SECONDS = 30
 
 # Frozenset of rollout statuses that indicate a clean/terminal manage exit

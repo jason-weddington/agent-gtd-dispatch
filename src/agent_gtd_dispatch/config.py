@@ -28,6 +28,7 @@ WORKSPACE_ROOT: Path = Path.home() / "workspace"
 MAX_TURNS: int = 100
 TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
 MANAGE_TIMEOUT_SECONDS: int = 4 * 60 * 60  # 4 hours for multi-wave manage runs
+MAX_MANAGE_RETRIES: int = 2  # max auto-recovery relaunches for manage mode
 
 # Planner (wave DAG)
 ANTHROPIC_API_KEY: str = ""

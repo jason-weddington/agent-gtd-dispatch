@@ -343,9 +343,6 @@ def _build_plan_prompt(
     return prompt
 
 
-_MAX_MANAGE_RETRIES_FOR_PROMPT = 2  # mirrors MAX_MANAGE_RETRIES in main.py
-
-
 def _build_manage_prompt(
     rollout_id: str,
     project: dict[str, Any],
@@ -364,7 +361,7 @@ def _build_manage_prompt(
             ## ⚠️ Recovery Context
 
             You are a *recovery* manage agent — a previous manager for this rollout exited unexpectedly
-            (retry attempt {manage_retry_count} of {_MAX_MANAGE_RETRIES_FOR_PROMPT}). The rollout is already in `running`
+            (retry attempt {manage_retry_count} of {config.MAX_MANAGE_RETRIES}). The rollout is already in `running`
             state. Read its current state via `advance_rollout` and continue normally. Items already terminal
             may have unmerged work waiting; process those first before dispatching new ones.
 
