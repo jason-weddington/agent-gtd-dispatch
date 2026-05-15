@@ -58,6 +58,7 @@ def _verify_api_key(
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Initialize config and DB on startup, cancel tasks on shutdown."""
     config.load()
+    dispatch.init_executor()
     await db.init_db()
     orphan_count = await db.reconcile_orphans()
     if orphan_count > 0:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from typing import ClassVar
 from unittest.mock import call, patch
@@ -9,12 +10,13 @@ from unittest.mock import call, patch
 import aiosqlite
 import pytest
 
-from agent_gtd_dispatch import config, db
+from agent_gtd_dispatch import config, db, dispatch
 from agent_gtd_dispatch.dispatch import (
     _MANAGE_ALLOWED_TOOLS,
     branch_name_for_item,
     build_system_prompt,
     cleanup_workspace,
+    init_executor,
     prepare_manage_workspace,
     prepare_workspace,
     repo_name_from_origin,
@@ -1050,3 +1052,105 @@ class TestPrepareManageWorkspace:
             prepare_manage_workspace("git@host:repos/myrepo", "abc123")
 
         assert nested_root.exists()
+
+
+# ---------------------------------------------------------------------------
+# Executor sizing tests (AC2, AC5, AC6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _env(tmp_path, monkeypatch):
+    """Set required env vars and use tmp path for workspace/db.
+
+    Mirrors the pattern from test_api.py so config.load() succeeds.
+    """
+    env = {
+        "DISPATCH_API_KEY": "test-key",
+        "AGENT_GTD_URL": "http://localhost:9999",
+        "AGENT_GTD_API_KEY": "test-gtd-key",
+        "ANTHROPIC_API_KEY": "sk-ant-test",
+        "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+    }
+    with patch.dict(os.environ, env):
+        config.load()
+        yield
+
+
+class TestInitExecutor:
+    def test_creates_executor_with_default_max_workers(self, _env) -> None:
+        """init_executor() with default config uses MAX_CONCURRENT_RUNS=32."""
+        init_executor()
+        assert dispatch._executor is not None
+        assert dispatch._executor._max_workers == 32
+
+    def test_creates_executor_with_configured_max_workers(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """init_executor() respects DISPATCH_MAX_CONCURRENT_RUNS env var."""
+        env = {
+            "DISPATCH_API_KEY": "test-key",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "test-gtd-key",
+            "ANTHROPIC_API_KEY": "sk-ant-test",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+            "DISPATCH_MAX_CONCURRENT_RUNS": "3",
+        }
+        with patch.dict(os.environ, env):
+            config.load()
+            init_executor()
+        assert dispatch._executor is not None
+        assert dispatch._executor._max_workers == 3
+
+    def test_shuts_down_old_executor_on_reinit(self, _env) -> None:
+        """Calling init_executor() twice replaces the old executor."""
+        init_executor()
+        first_executor = dispatch._executor
+        init_executor()
+        second_executor = dispatch._executor
+        assert second_executor is not first_executor
+
+    def test_executor_set_after_init(self, _env) -> None:
+        """_executor module-level var is None before init, set after."""
+        import agent_gtd_dispatch.dispatch as dispatch_module
+
+        dispatch_module._executor = None
+        init_executor()
+        assert dispatch_module._executor is not None
+
+
+class TestMaxConcurrentRunsConfig:
+    def test_default_is_32(self, _env) -> None:
+        """MAX_CONCURRENT_RUNS defaults to 32 when env var is absent."""
+        assert config.MAX_CONCURRENT_RUNS == 32
+
+    def test_reads_from_env_var(self, tmp_path) -> None:
+        """MAX_CONCURRENT_RUNS reads DISPATCH_MAX_CONCURRENT_RUNS from env."""
+        env = {
+            "DISPATCH_API_KEY": "test-key",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "test-gtd-key",
+            "ANTHROPIC_API_KEY": "sk-ant-test",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+            "DISPATCH_MAX_CONCURRENT_RUNS": "9",
+        }
+        with patch.dict(os.environ, env):
+            config.load()
+        assert config.MAX_CONCURRENT_RUNS == 9
+
+    def test_executor_wired_to_config(self, tmp_path) -> None:
+        """End-to-end: env var → config.load() → init_executor() → _executor._max_workers."""
+        env = {
+            "DISPATCH_API_KEY": "test-key",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "test-gtd-key",
+            "ANTHROPIC_API_KEY": "sk-ant-test",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+            "DISPATCH_MAX_CONCURRENT_RUNS": "9",
+        }
+        with patch.dict(os.environ, env):
+            config.load()
+            init_executor()
+        assert config.MAX_CONCURRENT_RUNS == 9
+        assert dispatch._executor is not None
+        assert dispatch._executor._max_workers == 9

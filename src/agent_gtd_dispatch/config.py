@@ -29,6 +29,7 @@ MAX_TURNS: int = 100
 TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
 MANAGE_TIMEOUT_SECONDS: int = 4 * 60 * 60  # 4 hours for multi-wave manage runs
 MAX_MANAGE_RETRIES: int = 2  # max auto-recovery relaunches for manage mode
+MAX_CONCURRENT_RUNS: int = 32  # thread-pool ceiling for run_in_executor
 
 # Planner (wave DAG)
 ANTHROPIC_API_KEY: str = ""
@@ -39,7 +40,7 @@ def load() -> None:
     """Load configuration from environment. Call once at startup."""
     global DISPATCH_API_KEY, AGENT_GTD_URL, AGENT_GTD_API_KEY
     global WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS, MANAGE_TIMEOUT_SECONDS
-    global ANTHROPIC_API_KEY, PLANNER_MODEL
+    global ANTHROPIC_API_KEY, PLANNER_MODEL, MAX_CONCURRENT_RUNS
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
@@ -55,3 +56,4 @@ def load() -> None:
         os.environ.get("DISPATCH_MANAGE_TIMEOUT_SECONDS", "14400")
     )
     PLANNER_MODEL = os.environ.get("DISPATCH_PLANNER_MODEL", "claude-sonnet-4-6")
+    MAX_CONCURRENT_RUNS = int(os.environ.get("DISPATCH_MAX_CONCURRENT_RUNS", "32"))

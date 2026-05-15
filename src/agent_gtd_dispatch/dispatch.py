@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import re
 import subprocess
@@ -15,6 +16,22 @@ from . import config, gtd_client
 from .engines import Engine, build_env
 
 logger = logging.getLogger(__name__)
+
+_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def init_executor() -> None:
+    """Create (or recreate) the module-level ThreadPoolExecutor.
+
+    Must be called after config.load() so that config.MAX_CONCURRENT_RUNS is set.
+    Shuts down the previous executor without waiting for running tasks to finish.
+    """
+    global _executor
+    if _executor is not None:
+        _executor.shutdown(wait=False)
+    _executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=config.MAX_CONCURRENT_RUNS
+    )
 
 
 def repo_name_from_origin(origin: str) -> str:
@@ -851,4 +868,4 @@ async def run_agent(
         return subprocess.CompletedProcess(cmd, proc.returncode, stdout="", stderr="")
 
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _stream)
+    return await loop.run_in_executor(_executor, _stream)
