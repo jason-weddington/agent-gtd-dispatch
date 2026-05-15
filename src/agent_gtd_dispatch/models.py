@@ -24,7 +24,7 @@ class Run(BaseModel):
     """A single dispatch run record."""
 
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
-    item_id: str
+    item_id: str | None = None
     project_name: str
     branch_name: str | None = None
     engine: str = "claude"
@@ -43,7 +43,7 @@ class Run(BaseModel):
 class DispatchRequest(BaseModel):
     """Request body for the /dispatch endpoint."""
 
-    item_id: str
+    item_id: str | None = None
     max_turns: int
     engine: str = "claude"
     agent_name: str | None = None
@@ -57,7 +57,7 @@ class RunResponse(BaseModel):
     """Response model for run endpoints."""
 
     id: str
-    item_id: str
+    item_id: str | None
     project_name: str
     branch_name: str | None
     engine: str

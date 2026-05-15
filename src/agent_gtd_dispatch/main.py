@@ -8,7 +8,7 @@ import subprocess
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -185,13 +185,22 @@ async def _dispatch_worker(
     _human_cancelled = False
 
     try:
-        # Fetch item and project
-        item = await gtd_client.get_item(run.item_id)
-        project_id = item.get("project_id")
-        if not project_id:
-            raise ValueError("Item has no project assigned")
-
-        project = await gtd_client.get_project(project_id)
+        # Fetch item and project.
+        # manage-mode runs have item_id=None — derive project from the rollout instead.
+        item: dict[str, Any] = {}
+        if run.item_id is not None:
+            item = await gtd_client.get_item(run.item_id)
+            project_id = item.get("project_id")
+            if not project_id:
+                raise ValueError("Item has no project assigned")
+            project = await gtd_client.get_project(project_id)
+        else:
+            assert run.rollout_id is not None  # noqa: S101 — guaranteed by route handler
+            rollout_info = await gtd_client.get_rollout(run.rollout_id)
+            project_id = rollout_info.get("project_id")
+            if not project_id:
+                raise ValueError("Rollout has no project assigned")
+            project = await gtd_client.get_project(project_id)
 
         # Build workspace
         git_origin = project.get("git_origin", "")
@@ -211,6 +220,8 @@ async def _dispatch_worker(
             await db.update_run(run.id, workspace_path=str(workspace))
 
             # Stage any attachments into {run_id}-attachments/ inside the workspace
+            # item_id is guaranteed non-None for non-manage modes (validated at route layer)
+            assert run.item_id is not None  # noqa: S101
             attachments = await dispatch.stage_attachments(
                 workspace, run.id, run.item_id
             )
@@ -227,6 +238,7 @@ async def _dispatch_worker(
             manage_retry_count=manage_retry_count,
         )
 
+        item_title = item.get("title", f"rollout:{run.rollout_id}")
         if mode == "manage":
             dispatch_comment = (
                 f"Rollout manager dispatched (run `{run.id}`, engine: {engine.name}). "
@@ -238,18 +250,19 @@ async def _dispatch_worker(
                 f"Working on branch `{run.branch_name}` in `{project['name']}`."
             )
 
-        await gtd_client.post_comment(
-            run.item_id,
-            dispatch_comment,
-            created_by=f"{engine.name}-dispatch",
-        )
+        if run.item_id is not None:
+            await gtd_client.post_comment(
+                run.item_id,
+                dispatch_comment,
+                created_by=f"{engine.name}-dispatch",
+            )
 
         agent_allowed_tools = list(_MANAGE_ALLOWED_TOOLS) if mode == "manage" else None
         result = await dispatch.run_agent(
             engine,
             workspace,
             system_prompt,
-            item["title"],
+            item_title,
             max_turns,
             run.agent_name,
             timeout_seconds,
@@ -284,7 +297,7 @@ async def _dispatch_worker(
             )
             if mode == "manage":
                 should_cleanup = False  # preserve workspace for debugging
-            if error_msg:
+            if error_msg and run.item_id is not None:
                 await gtd_client.post_comment(
                     run.item_id,
                     f"Agent exited with code {result.returncode} (run `{run.id}`)."
@@ -299,12 +312,13 @@ async def _dispatch_worker(
             completed_at=datetime.now(UTC).isoformat(),
             error=f"Timed out after {timeout_seconds}s",
         )
-        await gtd_client.post_comment(
-            run.item_id,
-            f"Agent timed out after {timeout_seconds // 60} minutes (run `{run.id}`). "
-            "The task may need to be broken down into smaller pieces.",
-            created_by=f"{engine.name}-dispatch",
-        )
+        if run.item_id is not None:
+            await gtd_client.post_comment(
+                run.item_id,
+                f"Agent timed out after {timeout_seconds // 60} minutes (run `{run.id}`). "
+                "The task may need to be broken down into smaller pieces.",
+                created_by=f"{engine.name}-dispatch",
+            )
         if mode == "manage":
             should_cleanup = False
     except asyncio.CancelledError:
@@ -391,32 +405,66 @@ async def dispatch_item(
             status_code=400,
             detail="rollout_id required for mode=manage",
         )
-
-    # Fetch item to validate and get project info
-    try:
-        item = await gtd_client.get_item(body.item_id)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Item not found") from None
-
-    project_id = item.get("project_id")
-    if not project_id:
-        raise HTTPException(status_code=400, detail="Item has no project assigned")
-
-    try:
-        project = await gtd_client.get_project(project_id)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Project not found") from None
-
-    if not project.get("git_origin"):
+    if body.mode != "manage" and not body.item_id:
         raise HTTPException(
             status_code=400,
-            detail=f"Project '{project['name']}' has no git_origin configured",
+            detail=f"item_id required for mode={body.mode}",
         )
 
     if body.mode == "manage":
+        # Derive project from rollout — item_id is None for manage-mode runs
+        assert body.rollout_id is not None  # noqa: S101 — validated above
+        try:
+            rollout = await gtd_client.get_rollout(body.rollout_id)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Rollout not found") from None
+
+        project_id = rollout.get("project_id")
+        if not project_id:
+            raise HTTPException(
+                status_code=400, detail="Rollout has no project assigned"
+            )
+
+        try:
+            project = await gtd_client.get_project(project_id)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+        if not project.get("git_origin"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Project '{project['name']}' has no git_origin configured",
+            )
+
         branch_name = None
+        item_id_for_run: str | None = None
     else:
+        # item_id validated non-empty above
+        assert body.item_id is not None  # noqa: S101
+        # Fetch item to validate and get project info
+        try:
+            item = await gtd_client.get_item(body.item_id)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Item not found") from None
+
+        project_id = item.get("project_id")
+        if not project_id:
+            raise HTTPException(status_code=400, detail="Item has no project assigned")
+
+        try:
+            project = await gtd_client.get_project(project_id)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Project not found") from None
+
+        if not project.get("git_origin"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Project '{project['name']}' has no git_origin configured",
+            )
+
         branch_name = dispatch.branch_name_for_item(body.item_id, item["title"])
+        item_id_for_run = body.item_id
+
     max_turns = body.max_turns
     if body.timeout_minutes:
         timeout_seconds = body.timeout_minutes * 60
@@ -426,7 +474,7 @@ async def dispatch_item(
         timeout_seconds = config.TIMEOUT_SECONDS
 
     run = Run(
-        item_id=body.item_id,
+        item_id=item_id_for_run,
         project_name=project["name"],
         branch_name=branch_name,
         engine=body.engine,

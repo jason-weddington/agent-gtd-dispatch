@@ -264,11 +264,11 @@ class TestDispatch:
         config.MANAGE_TIMEOUT_SECONDS = 14400
         config.TIMEOUT_SECONDS = 1800  # should NOT be used for manage mode
 
-        mock_client.get_item = AsyncMock(
+        mock_client.get_rollout = AsyncMock(
             return_value={
-                "id": "abc12345-6789",
-                "title": "Run wave",
+                "id": "wr-abc",
                 "project_id": "proj1",
+                "status": "running",
             }
         )
         mock_client.get_project = AsyncMock(
@@ -278,13 +278,11 @@ class TestDispatch:
                 "git_origin": "git@ubuntu-vm01:repos/wave-project",
             }
         )
-        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-run-wave"
         mock_dispatch.prepare_manage_workspace.return_value = None
 
         resp = client.post(
             "/dispatch",
             json={
-                "item_id": "abc12345-6789",
                 "max_turns": 200,
                 "mode": "manage",
                 "rollout_id": "wr-abc",
@@ -365,14 +363,14 @@ class TestDispatchManageMode:
 
     @patch("agent_gtd_dispatch.main.dispatch")
     @patch("agent_gtd_dispatch.main.gtd_client")
-    def test_manage_with_wave_run_id_accepted(
+    def test_manage_with_rollout_id_accepted(
         self, mock_client, mock_dispatch, client, auth_headers
     ):
-        mock_client.get_item = AsyncMock(
+        mock_client.get_rollout = AsyncMock(
             return_value={
-                "id": "abc12345-6789",
-                "title": "Run wave",
+                "id": "wr-abc",
                 "project_id": "proj1",
+                "status": "running",
             }
         )
         mock_client.get_project = AsyncMock(
@@ -384,13 +382,11 @@ class TestDispatchManageMode:
         )
         mock_client.post_comment = AsyncMock()
         mock_dispatch.build_system_prompt.return_value = "manage prompt"
-        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-run-wave"
         mock_dispatch.prepare_manage_workspace.return_value = None
 
         resp = client.post(
             "/dispatch",
             json={
-                "item_id": "abc12345-6789",
                 "max_turns": 200,
                 "mode": "manage",
                 "rollout_id": "wr-abc",
@@ -399,9 +395,22 @@ class TestDispatchManageMode:
         )
         assert resp.status_code == 200
         data = resp.json()
+        assert data["item_id"] is None
         assert data["mode"] == "manage"
         assert data["rollout_id"] == "wr-abc"
         assert data["branch_name"] is None
+
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_build_mode_without_item_id_returns_400(
+        self, mock_client, client, auth_headers
+    ):
+        resp = client.post(
+            "/dispatch",
+            json={"max_turns": 50, "mode": "build"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+        assert "item_id" in resp.json()["detail"]
 
 
 class TestPlan:

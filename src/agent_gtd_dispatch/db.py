@@ -23,7 +23,7 @@ async def init_db() -> None:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS runs (
                 id TEXT PRIMARY KEY,
-                item_id TEXT NOT NULL,
+                item_id TEXT,
                 project_name TEXT NOT NULL,
                 branch_name TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -50,7 +50,7 @@ async def _make_branch_name_nullable(db: aiosqlite.Connection) -> None:
     await db.execute("""
         CREATE TABLE runs_new (
             id TEXT PRIMARY KEY,
-            item_id TEXT NOT NULL,
+            item_id TEXT,
             project_name TEXT NOT NULL,
             branch_name TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
@@ -74,6 +74,43 @@ async def _make_branch_name_nullable(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def _make_item_id_nullable(db: aiosqlite.Connection) -> None:
+    """Recreate runs table to make item_id nullable.
+
+    SQLite does not support ALTER COLUMN, so we use the rename-copy pattern.
+    """
+    cursor = await db.execute("PRAGMA table_info(runs)")
+    existing_cols = [row[1] for row in await cursor.fetchall()]
+    cols_csv = ", ".join(existing_cols)
+
+    await db.execute("""
+        CREATE TABLE runs_new (
+            id TEXT PRIMARY KEY,
+            item_id TEXT,
+            project_name TEXT NOT NULL,
+            branch_name TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            started_at TEXT,
+            completed_at TEXT,
+            exit_code INTEGER,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            engine TEXT NOT NULL DEFAULT 'claude',
+            agent_name TEXT,
+            mode TEXT NOT NULL DEFAULT 'build',
+            rollout_id TEXT,
+            workspace_path TEXT
+        )
+    """)
+    # Copy only columns that exist in the current (old) table
+    await db.execute(
+        f"INSERT INTO runs_new ({cols_csv}) SELECT {cols_csv} FROM runs"  # noqa: S608
+    )
+    await db.execute("DROP TABLE runs")
+    await db.execute("ALTER TABLE runs_new RENAME TO runs")
+    await db.commit()
+
+
 async def _migrate_db(db: aiosqlite.Connection) -> None:
     """Add columns introduced after v1.1.0 and fix schema constraints."""
     cursor = await db.execute("PRAGMA table_info(runs)")
@@ -86,6 +123,14 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
         # Re-read column info after table recreation
         cursor2 = await db.execute("PRAGMA table_info(runs)")
         cols_info = await cursor2.fetchall()
+
+    # Migration: make item_id nullable (was NOT NULL before manage-mode dispatch)
+    item_id_col = next((row for row in cols_info if row[1] == "item_id"), None)
+    if item_id_col is not None and item_id_col[3] == 1:  # notnull=1 → needs fix
+        await _make_item_id_nullable(db)
+        # Re-read column info after table recreation
+        cursor3 = await db.execute("PRAGMA table_info(runs)")
+        cols_info = await cursor3.fetchall()
 
     existing = {row[1] for row in cols_info}
 
