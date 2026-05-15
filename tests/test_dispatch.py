@@ -284,6 +284,54 @@ class TestBuildSystemPrompt:
         assert "Claude Code" not in prompt
 
 
+class TestBuildPlanPrompt:
+    _item: ClassVar[dict] = {
+        "id": "abc12345-0000-0000-0000-000000000000",
+        "title": "Fix the login bug",
+        "description": "Users cannot log in with OAuth.",
+    }
+    _project: ClassVar[dict] = {"name": "my-cool-project"}
+
+    def _prompt(self) -> str:
+        return build_system_prompt(
+            self._item,
+            self._project,
+            branch_name=None,
+            max_turns=30,
+            mode="plan",
+        )
+
+    def test_includes_rubric_ollama_criteria(self) -> None:
+        assert "Route to `claude-code-ollama` when ALL of these hold" in self._prompt()
+
+    def test_includes_rubric_anthropic_criteria(self) -> None:
+        assert (
+            "Route to `claude-code` (Anthropic) when ANY of these hold"
+            in self._prompt()
+        )
+
+    def test_includes_engine_selection_step(self) -> None:
+        prompt = self._prompt()
+        assert "build_engine" in prompt
+
+    def test_build_mode_does_not_include_rubric(self) -> None:
+        prompt = build_system_prompt(
+            self._item, self._project, "feat/abc12345", 30, mode="build"
+        )
+        assert "Route to `claude-code-ollama`" not in prompt
+
+    def test_manage_mode_does_not_include_rubric(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            None,
+            30,
+            mode="manage",
+            rollout_id="wr-test-rollout",
+        )
+        assert "Route to `claude-code-ollama`" not in prompt
+
+
 @pytest.fixture
 def workspace_root(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)

@@ -327,7 +327,14 @@ def _build_plan_prompt(
         4. **Add patterns to follow.** Reference existing code the implementer should copy.
         5. **Define scope boundaries.** Explicitly state what NOT to touch.
         6. **Add verification steps.** How to test the changes (commands, expected output).
-        7. **Ask questions if unclear.** If the intent is ambiguous, post a comment asking
+        7. **Select build engine.** Evaluate this task against the Engine-Selection Rubric below.
+           - If ALL "Route to Ollama" criteria are met: call `update_item` with `build_engine="claude-code-ollama"`.
+           - Otherwise: leave `build_engine` unset (vanilla Claude Code is the default).
+           In both cases, append one line to the bottom of the item description:
+           `Build engine: claude-code-ollama — <one-sentence reason>` or
+           `Build engine: claude-code (default) — <one-sentence reason>`.
+           When in doubt, choose `claude-code` — false positives (bad Ollama output) cost more than false negatives.
+        8. **Ask questions if unclear.** If the intent is ambiguous, post a comment asking
            for clarification and stop. Do NOT guess.
 
         ## Rules
@@ -337,6 +344,38 @@ def _build_plan_prompt(
         - Use `update_item` (with the item's current version) to update the description.
         - Use `add_comment` with item_id="{item_id}" for questions or notes.
         - When grooming is complete, set item status to `ready` using `update_item`.
+
+        ## Engine-Selection Rubric
+
+        Two engines are available for build-mode dispatches:
+
+        - **`claude-code` (Anthropic API)** — full-capability default. Strong reasoning, large context, premium cost.
+        - **`claude-code-ollama` (local inference)** — same Claude Code harness, local model. Free, private, slower per token, weaker on hard reasoning.
+
+        ### Route to `claude-code-ollama` when ALL of these hold
+
+        1. **Single-file or tightly bounded** — changes touch 1-3 files, no orchestration across modules
+        2. **Pattern-following** — the AC can be expressed as "make X look like Y" or "do for B what was done for A"; a clear template exists in the codebase
+        3. **Mechanical edits dominate** — renames, string/copy changes, format fixes, type tightening, adding a missing null guard, single-method extractions
+        4. **Tests are clone-and-modify** — new tests fit an existing test pattern; no novel test design
+        5. **No cross-cutting decisions** — no "should this go here or there?" judgment; the right place is obvious from the AC
+        6. **No external system interaction** — pure code, no new API integrations, no novel database queries, no new auth flows
+
+        ### Route to `claude-code` (Anthropic) when ANY of these hold
+
+        1. **Multi-file orchestration** — changes touch 4+ files and require coordinating intent across them
+        2. **Novel design decisions** — the AC says "decide whether…" or "design a way to…"; no template
+        3. **Debugging** — investigating a bug whose root cause isn't named in the description
+        4. **Cross-cutting concerns** — auth, error handling, migration logic, performance work, threading/async correctness
+        5. **New API/protocol surface** — designing endpoints, request/response shapes, message formats
+        6. **Test design from scratch** — the test pattern doesn't exist yet; you're inventing it
+        7. **Wide blast radius** — change affects many consumers (e.g., model field changes, schema migrations)
+        8. **Security or data-integrity sensitive** — auth flows, password handling, encryption
+        9. **Plan/manage mode** — these always use Anthropic; the rubric only applies to `mode=build`
+
+        ### Default policy
+
+        When the task is on the boundary or uncertain, default to `claude-code` (Anthropic). The cost of a failed Ollama attempt outweighs the savings.
 
         ## Reporting
 
