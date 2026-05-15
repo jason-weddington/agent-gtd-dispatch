@@ -35,12 +35,20 @@ MAX_CONCURRENT_RUNS: int = 32  # thread-pool ceiling for run_in_executor
 ANTHROPIC_API_KEY: str = ""
 PLANNER_MODEL: str = "claude-sonnet-4-6"
 
+# Ollama local inference backend
+OLLAMA_BASE_URL: str = ""  # e.g. "http://10.0.0.5:11434/v1"; empty = disabled
+OLLAMA_API_KEY: str = "ollama"  # dummy value; Ollama ignores auth
+OLLAMA_DEFAULT_MODEL: str = "qwen3.5:35b"
+OLLAMA_TIMEOUT_MULTIPLIER: float = 2.0
+
 
 def load() -> None:
     """Load configuration from environment. Call once at startup."""
     global DISPATCH_API_KEY, AGENT_GTD_URL, AGENT_GTD_API_KEY
     global WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS, MANAGE_TIMEOUT_SECONDS
     global ANTHROPIC_API_KEY, PLANNER_MODEL, MAX_CONCURRENT_RUNS
+    global OLLAMA_BASE_URL, OLLAMA_API_KEY, OLLAMA_DEFAULT_MODEL
+    global OLLAMA_TIMEOUT_MULTIPLIER
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
@@ -57,3 +65,9 @@ def load() -> None:
     )
     PLANNER_MODEL = os.environ.get("DISPATCH_PLANNER_MODEL", "claude-sonnet-4-6")
     MAX_CONCURRENT_RUNS = int(os.environ.get("DISPATCH_MAX_CONCURRENT_RUNS", "32"))
+    OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "")
+    OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "ollama")
+    OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "qwen3.5:35b")
+    OLLAMA_TIMEOUT_MULTIPLIER = float(
+        os.environ.get("OLLAMA_TIMEOUT_MULTIPLIER", "2.0")
+    )

@@ -22,7 +22,13 @@ from agent_gtd_dispatch.dispatch import (
     repo_name_from_origin,
     run_agent,
 )
-from agent_gtd_dispatch.engines import CLAUDE, KIRO, build_env, get_engine
+from agent_gtd_dispatch.engines import (
+    CLAUDE,
+    CLAUDE_OLLAMA,
+    KIRO,
+    build_env,
+    get_engine,
+)
 from agent_gtd_dispatch.models import DispatchRequest, Run
 
 
@@ -1154,3 +1160,71 @@ class TestMaxConcurrentRunsConfig:
         assert config.MAX_CONCURRENT_RUNS == 9
         assert dispatch._executor is not None
         assert dispatch._executor._max_workers == 9
+
+
+class TestClaudeOllamaEngine:
+    def test_engine_registered(self) -> None:
+        assert get_engine("claude-code-ollama") is CLAUDE_OLLAMA
+
+    def test_binary_is_claude(self) -> None:
+        assert CLAUDE_OLLAMA.binary == "claude"
+
+    def test_env_injects_base_url(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://10.0.0.5:11434/v1")
+        monkeypatch.setattr(config, "OLLAMA_API_KEY", "ollama")
+        monkeypatch.setattr(config, "OLLAMA_DEFAULT_MODEL", "qwen3.5:35b")
+        env = build_env(CLAUDE_OLLAMA)
+        assert env["ANTHROPIC_BASE_URL"] == "http://10.0.0.5:11434/v1"
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "ollama"  # noqa: S105
+        assert env["ANTHROPIC_MODEL"] == "qwen3.5:35b"
+
+    def test_env_does_not_include_oauth_token(self, monkeypatch) -> None:
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "should-not-appear")
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://10.0.0.5:11434/v1")
+        monkeypatch.setattr(config, "OLLAMA_API_KEY", "ollama")
+        monkeypatch.setattr(config, "OLLAMA_DEFAULT_MODEL", "qwen3.5:35b")
+        env = build_env(CLAUDE_OLLAMA)
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+
+    def test_env_does_not_include_anthropic_api_key(self, monkeypatch) -> None:
+        # Regression guard: ANTHROPIC_API_KEY must never appear even for Ollama engine
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://10.0.0.5:11434/v1")
+        monkeypatch.setattr(config, "OLLAMA_API_KEY", "ollama")
+        monkeypatch.setattr(config, "OLLAMA_DEFAULT_MODEL", "qwen3.5:35b")
+        env = build_env(CLAUDE_OLLAMA)
+        assert "ANTHROPIC_API_KEY" not in env
+
+    def test_command_builder_same_structure_as_claude(self) -> None:
+        cmd = CLAUDE_OLLAMA.build_command("sys", "Fix bug", 20, None)
+        assert cmd[0] == "claude"
+        assert "--dangerously-skip-permissions" in cmd
+        assert "--print" in cmd
+        assert cmd[-1] == "Fix bug"
+
+
+class TestOllamaConfig:
+    def test_defaults(self, _env) -> None:
+        assert config.OLLAMA_BASE_URL == ""
+        assert config.OLLAMA_API_KEY == "ollama"
+        assert config.OLLAMA_DEFAULT_MODEL == "qwen3.5:35b"
+        assert config.OLLAMA_TIMEOUT_MULTIPLIER == 2.0
+
+    def test_reads_from_env(self, tmp_path) -> None:
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "k",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+            "OLLAMA_BASE_URL": "http://10.0.0.5:11434/v1",
+            "OLLAMA_API_KEY": "mykey",
+            "OLLAMA_DEFAULT_MODEL": "llama3:8b",
+            "OLLAMA_TIMEOUT_MULTIPLIER": "3.5",
+        }
+        with patch.dict(os.environ, env):
+            config.load()
+        assert config.OLLAMA_BASE_URL == "http://10.0.0.5:11434/v1"
+        assert config.OLLAMA_API_KEY == "mykey"
+        assert config.OLLAMA_DEFAULT_MODEL == "llama3:8b"
+        assert config.OLLAMA_TIMEOUT_MULTIPLIER == 3.5

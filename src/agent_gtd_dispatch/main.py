@@ -31,6 +31,26 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+
+async def _ollama_health_check() -> tuple[bool, str]:
+    """Check if the Ollama endpoint is reachable.
+
+    Returns (ok, reason). reason is non-empty only when ok=False.
+    """
+    import httpx  # already a dep; import at function scope for clarity
+
+    if not config.OLLAMA_BASE_URL:
+        return False, "OLLAMA_BASE_URL is not configured"
+    url = f"{config.OLLAMA_BASE_URL}/models"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=2.0)
+            resp.raise_for_status()
+        return True, ""
+    except Exception as exc:
+        return False, f"health check to {url} failed: {exc}"
+
+
 # Track running subprocesses for cancellation
 _active_processes: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
 
@@ -178,6 +198,34 @@ async def _dispatch_worker(
     now = datetime.now(UTC).isoformat()
     await db.update_run(run.id, status=RunStatus.running, started_at=now)
 
+    # --- Ollama health check + fallback ---
+    engine_used = engine  # may be replaced below
+    if engine.name == "claude-code-ollama":
+        ok, reason = await _ollama_health_check()
+        if not ok:
+            logger.warning(
+                "Ollama health check failed for run %s: %s — falling back to claude",
+                run.id,
+                reason,
+            )
+            fallback_msg = (
+                f"⚠️ Engine fallback: {reason}. Using claude (Anthropic) instead."
+            )
+            if run.item_id is not None:
+                try:
+                    await gtd_client.post_comment(
+                        run.item_id,
+                        fallback_msg,
+                        created_by="claude-code-ollama-dispatch",
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to post Ollama fallback comment for run %s", run.id
+                    )
+            engine_used = get_engine("claude")
+        else:
+            timeout_seconds = int(timeout_seconds * config.OLLAMA_TIMEOUT_MULTIPLIER)
+
     mode = run.mode or "build"
     workspace = None
     # For manage mode: preserve workspace on failure for debugging.
@@ -242,12 +290,12 @@ async def _dispatch_worker(
         item_title = item.get("title", f"rollout:{run.rollout_id}")
         if mode == "manage":
             dispatch_comment = (
-                f"Rollout manager dispatched (run `{run.id}`, engine: {engine.name}). "
+                f"Rollout manager dispatched (run `{run.id}`, engine: {engine_used.name}). "
                 f"Managing rollout `{run.rollout_id}` in `{project['name']}`."
             )
         else:
             dispatch_comment = (
-                f"Agent dispatched (run `{run.id}`, engine: {engine.name}). "
+                f"Agent dispatched (run `{run.id}`, engine: {engine_used.name}). "
                 f"Working on branch `{run.branch_name}` in `{project['name']}`."
             )
 
@@ -255,12 +303,12 @@ async def _dispatch_worker(
             await gtd_client.post_comment(
                 run.item_id,
                 dispatch_comment,
-                created_by=f"{engine.name}-dispatch",
+                created_by=f"{engine_used.name}-dispatch",
             )
 
         agent_allowed_tools = list(_MANAGE_ALLOWED_TOOLS) if mode == "manage" else None
         result = await dispatch.run_agent(
-            engine,
+            engine_used,
             workspace,
             system_prompt,
             item_title,
@@ -303,7 +351,7 @@ async def _dispatch_worker(
                     run.item_id,
                     f"Agent exited with code {result.returncode} (run `{run.id}`)."
                     f"\n\n```\n{error_msg}\n```",
-                    created_by=f"{engine.name}-dispatch",
+                    created_by=f"{engine_used.name}-dispatch",
                 )
 
     except subprocess.TimeoutExpired:
@@ -318,7 +366,7 @@ async def _dispatch_worker(
                 run.item_id,
                 f"Agent timed out after {timeout_seconds // 60} minutes (run `{run.id}`). "
                 "The task may need to be broken down into smaller pieces.",
-                created_by=f"{engine.name}-dispatch",
+                created_by=f"{engine_used.name}-dispatch",
             )
         if mode == "manage":
             should_cleanup = False
@@ -344,7 +392,7 @@ async def _dispatch_worker(
             dispatch.cleanup_workspace(workspace)
         if run.mode == "manage" and run.rollout_id and not _human_cancelled:
             await _maybe_relaunch_manage(
-                run, max_turns, engine, timeout_seconds, attribution
+                run, max_turns, engine_used, timeout_seconds, attribution
             )
 
 
@@ -395,8 +443,12 @@ async def dispatch_item(
     _: str = Depends(_verify_api_key),
 ) -> RunResponse:
     """Start a new dispatch run for a GTD item."""
+    # Plan-mode and manage-mode always use Anthropic, regardless of requested engine
+    effective_engine_name = body.engine
+    if body.mode != "build" and body.engine == "claude-code-ollama":
+        effective_engine_name = "claude"
     try:
-        engine = get_engine(body.engine)
+        engine = get_engine(effective_engine_name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
@@ -478,7 +530,7 @@ async def dispatch_item(
         item_id=item_id_for_run,
         project_name=project["name"],
         branch_name=branch_name,
-        engine=body.engine,
+        engine=effective_engine_name,
         agent_name=body.agent_name,
         mode=body.mode,
         rollout_id=body.rollout_id,

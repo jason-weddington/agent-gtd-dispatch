@@ -37,6 +37,7 @@ class Engine:
     auth_env_key: str
     env_keys: frozenset[str]
     build_command: Callable[[str, str, int, str | None], list[str]]
+    extra_env_fn: Callable[[], dict[str, str]] | None = None
 
 
 # Manage-mode env exposure
@@ -53,6 +54,8 @@ def build_env(engine: Engine, mode: str = "build") -> dict[str, str]:
         allowed = allowed | frozenset(_MANAGE_EXECUTOR_ENV_KEYS)
     env = {k: v for k, v in os.environ.items() if k in allowed}
     env["HOME"] = str(Path.home())
+    if engine.extra_env_fn is not None:
+        env.update(engine.extra_env_fn())
     return env
 
 
@@ -97,6 +100,17 @@ def _build_kiro_command(
     return cmd
 
 
+def _claude_ollama_extra_env() -> dict[str, str]:
+    """Extra env vars injected into the claude-code-ollama subprocess."""
+    from . import config  # local import so module is readable before config.load()
+
+    return {
+        "ANTHROPIC_BASE_URL": config.OLLAMA_BASE_URL,
+        "ANTHROPIC_AUTH_TOKEN": config.OLLAMA_API_KEY,
+        "ANTHROPIC_MODEL": config.OLLAMA_DEFAULT_MODEL,
+    }
+
+
 # --- Engine instances ---
 
 CLAUDE = Engine(
@@ -119,9 +133,19 @@ KIRO = Engine(
     build_command=_build_kiro_command,
 )
 
+CLAUDE_OLLAMA = Engine(
+    name="claude-code-ollama",
+    binary="claude",
+    auth_env_key="",  # auth is injected via extra_env_fn, not from parent env
+    env_keys=frozenset(),  # no keys inherited from parent env; all via extra_env_fn
+    build_command=_build_claude_command,
+    extra_env_fn=_claude_ollama_extra_env,
+)
+
 ENGINES: dict[str, Engine] = {
     "claude": CLAUDE,
     "kiro": KIRO,
+    "claude-code-ollama": CLAUDE_OLLAMA,
 }
 
 

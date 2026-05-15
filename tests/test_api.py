@@ -328,6 +328,117 @@ class TestDispatch:
         # _dispatch_worker must have been called with attribution kwarg
         assert mock_worker.call_args.kwargs["attribution"] == "claude-build-abc12345"
 
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_dispatch_ollama_engine_accepted(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ):
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={
+                "item_id": "abc12345-6789",
+                "max_turns": 50,
+                "engine": "claude-code-ollama",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["engine"] == "claude-code-ollama"
+
+    async def test_dispatch_ollama_fallback_posts_comment(
+        self, client, auth_headers
+    ) -> None:
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.engines import CLAUDE_OLLAMA
+        from agent_gtd_dispatch.main import _dispatch_worker
+        from agent_gtd_dispatch.models import Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-fallback",
+            project_name="TestProject",
+            branch_name="feat/abc-fix",
+            engine="claude-code-ollama",
+        )
+        await db.insert_run(run)
+
+        post_comment_mock = AsyncMock()
+
+        with (
+            patch(
+                "agent_gtd_dispatch.main._ollama_health_check",
+                new_callable=AsyncMock,
+                return_value=(False, "connection refused"),
+            ),
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_client,
+        ):
+            mock_client.post_comment = post_comment_mock
+            # Make get_item raise so _dispatch_worker stops after the fallback comment
+            mock_client.get_item = AsyncMock(side_effect=Exception("stop early"))
+
+            await _dispatch_worker(run, 50, CLAUDE_OLLAMA, 1800)
+
+        assert post_comment_mock.call_count >= 1
+        first_call_args = post_comment_mock.call_args_list[0]
+        comment_text = first_call_args[0][1]
+        assert "⚠️" in comment_text
+        assert "connection refused" in comment_text
+
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_dispatch_ollama_with_plan_mode_uses_claude(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ):
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={
+                "item_id": "abc12345-6789",
+                "max_turns": 50,
+                "engine": "claude-code-ollama",
+                "mode": "plan",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        # Engine override: plan mode forces claude regardless of requested engine
+        assert data["engine"] == "claude"
+
 
 class TestListRuns:
     def test_empty_list(self, client, auth_headers):
@@ -524,6 +635,50 @@ class TestTranscriptEndpoint:
         resp = client.get(f"/runs/{run.id}/transcript", headers=auth_headers)
         assert resp.status_code == 200
         assert resp.json()["text"] == "no transcript yet"
+
+
+class TestOllamaHealthCheck:
+    async def test_returns_false_when_base_url_empty(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.main import _ollama_health_check
+
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "")
+        ok, reason = await _ollama_health_check()
+        assert ok is False
+        assert "OLLAMA_BASE_URL" in reason
+
+    async def test_returns_true_on_successful_get(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.main import _ollama_health_check
+
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://10.0.0.5:11434/v1")
+
+        mock_resp = AsyncMock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client  # aenter returns itself
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            ok, reason = await _ollama_health_check()
+
+        assert ok is True
+        assert reason == ""
+
+    async def test_returns_false_on_connection_error(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.main import _ollama_health_check
+
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://unreachable:11434/v1")
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client  # aenter returns itself
+        mock_client.get = AsyncMock(side_effect=Exception("connection refused"))
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            ok, reason = await _ollama_health_check()
+
+        assert ok is False
+        assert "connection refused" in reason
 
 
 class TestStartupReconciliation:
