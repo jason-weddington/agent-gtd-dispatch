@@ -35,8 +35,11 @@ MAX_CONCURRENT_RUNS: int = 32  # thread-pool ceiling for run_in_executor
 ANTHROPIC_API_KEY: str = ""
 PLANNER_MODEL: str = "claude-sonnet-4-6"
 
-# Ollama local inference backend
-OLLAMA_BASE_URL: str = ""  # e.g. "http://10.0.0.5:11434/v1"; empty = disabled
+# Ollama local inference backend.
+# OLLAMA_BASE_URL is the Ollama root URL, e.g. "http://10.0.0.5:11434".
+# Do NOT include /v1 or any path suffix — Ollama exposes the Anthropic
+# Messages API at the root. Empty = engine disabled.
+OLLAMA_BASE_URL: str = ""
 OLLAMA_API_KEY: str = "ollama"  # dummy value; Ollama ignores auth
 OLLAMA_DEFAULT_MODEL: str = "qwen3.5:35b"
 OLLAMA_TIMEOUT_MULTIPLIER: float = 2.0

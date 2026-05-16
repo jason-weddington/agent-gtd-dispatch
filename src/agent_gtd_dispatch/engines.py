@@ -100,6 +100,32 @@ def _build_kiro_command(
     return cmd
 
 
+def _build_claude_ollama_command(
+    system_prompt: str,
+    title: str,
+    max_turns: int,
+    agent_name: str | None,
+) -> list[str]:
+    """Build command for claude-code-ollama: same as CLAUDE but injects --model."""
+    from . import config  # local import so module is readable before config.load()
+
+    cmd = [
+        "claude",
+        "--model",
+        config.OLLAMA_DEFAULT_MODEL,
+        "--dangerously-skip-permissions",
+        "--max-turns",
+        str(max_turns),
+        "--system-prompt",
+        system_prompt,
+        "--print",
+    ]
+    if agent_name:
+        cmd.extend(["--agent", agent_name])
+    cmd.append(title)
+    return cmd
+
+
 def _claude_ollama_extra_env() -> dict[str, str]:
     """Extra env vars injected into the claude-code-ollama subprocess."""
     from . import config  # local import so module is readable before config.load()
@@ -107,7 +133,6 @@ def _claude_ollama_extra_env() -> dict[str, str]:
     return {
         "ANTHROPIC_BASE_URL": config.OLLAMA_BASE_URL,
         "ANTHROPIC_AUTH_TOKEN": config.OLLAMA_API_KEY,
-        "ANTHROPIC_MODEL": config.OLLAMA_DEFAULT_MODEL,
     }
 
 
@@ -138,7 +163,7 @@ CLAUDE_OLLAMA = Engine(
     binary="claude",
     auth_env_key="",  # auth is injected via extra_env_fn, not from parent env
     env_keys=frozenset(),  # no keys inherited from parent env; all via extra_env_fn
-    build_command=_build_claude_command,
+    build_command=_build_claude_ollama_command,
     extra_env_fn=_claude_ollama_extra_env,
 )
 

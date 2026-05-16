@@ -41,7 +41,7 @@ async def _ollama_health_check() -> tuple[bool, str]:
 
     if not config.OLLAMA_BASE_URL:
         return False, "OLLAMA_BASE_URL is not configured"
-    url = f"{config.OLLAMA_BASE_URL}/models"
+    url = f"{config.OLLAMA_BASE_URL}/api/tags"
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, timeout=2.0)

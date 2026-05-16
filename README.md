@@ -33,6 +33,17 @@ export DISPATCH_WORKSPACE_ROOT="/path/to/workspaces" # default: ~/workspace
 uv run uvicorn agent_gtd_dispatch.main:app --host 0.0.0.0 --port 8001
 ```
 
+## Ollama local inference
+
+Set `OLLAMA_BASE_URL` to route `claude-code-ollama` dispatches through a local Ollama instance instead of the Anthropic API. If Ollama is unreachable at dispatch time, the engine falls back to vanilla `claude` with a comment posted to the GTD item.
+
+```bash
+export OLLAMA_BASE_URL="http://192.168.1.52:11434"   # root URL — no /v1 suffix
+export OLLAMA_DEFAULT_MODEL="qwen3.5:35b"            # default if omitted
+```
+
+The URL must be the **root** Ollama URL (e.g. `http://host:11434`). Do **not** append `/v1` or any path — Ollama 0.14+ exposes the Anthropic Messages API at the root path, while `/v1` is the OpenAI-compatible surface which Claude Code does not speak.
+
 ## Tests
 
 ```bash

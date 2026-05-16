@@ -1218,17 +1218,21 @@ class TestClaudeOllamaEngine:
         assert CLAUDE_OLLAMA.binary == "claude"
 
     def test_env_injects_base_url(self, monkeypatch) -> None:
-        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://10.0.0.5:11434/v1")
+        monkeypatch.setattr(
+            config, "OLLAMA_BASE_URL", "http://10.0.0.5:11434"
+        )  # no /v1
         monkeypatch.setattr(config, "OLLAMA_API_KEY", "ollama")
         monkeypatch.setattr(config, "OLLAMA_DEFAULT_MODEL", "qwen3.5:35b")
         env = build_env(CLAUDE_OLLAMA)
-        assert env["ANTHROPIC_BASE_URL"] == "http://10.0.0.5:11434/v1"
+        assert env["ANTHROPIC_BASE_URL"] == "http://10.0.0.5:11434"
         assert env["ANTHROPIC_AUTH_TOKEN"] == "ollama"  # noqa: S105
-        assert env["ANTHROPIC_MODEL"] == "qwen3.5:35b"
+        assert (
+            "ANTHROPIC_MODEL" not in env
+        )  # AC-3: model comes from --model flag, not env
 
     def test_env_does_not_include_oauth_token(self, monkeypatch) -> None:
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "should-not-appear")
-        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://10.0.0.5:11434/v1")
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://10.0.0.5:11434")
         monkeypatch.setattr(config, "OLLAMA_API_KEY", "ollama")
         monkeypatch.setattr(config, "OLLAMA_DEFAULT_MODEL", "qwen3.5:35b")
         env = build_env(CLAUDE_OLLAMA)
@@ -1237,18 +1241,25 @@ class TestClaudeOllamaEngine:
     def test_env_does_not_include_anthropic_api_key(self, monkeypatch) -> None:
         # Regression guard: ANTHROPIC_API_KEY must never appear even for Ollama engine
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://10.0.0.5:11434/v1")
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://10.0.0.5:11434")
         monkeypatch.setattr(config, "OLLAMA_API_KEY", "ollama")
         monkeypatch.setattr(config, "OLLAMA_DEFAULT_MODEL", "qwen3.5:35b")
         env = build_env(CLAUDE_OLLAMA)
         assert "ANTHROPIC_API_KEY" not in env
 
-    def test_command_builder_same_structure_as_claude(self) -> None:
+    def test_command_builder_same_structure_as_claude(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "OLLAMA_DEFAULT_MODEL", "qwen3.5:35b")
         cmd = CLAUDE_OLLAMA.build_command("sys", "Fix bug", 20, None)
         assert cmd[0] == "claude"
+        assert "--model" in cmd
+        assert cmd[cmd.index("--model") + 1] == "qwen3.5:35b"
         assert "--dangerously-skip-permissions" in cmd
         assert "--print" in cmd
         assert cmd[-1] == "Fix bug"
+
+    def test_vanilla_claude_command_has_no_model_flag(self) -> None:
+        cmd = CLAUDE.build_command("sys", "Fix bug", 20, None)
+        assert "--model" not in cmd
 
 
 class TestOllamaConfig:
