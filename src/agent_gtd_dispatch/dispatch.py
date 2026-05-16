@@ -322,27 +322,38 @@ def _build_plan_prompt(
         ## What to do
 
         1. **Read the codebase.** Understand existing patterns, architecture, and conventions.
-        2. **Write acceptance criteria.** Update the item description with clear, testable AC.
-        3. **Identify files to modify.** List specific file paths and what changes in each.
-        4. **Add patterns to follow.** Reference existing code the implementer should copy.
-        5. **Define scope boundaries.** Explicitly state what NOT to touch.
-        6. **Add verification steps.** How to test the changes (commands, expected output).
-        7. **Select build engine.** Evaluate this task against the Engine-Selection Rubric below.
+        2. **Write structured fields.** Call `update_item` with the structured fields — legality
+           validation reads these, not description prose, so these calls are mandatory:
+           - `acceptance_criteria`: list of testable AC strings, e.g.
+             `acceptance_criteria=["AC-1: the widget renders", "AC-2: tests pass"]`
+           - `files_to_modify`: list of dicts with `"path"` and `"change"` keys, e.g.
+             `files_to_modify=[{{"path": "src/foo.py", "change": "add error handling"}}, ...]`
+           - `scope_out`: list of things explicitly out of scope, e.g.
+             `scope_out=["Do NOT change the API surface", "Do NOT touch unrelated modules"]`
+           Free-form `description` is still fine for context/lead paragraph, but the structured
+           fields are the source of truth that the legality validator checks.
+        3. **Add patterns to follow.** Reference existing code the implementer should copy.
+        4. **Define scope boundaries.** Explicitly state what NOT to touch (use `scope_out`).
+        5. **Add verification steps.** How to test the changes (commands, expected output).
+        6. **Select build engine.** Evaluate this task against the Engine-Selection Rubric below.
            - Route to one of the four engines per the rubric criteria.
-           - Call `update_item` with `build_engine="<engine-name>"` if routing to anything other than the default (e.g. `build_engine="claude-code-ollama"`, `"claude-code-haiku"`, or `"claude-code-sonnet"`).
-           - Leave `build_engine` unset (don't call update_item for it) to route to `claude-code` (default Opus).
-           In all cases, append one line to the bottom of the item description:
-           `Build engine: <engine-name> — <one-sentence reason>` or
-           `Build engine: claude-code (default) — <one-sentence reason>`.
-           When uncertain, route UP (toward Opus), not down.
-        8. **Ask questions if unclear.** If the intent is ambiguous, post a comment asking
+           - Call `update_item(build_engine="<engine-name>")` if routing to anything other than the
+             default (e.g. `build_engine="claude-code-ollama"`, `"claude-code-haiku"`, or
+             `"claude-code-sonnet"`).
+           - Leave `build_engine` unset (don't call update_item for it) to route to `claude-code`
+             (default Opus).
+           - When uncertain, route UP (toward Opus), not down.
+        7. **Ask questions if unclear.** If the intent is ambiguous, post a comment asking
            for clarification and stop. Do NOT guess.
 
         ## Rules
 
         - Do NOT write code, create branches, or push anything.
         - Do NOT modify any files in the repo.
-        - Use `update_item` (with the item's current version) to update the description.
+        - Use `update_item` (with the item's current version) to set structured fields
+          (`acceptance_criteria`, `files_to_modify`, `scope_out`) and optionally `description`.
+        - **Legality validation reads `acceptance_criteria` and `files_to_modify` from the
+          structured fields only** — prose Markdown in `description` is ignored by the validator.
         - Use `add_comment` with item_id="{item_id}" for questions or notes.
         - When grooming is complete, set item status to `ready` using `update_item`.
 
@@ -372,7 +383,7 @@ def _build_plan_prompt(
 
         ### Route to `claude-code-sonnet` when
 
-        - Description has explicit `## Acceptance Criteria` + `## Files to Modify` AND
+        - Item has populated `acceptance_criteria` and `files_to_modify` structured fields AND
         - Task is too complex for mechanical pattern-matching (4+ files, or per-file logic is non-trivial), BUT
         - No novel design decisions, no debugging, no cross-cutting judgment
         - "Well-scoped non-trivial" sweet spot — the plan agent did the thinking, builder needs strong execution
@@ -398,7 +409,7 @@ def _build_plan_prompt(
         Post a comment when you start: "Planning..."
 
         **On success:**
-        1. Post a comment summarizing what you added to the description
+        1. Post a comment summarizing the structured fields you set and the build engine selected
         2. Set item status to `ready`
 
         **On failure/blocked:**

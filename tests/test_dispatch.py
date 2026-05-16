@@ -329,6 +329,29 @@ class TestBuildPlanPrompt:
         prompt = self._prompt()
         assert "build_engine" in prompt
 
+    def test_structured_fields_update_item_call(self) -> None:
+        prompt = self._prompt()
+        assert "acceptance_criteria" in prompt
+        assert "files_to_modify" in prompt
+        assert "scope_out" in prompt
+
+    def test_no_markdown_section_write_instructions(self) -> None:
+        prompt = self._prompt()
+        # Prompt must NOT instruct the agent to write Markdown sections into description
+        assert "## Acceptance Criteria" not in prompt
+        assert "## Files to Modify" not in prompt
+        assert "## Out of scope" not in prompt
+
+    def test_no_build_engine_dual_write_to_description(self) -> None:
+        prompt = self._prompt()
+        # Prompt must NOT tell the agent to append "Build engine: ..." to description
+        assert "Build engine: <engine-name>" not in prompt
+        assert "Build engine: claude-code (default)" not in prompt
+
+    def test_legality_validation_note_in_rules(self) -> None:
+        prompt = self._prompt()
+        assert "Legality validation reads" in prompt
+
     def test_build_mode_does_not_include_rubric(self) -> None:
         prompt = build_system_prompt(
             self._item, self._project, "feat/abc12345", 30, mode="build"
