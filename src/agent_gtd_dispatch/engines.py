@@ -136,6 +136,54 @@ def _claude_ollama_extra_env() -> dict[str, str]:
     }
 
 
+def _build_claude_sonnet_command(
+    system_prompt: str,
+    title: str,
+    max_turns: int,
+    agent_name: str | None,
+) -> list[str]:
+    """Build command for claude-code-sonnet: same as CLAUDE but pinned to Sonnet 4.6."""
+    cmd = [
+        "claude",
+        "--model",
+        "claude-sonnet-4-6",
+        "--dangerously-skip-permissions",
+        "--max-turns",
+        str(max_turns),
+        "--system-prompt",
+        system_prompt,
+        "--print",
+    ]
+    if agent_name:
+        cmd.extend(["--agent", agent_name])
+    cmd.append(title)
+    return cmd
+
+
+def _build_claude_haiku_command(
+    system_prompt: str,
+    title: str,
+    max_turns: int,
+    agent_name: str | None,
+) -> list[str]:
+    """Build command for claude-code-haiku: same as CLAUDE but pinned to Haiku 4.5."""
+    cmd = [
+        "claude",
+        "--model",
+        "claude-haiku-4-5-20251001",
+        "--dangerously-skip-permissions",
+        "--max-turns",
+        str(max_turns),
+        "--system-prompt",
+        system_prompt,
+        "--print",
+    ]
+    if agent_name:
+        cmd.extend(["--agent", agent_name])
+    cmd.append(title)
+    return cmd
+
+
 # --- Engine instances ---
 
 CLAUDE = Engine(
@@ -167,10 +215,30 @@ CLAUDE_OLLAMA = Engine(
     extra_env_fn=_claude_ollama_extra_env,
 )
 
+CLAUDE_SONNET = Engine(
+    name="claude-code-sonnet",
+    binary="claude",
+    auth_env_key="CLAUDE_CODE_OAUTH_TOKEN",
+    # ANTHROPIC_API_KEY is deliberately NOT exposed — see kb-01512.
+    env_keys=frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}),
+    build_command=_build_claude_sonnet_command,
+)
+
+CLAUDE_HAIKU = Engine(
+    name="claude-code-haiku",
+    binary="claude",
+    auth_env_key="CLAUDE_CODE_OAUTH_TOKEN",
+    # ANTHROPIC_API_KEY is deliberately NOT exposed — see kb-01512.
+    env_keys=frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}),
+    build_command=_build_claude_haiku_command,
+)
+
 ENGINES: dict[str, Engine] = {
     "claude": CLAUDE,
     "kiro": KIRO,
     "claude-code-ollama": CLAUDE_OLLAMA,
+    "claude-code-sonnet": CLAUDE_SONNET,
+    "claude-code-haiku": CLAUDE_HAIKU,
 }
 
 

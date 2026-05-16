@@ -24,7 +24,9 @@ from agent_gtd_dispatch.dispatch import (
 )
 from agent_gtd_dispatch.engines import (
     CLAUDE,
+    CLAUDE_HAIKU,
     CLAUDE_OLLAMA,
+    CLAUDE_SONNET,
     KIRO,
     build_env,
     get_engine,
@@ -311,9 +313,15 @@ class TestBuildPlanPrompt:
     def test_includes_rubric_ollama_criteria(self) -> None:
         assert "Route to `claude-code-ollama` when ALL of these hold" in self._prompt()
 
+    def test_includes_rubric_haiku_criteria(self) -> None:
+        assert "Route to `claude-code-haiku` when" in self._prompt()
+
+    def test_includes_rubric_sonnet_criteria(self) -> None:
+        assert "Route to `claude-code-sonnet` when" in self._prompt()
+
     def test_includes_rubric_anthropic_criteria(self) -> None:
         assert (
-            "Route to `claude-code` (Anthropic) when ANY of these hold"
+            "Route to `claude-code` (default Opus) when ANY of these hold"
             in self._prompt()
         )
 
@@ -1267,6 +1275,78 @@ class TestClaudeOllamaEngine:
     def test_vanilla_claude_command_has_no_model_flag(self) -> None:
         cmd = CLAUDE.build_command("sys", "Fix bug", 20, None)
         assert "--model" not in cmd
+
+
+class TestClaudeSonnetEngine:
+    def test_engine_registered(self) -> None:
+        assert get_engine("claude-code-sonnet") is CLAUDE_SONNET
+
+    def test_binary_is_claude(self) -> None:
+        assert CLAUDE_SONNET.binary == "claude"
+
+    def test_command_builder_has_model_flag(self) -> None:
+        cmd = CLAUDE_SONNET.build_command("sys", "Fix bug", 20, None)
+        assert cmd[0] == "claude"
+        assert cmd[1] == "--model"
+        assert cmd[2] == "claude-sonnet-4-6"
+        assert "--dangerously-skip-permissions" in cmd
+        assert "--print" in cmd
+        assert cmd[-1] == "Fix bug"
+
+    def test_env_includes_oauth_token(self, monkeypatch) -> None:
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-token")
+        env = build_env(CLAUDE_SONNET)
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "test-token"  # noqa: S105
+
+    def test_env_excludes_anthropic_api_key(self, monkeypatch) -> None:
+        # Regression guard: ANTHROPIC_API_KEY must never appear — see kb-01512
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        env = build_env(CLAUDE_SONNET)
+        assert "ANTHROPIC_API_KEY" not in env
+
+    def test_no_extra_env_fn(self) -> None:
+        assert CLAUDE_SONNET.extra_env_fn is None
+
+    def test_no_ollama_env_injected(self, monkeypatch) -> None:
+        env = build_env(CLAUDE_SONNET)
+        assert "ANTHROPIC_BASE_URL" not in env
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+
+class TestClaudeHaikuEngine:
+    def test_engine_registered(self) -> None:
+        assert get_engine("claude-code-haiku") is CLAUDE_HAIKU
+
+    def test_binary_is_claude(self) -> None:
+        assert CLAUDE_HAIKU.binary == "claude"
+
+    def test_command_builder_has_model_flag(self) -> None:
+        cmd = CLAUDE_HAIKU.build_command("sys", "Fix bug", 20, None)
+        assert cmd[0] == "claude"
+        assert cmd[1] == "--model"
+        assert cmd[2] == "claude-haiku-4-5-20251001"
+        assert "--dangerously-skip-permissions" in cmd
+        assert "--print" in cmd
+        assert cmd[-1] == "Fix bug"
+
+    def test_env_includes_oauth_token(self, monkeypatch) -> None:
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-token")
+        env = build_env(CLAUDE_HAIKU)
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "test-token"  # noqa: S105
+
+    def test_env_excludes_anthropic_api_key(self, monkeypatch) -> None:
+        # Regression guard: ANTHROPIC_API_KEY must never appear — see kb-01512
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        env = build_env(CLAUDE_HAIKU)
+        assert "ANTHROPIC_API_KEY" not in env
+
+    def test_no_extra_env_fn(self) -> None:
+        assert CLAUDE_HAIKU.extra_env_fn is None
+
+    def test_no_ollama_env_injected(self, monkeypatch) -> None:
+        env = build_env(CLAUDE_HAIKU)
+        assert "ANTHROPIC_BASE_URL" not in env
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
 
 
 class TestOllamaConfig:

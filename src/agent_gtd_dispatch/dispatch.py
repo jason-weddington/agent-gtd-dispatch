@@ -328,12 +328,13 @@ def _build_plan_prompt(
         5. **Define scope boundaries.** Explicitly state what NOT to touch.
         6. **Add verification steps.** How to test the changes (commands, expected output).
         7. **Select build engine.** Evaluate this task against the Engine-Selection Rubric below.
-           - If ALL "Route to Ollama" criteria are met: call `update_item` with `build_engine="claude-code-ollama"`.
-           - Otherwise: leave `build_engine` unset (vanilla Claude Code is the default).
-           In both cases, append one line to the bottom of the item description:
-           `Build engine: claude-code-ollama — <one-sentence reason>` or
+           - Route to one of the four engines per the rubric criteria.
+           - Call `update_item` with `build_engine="<engine-name>"` if routing to anything other than the default (e.g. `build_engine="claude-code-ollama"`, `"claude-code-haiku"`, or `"claude-code-sonnet"`).
+           - Leave `build_engine` unset (don't call update_item for it) to route to `claude-code` (default Opus).
+           In all cases, append one line to the bottom of the item description:
+           `Build engine: <engine-name> — <one-sentence reason>` or
            `Build engine: claude-code (default) — <one-sentence reason>`.
-           When in doubt, choose `claude-code` — false positives (bad Ollama output) cost more than false negatives.
+           When uncertain, route UP (toward Opus), not down.
         8. **Ask questions if unclear.** If the intent is ambiguous, post a comment asking
            for clarification and stop. Do NOT guess.
 
@@ -347,35 +348,50 @@ def _build_plan_prompt(
 
         ## Engine-Selection Rubric
 
-        Two engines are available for build-mode dispatches:
+        Four engines are available for build-mode dispatches:
 
-        - **`claude-code` (Anthropic API)** — full-capability default. Strong reasoning, large context, premium cost.
-        - **`claude-code-ollama` (local inference)** — same Claude Code harness, local model. Free, private, slower per token, weaker on hard reasoning.
+        - **`claude-code-ollama`** — local inference, $0 marginal cost, slow per token, weak on hard reasoning
+        - **`claude-code-haiku`** — cloud Haiku 4.5, very cheap, fast, weak-ish reasoning
+        - **`claude-code-sonnet`** — cloud Sonnet 4.6, medium cost, fast, strong reasoning for well-scoped work
+        - **`claude-code` (default Opus)** — cloud Opus, expensive, slower, most capable reasoning
 
         ### Route to `claude-code-ollama` when ALL of these hold
 
-        1. **Single-file or tightly bounded** — changes touch 1-3 files, no orchestration across modules
-        2. **Pattern-following** — the AC can be expressed as "make X look like Y" or "do for B what was done for A"; a clear template exists in the codebase
-        3. **Mechanical edits dominate** — renames, string/copy changes, format fixes, type tightening, adding a missing null guard, single-method extractions
-        4. **Tests are clone-and-modify** — new tests fit an existing test pattern; no novel test design
-        5. **No cross-cutting decisions** — no "should this go here or there?" judgment; the right place is obvious from the AC
-        6. **No external system interaction** — pure code, no new API integrations, no novel database queries, no new auth flows
+        1. Single-file or tightly bounded (1-3 files)
+        2. Pattern-following ("make X look like Y" / "do for B what was done for A")
+        3. Mechanical edits dominate (renames, formats, type tightening, null guards)
+        4. Tests are clone-and-modify; no novel test design
+        5. No cross-cutting decisions; right place is obvious from the AC
+        6. No external system interaction
+        7. **Wall-clock latency is acceptable** — Ollama is slow
 
-        ### Route to `claude-code` (Anthropic) when ANY of these hold
+        ### Route to `claude-code-haiku` when
 
-        1. **Multi-file orchestration** — changes touch 4+ files and require coordinating intent across them
-        2. **Novel design decisions** — the AC says "decide whether…" or "design a way to…"; no template
-        3. **Debugging** — investigating a bug whose root cause isn't named in the description
-        4. **Cross-cutting concerns** — auth, error handling, migration logic, performance work, threading/async correctness
-        5. **New API/protocol surface** — designing endpoints, request/response shapes, message formats
-        6. **Test design from scratch** — the test pattern doesn't exist yet; you're inventing it
-        7. **Wide blast radius** — change affects many consumers (e.g., model field changes, schema migrations)
-        8. **Security or data-integrity sensitive** — auth flows, password handling, encryption
-        9. **Plan/manage mode** — these always use Anthropic; the rubric only applies to `mode=build`
+        - All Ollama criteria above hold, BUT wall-clock matters (you want it done in <60s, not 5min)
+        - Mechanical task where iteration speed > raw cost
+
+        ### Route to `claude-code-sonnet` when
+
+        - Description has explicit `## Acceptance Criteria` + `## Files to Modify` AND
+        - Task is too complex for mechanical pattern-matching (4+ files, or per-file logic is non-trivial), BUT
+        - No novel design decisions, no debugging, no cross-cutting judgment
+        - "Well-scoped non-trivial" sweet spot — the plan agent did the thinking, builder needs strong execution
+
+        ### Route to `claude-code` (default Opus) when ANY of these hold
+
+        1. Multi-file orchestration with coordinating intent across modules
+        2. Novel design decisions ("decide whether…", "design a way to…")
+        3. Debugging (root cause not named in the description)
+        4. Cross-cutting concerns (auth, error handling, migrations, threading)
+        5. New API/protocol surface
+        6. Test design from scratch
+        7. Wide blast radius (model field changes, schema migrations affecting many consumers)
+        8. Security or data-integrity sensitive
+        9. Plan/manage mode — these always use the default; rubric only applies to `mode=build`
 
         ### Default policy
 
-        When the task is on the boundary or uncertain, default to `claude-code` (Anthropic). The cost of a failed Ollama attempt outweighs the savings.
+        When uncertain, route UP (toward Opus), not down. The cost of a failed cheap-engine attempt (re-dispatch + lead intervention) outweighs the savings.
 
         ## Reporting
 
