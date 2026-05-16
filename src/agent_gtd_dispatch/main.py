@@ -48,7 +48,10 @@ async def _ollama_health_check() -> tuple[bool, str]:
             resp.raise_for_status()
         return True, ""
     except Exception as exc:
-        return False, f"health check to {url} failed: {exc}"
+        return False, (
+            f"Invalid OLLAMA_BASE_URL={config.OLLAMA_BASE_URL!r}: "
+            f"health check to {url} failed: {exc}; expected format http://host:port"
+        )
 
 
 # Track running subprocesses for cancellation

@@ -1287,3 +1287,70 @@ class TestOllamaConfig:
         assert config.OLLAMA_API_KEY == "mykey"
         assert config.OLLAMA_DEFAULT_MODEL == "llama3:8b"
         assert config.OLLAMA_TIMEOUT_MULTIPLIER == 3.5
+
+    def test_empty_ollama_base_url_is_valid(self, tmp_path) -> None:
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "k",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+            # OLLAMA_BASE_URL absent = empty = valid
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config.load()  # must not raise
+        assert config.OLLAMA_BASE_URL == ""
+
+    def test_valid_http_url_is_accepted(self, tmp_path) -> None:
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "k",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+            "OLLAMA_BASE_URL": "http://192.168.1.52:11434",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config.load()  # must not raise
+
+    def test_valid_https_url_is_accepted(self, tmp_path) -> None:
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "k",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+            "OLLAMA_BASE_URL": "https://proxy.internal:8080",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config.load()  # must not raise
+
+    def test_missing_scheme_raises_value_error(self, tmp_path) -> None:
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "k",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+            "OLLAMA_BASE_URL": "192.168.1.52",
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ValueError, match="OLLAMA_BASE_URL"),
+        ):
+            config.load()
+
+    def test_missing_host_raises_value_error(self, tmp_path) -> None:
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "k",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+            "OLLAMA_BASE_URL": "http://",
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ValueError, match="OLLAMA_BASE_URL"),
+        ):
+            config.load()

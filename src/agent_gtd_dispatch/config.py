@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import urllib.parse
 from pathlib import Path
 
 
@@ -69,6 +70,15 @@ def load() -> None:
     PLANNER_MODEL = os.environ.get("DISPATCH_PLANNER_MODEL", "claude-sonnet-4-6")
     MAX_CONCURRENT_RUNS = int(os.environ.get("DISPATCH_MAX_CONCURRENT_RUNS", "32"))
     OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "")
+    if OLLAMA_BASE_URL:
+        _parsed = urllib.parse.urlparse(OLLAMA_BASE_URL)
+        if _parsed.scheme not in ("http", "https") or not _parsed.netloc:
+            msg = (
+                f"Invalid OLLAMA_BASE_URL={OLLAMA_BASE_URL!r}: must start with "
+                f"http:// or https:// and include a hostname. "
+                f"Expected format: http://host:port — got {OLLAMA_BASE_URL!r}"
+            )
+            raise ValueError(msg)
     OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "ollama")
     OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "qwen3.5:35b")
     OLLAMA_TIMEOUT_MULTIPLIER = float(
