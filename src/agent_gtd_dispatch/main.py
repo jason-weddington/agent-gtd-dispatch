@@ -24,6 +24,7 @@ from .dispatch import _MANAGE_ALLOWED_TOOLS
 from .engines import Engine, get_engine
 from .models import (
     DispatchRequest,
+    EngineSwap,
     PlanRequest,
     RolloutPlan,
     Run,
@@ -213,6 +214,14 @@ async def _dispatch_worker(
                 run.id,
                 reason,
             )
+            engine_used = get_engine("claude")
+            # Persist fallback signal to DB BEFORE attempting comment post so
+            # that a comment-post outage cannot leave the operator with zero info.
+            await db.update_run(
+                run.id,
+                engine_actual=engine_used.name,
+                error=f"ollama_fallback: {reason}",
+            )
             fallback_msg = (
                 f"⚠️ Engine fallback: {reason}. Using claude (Anthropic) instead."
             )
@@ -221,13 +230,12 @@ async def _dispatch_worker(
                     await gtd_client.post_comment(
                         run.item_id,
                         fallback_msg,
-                        created_by="claude-code-ollama-dispatch",
+                        created_by=attribution or "agent-gtd-dispatch",
                     )
                 except Exception:
                     logger.warning(
                         "Failed to post Ollama fallback comment for run %s", run.id
                     )
-            engine_used = get_engine("claude")
         else:
             timeout_seconds = int(timeout_seconds * config.OLLAMA_TIMEOUT_MULTIPLIER)
 
@@ -308,7 +316,7 @@ async def _dispatch_worker(
             await gtd_client.post_comment(
                 run.item_id,
                 dispatch_comment,
-                created_by=f"{engine_used.name}-dispatch",
+                created_by=attribution or "agent-gtd-dispatch",
             )
 
         agent_allowed_tools = list(_MANAGE_ALLOWED_TOOLS) if mode == "manage" else None
@@ -356,7 +364,7 @@ async def _dispatch_worker(
                     run.item_id,
                     f"Agent exited with code {result.returncode} (run `{run.id}`)."
                     f"\n\n```\n{error_msg}\n```",
-                    created_by=f"{engine_used.name}-dispatch",
+                    created_by=attribution or "agent-gtd-dispatch",
                 )
 
     except subprocess.TimeoutExpired:
@@ -371,7 +379,7 @@ async def _dispatch_worker(
                 run.item_id,
                 f"Agent timed out after {timeout_seconds // 60} minutes (run `{run.id}`). "
                 "The task may need to be broken down into smaller pieces.",
-                created_by=f"{engine_used.name}-dispatch",
+                created_by=attribution or "agent-gtd-dispatch",
             )
         if mode == "manage":
             should_cleanup = False
@@ -459,6 +467,7 @@ async def dispatch_item(
     effective_engine_name = body.engine
     if body.mode != "build" and body.engine == "claude-code-ollama":
         effective_engine_name = "claude"
+    engine_swapped = body.engine != effective_engine_name
     try:
         engine = get_engine(effective_engine_name)
     except ValueError as exc:
@@ -652,12 +661,21 @@ async def dispatch_item(
         item_id=item_id_for_run,
         project_name=project["name"],
         branch_name=branch_name,
-        engine=effective_engine_name,
+        engine=body.engine,
+        engine_actual=effective_engine_name,
         agent_name=body.agent_name,
         mode=body.mode,
         rollout_id=body.rollout_id,
     )
     await db.insert_run(run)
+
+    if engine_swapped:
+        logger.warning(
+            "engine_swap run_id=%s requested=%s effective=%s reason=plan/manage-mode-ollama-unsupported",
+            run.id,
+            body.engine,
+            effective_engine_name,
+        )
 
     # Start background task
     task = asyncio.create_task(
@@ -667,7 +685,16 @@ async def dispatch_item(
     )
     _active_processes[run.id] = task
 
-    return RunResponse(**run.model_dump())
+    return RunResponse(
+        **run.model_dump(),
+        engine_swap=EngineSwap(
+            from_engine=body.engine,
+            to_engine=effective_engine_name,
+            reason="plan/manage mode does not support ollama",
+        )
+        if engine_swapped
+        else None,
+    )
 
 
 @app.get("/runs", response_model=list[RunResponse])

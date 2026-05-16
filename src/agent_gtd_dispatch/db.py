@@ -60,6 +60,7 @@ async def _make_branch_name_nullable(db: aiosqlite.Connection) -> None:
             error TEXT,
             created_at TEXT NOT NULL,
             engine TEXT NOT NULL DEFAULT 'claude',
+            engine_actual TEXT,
             agent_name TEXT,
             mode TEXT NOT NULL DEFAULT 'build',
             rollout_id TEXT
@@ -96,6 +97,7 @@ async def _make_item_id_nullable(db: aiosqlite.Connection) -> None:
             error TEXT,
             created_at TEXT NOT NULL,
             engine TEXT NOT NULL DEFAULT 'claude',
+            engine_actual TEXT,
             agent_name TEXT,
             mode TEXT NOT NULL DEFAULT 'build',
             rollout_id TEXT,
@@ -152,6 +154,8 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE runs ADD COLUMN rollout_id TEXT")
     if "workspace_path" not in existing:
         await db.execute("ALTER TABLE runs ADD COLUMN workspace_path TEXT")
+    if "engine_actual" not in existing:
+        await db.execute("ALTER TABLE runs ADD COLUMN engine_actual TEXT")
     await db.commit()
 
 
@@ -175,16 +179,17 @@ async def insert_run(run: Run) -> None:
     async with aiosqlite.connect(db_path()) as db:
         await db.execute(
             """INSERT INTO runs
-               (id, item_id, project_name, branch_name, engine, agent_name,
-                mode, rollout_id, workspace_path, status, started_at, completed_at,
-                exit_code, error, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, item_id, project_name, branch_name, engine, engine_actual,
+                agent_name, mode, rollout_id, workspace_path, status, started_at,
+                completed_at, exit_code, error, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run.id,
                 run.item_id,
                 run.project_name,
                 run.branch_name,
                 run.engine,
+                run.engine_actual,
                 run.agent_name,
                 run.mode,
                 run.rollout_id,
@@ -209,6 +214,7 @@ async def update_run(
     exit_code: int | None = None,
     error: str | None = None,
     workspace_path: str | None = None,
+    engine_actual: str | None = None,
 ) -> None:
     """Update fields on an existing run."""
     parts: list[str] = []
@@ -231,6 +237,9 @@ async def update_run(
     if workspace_path is not None:
         parts.append("workspace_path = ?")
         values.append(workspace_path)
+    if engine_actual is not None:
+        parts.append("engine_actual = ?")
+        values.append(engine_actual)
 
     if not parts:
         return
@@ -305,6 +314,7 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         project_name=row["project_name"],
         branch_name=row["branch_name"],
         engine=row["engine"],
+        engine_actual=row["engine_actual"],
         agent_name=row["agent_name"],
         mode=row["mode"],
         rollout_id=row["rollout_id"],

@@ -438,8 +438,12 @@ class TestDispatch:
         )
         assert resp.status_code == 200
         data = resp.json()
-        # Engine override: plan mode forces claude regardless of requested engine
-        assert data["engine"] == "claude"
+        # engine = requested engine (preserved); engine_actual = effective engine after rewrite
+        assert data["engine"] == "claude-code-ollama"
+        assert data["engine_actual"] == "claude"
+        assert data["engine_swap"] is not None
+        assert data["engine_swap"]["from_engine"] == "claude-code-ollama"
+        assert data["engine_swap"]["to_engine"] == "claude"
 
 
 class TestListRuns:
