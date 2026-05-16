@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -559,7 +561,11 @@ class TestPlan:
         mock_planner.plan_rollout = AsyncMock(side_effect=Exception("GTD API down"))
         resp = client.post("/plan", json={"item_ids": ["id1"]}, headers=auth_headers)
         assert resp.status_code == 502
-        assert "GTD API down" in resp.json()["detail"]
+        detail = resp.json()["detail"]
+        assert isinstance(detail, dict)
+        assert "GTD API down" in detail["detail"]
+        assert "planner_model" in detail
+        assert detail["item_count"] == 1
 
     @patch("agent_gtd_dispatch.main.rollout_planner")
     def test_empty_item_ids_returns_422(self, mock_planner, client, auth_headers):
@@ -700,3 +706,82 @@ class TestStartupReconciliation:
             data = resp.json()
             assert data["status"] == "failed"
             assert data["error"] == "Service restarted while run was active"
+
+
+def _make_http_status_error(
+    status_code: int, body: str = "error"
+) -> httpx.HTTPStatusError:
+    """Build a minimal httpx.HTTPStatusError for testing."""
+    request = httpx.Request("GET", "http://gtd.local/api/items/abc")
+    response = httpx.Response(status_code, text=body, request=request)
+    return httpx.HTTPStatusError(
+        f"HTTP {status_code}",
+        request=request,
+        response=response,
+    )
+
+
+class TestBoundaryErrors:
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_get_item_404_returns_404(self, mock_client, client, auth_headers) -> None:
+        mock_client.get_item = AsyncMock(side_effect=_make_http_status_error(404))
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc123", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 404
+        data = resp.json()
+        assert data["detail"] == "Item not found"
+
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_get_item_500_returns_502_structured(
+        self, mock_client, client, auth_headers
+    ) -> None:
+        mock_client.get_item = AsyncMock(
+            side_effect=_make_http_status_error(500, "internal server error")
+        )
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc123", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 502
+        data = resp.json()
+        assert "upstream_status" in data["detail"]
+        assert data["detail"]["upstream_status"] == 500
+
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_get_item_connect_error_returns_503(
+        self, mock_client, client, auth_headers
+    ) -> None:
+        request = httpx.Request("GET", "http://gtd.local/api/items/abc")
+        mock_client.get_item = AsyncMock(
+            side_effect=httpx.ConnectError("Connection refused", request=request)
+        )
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc123", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 503
+        data = resp.json()
+        assert isinstance(data["detail"], dict)
+        assert "upstream" in data["detail"]["detail"].lower()
+
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_get_item_malformed_json_returns_502(
+        self, mock_client, client, auth_headers
+    ) -> None:
+        mock_client.get_item = AsyncMock(
+            side_effect=json.JSONDecodeError("Expecting value", "", 0)
+        )
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc123", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 502
+        data = resp.json()
+        assert isinstance(data["detail"], dict)
+        assert "malformed" in data["detail"]["detail"].lower()

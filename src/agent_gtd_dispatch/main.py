@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import subprocess
 from contextlib import asynccontextmanager
@@ -10,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -437,7 +439,14 @@ async def plan_rollout_endpoint(
     try:
         return await rollout_planner.plan_rollout(body.item_ids)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "detail": str(exc),
+                "planner_model": config.PLANNER_MODEL,
+                "item_count": len(body.item_ids),
+            },
+        ) from exc
 
 
 @app.post("/dispatch", response_model=RunResponse)
@@ -472,8 +481,36 @@ async def dispatch_item(
         assert body.rollout_id is not None  # noqa: S101 — validated above
         try:
             rollout = await gtd_client.get_rollout(body.rollout_id)
-        except Exception:
-            raise HTTPException(status_code=404, detail="Rollout not found") from None
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise HTTPException(
+                    status_code=404, detail="Rollout not found"
+                ) from exc
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "detail": "Upstream error fetching rollout",
+                    "upstream_status": exc.response.status_code,
+                    "upstream_body_snippet": exc.response.text[:200],
+                    "upstream_url": str(exc.request.url),
+                },
+            ) from exc
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "detail": "Upstream unreachable fetching rollout",
+                    "upstream_url": str(exc.request.url) if exc.request else None,
+                },
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "detail": "Upstream returned malformed JSON for rollout",
+                    "upstream_url": None,
+                },
+            ) from exc
 
         project_id = rollout.get("project_id")
         if not project_id:
@@ -483,8 +520,36 @@ async def dispatch_item(
 
         try:
             project = await gtd_client.get_project(project_id)
-        except Exception:
-            raise HTTPException(status_code=404, detail="Project not found") from None
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise HTTPException(
+                    status_code=404, detail="Project not found"
+                ) from exc
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "detail": "Upstream error fetching project",
+                    "upstream_status": exc.response.status_code,
+                    "upstream_body_snippet": exc.response.text[:200],
+                    "upstream_url": str(exc.request.url),
+                },
+            ) from exc
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "detail": "Upstream unreachable fetching project",
+                    "upstream_url": str(exc.request.url) if exc.request else None,
+                },
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "detail": "Upstream returned malformed JSON for project",
+                    "upstream_url": None,
+                },
+            ) from exc
 
         if not project.get("git_origin"):
             raise HTTPException(
@@ -500,8 +565,34 @@ async def dispatch_item(
         # Fetch item to validate and get project info
         try:
             item = await gtd_client.get_item(body.item_id)
-        except Exception:
-            raise HTTPException(status_code=404, detail="Item not found") from None
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise HTTPException(status_code=404, detail="Item not found") from exc
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "detail": "Upstream error fetching item",
+                    "upstream_status": exc.response.status_code,
+                    "upstream_body_snippet": exc.response.text[:200],
+                    "upstream_url": str(exc.request.url),
+                },
+            ) from exc
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "detail": "Upstream unreachable fetching item",
+                    "upstream_url": str(exc.request.url) if exc.request else None,
+                },
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "detail": "Upstream returned malformed JSON for item",
+                    "upstream_url": None,
+                },
+            ) from exc
 
         project_id = item.get("project_id")
         if not project_id:
@@ -509,8 +600,36 @@ async def dispatch_item(
 
         try:
             project = await gtd_client.get_project(project_id)
-        except Exception:
-            raise HTTPException(status_code=404, detail="Project not found") from None
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise HTTPException(
+                    status_code=404, detail="Project not found"
+                ) from exc
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "detail": "Upstream error fetching project",
+                    "upstream_status": exc.response.status_code,
+                    "upstream_body_snippet": exc.response.text[:200],
+                    "upstream_url": str(exc.request.url),
+                },
+            ) from exc
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "detail": "Upstream unreachable fetching project",
+                    "upstream_url": str(exc.request.url) if exc.request else None,
+                },
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "detail": "Upstream returned malformed JSON for project",
+                    "upstream_url": None,
+                },
+            ) from exc
 
         if not project.get("git_origin"):
             raise HTTPException(
