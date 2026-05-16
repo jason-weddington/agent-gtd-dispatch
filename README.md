@@ -224,6 +224,34 @@ Don't over-document; under-document and the agent wastes tokens grepping
 around.
 ```
 
+## Protocol package
+
+The `agent_gtd_dispatch_protocol` package lives in `packages/protocol/` and is the single source of truth for the dispatch wire contract. It exports six names:
+
+- `RunStatus` — run lifecycle enum
+- `DispatchRequest` — `POST /dispatch` request body
+- `RunResponse` — run read model returned by run endpoints
+- `PlanRequest` — `POST /plan` request body
+- `DagEdge` — directed dependency edge in a rollout DAG
+- `RolloutPlan` — planner output: nodes + edges + model name
+
+### Using from agent-gtd (or any external caller)
+
+Add the package as a git subdirectory dependency in your `pyproject.toml`:
+
+```toml
+[project]
+dependencies = [
+    "agent-gtd-dispatch-protocol",
+    ...
+]
+
+[tool.uv.sources]
+agent-gtd-dispatch-protocol = { git = "<github-url>", subdirectory = "packages/protocol" }
+```
+
+Replace `<github-url>` with the URL of this repository. Both sides then validate against one schema definition — field renames or new required fields are caught immediately.
+
 ## License
 
 MIT

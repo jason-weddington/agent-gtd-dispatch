@@ -2,11 +2,18 @@ version = 1
 revision = 3
 requires-python = ">=3.12"
 
+[manifest]
+members = [
+    "agent-gtd-dispatch",
+    "agent-gtd-dispatch-protocol",
+]
+
 [[package]]
 name = "agent-gtd-dispatch"
 version = "1.9.0"
 source = { editable = "." }
 dependencies = [
+    { name = "agent-gtd-dispatch-protocol" },
     { name = "aiosqlite" },
     { name = "anthropic" },
     { name = "fastapi" },
@@ -30,6 +37,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agent-gtd-dispatch-protocol", editable = "packages/protocol" },
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "anthropic", specifier = ">=0.40" },
     { name = "fastapi", specifier = ">=0.115" },
@@ -50,6 +58,17 @@ dev = [
     { name = "ruff", specifier = ">=0.9" },
     { name = "types-pyyaml", specifier = ">=6" },
 ]
+
+[[package]]
+name = "agent-gtd-dispatch-protocol"
+version = "0.1.0"
+source = { editable = "packages/protocol" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2" }]
 
 [[package]]
 name = "aiosqlite"
