@@ -1353,7 +1353,7 @@ class TestOllamaConfig:
     def test_defaults(self, _env) -> None:
         assert config.OLLAMA_BASE_URL == ""
         assert config.OLLAMA_API_KEY == "ollama"
-        assert config.OLLAMA_DEFAULT_MODEL == "qwen3.5:35b"
+        assert config.OLLAMA_DEFAULT_MODEL == "qwen3.6:35b"
         assert config.OLLAMA_TIMEOUT_MULTIPLIER == 2.0
 
     def test_reads_from_env(self, tmp_path) -> None:

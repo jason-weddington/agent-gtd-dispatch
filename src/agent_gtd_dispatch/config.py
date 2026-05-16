@@ -42,7 +42,7 @@ PLANNER_MODEL: str = "claude-sonnet-4-6"
 # Messages API at the root. Empty = engine disabled.
 OLLAMA_BASE_URL: str = ""
 OLLAMA_API_KEY: str = "ollama"  # dummy value; Ollama ignores auth
-OLLAMA_DEFAULT_MODEL: str = "qwen3.5:35b"
+OLLAMA_DEFAULT_MODEL: str = "qwen3.6:35b"
 OLLAMA_TIMEOUT_MULTIPLIER: float = 2.0
 
 
@@ -80,7 +80,7 @@ def load() -> None:
             )
             raise ValueError(msg)
     OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "ollama")
-    OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "qwen3.5:35b")
+    OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "qwen3.6:35b")
     OLLAMA_TIMEOUT_MULTIPLIER = float(
         os.environ.get("OLLAMA_TIMEOUT_MULTIPLIER", "2.0")
     )
