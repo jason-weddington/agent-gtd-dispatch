@@ -254,25 +254,32 @@ class TestBuildSystemPrompt:
             max_turns if max_turns is not None else self._max_turns,
         )
 
-    def test_includes_project_and_item_fields(self) -> None:
+    def test_includes_item_id_branch_and_max_turns(self) -> None:
         prompt = self._prompt()
-        assert "my-cool-project" in prompt
-        assert "Fix the login bug" in prompt
         assert "abc12345-0000-0000-0000-000000000000" in prompt
         assert self._branch in prompt
         assert "42" in prompt
 
-    def test_includes_description_when_present(self) -> None:
+    def test_get_item_instruction_present(self) -> None:
         prompt = self._prompt()
-        assert "Users cannot log in with OAuth." in prompt
+        assert "get_item" in prompt
+        assert "abc12345-0000-0000-0000-000000000000" in prompt
 
-    def test_fallback_when_no_description(self) -> None:
+    def test_description_not_embedded(self) -> None:
+        prompt = self._prompt()
+        assert "Users cannot log in with OAuth." not in prompt
+
+    def test_no_description_fallback_text(self) -> None:
         item_no_desc = {
             "id": "abc12345-0000-0000-0000-000000000000",
             "title": "Fix the login bug",
         }
         prompt = self._prompt(item=item_no_desc)
-        assert "No description provided" in prompt
+        assert "No description provided" not in prompt
+
+    def test_no_researching_codebase_milestone(self) -> None:
+        prompt = self._prompt()
+        assert "Researching codebase" not in prompt
 
     def test_says_already_on_branch(self) -> None:
         prompt = self._prompt()

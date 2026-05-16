@@ -773,15 +773,6 @@ def _build_build_prompt(
 ) -> str:
     """System prompt for build mode — implement and push a branch."""
     item_id = item["id"]
-    title = item["title"]
-    description = item.get("description", "")
-    project_name = project["name"]
-
-    desc_block = (
-        f"**Description:**\n{description}"
-        if description
-        else "No description provided — work from the title only."
-    )
 
     files_section = _build_supporting_files_section(attachments, run_id)
 
@@ -800,11 +791,9 @@ def _build_build_prompt(
 
         ## Your Task
 
-        **Project:** {project_name}
-        **Item:** {title}
-        **Item ID:** {item_id}
-
-        {desc_block}
+        Fetch GTD item `{item_id}` via the `get_item` MCP tool. Implement it
+        per its acceptance criteria, modifying the files it specifies.
+        The plan agent has already done the research — trust the spec.
         """
     )
 
@@ -816,7 +805,7 @@ def _build_build_prompt(
 
         ## Rules
 
-        1. **Understand first.** Read the codebase, understand the patterns, then act.
+        1. **Fetch the item first.** Call `get_item` with item_id="{item_id}" as your first action.
         2. **Branch.** You are already on branch `{branch_name}`. Stay on it. Never commit to main.
         3. **Test.** Run the project's test suite before committing. Fix failures.
         4. **Commit.** Use conventional commit messages. Small, focused commits.
@@ -830,7 +819,6 @@ def _build_build_prompt(
         with item_id="{item_id}". Keep comments terse — one line is fine.
 
         Post a comment at each milestone:
-        - When starting research/exploration: "Researching codebase..."
         - When starting implementation: "Implementing..."
         - When running tests: "Running tests..."
 
