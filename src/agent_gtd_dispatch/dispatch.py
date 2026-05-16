@@ -9,8 +9,11 @@ import re
 import subprocess
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from . import config, gtd_client
 from .engines import Engine, build_env
@@ -881,6 +884,7 @@ async def run_agent(
     allowed_tools: list[str] | None = None,
     mode: str = "build",
     attribution: str | None = None,
+    popen_callback: Callable[[subprocess.Popen[bytes]], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a headless agent CLI as a subprocess."""
     if timeout_seconds is None:
@@ -913,6 +917,8 @@ async def run_agent(
                 stdout=f,
                 stderr=subprocess.STDOUT,
             )
+            if popen_callback is not None:
+                popen_callback(proc)
             try:
                 proc.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:

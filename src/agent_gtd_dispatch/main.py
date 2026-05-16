@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import subprocess
@@ -59,6 +60,23 @@ async def _ollama_health_check() -> tuple[bool, str]:
 
 # Track running subprocesses for cancellation
 _active_processes: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
+_active_subprocesses: dict[str, subprocess.Popen[bytes]] = {}
+_run_event_queues: dict[str, asyncio.Queue[dict]] = {}  # type: ignore[type-arg]
+
+
+def _publish_run_event(run_id: str, status: str, completed_at: str | None) -> None:
+    """Publish a status-change event to the run's in-memory event queue."""
+    queue = _run_event_queues.get(run_id)
+    if queue is not None:
+        queue.put_nowait(
+            {
+                "event": "run-status-change",
+                "run_id": run_id,
+                "status": status,
+                "completed_at": completed_at,
+            }
+        )
+
 
 # Manage subprocess auto-recovery settings
 MAX_MANAGE_RETRIES = config.MAX_MANAGE_RETRIES  # re-exported for tests
@@ -203,6 +221,7 @@ async def _dispatch_worker(
     """Background task that executes a dispatch run."""
     now = datetime.now(UTC).isoformat()
     await db.update_run(run.id, status=RunStatus.running, started_at=now)
+    _publish_run_event(run.id, "running", None)
 
     # --- Ollama health check + fallback ---
     engine_used = engine  # may be replaced below
@@ -319,6 +338,9 @@ async def _dispatch_worker(
                 created_by=attribution or "agent-gtd-dispatch",
             )
 
+        def _register_subprocess(proc: subprocess.Popen[bytes]) -> None:
+            _active_subprocesses[run.id] = proc
+
         agent_allowed_tools = list(_MANAGE_ALLOWED_TOOLS) if mode == "manage" else None
         result = await dispatch.run_agent(
             engine_used,
@@ -331,6 +353,7 @@ async def _dispatch_worker(
             allowed_tools=agent_allowed_tools,
             mode=mode,
             attribution=attribution,
+            popen_callback=_register_subprocess,
         )
 
         completed = datetime.now(UTC).isoformat()
@@ -341,6 +364,7 @@ async def _dispatch_worker(
                 completed_at=completed,
                 exit_code=result.returncode,
             )
+            _publish_run_event(run.id, "succeeded", completed)
         else:
             # Derive error snippet from transcript (stdout/stderr are always "" with Popen streaming)
             error_msg = None
@@ -357,6 +381,7 @@ async def _dispatch_worker(
                 exit_code=result.returncode,
                 error=error_msg,
             )
+            _publish_run_event(run.id, "failed", completed)
             if mode == "manage":
                 should_cleanup = False  # preserve workspace for debugging
             if error_msg and run.item_id is not None:
@@ -368,12 +393,14 @@ async def _dispatch_worker(
                 )
 
     except subprocess.TimeoutExpired:
+        _timed_out_at = datetime.now(UTC).isoformat()
         await db.update_run(
             run.id,
             status=RunStatus.timed_out,
-            completed_at=datetime.now(UTC).isoformat(),
+            completed_at=_timed_out_at,
             error=f"Timed out after {timeout_seconds}s",
         )
+        _publish_run_event(run.id, "timed_out", _timed_out_at)
         if run.item_id is not None:
             await gtd_client.post_comment(
                 run.item_id,
@@ -385,11 +412,13 @@ async def _dispatch_worker(
             should_cleanup = False
     except asyncio.CancelledError:
         _human_cancelled = True
+        _cancelled_at = datetime.now(UTC).isoformat()
         await db.update_run(
             run.id,
             status=RunStatus.cancelled,
-            completed_at=datetime.now(UTC).isoformat(),
+            completed_at=_cancelled_at,
         )
+        _publish_run_event(run.id, "cancelled", _cancelled_at)
     except Exception as exc:
         await db.update_run(
             run.id,
@@ -401,6 +430,8 @@ async def _dispatch_worker(
             should_cleanup = False
     finally:
         _active_processes.pop(run.id, None)
+        _active_subprocesses.pop(run.id, None)
+        _run_event_queues.pop(run.id, None)
         if workspace is not None and should_cleanup:
             dispatch.cleanup_workspace(workspace)
         if run.mode == "manage" and run.rollout_id and not _human_cancelled:
@@ -677,6 +708,10 @@ async def dispatch_item(
             effective_engine_name,
         )
 
+    # Create event queue before starting the task so the cancel endpoint
+    # can enqueue events even if the task hasn't started yet.
+    _run_event_queues[run.id] = asyncio.Queue()
+
     # Start background task
     task = asyncio.create_task(
         _dispatch_worker(
@@ -756,24 +791,58 @@ async def cancel_run(
     run_id: str,
     _: str = Depends(_verify_api_key),
 ) -> RunResponse:
-    """Cancel a running dispatch."""
+    """Cancel a running dispatch.
+
+    Idempotent: returns 200 for already-terminal runs without side effects.
+    Sends SIGTERM to the subprocess, waits CANCEL_GRACE_SECONDS, then SIGKILL.
+    Posts a comment on the item (if present) and publishes an SSE event.
+    """
     run = await db.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
-    if run.status != RunStatus.running and run.status != RunStatus.pending:
-        raise HTTPException(
-            status_code=400, detail=f"Cannot cancel run in status '{run.status.value}'"
-        )
 
+    # Idempotent: terminal state → return 200 as-is with no side effects
+    _terminal = {
+        RunStatus.succeeded,
+        RunStatus.failed,
+        RunStatus.timed_out,
+        RunStatus.cancelled,
+    }
+    if run.status in _terminal:
+        return RunResponse(**run.model_dump())
+
+    # Cancel the asyncio task (stops the coroutine at its next await)
     task = _active_processes.get(run_id)
-    if task:
+    if task is not None:
         task.cancel()
 
-    await db.update_run(
-        run_id,
-        status=RunStatus.cancelled,
-        completed_at=datetime.now(UTC).isoformat(),
-    )
+    # Terminate the subprocess: SIGTERM, grace period, then SIGKILL
+    proc = _active_subprocesses.get(run_id)
+    if proc is not None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        await asyncio.sleep(config.CANCEL_GRACE_SECONDS)
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+
+    # Update DB to cancelled
+    completed = datetime.now(UTC).isoformat()
+    await db.update_run(run_id, status=RunStatus.cancelled, completed_at=completed)
+
+    # Post comment (best-effort; failures are logged, not raised)
+    if run.item_id is not None:
+        try:
+            await gtd_client.post_comment(
+                run.item_id,
+                "Run cancelled by lead via agent-gtd",
+                created_by="agent-gtd-dispatch",
+            )
+        except Exception:
+            logger.warning("Failed to post cancellation comment for run %s", run_id)
+
+    # Publish SSE event
+    _publish_run_event(run_id, "cancelled", completed)
 
     run = await db.get_run(run_id)
     if run is None:  # pragma: no cover
