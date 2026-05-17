@@ -739,6 +739,24 @@ class TestBuildManagePrompt:
             "not the launch placeholder item_id"
         )
 
+    def test_no_lower_coverage_threshold_guardrail(self) -> None:
+        prompt = self._prompt()
+        assert "fail_under" in prompt, (
+            "Guardrails section must reference 'fail_under' (the pyproject.toml key)"
+        )
+        assert "NEVER lower" in prompt, (
+            "Guardrails section must include the exact phrase 'NEVER lower'"
+        )
+
+    def test_guardrail_no_verify_and_type_ignore(self) -> None:
+        prompt = self._prompt()
+        assert "--no-verify" in prompt, (
+            "Guardrails section must explicitly prohibit 'git push --no-verify'"
+        )
+        assert "type: ignore" in prompt, (
+            "Guardrails section must explicitly prohibit blanket '# type: ignore' suppressions"
+        )
+
     def test_warm_up_phase_present(self) -> None:
         prompt = self._prompt()
         assert "uv sync" in prompt

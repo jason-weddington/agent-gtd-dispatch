@@ -773,6 +773,28 @@ def _build_manage_prompt(
         If the diff touches any of these areas, call `halt_rollout` and post a comment on
         the offending item explaining why — don't attempt to auto-merge.
 
+        ## Guardrails — Never Lower the Quality Bar
+
+        These rules are absolute. No circumstance justifies violating them.
+
+        **Coverage threshold — ratchets up only:**
+        - NEVER lower `[tool.coverage.report] fail_under` in `pyproject.toml`.
+        - Coverage threshold ratchets up only. After adding tests that increase coverage,
+          raise `fail_under` to lock in the gain — never edit it downward.
+        - If a build fails the pre-push coverage gate, your only options are:
+          1. Add tests to recover coverage (fix the deficit properly).
+          2. Halt the rollout and flag the lead — if the deficit is too large to fix inline.
+        - A `chore: lower coverage threshold` commit is a guardrail violation. If you see
+          one on the branch, revert it before merging.
+
+        **Additional prohibitions — do not cross these lines:**
+        - Do not comment out `pytest` hooks or skip the test suite.
+        - Do not skip linting (`--skip` flags, removing lint steps, etc.).
+        - Do not add blanket `# type: ignore` suppressions to silence type errors.
+        - Do not use `git push --no-verify` to bypass pre-push hooks.
+
+        When in doubt: halt. A halted rollout recovers. A merged regression does not.
+
         ## MCP Tools Available
 
         `advance_rollout`, `complete_item_in_rollout`, `halt_rollout`, `replan_rollout`,
