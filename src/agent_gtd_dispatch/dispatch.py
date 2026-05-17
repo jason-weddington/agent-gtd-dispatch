@@ -337,10 +337,9 @@ def _build_plan_prompt(
         4. **Define scope boundaries.** Explicitly state what NOT to touch (use `scope_out`).
         5. **Add verification steps.** How to test the changes (commands, expected output).
         6. **Select build engine.** Evaluate this task against the Engine-Selection Rubric below.
-           - Route to one of the four engines per the rubric criteria.
+           - Route to one of the three engines per the rubric criteria.
            - Call `update_item(build_engine="<engine-name>")` if routing to anything other than the
-             default (e.g. `build_engine="claude-code-ollama"`, `"claude-code-haiku"`, or
-             `"claude-code-sonnet"`).
+             default (e.g. `build_engine="claude-code-haiku"` or `"claude-code-sonnet"`).
            - Leave `build_engine` unset (don't call update_item for it) to route to `claude-code`
              (default Opus).
            - When uncertain, route UP (toward Opus), not down.
@@ -360,27 +359,20 @@ def _build_plan_prompt(
 
         ## Engine-Selection Rubric
 
-        Four engines are available for build-mode dispatches:
+        Three engines are available for build-mode dispatches:
 
-        - **`claude-code-ollama`** — local inference, $0 marginal cost, slow per token, weak on hard reasoning
         - **`claude-code-haiku`** — cloud Haiku 4.5, very cheap, fast, weak-ish reasoning
         - **`claude-code-sonnet`** — cloud Sonnet 4.6, medium cost, fast, strong reasoning for well-scoped work
         - **`claude-code` (default Opus)** — cloud Opus, expensive, slower, most capable reasoning
 
-        ### Route to `claude-code-ollama` when ALL of these hold
+        ### Route to `claude-code-haiku` when ALL of these hold
 
-        1. Single-file or tightly bounded (1-3 files)
-        2. Pattern-following ("make X look like Y" / "do for B what was done for A")
-        3. Mechanical edits dominate (renames, formats, type tightening, null guards)
-        4. Tests are clone-and-modify; no novel test design
-        5. No cross-cutting decisions; right place is obvious from the AC
-        6. No external system interaction
-        7. **Wall-clock latency is acceptable** — Ollama is slow
-
-        ### Route to `claude-code-haiku` when
-
-        - All Ollama criteria above hold, BUT wall-clock matters (you want it done in <60s, not 5min)
-        - Mechanical task where iteration speed > raw cost
+        1. **Single-file or tightly bounded** — changes touch 1-3 files, no orchestration across modules
+        2. **Pattern-following** — the AC can be expressed as "make X look like Y"; a clear template exists
+        3. **Mechanical edits dominate** — renames, string/copy changes, format fixes, type tightening, null guards
+        4. **Tests are clone-and-modify** — new tests fit an existing test pattern; no novel test design
+        5. **No cross-cutting decisions or novel design** — right place is obvious from AC; no judgment needed
+        6. **Wall-clock speed matters** — Haiku completes in <60 s
 
         ### Route to `claude-code-sonnet` when
 

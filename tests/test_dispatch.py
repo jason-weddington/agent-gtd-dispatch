@@ -310,8 +310,8 @@ class TestBuildPlanPrompt:
             mode="plan",
         )
 
-    def test_includes_rubric_ollama_criteria(self) -> None:
-        assert "Route to `claude-code-ollama` when ALL of these hold" in self._prompt()
+    def test_rubric_does_not_include_ollama_routing(self) -> None:
+        assert "Route to `claude-code-ollama`" not in self._prompt()
 
     def test_includes_rubric_haiku_criteria(self) -> None:
         assert "Route to `claude-code-haiku` when" in self._prompt()
