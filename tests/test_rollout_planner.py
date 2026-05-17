@@ -120,6 +120,53 @@ class TestPlanRollout:
         assert result.edges == []
         assert sorted(result.nodes) == ["id1", "id2"]
 
+    async def test_shared_file_path_produces_edge(self) -> None:
+        """Two items with the same file in files_to_modify; LLM sees path and returns edge."""
+        items = [
+            {
+                "id": "id1",
+                "title": "Item 1",
+                "description": "",
+                "blockers": [],
+                "files_to_modify": [{"path": "src/shared.py", "change": "add helper"}],
+                "acceptance_criteria": [],
+            },
+            {
+                "id": "id2",
+                "title": "Item 2",
+                "description": "",
+                "blockers": [],
+                "files_to_modify": [{"path": "src/shared.py", "change": "use helper"}],
+                "acceptance_criteria": [],
+            },
+        ]
+        mock_response = _make_tool_response(
+            [{"from_item_id": "id1", "to_item_id": "id2"}]
+        )
+        mock_gtd = _make_gtd_client(items)
+        mock_api_client = MagicMock()
+        mock_api_client.messages.create = AsyncMock(return_value=mock_response)
+        mock_anthropic = MagicMock()
+        mock_anthropic.AsyncAnthropic.return_value = mock_api_client
+
+        with (
+            patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+            patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
+        ):
+            from agent_gtd_dispatch.rollout_planner import plan_rollout
+
+            result = await plan_rollout(["id1", "id2"])
+
+        # Edge is returned
+        assert len(result.edges) == 1
+        assert result.edges[0].from_item_id == "id1"
+        assert result.edges[0].to_item_id == "id2"
+
+        # Shared path appeared in the context passed to the LLM
+        call_args = mock_api_client.messages.create.call_args
+        context_str = call_args.kwargs["messages"][0]["content"]
+        assert "src/shared.py" in context_str
+
     async def test_gtd_client_failure_propagates(self) -> None:
         mock_gtd = MagicMock()
         mock_gtd.get_item = AsyncMock(side_effect=RuntimeError("GTD API down"))
@@ -181,6 +228,62 @@ class TestBuildContext:
 
         ctx = _build_context([])
         assert "planning assistant" in ctx
+
+    def test_files_to_modify_paths_rendered(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _build_context
+
+        items = [
+            {
+                "id": "id1",
+                "title": "T",
+                "description": "",
+                "blockers": [],
+                "files_to_modify": [
+                    {"path": "src/foo.py", "change": "add function"},
+                    {"path": "src/bar.py", "change": "update import"},
+                ],
+            }
+        ]
+        ctx = _build_context(items)
+
+        assert "src/foo.py" in ctx
+        assert "src/bar.py" in ctx
+        # change descriptions must NOT appear
+        assert "add function" not in ctx
+        assert "update import" not in ctx
+
+    def test_acceptance_criteria_rendered(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _build_context
+
+        items = [
+            {
+                "id": "id1",
+                "title": "T",
+                "description": "",
+                "blockers": [],
+                "acceptance_criteria": ["AC-1: Do X", "AC-2: Do Y"],
+            }
+        ]
+        ctx = _build_context(items)
+
+        assert "AC-1: Do X" in ctx
+        assert "AC-2: Do Y" in ctx
+
+    def test_empty_files_to_modify_shows_none(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _build_context
+
+        items = [
+            {
+                "id": "id1",
+                "title": "T",
+                "description": "",
+                "blockers": [],
+                "files_to_modify": [],
+            }
+        ]
+        ctx = _build_context(items)
+
+        assert "Files to modify: none" in ctx
 
 
 class TestExtractEdges:

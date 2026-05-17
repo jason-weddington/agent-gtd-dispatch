@@ -87,7 +87,9 @@ def _build_context(items: list[dict[str, Any]]) -> str:
     """Build the user message for the planner LLM call.
 
     Args:
-        items: List of GTD item dicts, each with title, description, and blockers.
+        items: List of GTD item dicts, each with title, description, blockers,
+            files_to_modify (list of {path, change} dicts), and acceptance_criteria
+            (list of strings).
 
     Returns:
         Formatted context string for the planner prompt.
@@ -97,8 +99,8 @@ def _build_context(items: list[dict[str, Any]]) -> str:
         "edges between them.\n"
         "An edge {from_item_id: A, to_item_id: B} means B must wait for A to "
         "complete.\n"
-        "Derive edges from: declared blockers, 'Files to modify' overlaps in "
-        "descriptions, and phrases like 'Depends on X' in AC text.\n"
+        "Derive edges from declared blockers and shared file paths in the structured "
+        "`files_to_modify` field. Same file path across two items = candidate edge.\n"
         "Only reference item_ids from the provided list.\n",
     ]
     for item in items:
@@ -110,8 +112,23 @@ def _build_context(items: list[dict[str, Any]]) -> str:
             blocker_ids = ", ".join(str(b) for b in blockers)
         else:
             blocker_ids = "none"
+        files_to_modify = item.get("files_to_modify", [])
+        if isinstance(files_to_modify, list) and files_to_modify:
+            file_paths = ", ".join(
+                str(f.get("path", "")) for f in files_to_modify if isinstance(f, dict)
+            )
+        else:
+            file_paths = "none"
+        acceptance_criteria = item.get("acceptance_criteria", [])
         lines.append(f"## Item {item_id}: {title}")
         lines.append(f"Blockers (must complete first): {blocker_ids}")
+        lines.append(f"Files to modify: {file_paths}")
+        lines.append("Acceptance criteria:")
+        if isinstance(acceptance_criteria, list) and acceptance_criteria:
+            for ac in acceptance_criteria:
+                lines.append(str(ac))
+        else:
+            lines.append("none")
         lines.append("Description:")
         lines.append(description)
         lines.append("---")
