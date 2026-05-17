@@ -55,7 +55,7 @@ def _make_run(
         project_name="test-project",
         branch_name="feat/item-abc-fix",
         mode=mode,
-        engine="claude",
+        engine="claude-code",
         status=RunStatus(status),
         created_at=datetime.now(UTC),
     )

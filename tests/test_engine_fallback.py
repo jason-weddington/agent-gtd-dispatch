@@ -85,17 +85,17 @@ class TestPlanModeEngineSwap:
 
         # engine = requested (preserved), engine_actual = effective (rewritten)
         assert data["engine"] == "claude-code-ollama"
-        assert data["engine_actual"] == "claude"
+        assert data["engine_actual"] == "claude-code"
         assert data["engine_swap"] is not None
         assert data["engine_swap"]["from_engine"] == "claude-code-ollama"
-        assert data["engine_swap"]["to_engine"] == "claude"
+        assert data["engine_swap"]["to_engine"] == "claude-code"
         assert "plan/manage" in data["engine_swap"]["reason"]
 
         # DB row must also have both fields set correctly
         run = await db.get_run(data["id"])
         assert run is not None
         assert run.engine == "claude-code-ollama"
-        assert run.engine_actual == "claude"
+        assert run.engine_actual == "claude-code"
 
     @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.dispatch")
@@ -203,7 +203,7 @@ class TestOllamaFallbackDbUpdate:
 
         updated = await db.get_run(run.id)
         assert updated is not None
-        assert updated.engine_actual == "claude"
+        assert updated.engine_actual == "claude-code"
         assert updated.error == "ollama_fallback: connection refused"
 
 
@@ -272,7 +272,7 @@ class TestOllamaFallbackCommentFailure:
         updated = await db.get_run(run.id)
         assert updated is not None
         # engine_actual is set by the DB update that precedes the comment post
-        assert updated.engine_actual == "claude"
+        assert updated.engine_actual == "claude-code"
         # The error prefix is preserved; it may have been written before the failed comment
         assert updated.error is not None
         assert updated.error.startswith("ollama_fallback:")
@@ -349,8 +349,8 @@ class TestAttributionVocabulary:
             item_id="item-attr",
             project_name="TestProject",
             branch_name="feat/abc-fix",
-            engine="claude",
-            engine_actual="claude",
+            engine="claude-code",
+            engine_actual="claude-code",
         )
         await db.insert_run(run)
 
@@ -400,8 +400,8 @@ class TestAttributionVocabulary:
             item_id="item-attr",
             project_name="TestProject",
             branch_name="feat/abc-fix",
-            engine="claude",
-            engine_actual="claude",
+            engine="claude-code",
+            engine_actual="claude-code",
         )
         await db.insert_run(run)
 
@@ -456,8 +456,8 @@ class TestAttributionVocabulary:
             item_id="item-attr",
             project_name="TestProject",
             branch_name="feat/abc-fix",
-            engine="claude",
-            engine_actual="claude",
+            engine="claude-code",
+            engine_actual="claude-code",
         )
         await db.insert_run(run)
 
@@ -507,8 +507,8 @@ class TestAttributionVocabulary:
             item_id="item-noattr",
             project_name="TestProject",
             branch_name="feat/abc-fix",
-            engine="claude",
-            engine_actual="claude",
+            engine="claude-code",
+            engine_actual="claude-code",
         )
         await db.insert_run(run)
 

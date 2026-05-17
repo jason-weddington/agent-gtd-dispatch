@@ -139,7 +139,7 @@ class TestPrepareWorkspace:
 
 class TestGetEngine:
     def test_claude(self) -> None:
-        assert get_engine("claude") is CLAUDE
+        assert get_engine("claude-code") is CLAUDE
 
     def test_kiro(self) -> None:
         assert get_engine("kiro") is KIRO

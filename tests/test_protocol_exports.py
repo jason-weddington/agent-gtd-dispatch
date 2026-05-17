@@ -25,7 +25,7 @@ class TestProtocolExports:
             item_id=None,
             project_name="p",
             branch_name=None,
-            engine="claude",
+            engine="claude-code",
             agent_name=None,
             mode="build",
             rollout_id=None,

@@ -29,7 +29,7 @@ class Run(BaseModel):
     item_id: str | None = None
     project_name: str
     branch_name: str | None = None
-    engine: str = "claude"
+    engine: str = "claude-code"
     engine_actual: str | None = None
     agent_name: str | None = None
     mode: str = "build"

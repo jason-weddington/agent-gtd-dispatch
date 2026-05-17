@@ -22,7 +22,7 @@ def _make_run(mode: str = "manage", rollout_id: str = "rollout-abc") -> Run:
         project_name="test-project",
         mode=mode,
         rollout_id=rollout_id,
-        engine="claude",
+        engine="claude-code",
     )
 
 
@@ -199,7 +199,7 @@ async def test_human_cancellation_skips_relaunch() -> None:
         project_name="test-project",
         mode="manage",
         rollout_id="rollout-abc",
-        engine="claude",
+        engine="claude-code",
     )
     await db.insert_run(run)
 
@@ -255,7 +255,7 @@ async def test_build_mode_no_relaunch() -> None:
         project_name="test-project",
         mode="build",
         branch_name="feat/item-build-fix",
-        engine="claude",
+        engine="claude-code",
     )
     await db.insert_run(run)
 

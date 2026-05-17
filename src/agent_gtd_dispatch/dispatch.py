@@ -892,7 +892,7 @@ async def run_agent(
             f"{system_prompt}\n\n---\n\n## Task\n\n{title}"
         )
     cmd = engine.build_command(system_prompt, title, max_turns, agent_name)
-    if allowed_tools is not None and engine.name == "claude":
+    if allowed_tools is not None and engine.name == "claude-code":
         # Insert --allowedTools BEFORE --print.  claude's argparser breaks
         # when --allowedTools sits between --print and the positional prompt
         # ("Error: Input must be provided ... when using --print"); --print

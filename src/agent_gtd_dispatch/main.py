@@ -233,7 +233,7 @@ async def _dispatch_worker(
                 run.id,
                 reason,
             )
-            engine_used = get_engine("claude")
+            engine_used = get_engine("claude-code")
             # Persist fallback signal to DB BEFORE attempting comment post so
             # that a comment-post outage cannot leave the operator with zero info.
             await db.update_run(
@@ -242,7 +242,7 @@ async def _dispatch_worker(
                 error=f"ollama_fallback: {reason}",
             )
             fallback_msg = (
-                f"⚠️ Engine fallback: {reason}. Using claude (Anthropic) instead."
+                f"⚠️ Engine fallback: {reason}. Using claude-code (Anthropic) instead."
             )
             if run.item_id is not None:
                 try:
@@ -497,7 +497,7 @@ async def dispatch_item(
     # Plan-mode and manage-mode always use Anthropic, regardless of requested engine
     effective_engine_name = body.engine
     if body.mode != "build" and body.engine == "claude-code-ollama":
-        effective_engine_name = "claude"
+        effective_engine_name = "claude-code"
     engine_swapped = body.engine != effective_engine_name
     try:
         engine = get_engine(effective_engine_name)

@@ -59,7 +59,7 @@ async def _make_branch_name_nullable(db: aiosqlite.Connection) -> None:
             exit_code INTEGER,
             error TEXT,
             created_at TEXT NOT NULL,
-            engine TEXT NOT NULL DEFAULT 'claude',
+            engine TEXT NOT NULL DEFAULT 'claude-code',
             engine_actual TEXT,
             agent_name TEXT,
             mode TEXT NOT NULL DEFAULT 'build',
@@ -96,7 +96,7 @@ async def _make_item_id_nullable(db: aiosqlite.Connection) -> None:
             exit_code INTEGER,
             error TEXT,
             created_at TEXT NOT NULL,
-            engine TEXT NOT NULL DEFAULT 'claude',
+            engine TEXT NOT NULL DEFAULT 'claude-code',
             engine_actual TEXT,
             agent_name TEXT,
             mode TEXT NOT NULL DEFAULT 'build',
@@ -138,7 +138,7 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
 
     if "engine" not in existing:
         await db.execute(
-            "ALTER TABLE runs ADD COLUMN engine TEXT NOT NULL DEFAULT 'claude'"
+            "ALTER TABLE runs ADD COLUMN engine TEXT NOT NULL DEFAULT 'claude-code'"
         )
     if "agent_name" not in existing:
         await db.execute("ALTER TABLE runs ADD COLUMN agent_name TEXT")
@@ -156,6 +156,8 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE runs ADD COLUMN workspace_path TEXT")
     if "engine_actual" not in existing:
         await db.execute("ALTER TABLE runs ADD COLUMN engine_actual TEXT")
+    # Idempotent rename: migrate any legacy 'claude' engine rows to 'claude-code'
+    await db.execute("UPDATE runs SET engine = 'claude-code' WHERE engine = 'claude'")
     await db.commit()
 
 

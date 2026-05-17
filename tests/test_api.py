@@ -126,7 +126,7 @@ class TestDispatch:
         assert data["item_id"] == "abc12345-6789"
         assert data["status"] == "pending"
         assert data["branch_name"] == "feat/abc12345-fix-bug"
-        assert data["engine"] == "claude"
+        assert data["engine"] == "claude-code"
         assert data["agent_name"] is None
         assert data["id"]  # has a run ID
 
@@ -440,10 +440,10 @@ class TestDispatch:
         data = resp.json()
         # engine = requested engine (preserved); engine_actual = effective engine after rewrite
         assert data["engine"] == "claude-code-ollama"
-        assert data["engine_actual"] == "claude"
+        assert data["engine_actual"] == "claude-code"
         assert data["engine_swap"] is not None
         assert data["engine_swap"]["from_engine"] == "claude-code-ollama"
-        assert data["engine_swap"]["to_engine"] == "claude"
+        assert data["engine_swap"]["to_engine"] == "claude-code"
 
 
 class TestListRuns:

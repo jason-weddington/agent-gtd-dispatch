@@ -24,7 +24,7 @@ class DispatchRequest(BaseModel):
 
     item_id: str | None = None
     max_turns: int
-    engine: str = "claude"
+    engine: str = "claude-code"
     agent_name: str | None = None
     mode: str = "build"
     timeout_minutes: int | None = None

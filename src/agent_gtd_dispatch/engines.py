@@ -50,7 +50,7 @@ def build_env(engine: Engine, mode: str = "build") -> dict[str, str]:
     """Build a filtered env dict for the engine's subprocess."""
     allowed = COMMON_ENV_KEYS | engine.env_keys
     # Manage-mode env exposure: add dispatch URL + key for claude manage-mode executors
-    if engine.name == "claude" and mode == "manage":
+    if engine.name == "claude-code" and mode == "manage":
         allowed = allowed | frozenset(_MANAGE_EXECUTOR_ENV_KEYS)
     env = {k: v for k, v in os.environ.items() if k in allowed}
     env["HOME"] = str(Path.home())
@@ -187,7 +187,7 @@ def _build_claude_haiku_command(
 # --- Engine instances ---
 
 CLAUDE = Engine(
-    name="claude",
+    name="claude-code",
     binary="claude",
     auth_env_key="CLAUDE_CODE_OAUTH_TOKEN",
     # ANTHROPIC_API_KEY is deliberately NOT exposed to Claude Code subprocesses.
@@ -234,7 +234,7 @@ CLAUDE_HAIKU = Engine(
 )
 
 ENGINES: dict[str, Engine] = {
-    "claude": CLAUDE,
+    "claude-code": CLAUDE,
     "kiro": KIRO,
     "claude-code-ollama": CLAUDE_OLLAMA,
     "claude-code-sonnet": CLAUDE_SONNET,
