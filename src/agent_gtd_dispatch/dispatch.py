@@ -695,6 +695,8 @@ def _build_manage_prompt(
         Item: <item_id>
         COMMITEOF
         git push origin <default_branch>
+        git push origin --delete <branch_name>
+        git branch -D <branch_name>
         ```
 
         **Step 7 — Complete in rollout**
@@ -716,9 +718,13 @@ def _build_manage_prompt(
            and signals that via `result["graph_complete"]`.
 
         Check the response:
-        - If `result["graph_complete"]` is `true`: the rollout is closed. Publish a
-          final state if desired (optional), then EXIT with success — do NOT
-          call `advance_rollout` again (it will reject the now-completed rollout).
+        - If `result["graph_complete"]` is `true`: the rollout is closed. Before
+          exiting, clean up the manage branch from origin:
+          ```bash
+          git push origin --delete feat/{rollout_id[:8]}-manage || true
+          ```
+          Then EXIT with success — do NOT call `advance_rollout` again (it will
+          reject the now-completed rollout).
         - Otherwise: go back to Step 1 (advance) for the next wave / next
           unblocked items.
 

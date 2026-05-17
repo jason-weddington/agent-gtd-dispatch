@@ -848,6 +848,13 @@ class TestBuildManagePrompt:
             "Recovery Context block must appear before Phase 1 content"
         )
 
+    def test_branch_delete_on_squash_merge(self) -> None:
+        prompt = self._prompt()
+        assert "git push origin --delete" in prompt, (
+            "Step 6 squash-merge sequence must include 'git push origin --delete' "
+            "to remove the feature branch from origin after merging"
+        )
+
 
 # ---------------------------------------------------------------------------
 # AC-1.1 — rollout_id schema tests
