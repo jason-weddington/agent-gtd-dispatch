@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+from agent_gtd_dispatch_protocol.branches import make_branch_name
+
 from . import config, gtd_client
 from .engines import Engine, build_env
 
@@ -52,11 +54,7 @@ def repo_name_from_origin(origin: str) -> str:
     return Path(parsed.path).stem or "unknown"
 
 
-def branch_name_for_item(item_id: str, title: str) -> str:
-    """Build a branch-safe name from item ID and title."""
-    short_id = item_id[:8]
-    slug = re.sub(r"[^a-z0-9]+", "-", title.lower())[:40].strip("-")
-    return f"feat/{short_id}-{slug}"
+branch_name_for_item = make_branch_name
 
 
 def prepare_workspace(origin: str, run_id: str, branch_name: str) -> Path:

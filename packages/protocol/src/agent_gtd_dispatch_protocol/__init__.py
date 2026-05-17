@@ -7,6 +7,7 @@ agent-gtd) should depend on this package rather than duplicating models.
 
 from __future__ import annotations
 
+from agent_gtd_dispatch_protocol.branches import make_branch_name as make_branch_name
 from agent_gtd_dispatch_protocol.models import DagEdge as DagEdge
 from agent_gtd_dispatch_protocol.models import DispatchRequest as DispatchRequest
 from agent_gtd_dispatch_protocol.models import PlanRequest as PlanRequest
@@ -21,4 +22,5 @@ __all__ = [
     "RolloutPlan",
     "RunResponse",
     "RunStatus",
+    "make_branch_name",
 ]
