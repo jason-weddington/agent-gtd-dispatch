@@ -677,6 +677,23 @@ def _build_manage_prompt(
         )
         ```
 
+        Before merging, run a commit-count guard to confirm the build agent actually
+        pushed commits (guards against a build agent that reported success but pushed
+        no commits):
+        ```bash
+        git fetch origin <branch_name>
+        commit_count=$(git rev-list origin/<default_branch>..<branch_name> --count)
+        ```
+        If `commit_count` is 0 (branch has no commits beyond origin/main), the build
+        agent reported success but pushed no commits. Call:
+        ```
+        mcp__agent-gtd__halt_rollout(
+            rollout_id="{rollout_id}",
+            reason="build agent reported success but pushed no commits: <branch_name> has no commits beyond origin/<default_branch>"
+        )
+        ```
+        and STOP — do not attempt the squash merge.
+
         ```bash
         git checkout <default_branch>
         git merge --squash <branch_name>
@@ -857,9 +874,26 @@ def _build_build_prompt(
         2. **Branch.** You are already on branch `{branch_name}`. Stay on it. Never commit to main.
         3. **Test.** Run the project's test suite before committing. Fix failures.
         4. **Commit.** Use conventional commit messages. Small, focused commits.
-        5. **Push.** When done, push `{branch_name}` to origin.
+        5. **Push.** When done, push `{branch_name}` to origin. After pushing, verify the remote
+           ref advanced — run:
+           ```bash
+           git ls-remote origin refs/heads/{branch_name}
+           ```
+           Compare the returned SHA against `git rev-parse HEAD`. If the SHAs do not match
+           (or no SHA is returned), post a failure comment and do NOT set item status to `review`.
         6. **Stop if stuck.** If the task is too ambiguous, you lack information, or
            you cannot complete it cleanly — STOP. Do not guess or produce low-quality work.{att_rule}
+
+        ## No-Op Case — Work Already Done
+
+        Before writing any code, check whether the acceptance criteria are **already satisfied**
+        by existing code. If no source changes are needed:
+        - Post a comment describing what already exists and why no changes were needed
+          (e.g. "No changes needed — <feature> already implemented at <file>:<line>").
+        - Do NOT push any commits.
+        - Do NOT set item status to `review`. Leave it unchanged (stays `active`) so the lead
+          has a clear signal that no new code was shipped.
+        - STOP.
 
         ## Reporting
 

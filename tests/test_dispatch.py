@@ -292,6 +292,23 @@ class TestBuildSystemPrompt:
         assert "headless coding agent" in prompt
         assert "Claude Code" not in prompt
 
+    def test_verify_remote_ref_guidance_present(self) -> None:
+        prompt = self._prompt()
+        assert "verify the remote ref advanced" in prompt or "git ls-remote" in prompt
+
+    def test_no_op_guidance_present(self) -> None:
+        prompt = self._prompt()
+        assert any(
+            phrase in prompt
+            for phrase in [
+                "no changes needed",
+                "already satisfied",
+                "do not set status to review",
+                "Do NOT set item status to `review`",
+                "No-Op Case",
+            ]
+        )
+
 
 class TestBuildPlanPrompt:
     _item: ClassVar[dict] = {
@@ -854,6 +871,18 @@ class TestBuildManagePrompt:
             "Step 6 squash-merge sequence must include 'git push origin --delete' "
             "to remove the feature branch from origin after merging"
         )
+
+    def test_step_6_commit_count_guard_present(self) -> None:
+        prompt = self._prompt()
+        assert any(
+            phrase in prompt
+            for phrase in [
+                "rev-list",
+                "no commits",
+                "commits beyond",
+                "pushed no commits",
+            ]
+        ), "Step 6 must contain commit-count check language"
 
 
 # ---------------------------------------------------------------------------
