@@ -55,6 +55,21 @@ When `DISPATCH_AGENT_SUBPROCESS_USER=dispatch` is set, the service spawns agent 
 
 When `DISPATCH_AGENT_SUBPROCESS_USER` is empty (the default in dev/test), no user-switching occurs and the service runs everything under its own user — preserving the existing single-user behaviour.
 
+## Deployment
+
+The service uses a **two-user architecture** to enforce POSIX isolation between the API process and the agent subprocesses it spawns:
+
+- **`dispatch-svc`** runs the FastAPI service and owns the working copy at `~/agent-gtd-dispatch`. No agent subprocess can write to this directory.
+- **`dispatch`** is the unprivileged agent user. Agent workspaces live at `/home/dispatch/workspace/{run_id}/`. A narrow sudoers fragment (`/etc/sudoers.d/dispatch-svc`) allows `dispatch-svc` to spawn specific commands as `dispatch` — no `ALL=(ALL)` escalation.
+
+To bootstrap a fresh host or migrate an existing one:
+
+```bash
+sudo ./setup-dispatch-host.sh --env-file /path/to/.env
+```
+
+See **[docs/install.md](docs/install.md)** for the full install guide, env-file reference, rollback procedure, and troubleshooting.
+
 ## Tests
 
 ```bash

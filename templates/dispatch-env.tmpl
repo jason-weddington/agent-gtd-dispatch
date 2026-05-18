@@ -1,0 +1,46 @@
+# dispatch-env.tmpl — environment file template for the dispatch service.
+# Copy to /home/dispatch-svc/.env and fill in real values.
+# All lines beginning with # are comments.
+
+# =============================================================================
+# Required variables
+# =============================================================================
+
+# Dispatch API auth — callers must provide this as a Bearer token.
+DISPATCH_API_KEY=changeme
+
+# Agent GTD API (for fetching items/projects and posting comments).
+AGENT_GTD_URL=https://r7-research:8443
+AGENT_GTD_API_KEY=agtd_...
+
+# Anthropic API key (passed to Claude Code subprocess).
+ANTHROPIC_API_KEY=sk-ant-...
+
+# =============================================================================
+# Two-user split: agent subprocess user
+# =============================================================================
+
+# Username of the unprivileged agent user that owns workspace directories.
+# Must match the --agent-user argument used when running setup-dispatch-host.sh.
+# When set, the service spawns agent subprocesses via `sudo -u <value> -H`.
+# Leave empty to disable user-switching (dev/test only).
+DISPATCH_AGENT_SUBPROCESS_USER=dispatch
+
+# =============================================================================
+# Optional variables
+# =============================================================================
+
+# Workspace root for cloned repos (default: ~/workspace, relative to
+# DISPATCH_AGENT_SUBPROCESS_USER's home when user-switching is enabled).
+# DISPATCH_WORKSPACE_ROOT=/home/dispatch/workspace
+
+# Claude Code turn and timeout limits.
+# DISPATCH_MAX_TURNS=50
+# DISPATCH_TIMEOUT_SECONDS=1800
+
+# Ollama local inference — set OLLAMA_BASE_URL to route claude-code-ollama
+# dispatches through a local Ollama instance instead of the Anthropic API.
+# Root URL, no /v1 suffix (e.g. http://192.168.1.52:11434).
+# OLLAMA_BASE_URL=
+# OLLAMA_API_KEY=ollama
+# OLLAMA_DEFAULT_MODEL=qwen3:35b

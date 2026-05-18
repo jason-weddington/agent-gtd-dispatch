@@ -1,0 +1,23 @@
+[Unit]
+Description=Agent GTD Dispatch API
+After=network.target
+
+[Service]
+Type=simple
+User={{SERVICE_USER}}
+Group={{SERVICE_USER}}
+WorkingDirectory={{WORKING_DIR}}
+EnvironmentFile={{ENV_FILE}}
+ExecStart=/home/{{SERVICE_USER}}/.local/bin/uv run uvicorn agent_gtd_dispatch.main:app --host 0.0.0.0 --port 8100
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/{{SERVICE_USER}} /home/{{AGENT_USER}}/workspace
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

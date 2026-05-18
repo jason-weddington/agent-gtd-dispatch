@@ -6,7 +6,6 @@ dist/
 .env
 *.db
 data/
-deploy.sh
 .coverage
 .claude/
 system_prompt.md
