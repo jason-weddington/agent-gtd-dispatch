@@ -69,7 +69,7 @@ convention = "google"
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S106", "D", "E501"]
 "src/agent_gtd_dispatch/dispatch.py" = ["S603", "S607", "S608", "E501"]
-"src/agent_gtd_dispatch/main.py" = ["B008", "E501"]
+"src/agent_gtd_dispatch/main.py" = ["B008", "E501", "S603", "S607"]
 "src/agent_gtd_dispatch/agent_discovery.py" = ["S603", "S607"]
 
 [tool.mypy]

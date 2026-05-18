@@ -24,6 +24,7 @@ AGENT_GTD_API_KEY: str = ""
 
 # Workspace
 WORKSPACE_ROOT: Path = Path.home() / "workspace"
+AGENT_SUBPROCESS_USER: str = ""
 
 # Agent limits
 MAX_TURNS: int = 100
@@ -54,15 +55,21 @@ def load() -> None:
     global ANTHROPIC_API_KEY, PLANNER_MODEL, MAX_CONCURRENT_RUNS
     global OLLAMA_BASE_URL, OLLAMA_API_KEY, OLLAMA_DEFAULT_MODEL
     global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS
+    global AGENT_SUBPROCESS_USER
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
     AGENT_GTD_API_KEY = _require("AGENT_GTD_API_KEY")
     ANTHROPIC_API_KEY = _require("ANTHROPIC_API_KEY")
 
-    WORKSPACE_ROOT = Path(
-        os.environ.get("DISPATCH_WORKSPACE_ROOT", str(Path.home() / "workspace"))
-    )
+    AGENT_SUBPROCESS_USER = os.environ.get("DISPATCH_AGENT_SUBPROCESS_USER", "")
+    _workspace_env = os.environ.get("DISPATCH_WORKSPACE_ROOT", "")
+    if _workspace_env:
+        WORKSPACE_ROOT = Path(_workspace_env)
+    elif AGENT_SUBPROCESS_USER:
+        WORKSPACE_ROOT = Path.home().parent / AGENT_SUBPROCESS_USER / "workspace"
+    else:
+        WORKSPACE_ROOT = Path.home() / "workspace"
     MAX_TURNS = int(os.environ.get("DISPATCH_MAX_TURNS", "100"))
     TIMEOUT_SECONDS = int(os.environ.get("DISPATCH_TIMEOUT_SECONDS", "1800"))
     MANAGE_TIMEOUT_SECONDS = int(

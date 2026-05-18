@@ -36,6 +36,44 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 
+def _check_service_repo() -> None:
+    """Check that the service's own working copy is on main and clean.
+
+    Skips silently when the working copy doesn't exist (wheel deploy).
+    Raises SystemExit(1) if the repo is on a non-main branch or has
+    uncommitted changes — prevents the service from running with a
+    corrupted working copy.
+    """
+    repo = Path.home() / "agent-gtd-dispatch"
+    if not repo.is_dir():
+        return  # wheel deploy — no working copy to check
+    try:
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except Exception as exc:
+        logger.error("Service repo health check failed: %s", exc)
+        raise SystemExit(1) from exc
+    if branch != "main" or dirty:
+        logger.error(
+            "Service repo not on main or dirty: branch=%r dirty=%r",
+            branch,
+            bool(dirty),
+        )
+        raise SystemExit(1)
+
+
 async def _ollama_health_check() -> tuple[bool, str]:
     """Check if the Ollama endpoint is reachable.
 
@@ -102,6 +140,8 @@ def _verify_api_key(
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Initialize config and DB on startup, cancel tasks on shutdown."""
     config.load()
+    if config.AGENT_SUBPROCESS_USER:
+        _check_service_repo()
     dispatch.init_executor()
     await db.init_db()
     orphan_count = await db.reconcile_orphans()

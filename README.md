@@ -44,6 +44,17 @@ export OLLAMA_DEFAULT_MODEL="qwen3.5:35b"            # default if omitted
 
 The URL must be the **root** Ollama URL (e.g. `http://host:11434`). Do **not** append `/v1` or any path — Ollama 0.14+ exposes the Anthropic Messages API at the root path, while `/v1` is the OpenAI-compatible surface which Claude Code does not speak.
 
+## Process model
+
+The dispatch service uses a two-user architecture to enforce POSIX isolation between the service process and the agent subprocesses it spawns.
+
+- **`dispatch-svc`** runs the FastAPI service and owns its working copy at `~/agent-gtd-dispatch`. No agent can write to this directory.
+- **`dispatch`** is the unprivileged agent user. Agent subprocess workspaces live at `/home/dispatch/workspace/{run_id}/`. The service cannot write to the agent user's home directory.
+
+When `DISPATCH_AGENT_SUBPROCESS_USER=dispatch` is set, the service spawns agent subprocesses via `sudo -u dispatch -H`, which sets `HOME=/home/dispatch` automatically. Git clone, checkout, and the agent CLI all run as `dispatch`. Workspace cleanup uses `sudo -u dispatch rm -rf` so only the agent user can delete its own files.
+
+When `DISPATCH_AGENT_SUBPROCESS_USER` is empty (the default in dev/test), no user-switching occurs and the service runs everything under its own user — preserving the existing single-user behaviour.
+
 ## Tests
 
 ```bash

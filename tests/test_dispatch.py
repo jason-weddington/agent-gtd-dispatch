@@ -648,6 +648,51 @@ class TestRunAgent:
             mock_proc.wait.assert_called_once_with(timeout=300)
 
 
+class TestSudoWrapping:
+    async def test_run_agent_sudo_prefix_when_user_set(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            args, _kwargs = mock_popen.call_args
+            cmd = args[0]
+            assert cmd[:4] == ["sudo", "-u", "dispatch", "-H"]
+
+    async def test_run_agent_no_sudo_prefix_when_user_empty(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            args, _kwargs = mock_popen.call_args
+            cmd = args[0]
+            assert cmd[0] == "claude"
+
+    def test_prepare_workspace_sudo_prefix_when_user_set(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+        origin = "git@host:repos/myrepo"
+        run_id = "abc123"
+        branch = "feat/abc123-fix-bug"
+        with patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub:
+            prepare_workspace(origin, run_id, branch)
+        assert mock_sub.run.call_args_list[0].args[0][:4] == [
+            "sudo",
+            "-u",
+            "dispatch",
+            "-H",
+        ]
+
+
 class TestBuildManagePrompt:
     _project: ClassVar[dict] = {
         "name": "wave-project",

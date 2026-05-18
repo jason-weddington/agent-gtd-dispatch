@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 _executor: concurrent.futures.ThreadPoolExecutor | None = None
 
 
+def _sudo_wrap(cmd: list[str]) -> list[str]:
+    """Prepend sudo -u <user> -H when AGENT_SUBPROCESS_USER is set."""
+    if config.AGENT_SUBPROCESS_USER:
+        return ["sudo", "-u", config.AGENT_SUBPROCESS_USER, "-H", *cmd]
+    return cmd
+
+
 def init_executor() -> None:
     """Create (or recreate) the module-level ThreadPoolExecutor.
 
@@ -64,12 +71,12 @@ def prepare_workspace(origin: str, run_id: str, branch_name: str) -> Path:
 
     config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["git", "clone", origin, str(workspace)],
+        _sudo_wrap(["git", "clone", origin, str(workspace)]),
         check=True,
         capture_output=True,
     )
     subprocess.run(
-        ["git", "checkout", "-b", branch_name],
+        _sudo_wrap(["git", "checkout", "-b", branch_name]),
         cwd=workspace,
         check=True,
         capture_output=True,
@@ -93,18 +100,18 @@ def prepare_manage_workspace(git_origin: str, run_id: str) -> Path:
 
     config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["git", "clone", "--depth=50", git_origin, str(workspace)],
+        _sudo_wrap(["git", "clone", "--depth=50", git_origin, str(workspace)]),
         check=True,
         capture_output=True,
     )
     subprocess.run(
-        ["git", "remote", "set-head", "origin", "--auto"],
+        _sudo_wrap(["git", "remote", "set-head", "origin", "--auto"]),
         cwd=workspace,
         check=True,
         capture_output=True,
     )
     result = subprocess.run(
-        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        _sudo_wrap(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"]),
         cwd=workspace,
         check=True,
         capture_output=True,
@@ -112,7 +119,7 @@ def prepare_manage_workspace(git_origin: str, run_id: str) -> Path:
     )
     default_branch = result.stdout.strip().removeprefix("origin/")
     subprocess.run(
-        ["git", "checkout", default_branch],
+        _sudo_wrap(["git", "checkout", default_branch]),
         cwd=workspace,
         check=True,
         capture_output=True,
@@ -123,10 +130,13 @@ def prepare_manage_workspace(git_origin: str, run_id: str) -> Path:
 
 def cleanup_workspace(workspace: Path) -> None:
     """Remove a workspace directory after a run completes."""
-    import shutil
-
     if workspace.exists() and config.WORKSPACE_ROOT in workspace.parents:
-        shutil.rmtree(workspace, ignore_errors=True)
+        if config.AGENT_SUBPROCESS_USER:
+            subprocess.run(_sudo_wrap(["rm", "-rf", str(workspace)]), check=False)
+        else:
+            import shutil
+
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def write_transcript(workspace: Path, result: subprocess.CompletedProcess[str]) -> None:
@@ -962,6 +972,7 @@ async def run_agent(
     if attribution:
         env["AGENT_GTD_AGENT_NAME"] = attribution
 
+    cmd = _sudo_wrap(cmd)
     transcript_path = workspace / "transcript.txt"
     _setup_git_exclude(workspace)  # exclude transcript.txt BEFORE subprocess starts
 
