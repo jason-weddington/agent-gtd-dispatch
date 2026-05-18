@@ -627,6 +627,26 @@ class TestRunAgent:
             _, kwargs = mock_popen.call_args
             assert "AGENT_GTD_AGENT_NAME" not in kwargs["env"]
 
+    async def test_manage_mode_uses_manage_timeout_when_none(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "MANAGE_TIMEOUT_SECONDS", 14400)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 200, mode="manage")
+            mock_proc.wait.assert_called_once_with(timeout=14400)
+
+    async def test_build_mode_uses_timeout_seconds_when_none(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 300)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 200, mode="build")
+            mock_proc.wait.assert_called_once_with(timeout=300)
+
 
 class TestBuildManagePrompt:
     _project: ClassVar[dict] = {

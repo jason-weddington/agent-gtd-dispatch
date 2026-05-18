@@ -458,6 +458,7 @@ def _build_manage_prompt(
         **Rollout ID:** {rollout_id}
         **Project ID:** {project_id}
         **Turns remaining:** {max_turns}
+        **Time budget:** {config.MANAGE_TIMEOUT_SECONDS // 3600} hours ({config.MANAGE_TIMEOUT_SECONDS // 60} min) of wall-clock time. Up to {config.MAX_MANAGE_RETRIES} automatic relaunches on timeout — but each relaunch rebuilds context from rollout state. Complete as many waves as possible per run.
 
         This rollout ID is your primary anchor. Every action you take is scoped to it.
         Your workspace is a git clone of the project's default branch (auto-detected).
@@ -940,7 +941,11 @@ async def run_agent(
 ) -> subprocess.CompletedProcess[str]:
     """Run a headless agent CLI as a subprocess."""
     if timeout_seconds is None:
-        timeout_seconds = config.TIMEOUT_SECONDS
+        timeout_seconds = (
+            config.MANAGE_TIMEOUT_SECONDS
+            if mode == "manage"
+            else config.TIMEOUT_SECONDS
+        )
     if engine.name == "kiro":
         (workspace / "system_prompt.md").write_text(
             f"{system_prompt}\n\n---\n\n## Task\n\n{title}"
