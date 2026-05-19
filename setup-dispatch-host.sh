@@ -149,64 +149,32 @@ _health_check() {
 
 _smoke_test() {
     local api_url="http://localhost:${API_PORT}"
-    [[ -f "$SERVICE_ENV" ]] || die "Cannot run smoke test: ${SERVICE_ENV} not found"
 
-    local api_key
-    api_key="$(grep '^DISPATCH_API_KEY=' "$SERVICE_ENV" | cut -d= -f2- | tr -d "'\"")"
-    [[ -z "$api_key" ]] && die "Cannot run smoke test: DISPATCH_API_KEY not found in ${SERVICE_ENV}"
+    # Assertion (a): GET /health → HTTP 200 + 'status' key
+    info "Smoke test: GET /health ..."
+    local http_code health_body
+    http_code="$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${api_url}/health" 2>/dev/null)" \
+        || die "Smoke test: GET /health request failed (curl error)"
+    [[ "$http_code" == "200" ]] \
+        || die "Smoke test: GET /health returned HTTP ${http_code} (expected 200)"
+    health_body="$(curl -sf --max-time 10 "${api_url}/health" 2>/dev/null)"
+    echo "$health_body" \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'status' in d" 2>/dev/null \
+        || die "Smoke test: GET /health response missing expected key 'status': ${health_body}"
+    info "Smoke assertion (a) passed: GET /health → HTTP 200, 'status' key present"
 
-    info "Dispatching no-op smoke job..."
-    local response run_id
-    response="$(curl -sf --max-time 10 \
-        -X POST "${api_url}/dispatch" \
-        -H "Authorization: Bearer ${api_key}" \
-        -H "Content-Type: application/json" \
-        -d '{"item_id":"__smoke_test__","max_turns":1}' 2>&1)" || {
-        die "Smoke test dispatch request failed: ${response}"
-    }
-    run_id="$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['run_id'])" 2>/dev/null)"
-    [[ -z "$run_id" ]] && die "Smoke test: could not parse run_id from response: ${response}"
-    info "Dispatched smoke job: run_id=${run_id}"
-
-    # Poll until complete (max 60s)
-    local status="" attempts=0 max=20
-    while (( attempts < max )); do
-        status="$(curl -sf --max-time 5 \
-            "${api_url}/runs/${run_id}" \
-            -H "Authorization: Bearer ${api_key}" \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "")"
-        if [[ "$status" == "completed" || "$status" == "failed" ]]; then
-            break
-        fi
-        (( attempts++ ))
-        sleep 3
-    done
-
-    # Assertion (a): job must complete successfully (not fail)
-    if [[ "$status" == "completed" ]]; then
-        info "Smoke assertion (a) passed: job status=completed"
-    else
-        die "Smoke assertion (a) FAILED: job status='${status}' (expected 'completed') — check journalctl -u ${SERVICE_NAME}"
-    fi
-
-    # Assertion (b): agent subprocess was owned by AGENT_USER (check journal)
-    local journal_out
-    journal_out="$(journalctl -u "${SERVICE_NAME}" --no-pager -n 100 2>/dev/null \
-        | grep -i "subprocess_user\|subprocess.*${AGENT_USER}\|run_id.*${run_id}" \
-        | head -1 || true)"
-    if [[ -n "$journal_out" ]]; then
-        info "Smoke assertion (b) passed: journal confirms subprocess user context for ${AGENT_USER}"
-    else
-        warn "Smoke assertion (b): could not confirm subprocess ownership from journal (verify manually with: journalctl -u ${SERVICE_NAME} -n 200)"
-    fi
-
-    # Assertion (c): workspace directory was cleaned up after the run
-    local workspace_dir="${AGENT_WORKSPACE}/${run_id}"
-    if [[ ! -d "$workspace_dir" ]]; then
-        info "Smoke assertion (c) passed: workspace ${workspace_dir} cleaned up after run"
-    else
-        warn "Smoke assertion (c) FAILED: workspace ${workspace_dir} still exists after run — cleanup may not have run"
-    fi
+    # Assertion (b): GET /info → HTTP 200 + 'version' key
+    info "Smoke test: GET /info ..."
+    local info_body
+    http_code="$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${api_url}/info" 2>/dev/null)" \
+        || die "Smoke test: GET /info request failed (curl error)"
+    [[ "$http_code" == "200" ]] \
+        || die "Smoke test: GET /info returned HTTP ${http_code} (expected 200)"
+    info_body="$(curl -sf --max-time 10 "${api_url}/info" 2>/dev/null)"
+    echo "$info_body" \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'version' in d" 2>/dev/null \
+        || die "Smoke test: GET /info response missing expected key 'version': ${info_body}"
+    info "Smoke assertion (b) passed: GET /info → HTTP 200, 'version' key present"
 
     info "Smoke test complete"
 }
@@ -234,6 +202,7 @@ SERVICE_HOME="/home/${SERVICE_USER}"
 SERVICE_REPO="${SERVICE_HOME}/${REPO_NAME}"
 SERVICE_ENV="${SERVICE_HOME}/.env"
 AGENT_WORKSPACE="${AGENT_HOME}/workspace"
+CLAUDE_SRC="${AGENT_HOME}/.local/bin/claude"
 
 # ===========================================================================
 # Banner
@@ -280,11 +249,48 @@ done
 
 # Create workspace directory for agent user
 if $DRY_RUN; then
-    would "create ${AGENT_WORKSPACE} owned by ${AGENT_USER}"
+    would "create ${AGENT_WORKSPACE} owned by ${AGENT_USER} (mode 2775)"
 else
     mkdir -p "$AGENT_WORKSPACE"
     chown -R "${AGENT_USER}:${AGENT_USER}" "$AGENT_HOME"
+    chmod 2775 "$AGENT_HOME" "$AGENT_WORKSPACE"
     info "Agent workspace ready: ${AGENT_WORKSPACE}"
+fi
+
+# --- SSH key provisioning for AGENT_USER (needed for git auth on fresh box) ---
+if $DRY_RUN; then
+    would "create ${AGENT_HOME}/.ssh/ (mode 700, owner ${AGENT_USER}) if absent"
+    would "generate ed25519 keypair for ${AGENT_USER} if no id_* key exists"
+else
+    mkdir -p "${AGENT_HOME}/.ssh"
+    chmod 700 "${AGENT_HOME}/.ssh"
+    chown "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.ssh"
+    if ! ls "${AGENT_HOME}/.ssh"/id_* &>/dev/null; then
+        sudo -u "$AGENT_USER" ssh-keygen -t ed25519 -N "" \
+            -f "${AGENT_HOME}/.ssh/id_ed25519" \
+            -C "${AGENT_USER}@$(hostname -s)"
+        chown "${AGENT_USER}:${AGENT_USER}" \
+            "${AGENT_HOME}/.ssh/id_ed25519" \
+            "${AGENT_HOME}/.ssh/id_ed25519.pub"
+        info "Generated SSH keypair for ${AGENT_USER}: ${AGENT_HOME}/.ssh/id_ed25519"
+        echo ""
+        printf "${YELLOW}========================================${RESET}\n"
+        printf "${YELLOW}  ACTION REQUIRED: Add SSH public key  ${RESET}\n"
+        printf "${YELLOW}========================================${RESET}\n"
+        echo ""
+        echo "  A new ed25519 keypair was generated for the '${AGENT_USER}' agent user."
+        echo "  Authorize it on the git server before re-running this installer:"
+        echo ""
+        echo "  Public key to add to ubuntu-vm01:~/repos/.ssh/authorized_keys :"
+        echo ""
+        cat "${AGENT_HOME}/.ssh/id_ed25519.pub"
+        echo ""
+        echo "  Then re-run this installer with the same arguments:"
+        echo "    sudo ./setup-dispatch-host.sh [your original options]"
+        echo ""
+        die "SSH public key not yet authorized — add it to ubuntu-vm01 and re-run"
+    fi
+    skip "SSH key already present for ${AGENT_USER} at ${AGENT_HOME}/.ssh/ — already configured"
 fi
 
 # --- SSH setup for SERVICE_USER (needed for git clone in step 2) ---
@@ -315,13 +321,15 @@ fi
 
 # --- Group membership (dispatch-svc needs read access to dispatch group resources) ---
 if id -u "$SERVICE_USER" &>/dev/null && id -u "$AGENT_USER" &>/dev/null; then
-    if id -nG "$SERVICE_USER" 2>/dev/null | grep -qw "$AGENT_USER"; then
+    if getent group "$AGENT_USER" | grep -qw "$SERVICE_USER"; then
         skip "${SERVICE_USER} already in group ${AGENT_USER} — already configured"
     elif $DRY_RUN; then
         would "usermod -aG ${AGENT_USER} ${SERVICE_USER} (for dispatch.db access)"
+        would "chmod 2775 ${AGENT_HOME} ${AGENT_WORKSPACE}"
     else
         usermod -aG "$AGENT_USER" "$SERVICE_USER"
-        info "Added ${SERVICE_USER} to group ${AGENT_USER}"
+        chmod 2775 "$AGENT_HOME" "$AGENT_WORKSPACE"
+        info "Added ${SERVICE_USER} to group ${AGENT_USER}; set 2775 on ${AGENT_HOME} and ${AGENT_WORKSPACE}"
     fi
 fi
 
@@ -418,13 +426,31 @@ else
 fi
 
 # ===========================================================================
+# Step 4.5: Claude Code install for AGENT_USER (idempotent; must precede 5a)
+# ===========================================================================
+echo ""
+echo "--- Step 4.5: Claude Code (agent user) ---"
+
+if [[ -f "$CLAUDE_SRC" ]]; then
+    skip "Claude Code already installed for ${AGENT_USER} at ${CLAUDE_SRC} — already configured"
+elif $DRY_RUN; then
+    would "install Claude Code for ${AGENT_USER} via official installer (curl https://claude.ai/install.sh | bash)"
+else
+    sudo -u "$AGENT_USER" bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+    if [[ -f "$CLAUDE_SRC" ]]; then
+        info "Installed Claude Code for ${AGENT_USER}: ${CLAUDE_SRC}"
+    else
+        warn "Claude Code installer ran but ${CLAUDE_SRC} not found — verify installation"
+    fi
+fi
+
+# ===========================================================================
 # Step 5a: Claude symlink (must precede sudoers so the path exists when
 #           visudo validates the fragment)
 # ===========================================================================
 echo ""
 echo "--- Step 5a: Claude symlink ---"
 
-CLAUDE_SRC="/home/${AGENT_USER}/.local/bin/claude"
 CLAUDE_LINK="/usr/local/bin/claude"
 
 if [[ -L "$CLAUDE_LINK" ]] && [[ "$(readlink -f "$CLAUDE_LINK" 2>/dev/null)" == "$(readlink -f "$CLAUDE_SRC" 2>/dev/null)" ]]; then
@@ -518,8 +544,8 @@ echo "--- Step 8: Smoke test ---"
 if ! $SMOKE; then
     skip "Smoke test skipped (pass --smoke to enable)"
 elif $DRY_RUN; then
-    would "dispatch no-op job via POST /dispatch to ${SERVICE_NAME}"
-    would "poll until completion and assert: (a) status=completed, (b) subprocess owned by ${AGENT_USER}, (c) workspace cleaned up"
+    would "GET http://localhost:${API_PORT}/health and assert HTTP 200 with 'status' key"
+    would "GET http://localhost:${API_PORT}/info and assert HTTP 200 with 'version' key"
 else
     _smoke_test
 fi

@@ -44,3 +44,20 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # OLLAMA_BASE_URL=
 # OLLAMA_API_KEY=ollama
 # OLLAMA_DEFAULT_MODEL=qwen3:35b
+
+# =============================================================================
+# Authentication extras (must survive sudo boundary — listed in sudoers env_keep)
+# =============================================================================
+
+# Claude Code OAuth token — alternative to ANTHROPIC_API_KEY for OAuth-based
+# authentication to Anthropic. Set this instead of ANTHROPIC_API_KEY when using
+# Claude Code's OAuth login flow.
+# CLAUDE_CODE_OAUTH_TOKEN=
+
+# Knowledge base database URL — passed to agent subprocesses for KB access.
+# KB_DATABASE_URL=
+
+# Agent identity name — used for GTD comment attribution so comments appear
+# under a specific agent name (e.g. claude-build-abc12345) rather than the
+# generic service identity.
+# AGENT_GTD_AGENT_NAME=

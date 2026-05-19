@@ -51,6 +51,59 @@ Useful for auditing a migration before applying it.
 
 ---
 
+## Fresh box install
+
+On a truly fresh host (no `dispatch` user, no Claude, no git credentials), the
+installer may halt after **Phase 1** with an "ACTION REQUIRED" message asking you
+to add an SSH public key to the git server. This is expected — it is a two-phase
+flow:
+
+### Phase 1 — generate credentials, halt
+
+Run the installer once. It will:
+
+1. Create the `dispatch` and `dispatch-svc` system users.
+2. Create the agent workspace (`/home/dispatch/workspace`) with group-writable permissions (mode 2775).
+3. Generate a fresh `ed25519` SSH keypair for the `dispatch` user.
+4. **Print the public key and exit** with instructions like:
+
+```
+========================================
+  ACTION REQUIRED: Add SSH public key
+========================================
+
+  A new ed25519 keypair was generated for the 'dispatch' agent user.
+  Authorize it on the git server before re-running this installer:
+
+  Public key to add to ubuntu-vm01:~/repos/.ssh/authorized_keys :
+
+  ssh-ed25519 AAAA... dispatch@r7-research
+
+  Then re-run this installer with the same arguments:
+    sudo ./setup-dispatch-host.sh [your original options]
+```
+
+Add the printed public key to the git server:
+
+```bash
+# On ubuntu-vm01:
+echo "ssh-ed25519 AAAA... dispatch@r7-research" >> ~/repos/.ssh/authorized_keys
+```
+
+### Phase 2 — complete install
+
+Re-run the installer with the same arguments:
+
+```bash
+sudo ./setup-dispatch-host.sh --env-file /tmp/dispatch.env --smoke
+```
+
+The SSH key now exists, so the installer skips key generation, copies it to
+`dispatch-svc`'s `.ssh/`, clones the repos, installs Claude Code for the
+`dispatch` user, sets up the systemd unit, and completes normally.
+
+---
+
 ## Migration — pironman01 (two-user split)
 
 pironman01 previously ran the service as the `dispatch` user. The two-user
@@ -312,6 +365,69 @@ sudo grep env_keep /etc/sudoers.d/dispatch-svc
 sudo journalctl -u dispatch-api -n 50 --no-pager
 # Check for: port already in use, missing env vars, Python import errors
 sudo ss -tlnp | grep 8100   # confirm port is free (or in use by another process)
+```
+
+---
+
+### Claude binary missing after Step 4.5
+
+**Symptom**: Step 4.5 reports `Claude Code installer ran but /home/dispatch/.local/bin/claude not found`, or Step 5a warns `Agent claude binary not found`.
+
+**Cause**: The official Claude Code installer (`claude.ai/install.sh`) failed silently, or installed to an unexpected location.
+
+**Fix**: Install Claude Code manually as the `dispatch` user, then re-run the installer:
+```bash
+sudo -u dispatch bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+ls -la /home/dispatch/.local/bin/claude   # verify binary exists
+sudo ./setup-dispatch-host.sh             # re-run to create symlink + sudoers
+```
+
+If Claude Code requires a different install path, set `ANTHROPIC_CLAUDE_PATH` or check the
+output of `sudo -u dispatch bash -c 'which claude 2>/dev/null || echo not found'`.
+
+---
+
+### Installer halts at "ACTION REQUIRED: Add SSH public key"
+
+**Symptom**: Step 1 prints a yellow banner and exits with `[ERROR] SSH public key not yet authorized`.
+
+**Cause**: This is a normal Phase 1 halt on a fresh host. The `dispatch` agent user had no
+SSH keypair, so the installer generated one and is waiting for you to authorize it.
+
+**Fix**: This is expected — follow the [Fresh box install](#fresh-box-install) two-phase flow above:
+1. Copy the printed public key.
+2. Append it to `ubuntu-vm01:~/repos/.ssh/authorized_keys`.
+3. Re-run the installer with the same arguments.
+
+If you want to use an existing keypair instead of the generated one, place it at
+`/home/dispatch/.ssh/id_ed25519` (and `.pub`) before running the installer.
+
+---
+
+### SQLite workspace permission error (dispatch-svc cannot open dispatch.db)
+
+**Symptom**: Dispatch API starts but every run fails immediately with a SQLite error such as
+`unable to open database file` or `disk I/O error`. `journalctl` shows permission denied on
+`/home/dispatch/workspace/dispatch.db`.
+
+**Cause**: On a fresh box, `/home/dispatch` is created with mode `0700` (home directory
+default), so `dispatch-svc` cannot traverse the path to reach `dispatch.db` even though
+it is a member of the `dispatch` group.
+
+**Fix**: The installer now sets mode `2775` on `/home/dispatch` and `/home/dispatch/workspace`
+during Step 1. If you are on an older install, fix it manually:
+```bash
+sudo chmod 2775 /home/dispatch /home/dispatch/workspace
+# Verify dispatch-svc is in the dispatch group:
+getent group dispatch | grep dispatch-svc || sudo usermod -aG dispatch dispatch-svc
+# Restart the service:
+sudo systemctl restart dispatch-api
+```
+
+If `dispatch.db` itself has wrong permissions:
+```bash
+sudo chmod g+rw /home/dispatch/workspace/dispatch.db
+sudo chown dispatch:dispatch /home/dispatch/workspace/dispatch.db
 ```
 
 ---
