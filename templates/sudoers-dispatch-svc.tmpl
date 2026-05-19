@@ -5,4 +5,15 @@
 # {{SERVICE_USER}} = the dispatch service user (default: dispatch-svc)
 # {{AGENT_USER}}   = the agent subprocess user (default: dispatch)
 
-{{SERVICE_USER}} ALL=({{AGENT_USER}}) NOPASSWD: /usr/bin/git, /home/{{AGENT_USER}}/.local/bin/uv, /usr/bin/claude, /usr/bin/python3, /bin/bash
+# Environment variables that must survive the sudo boundary.
+# CLAUDE_CODE_OAUTH_TOKEN  — Claude Code OAuth credential (auth to Anthropic)
+# ANTHROPIC_API_KEY        — Anthropic API key (auth to Anthropic API)
+# AGENT_GTD_URL            — Agent GTD API base URL (task management)
+# AGENT_GTD_API_KEY        — Agent GTD API key (auth to task management)
+# DISPATCH_API_KEY         — Dispatch service bearer token (internal auth)
+# KB_DATABASE_URL          — Knowledge base database URL (agent KB access)
+# OLLAMA_BASE_URL          — Ollama API base URL (local LLM access)
+# AGENT_GTD_AGENT_NAME     — Agent identity name (for GTD comment attribution)
+Defaults:{{SERVICE_USER}} env_keep += "CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY AGENT_GTD_URL AGENT_GTD_API_KEY DISPATCH_API_KEY KB_DATABASE_URL OLLAMA_BASE_URL AGENT_GTD_AGENT_NAME"
+
+{{SERVICE_USER}} ALL=({{AGENT_USER}}) NOPASSWD: /usr/bin/git, /home/{{AGENT_USER}}/.local/bin/uv, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash

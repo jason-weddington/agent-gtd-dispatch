@@ -12,12 +12,5 @@ ExecStart=/home/{{SERVICE_USER}}/.local/bin/uv run uvicorn agent_gtd_dispatch.ma
 Restart=on-failure
 RestartSec=5
 
-# Security hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/home/{{SERVICE_USER}} /home/{{AGENT_USER}}/workspace
-PrivateTmp=true
-
 [Install]
 WantedBy=multi-user.target

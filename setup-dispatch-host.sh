@@ -91,15 +91,19 @@ EOF
 # Helper functions (defined before use)
 # ===========================================================================
 
-_install_sudoers() {
+_render_sudoers() {
     local tmpl="${TMPL_DIR}/sudoers-dispatch-svc.tmpl"
     [[ -f "$tmpl" ]] || die "Template not found: ${tmpl}"
-    local tmpfile
-    tmpfile="$(mktemp /tmp/dispatch-sudoers.XXXXXX)"
     sed \
         -e "s|{{SERVICE_USER}}|${SERVICE_USER}|g" \
         -e "s|{{AGENT_USER}}|${AGENT_USER}|g" \
-        "$tmpl" > "$tmpfile"
+        "$tmpl"
+}
+
+_install_sudoers() {
+    local tmpfile
+    tmpfile="$(mktemp /tmp/dispatch-sudoers.XXXXXX)"
+    _render_sudoers > "$tmpfile"
     if ! visudo -c -f "$tmpfile"; then
         rm -f "$tmpfile"
         die "visudo validation failed — sudoers fragment NOT installed"
@@ -177,27 +181,31 @@ _smoke_test() {
         (( attempts++ ))
         sleep 3
     done
-    info "Smoke job finished with status: ${status}"
 
-    # Assertion (a): agent subprocess was owned by AGENT_USER (check journal)
+    # Assertion (a): job must complete successfully (not fail)
+    if [[ "$status" == "completed" ]]; then
+        info "Smoke assertion (a) passed: job status=completed"
+    else
+        die "Smoke assertion (a) FAILED: job status='${status}' (expected 'completed') — check journalctl -u ${SERVICE_NAME}"
+    fi
+
+    # Assertion (b): agent subprocess was owned by AGENT_USER (check journal)
     local journal_out
     journal_out="$(journalctl -u "${SERVICE_NAME}" --no-pager -n 100 2>/dev/null \
         | grep -i "subprocess_user\|subprocess.*${AGENT_USER}\|run_id.*${run_id}" \
         | head -1 || true)"
     if [[ -n "$journal_out" ]]; then
-        info "Journal confirms subprocess user context found"
+        info "Smoke assertion (b) passed: journal confirms subprocess user context for ${AGENT_USER}"
     else
-        warn "Could not confirm subprocess ownership from journal (verify manually with: journalctl -u ${SERVICE_NAME} -n 200)"
+        warn "Smoke assertion (b): could not confirm subprocess ownership from journal (verify manually with: journalctl -u ${SERVICE_NAME} -n 200)"
     fi
 
-    # Assertion (b): repo is on main, git status clean
-    local git_branch git_dirty
-    git_branch="$(sudo -u "$SERVICE_USER" git -C "$SERVICE_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")"
-    git_dirty="$(sudo -u "$SERVICE_USER" git -C "$SERVICE_REPO" status --porcelain 2>/dev/null || echo "?")"
-    if [[ "$git_branch" == "main" && -z "$git_dirty" ]]; then
-        info "Repo is on main and clean — smoke assertion (b) passed"
+    # Assertion (c): workspace directory was cleaned up after the run
+    local workspace_dir="${AGENT_WORKSPACE}/${run_id}"
+    if [[ ! -d "$workspace_dir" ]]; then
+        info "Smoke assertion (c) passed: workspace ${workspace_dir} cleaned up after run"
     else
-        warn "Smoke assertion (b): branch=${git_branch}, dirty='${git_dirty}'"
+        warn "Smoke assertion (c) FAILED: workspace ${workspace_dir} still exists after run — cleanup may not have run"
     fi
 
     info "Smoke test complete"
@@ -277,6 +285,55 @@ else
     mkdir -p "$AGENT_WORKSPACE"
     chown -R "${AGENT_USER}:${AGENT_USER}" "$AGENT_HOME"
     info "Agent workspace ready: ${AGENT_WORKSPACE}"
+fi
+
+# --- SSH setup for SERVICE_USER (needed for git clone in step 2) ---
+if $DRY_RUN; then
+    would "create ${SERVICE_HOME}/.ssh/ (mode 700)"
+    would "ssh-keyscan ubuntu-vm01 >> ${SERVICE_HOME}/.ssh/known_hosts"
+    would "copy ${AGENT_HOME}/.ssh/id_* keys to ${SERVICE_HOME}/.ssh/ if present"
+    would "chown -R ${SERVICE_USER}:${SERVICE_USER} ${SERVICE_HOME}/.ssh/"
+else
+    mkdir -p "${SERVICE_HOME}/.ssh"
+    chmod 700 "${SERVICE_HOME}/.ssh"
+    ssh-keyscan ubuntu-vm01 >> "${SERVICE_HOME}/.ssh/known_hosts" 2>/dev/null \
+        && info "Populated ${SERVICE_HOME}/.ssh/known_hosts via ssh-keyscan ubuntu-vm01" \
+        || warn "ssh-keyscan ubuntu-vm01 failed — known_hosts may be incomplete"
+    # Copy SSH key files from agent user if present (enables git auth for SERVICE_USER)
+    key_copied=false
+    for key in "${AGENT_HOME}/.ssh"/id_*; do
+        [[ -f "$key" ]] || continue
+        cp "$key" "${SERVICE_HOME}/.ssh/"
+        chmod 600 "${SERVICE_HOME}/.ssh/$(basename "$key")"
+        key_copied=true
+    done
+    $key_copied && info "Copied SSH key(s) from ${AGENT_HOME}/.ssh/ to ${SERVICE_HOME}/.ssh/" \
+        || warn "No id_* keys found in ${AGENT_HOME}/.ssh/ — git clone may fail without auth"
+    chown -R "${SERVICE_USER}:${SERVICE_USER}" "${SERVICE_HOME}/.ssh"
+    info "SSH directory seeded for ${SERVICE_USER}"
+fi
+
+# --- Group membership (dispatch-svc needs read access to dispatch group resources) ---
+if id -u "$SERVICE_USER" &>/dev/null && id -u "$AGENT_USER" &>/dev/null; then
+    if id -nG "$SERVICE_USER" 2>/dev/null | grep -qw "$AGENT_USER"; then
+        skip "${SERVICE_USER} already in group ${AGENT_USER} — already configured"
+    elif $DRY_RUN; then
+        would "usermod -aG ${AGENT_USER} ${SERVICE_USER} (for dispatch.db access)"
+    else
+        usermod -aG "$AGENT_USER" "$SERVICE_USER"
+        info "Added ${SERVICE_USER} to group ${AGENT_USER}"
+    fi
+fi
+
+# Fix dispatch.db permissions if it already exists on this host
+DB_PATH="${AGENT_WORKSPACE}/dispatch.db"
+if [[ -f "$DB_PATH" ]]; then
+    if $DRY_RUN; then
+        would "chmod g+rw ${DB_PATH} (for ${SERVICE_USER} read/write access via group)"
+    else
+        chmod g+rw "$DB_PATH"
+        info "Fixed dispatch.db group permissions: ${DB_PATH}"
+    fi
 fi
 
 # ===========================================================================
@@ -361,21 +418,43 @@ else
 fi
 
 # ===========================================================================
-# Step 5: Sudoers fragment
+# Step 5a: Claude symlink (must precede sudoers so the path exists when
+#           visudo validates the fragment)
 # ===========================================================================
 echo ""
-echo "--- Step 5: Sudoers ---"
+echo "--- Step 5a: Claude symlink ---"
 
-SUDOERS_EXPECTED="${SERVICE_USER} ALL=(${AGENT_USER}) NOPASSWD: /usr/bin/git, /home/${AGENT_USER}/.local/bin/uv, /usr/bin/claude, /usr/bin/python3, /bin/bash"
+CLAUDE_SRC="/home/${AGENT_USER}/.local/bin/claude"
+CLAUDE_LINK="/usr/local/bin/claude"
+
+if [[ -L "$CLAUDE_LINK" ]] && [[ "$(readlink -f "$CLAUDE_LINK" 2>/dev/null)" == "$(readlink -f "$CLAUDE_SRC" 2>/dev/null)" ]]; then
+    skip "${CLAUDE_LINK} already points to ${CLAUDE_SRC} — already configured"
+elif $DRY_RUN; then
+    would "create symlink ${CLAUDE_LINK} -> ${CLAUDE_SRC}"
+else
+    if [[ ! -f "$CLAUDE_SRC" ]]; then
+        warn "Agent claude binary not found at ${CLAUDE_SRC} — skipping symlink (install claude as ${AGENT_USER} first)"
+    else
+        ln -sf "$CLAUDE_SRC" "$CLAUDE_LINK"
+        info "Created symlink ${CLAUDE_LINK} -> ${CLAUDE_SRC}"
+    fi
+fi
+
+# ===========================================================================
+# Step 5b: Sudoers fragment
+# ===========================================================================
+echo ""
+echo "--- Step 5b: Sudoers ---"
 
 if [[ -f "$SUDOERS_FILE" ]]; then
-    existing_rule="$(grep -v '^#' "$SUDOERS_FILE" | grep -v '^[[:space:]]*$' | head -1 || true)"
-    if [[ "$existing_rule" == "$SUDOERS_EXPECTED" ]]; then
-        skip "${SUDOERS_FILE} already correct — already configured"
+    current_sudoers="$(cat "$SUDOERS_FILE")"
+    rendered_sudoers="$(_render_sudoers)"
+    if [[ "$current_sudoers" == "$rendered_sudoers" ]]; then
+        skip "${SUDOERS_FILE} already up to date — already configured"
     else
         warn "${SUDOERS_FILE} exists but content differs — will overwrite"
         if $DRY_RUN; then
-            would "overwrite ${SUDOERS_FILE} with correct content"
+            would "overwrite ${SUDOERS_FILE} with rendered sudoers template"
         else
             _install_sudoers
         fi
@@ -440,7 +519,7 @@ if ! $SMOKE; then
     skip "Smoke test skipped (pass --smoke to enable)"
 elif $DRY_RUN; then
     would "dispatch no-op job via POST /dispatch to ${SERVICE_NAME}"
-    would "poll until completion and assert: (a) subprocess owned by ${AGENT_USER}, (b) repo on main + clean"
+    would "poll until completion and assert: (a) status=completed, (b) subprocess owned by ${AGENT_USER}, (c) workspace cleaned up"
 else
     _smoke_test
 fi

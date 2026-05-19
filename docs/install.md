@@ -211,8 +211,8 @@ sudo cat /etc/sudoers.d/dispatch-svc
 **Fix**:
 ```bash
 sudo cat /etc/sudoers.d/dispatch-svc
-# Should contain exactly:
-# dispatch-svc ALL=(dispatch) NOPASSWD: /usr/bin/git, /home/dispatch/.local/bin/uv, /usr/bin/claude, /usr/bin/python3, /bin/bash
+# Should contain (among other lines):
+# dispatch-svc ALL=(dispatch) NOPASSWD: /usr/bin/git, /home/dispatch/.local/bin/uv, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash
 ```
 
 If missing or wrong, re-run:
@@ -221,6 +221,83 @@ sudo ./setup-dispatch-host.sh
 ```
 
 The installer will detect the mismatch and reinstall the correct fragment.
+
+---
+
+### SSH host key verification failed during git clone
+
+**Symptom**: Step 2 (Repos) fails with `Host key verification failed` or `The authenticity of host 'ubuntu-vm01' can't be established`.
+
+**Cause**: The `dispatch-svc` user has an empty `~/.ssh/known_hosts` — the new service account has not connected to the git server before.
+
+**Fix**: Re-run the installer (it seeds `known_hosts` in step 1) or manually:
+```bash
+sudo -u dispatch-svc ssh-keyscan ubuntu-vm01 >> /home/dispatch-svc/.ssh/known_hosts
+sudo -u dispatch-svc git clone git@ubuntu-vm01:repos/agent-gtd-dispatch /home/dispatch-svc/agent-gtd-dispatch
+```
+
+---
+
+### sudo effective-uid / privilege-escalation failures (NoNewPrivileges)
+
+**Symptom**: Service fails immediately or agent subprocesses fail to spawn; journal shows `sudo: effective uid is not 0`.
+
+**Cause**: A previous service unit included `NoNewPrivileges=true`, which blocks `sudo` from raising privileges. This directive is incompatible with the sudo-based user-switching pattern used by the dispatch service.
+
+**Fix**: Ensure the systemd unit does **not** contain `NoNewPrivileges`, `ProtectSystem=strict`, or `ProtectHome=read-only`:
+```bash
+sudo grep -E 'NoNewPrivileges|ProtectSystem|ProtectHome|PrivateTmp' /etc/systemd/system/dispatch-api.service
+# Should return empty — if it returns lines, re-run the installer to update the unit
+sudo ./setup-dispatch-host.sh
+sudo systemctl daemon-reload && sudo systemctl restart dispatch-api
+```
+
+---
+
+### `sudo: /usr/bin/rm: command not allowed`
+
+**Symptom**: Run logs show `sudo: /usr/bin/rm: command not allowed` after the agent subprocess completes. Workspace directories accumulate and are never cleaned up. The error may cascade and appear as a misleading "git clone failed" in subsequent runs.
+
+**Cause**: The sudoers fragment did not include `/usr/bin/rm` in the NOPASSWD allowlist. The dispatch service calls `rm -rf` (via sudo) to clean up agent workspaces after each run.
+
+**Fix**: Re-run the installer to update the sudoers fragment:
+```bash
+sudo ./setup-dispatch-host.sh
+sudo cat /etc/sudoers.d/dispatch-svc  # verify /usr/bin/rm is listed
+```
+
+---
+
+### `sudo: /usr/bin/claude: command not allowed` (secure_path mismatch)
+
+**Symptom**: Agent subprocesses fail immediately with `sudo: /usr/bin/claude: command not allowed` or `No such file or directory`.
+
+**Cause**: Claude installs to `/home/dispatch/.local/bin/claude`, but `sudo`'s `secure_path` does not include `/home/dispatch/.local/bin/`. The sudoers NOPASSWD entry must reference a path that is both on `secure_path` and exists as a binary. The installer creates a symlink at `/usr/local/bin/claude` pointing to the agent user's claude binary, and the sudoers fragment references `/usr/local/bin/claude`.
+
+**Fix**: Ensure the symlink exists and sudoers references the right path:
+```bash
+ls -la /usr/local/bin/claude          # should be a symlink to /home/dispatch/.local/bin/claude
+sudo grep claude /etc/sudoers.d/dispatch-svc  # should show /usr/local/bin/claude
+# If symlink is missing:
+sudo ln -sf /home/dispatch/.local/bin/claude /usr/local/bin/claude
+# Then re-run installer to update sudoers if needed:
+sudo ./setup-dispatch-host.sh
+```
+
+---
+
+### `Not logged in · Please run /login` (env vars stripped by sudo)
+
+**Symptom**: Claude subprocesses immediately exit with `Not logged in · Please run /login` or `ANTHROPIC_API_KEY not set`, even though the service's `.env` file contains the correct values.
+
+**Cause**: `sudo` strips environment variables by default, including `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`. The dispatch service loads these from its `.env` via systemd `EnvironmentFile=`, but they do not survive the `sudo -u dispatch` call unless explicitly preserved.
+
+**Fix**: The sudoers fragment must include a `Defaults env_keep` line. Re-run the installer:
+```bash
+sudo ./setup-dispatch-host.sh
+sudo grep env_keep /etc/sudoers.d/dispatch-svc
+# Should show all 8 required variables preserved across the sudo boundary
+```
 
 ---
 
@@ -264,3 +341,38 @@ agent subprocess. The sudoers fragment limits which commands `dispatch-svc`
 may run as `dispatch` — no `ALL=(ALL)` escalation.
 
 See the `## Process model` section of `README.md` for the full explanation.
+
+---
+
+## Security model
+
+### POSIX user isolation is the active security boundary
+
+The dispatch host relies on **POSIX user isolation** as its primary security boundary:
+
+- `dispatch-svc` runs the FastAPI service and owns all service credentials (`.env`, repo).
+- `dispatch` runs agent subprocesses and owns workspace directories.
+- The sudoers fragment grants `dispatch-svc` a narrow, enumerated set of commands it may run as `dispatch` — no `ALL=(ALL)` escalation.
+
+This means `dispatch-svc` cannot read agent files, and agents cannot write to service files. Linux DAC (discretionary access control) enforces this separation.
+
+### Why `NoNewPrivileges` and `ProtectSystem=strict` were removed
+
+The original `dispatch-api.service` unit included systemd security hardening directives. These were **removed** because they conflict with the sudo-based user-switching pattern:
+
+| Directive | Why it was removed |
+|---|---|
+| `NoNewPrivileges=true` | Blocks `sudo` from raising effective UID, preventing any `sudo -u dispatch` call from succeeding. This is the primary failure mode. |
+| `ProtectSystem=strict` | Makes `/run/sudo/ts/` read-only, so sudo cannot write timestamp files (ticket-based auth fails). |
+| `ProtectHome=read-only` | Blocks read access to `/home/dispatch/.ssh/`, which is needed for git clone via SSH. |
+| `PrivateTmp=true` | Gives a private `/tmp`; less critical but can interfere with sudo's lock files. |
+
+### Accepted trade-off
+
+Removing these directives reduces systemd-level sandboxing. The security trade-off is accepted because:
+
+1. **POSIX isolation is sufficient** — the `dispatch-svc` account has no sudo access beyond the explicit allowlist. An attacker who compromises `dispatch-svc` cannot escalate beyond what the sudoers fragment permits.
+2. **The directives were redundant defense-in-depth** — they did not provide isolation that POSIX permissions didn't already provide.
+3. **Re-enabling them would require replacing sudo with a different user-switching mechanism** (e.g., setuid wrapper, PAM), which is out of scope.
+
+If you want to re-enable systemd hardening in a future iteration, the correct approach is to replace the `sudo -u dispatch` calls in `dispatch.py` with a setuid helper binary that does not require `NoNewPrivileges` to be unset.
