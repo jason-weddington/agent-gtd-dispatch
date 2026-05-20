@@ -67,7 +67,113 @@ class TestInfoEndpoint:
     def test_shape(self, client) -> None:
         resp = client.get("/info")
         data = resp.json()
-        assert set(data.keys()) == {"engine", "version"}
+        assert set(data.keys()) == {
+            "engine",
+            "version",
+            "max_concurrent_runs",
+            "active_runs",
+            "engines",
+            "agents",
+        }
+
+    def test_capacity_fields(self, client) -> None:
+        resp = client.get("/info")
+        data = resp.json()
+        assert isinstance(data["max_concurrent_runs"], int)
+        assert data["max_concurrent_runs"] > 0
+        assert isinstance(data["active_runs"], int)
+        assert data["active_runs"] >= 0
+
+    def test_engines_list_filtered_by_availability(self, client) -> None:
+        # Fixture sets ANTHROPIC_API_KEY → claude-code/sonnet/haiku available;
+        # KIRO_API_KEY and OLLAMA_BASE_URL not set → kiro and ollama excluded.
+        resp = client.get("/info")
+        engines = resp.json()["engines"]
+        assert isinstance(engines, list)
+        assert all(isinstance(e, str) for e in engines)
+        assert set(engines) == {
+            "claude-code",
+            "claude-code-sonnet",
+            "claude-code-haiku",
+        }
+
+    def test_agents_list_from_discovery_script(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        script = tmp_path / "list_agents.sh"
+        script.write_text("#!/usr/bin/env bash\nprintf 'foo\\tFoo agent\\nbar\\n'\n")
+        script.chmod(0o755)
+        monkeypatch.setattr(
+            "agent_gtd_dispatch.agent_discovery._get_script_path", lambda: script
+        )
+        resp = client.get("/info")
+        data = resp.json()
+        assert data["agents"] == ["foo", "bar"]
+
+    def test_agents_list_empty_when_script_missing(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            "agent_gtd_dispatch.agent_discovery._get_script_path",
+            lambda: tmp_path / "nonexistent.sh",
+        )
+        resp = client.get("/info")
+        assert resp.json()["agents"] == []
+
+
+class TestEngineAvailability:
+    def test_claude_code_available_with_oauth_token(self, monkeypatch) -> None:
+        from agent_gtd_dispatch.engines import CLAUDE, is_engine_available
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
+        assert is_engine_available(CLAUDE) is True
+
+    def test_claude_code_available_with_api_key(self, monkeypatch) -> None:
+        from agent_gtd_dispatch.engines import CLAUDE, is_engine_available
+
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        assert is_engine_available(CLAUDE) is True
+
+    def test_claude_code_unavailable_without_credentials(self, monkeypatch) -> None:
+        from agent_gtd_dispatch.engines import CLAUDE, is_engine_available
+
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        assert is_engine_available(CLAUDE) is False
+
+    def test_kiro_requires_kiro_api_key(self, monkeypatch) -> None:
+        from agent_gtd_dispatch.engines import KIRO, is_engine_available
+
+        monkeypatch.delenv("KIRO_API_KEY", raising=False)
+        assert is_engine_available(KIRO) is False
+        monkeypatch.setenv("KIRO_API_KEY", "k")
+        assert is_engine_available(KIRO) is True
+
+    def test_ollama_requires_base_url(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.engines import CLAUDE_OLLAMA, is_engine_available
+
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "")
+        assert is_engine_available(CLAUDE_OLLAMA) is False
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://ollama.local:11434")
+        assert is_engine_available(CLAUDE_OLLAMA) is True
+
+    def test_get_available_engine_names_filters(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.engines import get_available_engine_names
+
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        monkeypatch.delenv("KIRO_API_KEY", raising=False)
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "")
+        names = get_available_engine_names()
+        assert set(names) == {
+            "claude-code",
+            "claude-code-sonnet",
+            "claude-code-haiku",
+        }
 
 
 # ---------------------------------------------------------------------------

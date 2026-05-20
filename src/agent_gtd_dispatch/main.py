@@ -22,10 +22,11 @@ if TYPE_CHECKING:
 from . import config, db, dispatch, gtd_client, rollout_planner
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
 from .dispatch import _MANAGE_ALLOWED_TOOLS
-from .engines import Engine, get_engine
+from .engines import Engine, get_available_engine_names, get_engine
 from .models import (
     DispatchRequest,
     EngineSwap,
+    InfoResponse,
     PlanRequest,
     RolloutPlan,
     Run,
@@ -490,10 +491,23 @@ async def health() -> dict[str, object]:
     return {"status": "ok", "active_runs": active}
 
 
-@app.get("/info")
-async def info() -> dict[str, str]:
-    """Return engine identity and service version. No auth required."""
-    return {"engine": ENGINE_NAME, "version": SERVICE_VERSION}
+@app.get("/info", response_model=InfoResponse)
+async def info() -> InfoResponse:
+    """Return engine identity, version, capacity, and capabilities. No auth required.
+
+    The capacity fields (max_concurrent_runs, active_runs) and capability lists
+    (engines, agents) let a multi-host router on the caller side filter and
+    rank dispatch targets without a separate round trip to /agents.
+    """
+    agent_dicts = await run_list_agents_script()
+    return InfoResponse(
+        engine=ENGINE_NAME,
+        version=SERVICE_VERSION,
+        max_concurrent_runs=config.MAX_CONCURRENT_RUNS,
+        active_runs=len(_active_processes),
+        engines=get_available_engine_names(),
+        agents=[a["name"] for a in agent_dicts],
+    )
 
 
 @app.get("/agents")

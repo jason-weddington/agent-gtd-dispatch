@@ -241,6 +241,39 @@ ENGINES: dict[str, Engine] = {
     "claude-code-haiku": CLAUDE_HAIKU,
 }
 
+# Engine names that share the Claude Code auth path (OAuth token OR API key)
+_CLAUDE_CODE_ENGINES: frozenset[str] = frozenset(
+    {"claude-code", "claude-code-sonnet", "claude-code-haiku"}
+)
+
+
+def is_engine_available(engine: Engine) -> bool:
+    """Return True if the host env has credentials for this engine.
+
+    Claude Code engines accept either CLAUDE_CODE_OAUTH_TOKEN (Max
+    subscription) or ANTHROPIC_API_KEY (pay-as-you-go) — either presence
+    is sufficient. Kiro requires KIRO_API_KEY. The Ollama-routed Claude
+    engine requires OLLAMA_BASE_URL to be configured.
+    """
+    name = engine.name
+    if name in _CLAUDE_CODE_ENGINES:
+        return bool(
+            os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            or os.environ.get("ANTHROPIC_API_KEY")
+        )
+    if name == "kiro":
+        return bool(os.environ.get("KIRO_API_KEY"))
+    if name == "claude-code-ollama":
+        from . import config
+
+        return bool(config.OLLAMA_BASE_URL)
+    return False
+
+
+def get_available_engine_names() -> list[str]:
+    """Return registered engine names whose credentials are present in the env."""
+    return [name for name, engine in ENGINES.items() if is_engine_available(engine)]
+
 
 def get_engine(name: str) -> Engine:
     """Look up an engine by name, raising ValueError if unknown."""

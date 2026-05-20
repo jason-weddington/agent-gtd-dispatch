@@ -22,6 +22,21 @@ class EngineSwap(BaseModel):
     reason: str
 
 
+class InfoResponse(BaseModel):
+    """Service identity, capacity, and capabilities returned by GET /info.
+
+    Consumed by multi-host routers on the agent_gtd side to filter
+    dispatch targets by available engines/agents and pick by capacity.
+    """
+
+    engine: str
+    version: str
+    max_concurrent_runs: int
+    active_runs: int
+    engines: list[str]
+    agents: list[str]
+
+
 class Run(BaseModel):
     """A single dispatch run record."""
 
