@@ -29,6 +29,26 @@ export ANTHROPIC_API_KEY="your-anthropic-key"       # optional if using OAuth
 export DISPATCH_WORKSPACE_ROOT="/path/to/workspaces" # default: ~/workspace
 ```
 
+### Generating `DISPATCH_API_KEY`
+
+`DISPATCH_API_KEY` is a shared secret — any high-entropy string the dispatch
+service and its callers both know. Generate one with:
+
+```bash
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
+Put the same value in:
+
+- the dispatch service's env (`/home/dispatch-svc/.env` in production, or the
+  shell environment in dev)
+- every caller's config (e.g. the **Agent Dispatch** host entries in the
+  Agent GTD Settings page — paste this into the API Key field for each host)
+
+Rotating: pick a new value, update the dispatch service env + restart, then
+update each caller. Mismatches show up as `401 Not authenticated` on Bearer
+endpoints.
+
 ```bash
 uv run uvicorn agent_gtd_dispatch.main:app --host 0.0.0.0 --port 8001
 ```
