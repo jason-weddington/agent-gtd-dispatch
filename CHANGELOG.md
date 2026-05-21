@@ -2,6 +2,158 @@
 
 <!-- version list -->
 
+## v1.10.0 (2026-05-21)
+
+### Bug Fixes
+
+- **0232d8b9**: Installer round-2 gaps — fresh-box install on r7-research
+  ([`ccbdaa2`](https://github.com/repos/agent-gtd-dispatch/commit/ccbdaa263fbdfcdfbf6a4a27128fd6e232d8285a))
+
+- **5c2ce573**: Retry deploy.sh health probe for up to 30s
+  ([`2047763`](https://github.com/repos/agent-gtd-dispatch/commit/2047763dd0d2c3fc445e38eb402ef313bf30658f))
+
+- **70081a9d**: Installer gaps discovered during pironman01 migration
+  ([`0f73808`](https://github.com/repos/agent-gtd-dispatch/commit/0f7380800b86c89cd044165c7d8bd89636727e2c))
+
+- **952ef40b**: URGENT: Manager timeout uses build-mode 90min limit instead of intended 4hr
+  MANAGE_TIMEOUT_SECONDS
+  ([`bd32db1`](https://github.com/repos/agent-gtd-dispatch/commit/bd32db18149e42c7654ffeed584add213068c37c))
+
+- **dispatch**: Accept item_id=null when mode=manage
+  ([`6bc1bfc`](https://github.com/repos/agent-gtd-dispatch/commit/6bc1bfc12ee4eb39f24ec9f725fc53428905e117))
+
+- **ollama**: Use --model CLI flag and Anthropic-native root URL
+  ([`ee8435a`](https://github.com/repos/agent-gtd-dispatch/commit/ee8435a5d02f5d9efe4718c459939857d823b914))
+
+### Chores
+
+- **deploy**: Deploy to all 3 hosts by default
+  ([`5c717af`](https://github.com/repos/agent-gtd-dispatch/commit/5c717af327315c5688035915c5f15a3f43644e88))
+
+- **format**: Apply ruff-format to dispatch.py
+  ([`a24df05`](https://github.com/repos/agent-gtd-dispatch/commit/a24df05668ad1cb9ca2743d3a356057e39e9cfd3))
+
+- **lint**: Add S108 noqa to test dummy /tmp paths
+  ([`bf14cd5`](https://github.com/repos/agent-gtd-dispatch/commit/bf14cd5f27cd7646f77a9f17c0b9ad0ed5da5bae))
+
+- **ollama**: Bump default model qwen3.5:35b -> qwen3.6:35b
+  ([`eb28094`](https://github.com/repos/agent-gtd-dispatch/commit/eb280945d811154c92eb825d4fbf1b30c06bc3a1))
+
+### Documentation
+
+- Generalize SSH-key-authorize halt message in installer
+  ([`8119341`](https://github.com/repos/agent-gtd-dispatch/commit/8119341214e3447e50f12fb8cd5d65648c8b57b6))
+
+- **manage-prompt**: Consume complete_in_wave's graph_complete + drop separate complete_item
+  ([`138107f`](https://github.com/repos/agent-gtd-dispatch/commit/138107ffeeeeca78e1d40b86b9dc5a9918c7f97f))
+
+- **manage-prompt**: Findings 6/7/12 from lead-as-manager walkthrough
+  ([`2cda236`](https://github.com/repos/agent-gtd-dispatch/commit/2cda236ae1e2908482c7059393ad51351cf5b896))
+
+### Features
+
+- Add update_wave_state calls to manage prompt
+  ([`2e6b97f`](https://github.com/repos/agent-gtd-dispatch/commit/2e6b97f9387b68639aef4bf1546daa05640a0201))
+
+- Extend /info with capacity + per-host engines/agents
+  ([`a2fc32c`](https://github.com/repos/agent-gtd-dispatch/commit/a2fc32c39849b52fe50e8cb1281cbd158e97c745))
+
+- **00e4960e**: Claude-code-ollama dispatch engine (Claude Code with local Ollama backend)
+  ([`fd4c4a4`](https://github.com/repos/agent-gtd-dispatch/commit/fd4c4a4ef5b4336a56801bfea56acf6390871849))
+
+- **130b8e1f**: Investigate: dispatch caps at 6 concurrent despite 9 set in UI
+  ([`66200a2`](https://github.com/repos/agent-gtd-dispatch/commit/66200a22c81e12dd32975712b2c7b30227fd62a7))
+
+- **1cd581d1**: Plan-mode agent applies engine-selection rubric to set build_engine
+  ([`88ead51`](https://github.com/repos/agent-gtd-dispatch/commit/88ead5187551d5780341ca753e77cd17b30af748))
+
+- **31c07ef3**: Remove duplicate `_MAX_MANAGE_RETRIES_FOR_PROMPT` constant — import from main.py
+  instead
+  ([`1d97b2a`](https://github.com/repos/agent-gtd-dispatch/commit/1d97b2abd89b9f2a2444c2f9b0c297e1ab4ef011))
+
+- **43685c5d**: Log each orphaned run ID individually on reconcile
+  ([`e740c8c`](https://github.com/repos/agent-gtd-dispatch/commit/e740c8ce02cccb718023575ee23f4125062efc5d))
+
+- **4ff92fd0**: Manage prompt should delete feature branches from origin after squash-merge
+  ([`8729645`](https://github.com/repos/agent-gtd-dispatch/commit/87296453da30bfeb39300b81fbd4e625fbf52f83))
+
+- **69e7c83e**: Enforce max_concurrent_runs at POST /dispatch (503 at cap)
+  ([`f797d3a`](https://github.com/repos/agent-gtd-dispatch/commit/f797d3af4c029cbdfeee1ad585978fb97be25686))
+
+- **7042818c**: URGENT: Manage prompt must forbid lowering coverage threshold (ratchet up only)
+  ([`ba85138`](https://github.com/repos/agent-gtd-dispatch/commit/ba85138cb61992ecc0f35e13ec3dfdf6c1026f09))
+
+- **77137fb4**: Extract shared dispatch wire-contract schemas into protocol package
+  ([`6b2cda9`](https://github.com/repos/agent-gtd-dispatch/commit/6b2cda940fb5c0ac7a310e6cd21c57dabef1778a))
+
+- **865b0e4e**: Engine name mismatch: agent-gtd `claude-code` vs dispatch service `claude`
+  ([`d83da64`](https://github.com/repos/agent-gtd-dispatch/commit/d83da64afbaafa7bee7022f90060bf754ce1f8ef))
+
+- **8939136f**: Tighten dispatch-service HTTP boundary
+  ([`0bb792c`](https://github.com/repos/agent-gtd-dispatch/commit/0bb792c8c2f404936f5ca1342722ef200c4a5948))
+
+- **92bfa404**: Mothball Ollama in plan-mode rubric: remove from routing options
+  ([`c4d46a8`](https://github.com/repos/agent-gtd-dispatch/commit/c4d46a80912f91f8c185fbf8fe5bbb3ab814f2ee))
+
+- **931eef2f**: Deduplicate make_branch_name / branch_name_for_item into the shared protocol package
+  ([`c12a1a2`](https://github.com/repos/agent-gtd-dispatch/commit/c12a1a2f219598e34e3d3404127bc29d829a9404))
+
+- **998544ac**: Two-user split: agent subprocesses run as `dispatch`, service runs as `dispatch-svc`
+  (code side)
+  ([`0d25617`](https://github.com/repos/agent-gtd-dispatch/commit/0d2561797df7e9919193d56f51abaae8ecfbfe53))
+
+- **a9fc6d4b**: Cross-service cancel propagation dispatch endpoint
+  ([`d466796`](https://github.com/repos/agent-gtd-dispatch/commit/d4667969782842366cd6735b15770e2b39d4b194))
+
+- **af2edd2d**: Idempotent setup-dispatch-host.sh installer + in-repo deploy.sh
+  ([`7b8a50b`](https://github.com/repos/agent-gtd-dispatch/commit/7b8a50b808f23efc254dbe7b4d85f79e6cb7453d))
+
+- **bcb51580**: Plan-mode prompt writes structured fields via update_item
+  ([`b3ef860`](https://github.com/repos/agent-gtd-dispatch/commit/b3ef8605d9a704c901c1d8c84bd536f643e48b92))
+
+- **c1a3e167**: Build agent reported 'success' on de0faf2a without pushing any commits
+  (verified-but-not-committed)
+  ([`c8b4b28`](https://github.com/repos/agent-gtd-dispatch/commit/c8b4b2899fe9857757188c0c91477a75fc121a9e))
+
+- **c6963f04**: Build prompt: minimal — system prompt + fetch GTD item, no pre-rendering
+  ([`9fc6dfd`](https://github.com/repos/agent-gtd-dispatch/commit/9fc6dfd7b0d174abd44d4754ced7a8273e19f78f))
+
+- **dispatch**: Auto-recovery of dead manage subprocess + recovery prompt addendum
+  ([`3489dc5`](https://github.com/repos/agent-gtd-dispatch/commit/3489dc5d918b0c5ca7581b1b276dca76e9fbc1bf))
+
+- **dispatch**: Capture subprocess transcript on every run
+  ([`a4c568d`](https://github.com/repos/agent-gtd-dispatch/commit/a4c568d5698d82127e773da9c1393c266e3fd46f))
+
+- **e261e681**: Claude-code-sonnet + claude-code-haiku engines + 4-way rubric
+  ([`d6ab4fb`](https://github.com/repos/agent-gtd-dispatch/commit/d6ab4fb65ac330aa50413f9603578daf35f83da3))
+
+- **ee444a91**: Validate OLLAMA_BASE_URL at config.load() — fail fast on missing scheme/port
+  ([`e3288be`](https://github.com/repos/agent-gtd-dispatch/commit/e3288be79b5d3179fc90c67c9bf4315a69fa483f))
+
+- **fc39976a**: Replace planner's free-text dependency hints with structured signals
+  ([`c78825e`](https://github.com/repos/agent-gtd-dispatch/commit/c78825e5cee2ae1dba312551af74295d8b5930b9))
+
+- **fe065a45**: Make dispatch engine fallback/swap visible to operator
+  ([`6ba576a`](https://github.com/repos/agent-gtd-dispatch/commit/6ba576a4f9213efcb475d1faab81cda05d773cfd))
+
+- **observability**: Wire attribution field through dispatch service env
+  ([`38f9364`](https://github.com/repos/agent-gtd-dispatch/commit/38f936416316d4a2bcdb22705360584c419e1928))
+
+- **transcripts**: Stream agent stdout to transcript.txt in real time + GET /runs/{id}/transcript
+  ([`1c937d2`](https://github.com/repos/agent-gtd-dispatch/commit/1c937d2a83dec74b6a1cd8b3787b992554333184))
+
+- **wave-manager**: Strip deterministic scaffolding, let manage agent reason
+  ([`55792ba`](https://github.com/repos/agent-gtd-dispatch/commit/55792ba0d02e5a8f1bb987a964c0785a57a3b054))
+
+### Refactoring
+
+- **rollout**: Rename wave → rollout in agent-gtd-dispatch to match agent_gtd
+  ([`0b34591`](https://github.com/repos/agent-gtd-dispatch/commit/0b3459136f3bd94d2a07e37694308251a04981d5))
+
+- **wave-manager**: Flip allowlist → halt-list (default-allow + escape hatch)
+  ([`d218842`](https://github.com/repos/agent-gtd-dispatch/commit/d21884289914292ec0347407326bae7c5567c21e))
+
+
 ## v1.9.0 (2026-05-12)
 
 ### Bug Fixes
