@@ -31,9 +31,19 @@ sudo -u ${SERVICE_USER} bash -c "cd ${REPO_DIR} && /home/${SERVICE_USER}/.local/
 # Restart the service
 sudo systemctl restart ${SERVICE_NAME}
 
-# Quick health probe
-sleep 2
-if curl -sf --max-time 5 http://localhost:8100/health >/dev/null; then
+# Quick health probe — retry loop (up to 30s for slower hosts)
+_ok=0
+for _i in \$(seq 1 30); do
+    if curl -sf --max-time 1 http://localhost:8100/health >/dev/null 2>&1; then
+        _ok=1
+        break
+    fi
+    if [ \$_i -lt 30 ]; then
+        sleep 1
+    fi
+done
+
+if [ \$_ok -eq 1 ]; then
     echo "[OK]   Service is healthy"
 else
     echo "[WARN] Health check failed after restart — check: journalctl -u ${SERVICE_NAME} -n 50" >&2
