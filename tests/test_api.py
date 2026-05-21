@@ -446,6 +446,93 @@ class TestDispatch:
         assert data["engine_swap"]["to_engine"] == "claude-code"
 
 
+class TestMaxConcurrentRunsEnforcement:
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    @patch("agent_gtd_dispatch.main.dispatch")
+    def test_rejects_when_at_capacity(
+        self, mock_dispatch, mock_client, client, auth_headers, monkeypatch
+    ) -> None:
+        """POST /dispatch returns 503 when active_runs >= max_concurrent_runs."""
+        # Set max to 1, then fill it
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 1)
+        monkeypatch.setattr("agent_gtd_dispatch.main._active_processes", {"run1": None})
+
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc123", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 503
+        data = resp.json()
+        assert isinstance(data["detail"], dict)
+        assert "capacity" in data["detail"]["detail"].lower()
+        assert data["detail"]["active_runs"] == 1
+        assert data["detail"]["max_concurrent_runs"] == 1
+
+    def test_accepts_when_below_capacity(
+        self, client, auth_headers, monkeypatch
+    ) -> None:
+        """POST /dispatch succeeds when active_runs < max_concurrent_runs."""
+        # Set max to 2, fill with 1, then accept 1 more
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 2)
+        monkeypatch.setattr("agent_gtd_dispatch.main._active_processes", {"run1": None})
+
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc123", "max_turns": 50},
+            headers=auth_headers,
+        )
+        # Should fail at the gtd_client.get_item stage but NOT at the capacity check
+        # because we're below capacity. The 502 is from upstream error, not capacity check.
+        # Capacity check should have passed, so we should get 502 or 503 from upstream,
+        # NOT 503 from the capacity check which would have "capacity" in the detail.
+        if resp.status_code == 503:
+            data = resp.json()
+            assert "capacity" not in str(data).lower()
+
+    def test_accepts_when_empty(self, client, auth_headers, monkeypatch) -> None:
+        """POST /dispatch succeeds when active_runs == 0 < max_concurrent_runs."""
+        # Ensure _active_processes is empty
+        monkeypatch.setattr("agent_gtd_dispatch.main._active_processes", {})
+
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc123", "max_turns": 50},
+            headers=auth_headers,
+        )
+        # Should fail at the gtd_client.get_item stage but NOT at the capacity check
+        # because we're below capacity. The 502 is from upstream error, not capacity check.
+        # Capacity check should have passed, so we should get 502 or 503 from upstream,
+        # NOT 503 from the capacity check which would have "capacity" in the detail.
+        if resp.status_code == 503:
+            data = resp.json()
+            assert "capacity" not in str(data).lower()
+
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    @patch("agent_gtd_dispatch.main.dispatch")
+    def test_manage_mode_respects_concurrent_limit(
+        self, mock_dispatch, mock_client, client, auth_headers, monkeypatch
+    ) -> None:
+        """POST /dispatch for manage mode also respects max_concurrent_runs."""
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 1)
+        monkeypatch.setattr("agent_gtd_dispatch.main._active_processes", {"run1": None})
+
+        resp = client.post(
+            "/dispatch",
+            json={"rollout_id": "rollout123", "mode": "manage", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["detail"]["active_runs"] == 1
+
+
 class TestListRuns:
     def test_empty_list(self, client, auth_headers):
         resp = client.get("/runs", headers=auth_headers)

@@ -549,6 +549,17 @@ async def dispatch_item(
     _: str = Depends(_verify_api_key),
 ) -> RunResponse:
     """Start a new dispatch run for a GTD item."""
+    # Check concurrent runs limit before proceeding
+    if len(_active_processes) >= config.MAX_CONCURRENT_RUNS:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "detail": "Dispatch service at capacity",
+                "active_runs": len(_active_processes),
+                "max_concurrent_runs": config.MAX_CONCURRENT_RUNS,
+            },
+        )
+
     # Plan-mode and manage-mode always use Anthropic, regardless of requested engine
     effective_engine_name = body.engine
     if body.mode != "build" and body.engine == "claude-code-ollama":
