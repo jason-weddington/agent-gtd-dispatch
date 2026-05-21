@@ -27,10 +27,10 @@ def _env(tmp_path):
 
 
 class TestReconcileOrphans:
-    async def test_returns_zero_when_no_runs(self) -> None:
+    async def test_returns_empty_list_when_no_runs(self) -> None:
         await db.init_db()
-        count = await db.reconcile_orphans()
-        assert count == 0
+        orphaned_ids = await db.reconcile_orphans()
+        assert orphaned_ids == []
 
     async def test_pending_run_marked_failed(self) -> None:
         await db.init_db()
@@ -38,9 +38,10 @@ class TestReconcileOrphans:
         assert run.status == RunStatus.pending
         await db.insert_run(run)
 
-        count = await db.reconcile_orphans()
+        orphaned_ids = await db.reconcile_orphans()
 
-        assert count == 1
+        assert len(orphaned_ids) == 1
+        assert run.id in orphaned_ids
         updated = await db.get_run(run.id)
         assert updated is not None
         assert updated.status == RunStatus.failed
@@ -52,9 +53,10 @@ class TestReconcileOrphans:
         await db.insert_run(run)
         await db.update_run(run.id, status=RunStatus.running)
 
-        count = await db.reconcile_orphans()
+        orphaned_ids = await db.reconcile_orphans()
 
-        assert count == 1
+        assert len(orphaned_ids) == 1
+        assert run.id in orphaned_ids
         updated = await db.get_run(run.id)
         assert updated is not None
         assert updated.status == RunStatus.failed
@@ -73,9 +75,9 @@ class TestReconcileOrphans:
             await db.insert_run(run)
             await db.update_run(run.id, status=status)
 
-        count = await db.reconcile_orphans()
+        orphaned_ids = await db.reconcile_orphans()
 
-        assert count == 0
+        assert orphaned_ids == []
 
     async def test_multiple_orphans_all_reconciled(self) -> None:
         await db.init_db()
@@ -88,9 +90,11 @@ class TestReconcileOrphans:
         # Manually set one to running
         await db.update_run(runs[0].id, status=RunStatus.running)
 
-        count = await db.reconcile_orphans()
+        orphaned_ids = await db.reconcile_orphans()
 
-        assert count == 3
+        assert len(orphaned_ids) == 3
+        run_ids_set = {run.id for run in runs}
+        assert set(orphaned_ids) == run_ids_set
         for run in runs:
             updated = await db.get_run(run.id)
             assert updated is not None

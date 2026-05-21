@@ -161,19 +161,30 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
-async def reconcile_orphans() -> int:
+async def reconcile_orphans() -> list[str]:
     """Mark any runs stuck in pending/running as failed (service restart).
 
-    Returns the number of rows updated.
+    Returns the list of run IDs that were reconciled.
     """
     async with aiosqlite.connect(db_path()) as db:
+        # Fetch orphaned run IDs first
         cursor = await db.execute(
-            "UPDATE runs SET status = 'failed',"
-            " error = 'Service restarted while run was active'"
-            " WHERE status IN ('pending', 'running')"
+            "SELECT id FROM runs WHERE status IN ('pending', 'running')"
         )
-        await db.commit()
-        return cursor.rowcount
+        orphaned_ids = [row[0] for row in await cursor.fetchall()]
+
+        if orphaned_ids:
+            # Update all orphaned runs
+            placeholders = ",".join("?" * len(orphaned_ids))
+            await db.execute(
+                f"UPDATE runs SET status = 'failed',"  # noqa: S608
+                " error = 'Service restarted while run was active'"
+                f" WHERE id IN ({placeholders})",
+                orphaned_ids,
+            )
+            await db.commit()
+
+        return orphaned_ids
 
 
 async def insert_run(run: Run) -> None:

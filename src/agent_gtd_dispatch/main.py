@@ -145,9 +145,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         _check_service_repo()
     dispatch.init_executor()
     await db.init_db()
-    orphan_count = await db.reconcile_orphans()
-    if orphan_count > 0:
-        logger.warning("Reconciled %d orphaned run(s) on startup", orphan_count)
+    orphaned_run_ids = await db.reconcile_orphans()
+    if orphaned_run_ids:
+        for run_id in orphaned_run_ids:
+            logger.warning("Reconciled orphaned run: %s", run_id)
     else:
         logger.info("No orphaned runs found on startup")
     yield
