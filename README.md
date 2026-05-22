@@ -90,6 +90,45 @@ sudo ./setup-dispatch-host.sh --env-file /path/to/.env
 
 See **[docs/install.md](docs/install.md)** for the full install guide, env-file reference, rollback procedure, and troubleshooting.
 
+### MCP servers for the agent user
+
+The installer registers three MCP servers for the `dispatch` (agent) user so that
+dispatched Claude Code agents have tool access to GTD, the personal knowledge base,
+and AWS documentation:
+
+| Server | Purpose |
+|---|---|
+| `agent-gtd` | GTD items, comments, and dispatch — lets agents post comments and update items via MCP rather than raw `curl` |
+| `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) |
+| `aws-documentation-mcp-server` | AWS docs for any AWS-related implementation work |
+
+Registration is **per-host and per-user** (`--scope user`, writes to
+`/home/dispatch/.claude.json`). Step 4.6 of the installer handles this automatically.
+
+**Config file**: `templates/mcp-servers.sh`
+
+This Bash-sourceable file defines a single `MCP_SERVERS` array. Each entry uses the
+format `"<name>|<args-after-claude-mcp-add-NAME>"`. The installer reads this file and
+runs `claude mcp add <name> <args>` for each entry (with an idempotent remove-first
+pattern so re-running is safe).
+
+**To add a new MCP server:**
+
+1. Append an entry to `MCP_SERVERS` in `templates/mcp-servers.sh`.
+2. Re-run `sudo ./setup-dispatch-host.sh` on each host — Step 4.6 will register the
+   new server and leave existing registrations unchanged.
+
+Alternatively, register it manually on a specific host:
+```bash
+sudo -u dispatch -H bash -lc "claude mcp add <name> --scope user <args>"
+```
+
+**To verify registration on a host:**
+```bash
+ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && claude mcp list"'
+# → all three servers listed
+```
+
 ## Tests
 
 ```bash

@@ -152,6 +152,61 @@ owned by `dispatch-svc`. Never commit it to git.
 
 ---
 
+## MCP servers for the agent user
+
+Step 4.6 of the installer registers three MCP servers for the `dispatch` (agent) user.
+This gives dispatched Claude Code agents tool access to GTD, the personal knowledge
+base, and AWS documentation — enabling proper attribution on GTD comments instead of
+falling back to raw `curl` calls.
+
+| Server | Purpose |
+|---|---|
+| `agent-gtd` | GTD items, comments, and dispatch (prevents `created_by="human"` regression) |
+| `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) |
+| `aws-documentation-mcp-server` | AWS docs for any AWS-related implementation work |
+
+Registration is **per-host and per-user** using `--scope user`, which writes to
+`/home/dispatch/.claude.json`.
+
+### Config file
+
+`templates/mcp-servers.sh` in the repo root defines the `MCP_SERVERS` array. Each
+entry has the format:
+
+```
+"<name>|<args-after-claude-mcp-add-NAME>"
+```
+
+The installer sources this file during Step 4.6 and runs `claude mcp add` for each
+entry with an idempotent remove-first pattern (safe to re-run).
+
+### Adding a new MCP server
+
+1. Append an entry to `MCP_SERVERS` in `templates/mcp-servers.sh`.
+2. Re-run `sudo ./setup-dispatch-host.sh` on each host — Step 4.6 registers the new
+   server and leaves existing registrations unchanged.
+
+Or register it manually on a specific host only:
+```bash
+sudo -u dispatch -H bash -lc "claude mcp add <name> --scope user <args>"
+```
+
+### Verifying registration
+
+```bash
+# List registered servers on a host:
+ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && claude mcp list"'
+# → agent-gtd: ...
+# → aws-documentation-mcp-server: ...
+# → personal-kb: ...
+
+# Inspect ~/.claude.json directly:
+ssh <HOST> 'sudo cat /home/dispatch/.claude.json' | jq '.mcpServers | keys'
+# → ["agent-gtd", "aws-documentation-mcp-server", "personal-kb"]
+```
+
+---
+
 ## Rollback procedure
 
 To undo the installer step by step (in reverse order):

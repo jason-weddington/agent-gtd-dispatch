@@ -446,6 +446,46 @@ else
 fi
 
 # ===========================================================================
+# Step 4.6: MCP servers (agent user)
+# ===========================================================================
+echo ""
+echo "--- Step 4.6: MCP servers (agent user) ---"
+
+if ! $DRY_RUN && [[ ! -f "$CLAUDE_SRC" ]]; then
+    warn "Claude Code not found at ${CLAUDE_SRC} — skipping MCP server registration (install claude as ${AGENT_USER} first)"
+elif $DRY_RUN; then
+    would "source ${TMPL_DIR}/mcp-servers.sh and register each MCP server for ${AGENT_USER} via claude mcp add --scope user"
+else
+    MCP_CONF="${TMPL_DIR}/mcp-servers.sh"
+    if [[ ! -f "$MCP_CONF" ]]; then
+        die "MCP server config not found at ${MCP_CONF} — cannot register MCP servers"
+    fi
+    # shellcheck source=templates/mcp-servers.sh
+    source "$MCP_CONF"
+    for entry in "${MCP_SERVERS[@]}"; do
+        mcp_name="${entry%%|*}"
+        mcp_args="${entry#*|}"
+        # Idempotent: remove first (tolerate "not registered"), then add
+        sudo -u "$AGENT_USER" -H bash -lc \
+            "cd /home/${AGENT_USER} && ${CLAUDE_SRC} mcp remove ${mcp_name} --scope user 2>/dev/null || true"
+        # word-split mcp_args intentionally — they are space-separated CLI flags
+        # shellcheck disable=SC2086
+        sudo -u "$AGENT_USER" -H bash -lc \
+            "cd /home/${AGENT_USER} && ${CLAUDE_SRC} mcp add ${mcp_name} ${mcp_args}"
+        info "Registered MCP server '${mcp_name}' for ${AGENT_USER}"
+    done
+    # Smoke test: verify agent-gtd is listed (name presence only — cold uvx cache
+    # makes the "✓ Connected" health check unreliable on first invocation)
+    if sudo -u "$AGENT_USER" -H bash -lc \
+            "cd /home/${AGENT_USER} && ${CLAUDE_SRC} mcp list" 2>/dev/null \
+            | grep -q "^agent-gtd:"; then
+        info "Smoke test passed: 'agent-gtd' MCP server registered for ${AGENT_USER}"
+    else
+        die "Smoke test failed: 'agent-gtd' not found in \`claude mcp list\` output for ${AGENT_USER} — registration may have failed"
+    fi
+fi
+
+# ===========================================================================
 # Step 5a: Claude symlink (must precede sudoers so the path exists when
 #           visudo validates the fragment)
 # ===========================================================================
