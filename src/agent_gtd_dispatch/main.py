@@ -10,7 +10,7 @@ import subprocess
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Security
@@ -101,6 +101,19 @@ async def _ollama_health_check() -> tuple[bool, str]:
 _active_processes: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
 _active_subprocesses: dict[str, subprocess.Popen[bytes]] = {}
 _run_event_queues: dict[str, asyncio.Queue[dict]] = {}  # type: ignore[type-arg]
+
+
+class _PendingDispatch(NamedTuple):
+    """Queued dispatch waiting for a free slot."""
+
+    run: Run
+    engine: Engine
+    max_turns: int
+    timeout_seconds: int
+    attribution: str | None
+
+
+_pending_queue: list[_PendingDispatch] = []
 
 
 def _publish_run_event(run_id: str, status: str, completed_at: str | None) -> None:
@@ -249,6 +262,27 @@ async def _maybe_relaunch_manage(
         )
     )
     _active_processes[new_run.id] = task
+
+
+def _try_start_pending() -> None:
+    """Start as many queued dispatches as there are free slots.
+
+    Called synchronously from _dispatch_worker's finally block after a run
+    completes, freeing a slot. No await between slot-count check and task
+    creation — stays atomic within the event-loop tick.
+    """
+    while _pending_queue and len(_active_processes) < config.MAX_CONCURRENT_RUNS:
+        pending = _pending_queue.pop(0)
+        task = asyncio.create_task(
+            _dispatch_worker(
+                pending.run,
+                pending.max_turns,
+                pending.engine,
+                pending.timeout_seconds,
+                attribution=pending.attribution,
+            )
+        )
+        _active_processes[pending.run.id] = task
 
 
 async def _dispatch_worker(
@@ -472,6 +506,7 @@ async def _dispatch_worker(
             should_cleanup = False
     finally:
         _active_processes.pop(run.id, None)
+        _try_start_pending()  # wake up a queued dispatch now that a slot freed
         _active_subprocesses.pop(run.id, None)
         _run_event_queues.pop(run.id, None)
         if workspace is not None and should_cleanup:
@@ -549,17 +584,6 @@ async def dispatch_item(
     _: str = Depends(_verify_api_key),
 ) -> RunResponse:
     """Start a new dispatch run for a GTD item."""
-    # Check concurrent runs limit before proceeding
-    if len(_active_processes) >= config.MAX_CONCURRENT_RUNS:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "detail": "Dispatch service at capacity",
-                "active_runs": len(_active_processes),
-                "max_concurrent_runs": config.MAX_CONCURRENT_RUNS,
-            },
-        )
-
     # Plan-mode and manage-mode always use Anthropic, regardless of requested engine
     effective_engine_name = body.engine
     if body.mode != "build" and body.engine == "claude-code-ollama":
@@ -774,11 +798,36 @@ async def dispatch_item(
             effective_engine_name,
         )
 
-    # Create event queue before starting the task so the cancel endpoint
-    # can enqueue events even if the task hasn't started yet.
+    # Create event queue so the cancel/SSE endpoints can enqueue events for
+    # both running AND queued runs (the run.id is known before the task starts).
     _run_event_queues[run.id] = asyncio.Queue()
 
-    # Start background task
+    # ATOMIC capacity check: no await between this check and task creation /
+    # queue append, so concurrent coroutines cannot both pass for the same slot.
+    if len(_active_processes) >= config.MAX_CONCURRENT_RUNS:
+        # Service is at capacity — queue the run and return 200 immediately.
+        # _try_start_pending() will promote it when a slot frees.
+        _pending_queue.append(
+            _PendingDispatch(
+                run=run,
+                engine=engine,
+                max_turns=max_turns,
+                timeout_seconds=timeout_seconds,
+                attribution=body.attribution,
+            )
+        )
+        return RunResponse(
+            **run.model_dump(),
+            engine_swap=EngineSwap(
+                from_engine=body.engine,
+                to_engine=effective_engine_name,
+                reason="plan/manage mode does not support ollama",
+            )
+            if engine_swapped
+            else None,
+        )
+
+    # Slot available — start the background task immediately.
     task = asyncio.create_task(
         _dispatch_worker(
             run, max_turns, engine, timeout_seconds, attribution=body.attribution

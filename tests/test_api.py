@@ -449,27 +449,45 @@ class TestDispatch:
 class TestMaxConcurrentRunsEnforcement:
     @patch("agent_gtd_dispatch.main.gtd_client")
     @patch("agent_gtd_dispatch.main.dispatch")
-    def test_rejects_when_at_capacity(
+    def test_queues_when_at_capacity(
         self, mock_dispatch, mock_client, client, auth_headers, monkeypatch
     ) -> None:
-        """POST /dispatch returns 503 when active_runs >= max_concurrent_runs."""
-        # Set max to 1, then fill it
+        """POST /dispatch returns 200 status=pending (queued) when at capacity."""
+        from unittest.mock import AsyncMock
+
         from agent_gtd_dispatch import config
 
         monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 1)
         monkeypatch.setattr("agent_gtd_dispatch.main._active_processes", {"run1": None})
+
+        fresh_queue: list = []
+        monkeypatch.setattr("agent_gtd_dispatch.main._pending_queue", fresh_queue)
+
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc123",
+                "title": "Test item",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc123-test-item"
 
         resp = client.post(
             "/dispatch",
             json={"item_id": "abc123", "max_turns": 50},
             headers=auth_headers,
         )
-        assert resp.status_code == 503
+        assert resp.status_code == 200
         data = resp.json()
-        assert isinstance(data["detail"], dict)
-        assert "capacity" in data["detail"]["detail"].lower()
-        assert data["detail"]["active_runs"] == 1
-        assert data["detail"]["max_concurrent_runs"] == 1
+        assert data["status"] == "pending"
+        assert len(fresh_queue) == 1
 
     def test_accepts_when_below_capacity(
         self, client, auth_headers, monkeypatch
@@ -514,23 +532,178 @@ class TestMaxConcurrentRunsEnforcement:
 
     @patch("agent_gtd_dispatch.main.gtd_client")
     @patch("agent_gtd_dispatch.main.dispatch")
-    def test_manage_mode_respects_concurrent_limit(
+    def test_manage_mode_queues_at_concurrent_limit(
         self, mock_dispatch, mock_client, client, auth_headers, monkeypatch
     ) -> None:
-        """POST /dispatch for manage mode also respects max_concurrent_runs."""
+        """POST /dispatch for manage mode also queues (200 pending) at max_concurrent_runs."""
+        from unittest.mock import AsyncMock
+
         from agent_gtd_dispatch import config
 
         monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 1)
         monkeypatch.setattr("agent_gtd_dispatch.main._active_processes", {"run1": None})
+
+        fresh_queue: list = []
+        monkeypatch.setattr("agent_gtd_dispatch.main._pending_queue", fresh_queue)
+
+        mock_client.get_rollout = AsyncMock(
+            return_value={
+                "id": "rollout123",
+                "project_id": "proj1",
+                "status": "running",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "WaveProject",
+                "git_origin": "git@ubuntu-vm01:repos/wave-project",
+            }
+        )
 
         resp = client.post(
             "/dispatch",
             json={"rollout_id": "rollout123", "mode": "manage", "max_turns": 50},
             headers=auth_headers,
         )
-        assert resp.status_code == 503
+        assert resp.status_code == 200
         data = resp.json()
-        assert data["detail"]["active_runs"] == 1
+        assert data["status"] == "pending"
+        assert len(fresh_queue) == 1
+
+
+class TestBurstDispatch:
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_burst_within_cap(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers, monkeypatch
+    ) -> None:
+        """N parallel dispatches within cap all return 200 — no burst gets stuck pending."""
+        from unittest.mock import AsyncMock
+
+        from agent_gtd_dispatch import config
+
+        n = 3
+        monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", n)
+        monkeypatch.setattr("agent_gtd_dispatch.main._active_processes", {})
+
+        fresh_queue: list = []
+        monkeypatch.setattr("agent_gtd_dispatch.main._pending_queue", fresh_queue)
+
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "item-burst",
+                "title": "Burst item",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/item-burst"
+
+        for _ in range(n):
+            resp = client.post(
+                "/dispatch",
+                json={"item_id": "item-burst", "max_turns": 50},
+                headers=auth_headers,
+            )
+            assert resp.status_code == 200
+
+        # All dispatches should have been handled (either running or the worker was called)
+        # None should have ended up queued due to a race-induced false over-cap signal.
+        assert len(fresh_queue) == 0
+        assert mock_worker.call_count == n
+
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_over_cap_queues(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers, monkeypatch
+    ) -> None:
+        """When service is at cap, dispatch returns 200 with status=pending and queues."""
+        from unittest.mock import AsyncMock
+
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 1)
+        monkeypatch.setattr(
+            "agent_gtd_dispatch.main._active_processes", {"existing-run": None}
+        )
+
+        fresh_queue: list = []
+        monkeypatch.setattr("agent_gtd_dispatch.main._pending_queue", fresh_queue)
+
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "item-queued",
+                "title": "Queued item",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/item-queued"
+
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "item-queued", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "pending"
+
+        # The run must be in the pending queue, not started
+        assert len(fresh_queue) == 1
+        assert fresh_queue[0].run.item_id == "item-queued"
+        mock_worker.assert_not_called()
+
+    async def test_slot_free_drains_queue(self, monkeypatch) -> None:
+        """When a slot frees, _try_start_pending() promotes a queued run."""
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.engines import get_engine
+        from agent_gtd_dispatch.main import (
+            _PendingDispatch,
+            _try_start_pending,
+        )
+        from agent_gtd_dispatch.models import Run
+
+        monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 2)
+
+        fresh_active: dict = {}
+        monkeypatch.setattr("agent_gtd_dispatch.main._active_processes", fresh_active)
+
+        run = Run(item_id="item-drain", project_name="proj", branch_name="feat/drain")
+        engine = get_engine("claude-code")
+
+        fresh_queue: list = [
+            _PendingDispatch(
+                run=run,
+                engine=engine,
+                max_turns=50,
+                timeout_seconds=1800,
+                attribution=None,
+            )
+        ]
+        monkeypatch.setattr("agent_gtd_dispatch.main._pending_queue", fresh_queue)
+
+        with patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock):
+            _try_start_pending()
+
+        # Queue should be drained and the run promoted to active
+        assert len(fresh_queue) == 0
+        assert run.id in fresh_active
 
 
 class TestListRuns:
