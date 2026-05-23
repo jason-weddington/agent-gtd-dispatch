@@ -62,10 +62,10 @@ def _env(tmp_path):
 
 @pytest.mark.parametrize(
     "status",
-    ["completed", "halted", "cancelled", "crashed"],
+    ["completed", "halted", "cancelled"],
 )
 async def test_clean_exit_does_not_relaunch(status: str) -> None:
-    """All four clean-exit statuses should result in no relaunch."""
+    """All three clean-exit statuses should result in no relaunch."""
     run = _make_run()
     engine = MagicMock()
 

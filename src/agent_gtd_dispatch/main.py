@@ -135,9 +135,7 @@ MAX_MANAGE_RETRIES = config.MAX_MANAGE_RETRIES  # re-exported for tests
 MANAGE_RETRY_BACKOFF_SECONDS = 30
 
 # Frozenset of rollout statuses that indicate a clean/terminal manage exit
-_CLEAN_EXIT_STATUSES: frozenset[str] = frozenset(
-    {"completed", "halted", "cancelled", "crashed"}
-)
+_CLEAN_EXIT_STATUSES: frozenset[str] = frozenset({"completed", "halted", "cancelled"})
 
 security = HTTPBearer()
 
