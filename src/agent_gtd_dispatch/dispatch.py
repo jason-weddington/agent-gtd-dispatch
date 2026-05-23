@@ -330,6 +330,29 @@ def _build_plan_prompt(
     prompt += textwrap.dedent(
         f"""\
 
+        ## Before You Begin
+
+        Before writing any acceptance criteria, complete these three steps:
+
+        1. **Read repo conventions** — Read `docs/codebase.md`, `docs/architecture.md`,
+           `docs/domain.md` (any that exist). Fall back to `CLAUDE.md` if none found;
+           note the gap in the plan output.
+        2. **Search the KB** — Call `kb_search(project_ref="{project_name}")` to skim for
+           relevant conventions, anti-patterns, and prior decisions. Pull applicable
+           `kb-XXXXX` IDs into the plan output.
+        3. **Architectural-awareness sweep** — Before finalizing AC, explicitly call out:
+           - **Magic strings**: should any be a `Literal` type or enum instead of bare strings?
+           - **Duplication risk**: does this logic risk duplicating something already in a
+             shared module or utility?
+           - **Typed data homes**: do any data shapes already have a typed home (Pydantic
+             model, TypedDict, or dataclass)?
+           State "No architectural concerns found" if clean.
+        """
+    )
+
+    prompt += textwrap.dedent(
+        f"""\
+
         ## What to do
 
         1. **Read the codebase.** Understand existing patterns, architecture, and conventions.

@@ -369,6 +369,45 @@ class TestBuildPlanPrompt:
         prompt = self._prompt()
         assert "Legality validation reads" in prompt
 
+    def test_step_zero_doc_reading_present(self) -> None:
+        assert "docs/codebase.md" in self._prompt()
+
+    def test_step_zero_claude_md_fallback_present(self) -> None:
+        assert "CLAUDE.md" in self._prompt()
+
+    def test_step_zero_kb_search_present(self) -> None:
+        assert "kb_search" in self._prompt()
+
+    def test_step_zero_kb_search_uses_project_ref(self) -> None:
+        prompt = self._prompt()
+        assert "project_ref=" in prompt
+        assert "my-cool-project" in prompt
+
+    def test_step_zero_architectural_magic_strings_present(self) -> None:
+        prompt = self._prompt()
+        assert any(phrase in prompt for phrase in ["Literal", "enum"])
+
+    def test_step_zero_architectural_duplication_present(self) -> None:
+        prompt = self._prompt()
+        assert any(
+            phrase in prompt for phrase in ["shared", "duplicate", "duplicating"]
+        )
+
+    def test_step_zero_architectural_typed_home_present(self) -> None:
+        prompt = self._prompt()
+        assert any(
+            phrase in prompt
+            for phrase in ["Pydantic", "TypedDict", "dataclass", "typed home"]
+        )
+
+    def test_step_zero_appears_before_what_to_do(self) -> None:
+        prompt = self._prompt()
+        step_zero_idx = prompt.find("## Before You Begin")
+        what_to_do_idx = prompt.find("## What to do")
+        assert step_zero_idx != -1
+        assert what_to_do_idx != -1
+        assert step_zero_idx < what_to_do_idx
+
     def test_build_mode_does_not_include_rubric(self) -> None:
         prompt = build_system_prompt(
             self._item, self._project, "feat/abc12345", 30, mode="build"
