@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import defaultdict, deque
 from typing import Any, cast
 
 import anthropic
@@ -78,9 +79,50 @@ async def plan_rollout(item_ids: list[str]) -> RolloutPlan:
     tool_block = next(b for b in response.content if b.type == "tool_use")
     tool_input = cast("dict[str, Any]", tool_block.input)
     edges = _extract_edges(tool_input, set(item_ids))
+    _assert_acyclic(list(item_ids), edges)
     return RolloutPlan(
         nodes=list(item_ids), edges=edges, planner_model=config.PLANNER_MODEL
     )
+
+
+def _assert_acyclic(nodes: list[str], edges: list[DagEdge]) -> None:
+    """Assert the graph defined by nodes and edges is acyclic (a valid DAG).
+
+    Uses Kahn's topological-sort algorithm. If any cycle exists (including
+    self-loops), raises ValueError rather than allowing a broken plan to be
+    persisted and silently blocking items forever.
+
+    Args:
+        nodes: All node IDs in the graph.
+        edges: Directed edges; an edge with from_item_id=A and to_item_id=B
+            means A must complete before B.
+
+    Raises:
+        ValueError: If a cyclic dependency is detected.
+    """
+    in_degree: dict[str, int] = {node: 0 for node in nodes}
+    adjacency: defaultdict[str, list[str]] = defaultdict(list)
+
+    for edge in edges:
+        adjacency[edge.from_item_id].append(edge.to_item_id)
+        in_degree[edge.to_item_id] = in_degree.get(edge.to_item_id, 0) + 1
+
+    queue: deque[str] = deque(node for node in nodes if in_degree[node] == 0)
+    processed = 0
+
+    while queue:
+        node = queue.popleft()
+        processed += 1
+        for successor in adjacency[node]:
+            in_degree[successor] -= 1
+            if in_degree[successor] == 0:
+                queue.append(successor)
+
+    if processed < len(nodes):
+        raise ValueError(
+            f"cyclic dependency detected in rollout plan: "
+            f"{len(nodes) - processed} node(s) involved in a cycle"
+        )
 
 
 def _build_context(items: list[dict[str, Any]]) -> str:

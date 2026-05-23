@@ -181,6 +181,30 @@ class TestPlanRollout:
             with pytest.raises(RuntimeError, match="GTD API down"):
                 await plan_rollout(["id1"])
 
+    async def test_cyclic_llm_output_raises(self) -> None:
+        items = [
+            {"id": "id1", "title": "Item 1", "description": "", "blockers": []},
+            {"id": "id2", "title": "Item 2", "description": "", "blockers": []},
+        ]
+        # LLM hallucinates a two-node cycle: id1 -> id2 -> id1
+        mock_response = _make_tool_response(
+            [
+                {"from_item_id": "id1", "to_item_id": "id2"},
+                {"from_item_id": "id2", "to_item_id": "id1"},
+            ]
+        )
+        mock_gtd = _make_gtd_client(items)
+        mock_anthropic = _make_anthropic_module(mock_response)
+
+        with (
+            patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+            patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
+        ):
+            from agent_gtd_dispatch.rollout_planner import plan_rollout
+
+            with pytest.raises(ValueError, match="cyclic"):
+                await plan_rollout(["id1", "id2"])
+
 
 class TestBuildContext:
     def test_formats_item_with_blockers(self) -> None:
@@ -334,3 +358,53 @@ class TestExtractEdges:
 
         edges = _extract_edges({}, {"a", "b"})
         assert edges == []
+
+
+class TestAssertAcyclic:
+    def _make_edges(self, pairs: list[tuple[str, str]]):
+        from agent_gtd_dispatch.models import DagEdge
+
+        return [DagEdge(from_item_id=f, to_item_id=t) for f, t in pairs]
+
+    def test_self_loop_raises(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _assert_acyclic
+
+        edges = self._make_edges([("A", "A")])
+        with pytest.raises(ValueError, match="cyclic"):
+            _assert_acyclic(["A"], edges)
+
+    def test_two_node_cycle_raises(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _assert_acyclic
+
+        edges = self._make_edges([("A", "B"), ("B", "A")])
+        with pytest.raises(ValueError, match="cyclic"):
+            _assert_acyclic(["A", "B"], edges)
+
+    def test_three_node_cycle_raises(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _assert_acyclic
+
+        edges = self._make_edges([("A", "B"), ("B", "C"), ("C", "A")])
+        with pytest.raises(ValueError, match="cyclic"):
+            _assert_acyclic(["A", "B", "C"], edges)
+
+    def test_linear_chain_passes(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _assert_acyclic
+
+        edges = self._make_edges([("A", "B"), ("B", "C")])
+        _assert_acyclic(["A", "B", "C"], edges)  # should not raise
+
+    def test_diamond_dag_passes(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _assert_acyclic
+
+        edges = self._make_edges([("A", "B"), ("A", "C"), ("B", "D"), ("C", "D")])
+        _assert_acyclic(["A", "B", "C", "D"], edges)  # should not raise
+
+    def test_empty_edges_passes(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _assert_acyclic
+
+        _assert_acyclic(["A", "B", "C"], [])  # should not raise
+
+    def test_single_node_no_edges_passes(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _assert_acyclic
+
+        _assert_acyclic(["A"], [])  # should not raise
