@@ -164,6 +164,10 @@ All endpoints marked **Bearer** require an `Authorization: Bearer <DISPATCH_API_
 
 Returns an empty list if `list_agents.sh` is missing, not executable, times out, or exits non-zero. Never returns a 5xx.
 
+## Dispatch modes and rollouts
+
+Every `/dispatch` call carries a `mode` field: `plan` (groom a single item), `build` (implement and push a feature branch for a single item), or `manage` (drive a whole rollout — a planned wave of items in one project — end-to-end). The manage mode dispatches each child build itself, runs quality gates, squash-merges to `main`, and advances the rollout DAG built by `POST /plan`. For the full reference — DAG construction, the manager's wave loop, the `update_rollout_state` replacement contract, recovery semantics on unexpected manage exits, quality gates and sensitive-area guardrails — see **[docs/rollouts.md](docs/rollouts.md)**.
+
 ## Agent Discovery
 
 The `/agents` endpoint delegates to a user-supplied shell script so that each deployment can expose engine-specific agent lists without leaking engine internals into this OSS repo.
