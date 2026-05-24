@@ -1239,18 +1239,18 @@ class TestPrepareManageWorkspace:
             check=True,
             capture_output=True,
         )
-        # 2. git remote set-head origin --auto
+        # 2. git remote set-head origin --auto (non-fatal: check=False)
         assert calls[1] == call(
             ["git", "remote", "set-head", "origin", "--auto"],
             cwd=expected_workspace,
-            check=True,
+            check=False,
             capture_output=True,
         )
-        # 3. git symbolic-ref (with text=True)
+        # 3. git symbolic-ref (with text=True; check=False so failure is handled)
         assert calls[2] == call(
             ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
             cwd=expected_workspace,
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
         )
@@ -1302,6 +1302,92 @@ class TestPrepareManageWorkspace:
             prepare_manage_workspace("git@host:repos/myrepo", "abc123")
 
         assert nested_root.exists()
+
+    def test_set_head_auto_failure_falls_back_to_branch_probe(
+        self, workspace_root, tmp_path
+    ) -> None:
+        origin = "git@host:repos/myrepo"
+        run_id = "abc123"
+        expected_workspace = tmp_path / f"repos-{run_id}"
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "set-head" in cmd:
+                return _completed(1)
+            if "symbolic-ref" in cmd:
+                return _completed(1)
+            if "branch" in cmd and "-r" in cmd:
+                return _completed(0, stdout="origin/main\norigin/HEAD\n")
+            return _completed(0)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub:
+            mock_sub.side_effect = side_effect
+            prepare_manage_workspace(origin, run_id)
+
+        checkout_call = mock_sub.call_args_list[-1]
+        assert checkout_call == call(
+            ["git", "checkout", "main"],
+            cwd=expected_workspace,
+            check=True,
+            capture_output=True,
+        )
+
+    def test_set_head_auto_failure_falls_back_to_master(
+        self, workspace_root, tmp_path
+    ) -> None:
+        origin = "git@host:repos/myrepo"
+        run_id = "abc123"
+        expected_workspace = tmp_path / f"repos-{run_id}"
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "set-head" in cmd:
+                return _completed(1)
+            if "symbolic-ref" in cmd:
+                return _completed(1)
+            if "branch" in cmd and "-r" in cmd:
+                return _completed(0, stdout="origin/master\n")
+            return _completed(0)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub:
+            mock_sub.side_effect = side_effect
+            prepare_manage_workspace(origin, run_id)
+
+        checkout_call = mock_sub.call_args_list[-1]
+        assert checkout_call == call(
+            ["git", "checkout", "master"],
+            cwd=expected_workspace,
+            check=True,
+            capture_output=True,
+        )
+
+    def test_set_head_auto_nonfatal_does_not_raise(
+        self, workspace_root, tmp_path
+    ) -> None:
+        origin = "git@host:repos/myrepo"
+        run_id = "abc123"
+        expected_workspace = tmp_path / f"repos-{run_id}"
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "set-head" in cmd:
+                return _completed(1)  # set-head fails, but must not raise
+            if "symbolic-ref" in cmd:
+                return _completed(0, stdout="origin/main\n")
+            return _completed(0)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub:
+            mock_sub.side_effect = side_effect
+            # Must not raise despite set-head returning non-zero
+            prepare_manage_workspace(origin, run_id)
+
+        checkout_call = mock_sub.call_args_list[-1]
+        assert checkout_call == call(
+            ["git", "checkout", "main"],
+            cwd=expected_workspace,
+            check=True,
+            capture_output=True,
+        )
 
 
 # ---------------------------------------------------------------------------

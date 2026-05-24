@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 _executor: concurrent.futures.ThreadPoolExecutor | None = None
 
+_DEFAULT_BRANCH_CANDIDATES: tuple[str, ...] = ("main", "master")
+
 
 def _sudo_wrap(cmd: list[str]) -> list[str]:
     """Prepend sudo -u <user> -H when AGENT_SUBPROCESS_USER is set."""
@@ -90,9 +92,11 @@ def prepare_manage_workspace(git_origin: str, run_id: str) -> Path:
 
     Steps:
     1. git clone --depth=50 {git_origin} {workspace}
-    2. git remote set-head origin --auto  (populate HEAD ref)
+    2. git remote set-head origin --auto  (populate HEAD ref; non-fatal if it fails)
     3. git symbolic-ref --short refs/remotes/origin/HEAD  → detect default branch
-    4. git checkout {default_branch}  (explicit, stays on default branch)
+    4. If step 3 fails, probe remote branches via git branch -r and pick the first
+       match from _DEFAULT_BRANCH_CANDIDATES (defaults to _DEFAULT_BRANCH_CANDIDATES[0])
+    5. git checkout {default_branch}  (explicit, stays on default branch)
 
     Returns the workspace path.
     """
@@ -107,17 +111,32 @@ def prepare_manage_workspace(git_origin: str, run_id: str) -> Path:
     subprocess.run(
         _sudo_wrap(["git", "remote", "set-head", "origin", "--auto"]),
         cwd=workspace,
-        check=True,
+        check=False,
         capture_output=True,
     )
     result = subprocess.run(
         _sudo_wrap(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"]),
         cwd=workspace,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
-    default_branch = result.stdout.strip().removeprefix("origin/")
+    if result.returncode != 0 or not result.stdout.strip():
+        branches_result = subprocess.run(
+            _sudo_wrap(["git", "branch", "-r", "--format=%(refname:short)"]),
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        remote_branches = branches_result.stdout.splitlines()
+        default_branch = _DEFAULT_BRANCH_CANDIDATES[0]
+        for candidate in _DEFAULT_BRANCH_CANDIDATES:
+            if f"origin/{candidate}" in remote_branches:
+                default_branch = candidate
+                break
+    else:
+        default_branch = result.stdout.strip().removeprefix("origin/")
     subprocess.run(
         _sudo_wrap(["git", "checkout", default_branch]),
         cwd=workspace,
