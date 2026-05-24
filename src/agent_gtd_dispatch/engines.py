@@ -48,6 +48,10 @@ _MANAGE_EXECUTOR_ENV_KEYS: tuple[str, ...] = ("DISPATCH_LOCAL_URL", "DISPATCH_AP
 
 def build_env(engine: Engine, mode: str = "build") -> dict[str, str]:
     """Build a filtered env dict for the engine's subprocess."""
+    import pwd
+
+    from . import config  # local import so module is readable before config.load()
+
     allowed = COMMON_ENV_KEYS | engine.env_keys
     # Manage-mode env exposure: add dispatch URL + key for claude manage-mode executors
     if engine.name == "claude-code" and mode == "manage":
@@ -56,6 +60,25 @@ def build_env(engine: Engine, mode: str = "build") -> dict[str, str]:
     env["HOME"] = str(Path.home())
     if engine.extra_env_fn is not None:
         env.update(engine.extra_env_fn())
+
+    # Prepend ~/.local/bin for the agent user so uvx/MCP binaries (personal-kb,
+    # agent-gtd) are discoverable after sudo's env_reset strips PATH.
+    if config.AGENT_SUBPROCESS_USER:
+        try:
+            pw = pwd.getpwnam(config.AGENT_SUBPROCESS_USER)
+            local_bin = Path(pw.pw_dir) / ".local" / "bin"
+        except KeyError:
+            local_bin = Path.home() / ".local" / "bin"
+    else:
+        local_bin = Path.home() / ".local" / "bin"
+
+    local_bin_str = str(local_bin)
+    current_path = env.get("PATH", "")
+    if local_bin_str not in current_path.split(":"):
+        env["PATH"] = (
+            f"{local_bin_str}:{current_path}" if current_path else local_bin_str
+        )
+
     return env
 
 

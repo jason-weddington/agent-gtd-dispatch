@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import pwd
 import subprocess
+from pathlib import Path
 from typing import ClassVar
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
 import aiosqlite
 import pytest
@@ -32,6 +34,21 @@ from agent_gtd_dispatch.engines import (
     get_engine,
 )
 from agent_gtd_dispatch.models import DispatchRequest, Run
+
+
+def _dispatch_sudo_available() -> bool:
+    """Return True if 'dispatch' system user exists and we can sudo to them."""
+    try:
+        pwd.getpwnam("dispatch")
+    except KeyError:
+        return False
+    result = subprocess.run(  # noqa: S603
+        ["/usr/bin/sudo", "-n", "-u", "dispatch", "true"], capture_output=True
+    )
+    return result.returncode == 0
+
+
+_DISPATCH_SUDO_AVAILABLE = _dispatch_sudo_available()
 
 
 class TestRepoNameFromOrigin:
@@ -236,6 +253,38 @@ class TestBuildEnv:
         env = build_env(CLAUDE, mode="manage")
         assert "ANTHROPIC_API_KEY" not in env
         assert env["DISPATCH_LOCAL_URL"] == "http://localhost:8100"
+
+    def test_path_starts_with_local_bin_for_agent_user(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        mock_pw = MagicMock()
+        mock_pw.pw_dir = "/home/dispatch"
+        with patch("pwd.getpwnam", return_value=mock_pw):
+            env = build_env(CLAUDE)
+        assert env["PATH"].startswith("/home/dispatch/.local/bin:")
+
+    def test_path_fallback_when_user_unset(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        env = build_env(CLAUDE)
+        expected_prefix = str(Path.home() / ".local" / "bin") + ":"
+        assert env["PATH"].startswith(expected_prefix)
+
+    def test_path_fallback_when_user_not_found_keyerror(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "nonexistent-user-xyz")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        with patch("pwd.getpwnam", side_effect=KeyError):
+            env = build_env(CLAUDE)
+        expected_prefix = str(Path.home() / ".local" / "bin") + ":"
+        assert env["PATH"].startswith(expected_prefix)
+
+    def test_path_no_duplication_when_already_present(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        local_bin = str(Path.home() / ".local" / "bin")
+        monkeypatch.setenv("PATH", f"{local_bin}:/usr/bin:/bin")
+        env = build_env(CLAUDE)
+        parts = env["PATH"].split(":")
+        assert parts.count(local_bin) == 1
 
 
 class TestBuildSystemPrompt:
@@ -730,6 +779,21 @@ class TestSudoWrapping:
             "dispatch",
             "-H",
         ]
+
+    @pytest.mark.skipif(
+        not _DISPATCH_SUDO_AVAILABLE,
+        reason="requires 'dispatch' system user and passwordless sudo access",
+    )
+    def test_sudo_wrap_path_includes_local_bin(self, monkeypatch) -> None:
+        from agent_gtd_dispatch.dispatch import _sudo_wrap
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        env = build_env(CLAUDE)
+        cmd = _sudo_wrap(["bash", "-c", "printf '%s' \"$PATH\""])
+        result = subprocess.run(  # noqa: S603
+            cmd, env=env, capture_output=True, text=True, timeout=10
+        )
+        assert "/home/dispatch/.local/bin" in result.stdout
 
 
 class TestBuildManagePrompt:
