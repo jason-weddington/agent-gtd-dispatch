@@ -14,7 +14,6 @@ import pytest
 
 from agent_gtd_dispatch import config, db, dispatch
 from agent_gtd_dispatch.dispatch import (
-    _MANAGE_ALLOWED_TOOLS,
     branch_name_for_item,
     build_system_prompt,
     cleanup_workspace,
@@ -846,24 +845,6 @@ class TestBuildManagePrompt:
             rollout_id="wr-123",
         )
         assert "rollout-manager" in prompt or "executor" in prompt
-
-    def test_manage_allowed_tools_constant_is_not_empty(self) -> None:
-        assert len(_MANAGE_ALLOWED_TOOLS) > 0
-        assert "mcp__agent-gtd__advance_rollout" in _MANAGE_ALLOWED_TOOLS
-        assert "mcp__agent-gtd__complete_item_in_rollout" in _MANAGE_ALLOWED_TOOLS
-        assert "mcp__agent-gtd__halt_rollout" in _MANAGE_ALLOWED_TOOLS
-
-    def test_dispatch_item_in_allowed_tools(self) -> None:
-        assert "mcp__agent-gtd__dispatch_item" in _MANAGE_ALLOWED_TOOLS
-
-    def test_list_comments_in_allowed_tools(self) -> None:
-        assert "mcp__agent-gtd__list_comments" in _MANAGE_ALLOWED_TOOLS
-
-    def test_update_item_in_allowed_tools(self) -> None:
-        assert "mcp__agent-gtd__update_item" in _MANAGE_ALLOWED_TOOLS
-
-    def test_ping_rollout_not_in_allowed_tools(self) -> None:
-        assert "mcp__agent-gtd__ping_rollout" not in _MANAGE_ALLOWED_TOOLS
 
     def test_all_wave_loop_steps_present(self) -> None:
         prompt = self._prompt()

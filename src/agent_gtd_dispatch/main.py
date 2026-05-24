@@ -21,7 +21,6 @@ if TYPE_CHECKING:
 
 from . import config, db, dispatch, gtd_client, rollout_planner
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
-from .dispatch import _MANAGE_ALLOWED_TOOLS
 from .engines import Engine, get_available_engine_names, get_engine
 from .models import (
     DispatchRequest,
@@ -415,7 +414,6 @@ async def _dispatch_worker(
         def _register_subprocess(proc: subprocess.Popen[bytes]) -> None:
             _active_subprocesses[run.id] = proc
 
-        agent_allowed_tools = list(_MANAGE_ALLOWED_TOOLS) if mode == "manage" else None
         result = await dispatch.run_agent(
             engine_used,
             workspace,
@@ -424,7 +422,6 @@ async def _dispatch_worker(
             max_turns,
             run.agent_name,
             timeout_seconds,
-            allowed_tools=agent_allowed_tools,
             mode=mode,
             attribution=attribution,
             popen_callback=_register_subprocess,

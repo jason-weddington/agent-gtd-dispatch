@@ -252,29 +252,6 @@ def _build_supporting_files_section(
     )
 
 
-_MANAGE_ALLOWED_TOOLS: tuple[str, ...] = (
-    "mcp__agent-gtd__advance_rollout",
-    "mcp__agent-gtd__complete_item_in_rollout",
-    "mcp__agent-gtd__halt_rollout",
-    "mcp__agent-gtd__replan_rollout",
-    "mcp__agent-gtd__update_rollout_state",
-    "mcp__agent-gtd__dispatch_item",  # dispatch child build runs
-    "mcp__agent-gtd__add_comment",
-    "mcp__agent-gtd__get_item",
-    "mcp__agent-gtd__update_item",  # AC reconciliation
-    "mcp__agent-gtd__list_items",
-    "mcp__agent-gtd__get_run_status",
-    "mcp__agent-gtd__list_runs",
-    "mcp__agent-gtd__list_comments",  # read final agent comment
-    "Bash",
-    "Read",
-    "Write",
-    "Edit",
-    "Glob",
-    "Grep",
-)
-
-
 def build_system_prompt(
     item: dict[str, Any],
     project: dict[str, Any],
