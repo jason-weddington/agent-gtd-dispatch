@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from agent_gtd_dispatch_protocol.models import DispatchMode
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -46,7 +48,9 @@ class Engine:
 _MANAGE_EXECUTOR_ENV_KEYS: tuple[str, ...] = ("DISPATCH_LOCAL_URL", "DISPATCH_API_KEY")
 
 
-def build_env(engine: Engine, mode: str = "build") -> dict[str, str]:
+def build_env(
+    engine: Engine, mode: DispatchMode = DispatchMode.BUILD
+) -> dict[str, str]:
     """Build a filtered env dict for the engine's subprocess."""
     import pwd
 
@@ -54,7 +58,7 @@ def build_env(engine: Engine, mode: str = "build") -> dict[str, str]:
 
     allowed = COMMON_ENV_KEYS | engine.env_keys
     # Manage-mode env exposure: add dispatch URL + key for claude manage-mode executors
-    if engine.name == "claude-code" and mode == "manage":
+    if engine.name == "claude-code" and mode == DispatchMode.MANAGE:
         allowed = allowed | frozenset(_MANAGE_EXECUTOR_ENV_KEYS)
     env = {k: v for k, v in os.environ.items() if k in allowed}
     env["HOME"] = str(Path.home())

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 from agent_gtd_dispatch_protocol.branches import make_branch_name
+from agent_gtd_dispatch_protocol.models import DispatchMode
 
 from . import config, gtd_client
 from .engines import Engine, build_env
@@ -257,18 +258,18 @@ def build_system_prompt(
     project: dict[str, Any],
     branch_name: str | None,
     max_turns: int,
-    mode: str = "build",
+    mode: DispatchMode = DispatchMode.BUILD,
     attachments: list[dict[str, Any]] | None = None,
     run_id: str = "",
     rollout_id: str | None = None,
     manage_retry_count: int = 0,
 ) -> str:
     """Build the headless agent system prompt."""
-    if mode == "plan":
+    if mode == DispatchMode.PLAN:
         return _build_plan_prompt(
             item, project, max_turns, attachments=attachments, run_id=run_id
         )
-    if mode == "manage":
+    if mode == DispatchMode.MANAGE:
         return _build_manage_prompt(
             rollout_id or "", project, max_turns, manage_retry_count=manage_retry_count
         )
@@ -964,7 +965,7 @@ async def run_agent(
     agent_name: str | None = None,
     timeout_seconds: int | None = None,
     allowed_tools: list[str] | None = None,
-    mode: str = "build",
+    mode: DispatchMode = DispatchMode.BUILD,
     attribution: str | None = None,
     popen_callback: Callable[[subprocess.Popen[bytes]], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -972,7 +973,7 @@ async def run_agent(
     if timeout_seconds is None:
         timeout_seconds = (
             config.MANAGE_TIMEOUT_SECONDS
-            if mode == "manage"
+            if mode == DispatchMode.MANAGE
             else config.TIMEOUT_SECONDS
         )
     if engine.name == "kiro":

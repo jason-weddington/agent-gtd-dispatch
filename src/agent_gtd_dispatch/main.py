@@ -23,6 +23,7 @@ from . import config, db, dispatch, gtd_client, rollout_planner
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
 from .engines import Engine, get_available_engine_names, get_engine
 from .models import (
+    DispatchMode,
     DispatchRequest,
     EngineSwap,
     InfoResponse,
@@ -242,7 +243,7 @@ async def _maybe_relaunch_manage(
     new_run = Run(
         item_id=run.item_id,
         project_name=run.project_name,
-        mode="manage",
+        mode=DispatchMode.MANAGE,
         rollout_id=run.rollout_id,
         engine=run.engine,
         agent_name=run.agent_name,
@@ -331,7 +332,7 @@ async def _dispatch_worker(
         else:
             timeout_seconds = int(timeout_seconds * config.OLLAMA_TIMEOUT_MULTIPLIER)
 
-    mode = run.mode or "build"
+    mode = run.mode
     workspace = None
     # For manage mode: preserve workspace on failure for debugging.
     # For build/plan mode: always clean up.
@@ -361,7 +362,7 @@ async def _dispatch_worker(
         if not git_origin:
             raise ValueError(f"Project '{project['name']}' has no git_origin")
 
-        if mode == "manage":
+        if mode == DispatchMode.MANAGE:
             # Clone the project's default branch for quality gates + git operations
             workspace = dispatch.prepare_manage_workspace(git_origin, run.id)
             await db.update_run(run.id, workspace_path=str(workspace))
@@ -393,7 +394,7 @@ async def _dispatch_worker(
         )
 
         item_title = item.get("title", f"rollout:{run.rollout_id}")
-        if mode == "manage":
+        if mode == DispatchMode.MANAGE:
             dispatch_comment = (
                 f"Rollout manager dispatched (run `{run.id}`, engine: {engine_used.name}). "
                 f"Managing rollout `{run.rollout_id}` in `{project['name']}`."
@@ -453,7 +454,7 @@ async def _dispatch_worker(
                 error=error_msg,
             )
             _publish_run_event(run.id, "failed", completed)
-            if mode == "manage":
+            if mode == DispatchMode.MANAGE:
                 should_cleanup = False  # preserve workspace for debugging
             if error_msg and run.item_id is not None:
                 await gtd_client.post_comment(
@@ -479,7 +480,7 @@ async def _dispatch_worker(
                 "The task may need to be broken down into smaller pieces.",
                 created_by=attribution or "agent-gtd-dispatch",
             )
-        if mode == "manage":
+        if mode == DispatchMode.MANAGE:
             should_cleanup = False
     except asyncio.CancelledError:
         _human_cancelled = True
@@ -497,7 +498,7 @@ async def _dispatch_worker(
             completed_at=datetime.now(UTC).isoformat(),
             error=str(exc)[:500],
         )
-        if mode == "manage":
+        if mode == DispatchMode.MANAGE:
             should_cleanup = False
     finally:
         _active_processes.pop(run.id, None)
@@ -506,7 +507,7 @@ async def _dispatch_worker(
         _run_event_queues.pop(run.id, None)
         if workspace is not None and should_cleanup:
             dispatch.cleanup_workspace(workspace)
-        if run.mode == "manage" and run.rollout_id and not _human_cancelled:
+        if run.mode == DispatchMode.MANAGE and run.rollout_id and not _human_cancelled:
             await _maybe_relaunch_manage(
                 run, max_turns, engine_used, timeout_seconds, attribution
             )
@@ -581,7 +582,7 @@ async def dispatch_item(
     """Start a new dispatch run for a GTD item."""
     # Plan-mode and manage-mode always use Anthropic, regardless of requested engine
     effective_engine_name = body.engine
-    if body.mode != "build" and body.engine == "claude-code-ollama":
+    if body.mode != DispatchMode.BUILD and body.engine == "claude-code-ollama":
         effective_engine_name = "claude-code"
     engine_swapped = body.engine != effective_engine_name
     try:
@@ -590,18 +591,18 @@ async def dispatch_item(
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
     # Validate mode-specific requirements
-    if body.mode == "manage" and not body.rollout_id:
+    if body.mode == DispatchMode.MANAGE and not body.rollout_id:
         raise HTTPException(
             status_code=400,
             detail="rollout_id required for mode=manage",
         )
-    if body.mode != "manage" and not body.item_id:
+    if body.mode != DispatchMode.MANAGE and not body.item_id:
         raise HTTPException(
             status_code=400,
             detail=f"item_id required for mode={body.mode}",
         )
 
-    if body.mode == "manage":
+    if body.mode == DispatchMode.MANAGE:
         # Derive project from rollout — item_id is None for manage-mode runs
         assert body.rollout_id is not None  # noqa: S101 — validated above
         try:
@@ -768,7 +769,7 @@ async def dispatch_item(
     max_turns = body.max_turns
     if body.timeout_minutes:
         timeout_seconds = body.timeout_minutes * 60
-    elif body.mode == "manage":
+    elif body.mode == DispatchMode.MANAGE:
         timeout_seconds = config.MANAGE_TIMEOUT_SECONDS
     else:
         timeout_seconds = config.TIMEOUT_SECONDS

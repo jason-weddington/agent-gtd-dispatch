@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from agent_gtd_dispatch_protocol.models import DagEdge as DagEdge
+from agent_gtd_dispatch_protocol.models import DispatchMode as DispatchMode
 from agent_gtd_dispatch_protocol.models import DispatchRequest as DispatchRequest
 from agent_gtd_dispatch_protocol.models import PlanRequest as PlanRequest
 from agent_gtd_dispatch_protocol.models import RolloutPlan as RolloutPlan
@@ -47,7 +48,7 @@ class Run(BaseModel):
     engine: str = "claude-code"
     engine_actual: str | None = None
     agent_name: str | None = None
-    mode: str = "build"
+    mode: DispatchMode = DispatchMode.BUILD
     rollout_id: str | None = None
     workspace_path: str | None = None
     status: RunStatus = RunStatus.pending

@@ -19,6 +19,14 @@ class RunStatus(StrEnum):
     cancelled = "cancelled"
 
 
+class DispatchMode(StrEnum):
+    """Dispatch execution mode."""
+
+    BUILD = "build"
+    PLAN = "plan"
+    MANAGE = "manage"
+
+
 class DispatchRequest(BaseModel):
     """Request body for the /dispatch endpoint."""
 
@@ -26,7 +34,7 @@ class DispatchRequest(BaseModel):
     max_turns: int
     engine: str = "claude-code"
     agent_name: str | None = None
-    mode: str = "build"
+    mode: DispatchMode = DispatchMode.BUILD
     timeout_minutes: int | None = None
     rollout_id: str | None = None
     attribution: str | None = None
@@ -41,7 +49,7 @@ class RunResponse(BaseModel):
     branch_name: str | None
     engine: str
     agent_name: str | None
-    mode: str
+    mode: DispatchMode
     rollout_id: str | None
     status: RunStatus
     started_at: datetime | None
@@ -75,6 +83,7 @@ class RolloutPlan(BaseModel):
 __all__ = [
     "UTC",
     "DagEdge",
+    "DispatchMode",
     "DispatchRequest",
     "PlanRequest",
     "RolloutPlan",
