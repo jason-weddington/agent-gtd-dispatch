@@ -17,4 +17,9 @@
 # PATH                     — Required so uvx/MCP binaries in ~/.local/bin survive env_reset
 Defaults:{{SERVICE_USER}} env_keep += "CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY AGENT_GTD_URL AGENT_GTD_API_KEY DISPATCH_API_KEY KB_DATABASE_URL OLLAMA_BASE_URL AGENT_GTD_AGENT_NAME PATH"
 
+# Override secure_path to include ~/.local/bin for the agent user, so uvx/MCP
+# binaries and other executables installed to the agent user's ~/.local/bin are
+# discoverable and executable even after sudo's env_reset applies secure_path.
+Defaults:{{SERVICE_USER}} secure_path="/home/{{AGENT_USER}}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 {{SERVICE_USER}} ALL=({{AGENT_USER}}) NOPASSWD: /usr/bin/git, /home/{{AGENT_USER}}/.local/bin/uv, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash
