@@ -320,7 +320,7 @@ sudo cat /etc/sudoers.d/dispatch-svc
 ```bash
 sudo cat /etc/sudoers.d/dispatch-svc
 # Should contain (among other lines):
-# dispatch-svc ALL=(dispatch) NOPASSWD: /usr/bin/git, /home/dispatch/.local/bin/uv, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash
+# dispatch-svc ALL=(dispatch) NOPASSWD: /usr/bin/git, /home/dispatch/.local/bin/uv, /home/dispatch/.local/bin/claude, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash
 ```
 
 If missing or wrong, re-run:

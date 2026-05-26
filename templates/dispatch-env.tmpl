@@ -30,6 +30,12 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # Optional variables
 # =============================================================================
 
+# Maximum concurrent agent runs — set per host based on core count.
+# Formula: num_cores × 1.5; e.g. 4 cores → 6, 8 cores → 12.
+# Default (32) is too high for Pi-class hosts (e.g. pironman01 with 4 cores).
+# See kb-01544 for capacity sizing rationale.
+# DISPATCH_MAX_CONCURRENT_RUNS=6
+
 # Workspace root for cloned repos (default: ~/workspace, relative to
 # DISPATCH_AGENT_SUBPROCESS_USER's home when user-switching is enabled).
 # DISPATCH_WORKSPACE_ROOT=/home/dispatch/workspace

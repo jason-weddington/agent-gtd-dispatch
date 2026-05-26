@@ -260,11 +260,15 @@ fi
 # --- SSH key provisioning for AGENT_USER (needed for git auth on fresh box) ---
 if $DRY_RUN; then
     would "create ${AGENT_HOME}/.ssh/ (mode 700, owner ${AGENT_USER}) if absent"
+    would "ssh-keyscan ubuntu-vm01 >> ${AGENT_HOME}/.ssh/known_hosts"
     would "generate ed25519 keypair for ${AGENT_USER} if no id_* key exists"
 else
     mkdir -p "${AGENT_HOME}/.ssh"
     chmod 700 "${AGENT_HOME}/.ssh"
     chown "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.ssh"
+    ssh-keyscan ubuntu-vm01 >> "${AGENT_HOME}/.ssh/known_hosts" 2>/dev/null \
+        && info "Populated ${AGENT_HOME}/.ssh/known_hosts via ssh-keyscan ubuntu-vm01" \
+        || warn "ssh-keyscan ubuntu-vm01 failed — known_hosts may be incomplete"
     if ! ls "${AGENT_HOME}/.ssh"/id_* &>/dev/null; then
         sudo -u "$AGENT_USER" ssh-keygen -t ed25519 -N "" \
             -f "${AGENT_HOME}/.ssh/id_ed25519" \
