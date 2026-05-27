@@ -458,12 +458,31 @@ echo "--- Step 4.6: MCP servers (agent user) ---"
 if ! $DRY_RUN && [[ ! -f "$CLAUDE_SRC" ]]; then
     warn "Claude Code not found at ${CLAUDE_SRC} — skipping MCP server registration (install claude as ${AGENT_USER} first)"
 elif $DRY_RUN; then
+    would "read TEAM_KB_DATABASE_URL and KB_ANTHROPIC_API_KEY from ${SERVICE_ENV} (for KB MCP servers)"
     would "source ${TMPL_DIR}/mcp-servers.sh and register each MCP server for ${AGENT_USER} via claude mcp add --scope user"
 else
     MCP_CONF="${TMPL_DIR}/mcp-servers.sh"
     if [[ ! -f "$MCP_CONF" ]]; then
         die "MCP server config not found at ${MCP_CONF} — cannot register MCP servers"
     fi
+    # Secrets for the KB MCP servers are kept out of git. Pull them from the installed
+    # service .env and export so mcp-servers.sh can inject them per-server:
+    #   TEAM_KB_DATABASE_URL  → team-kb's DB connection string (skipped if unset)
+    #   KB_ANTHROPIC_API_KEY  → ANTHROPIC_API_KEY for both KB servers' LLM calls.
+    #     Deliberately NOT named ANTHROPIC_API_KEY: that name would reach Claude Code's
+    #     launch env and flip billing off the Max subscription (engines.py / kb-01512).
+    _read_env_var() {  # $1=var name in .env; strips surrounding single/double quotes
+        local v
+        v="$(sed -n "s/^$1=//p" "$SERVICE_ENV" | tail -n1)"
+        v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+        printf '%s' "$v"
+    }
+    if [[ -f "$SERVICE_ENV" ]]; then
+        TEAM_KB_DATABASE_URL="$(_read_env_var TEAM_KB_DATABASE_URL)"; export TEAM_KB_DATABASE_URL
+        KB_ANTHROPIC_API_KEY="$(_read_env_var KB_ANTHROPIC_API_KEY)"; export KB_ANTHROPIC_API_KEY
+    fi
+    [[ -z "${TEAM_KB_DATABASE_URL:-}" ]] && warn "TEAM_KB_DATABASE_URL not set in ${SERVICE_ENV} — team-kb MCP server will be skipped"
+    [[ -z "${KB_ANTHROPIC_API_KEY:-}" ]] && warn "KB_ANTHROPIC_API_KEY not set in ${SERVICE_ENV} — KB servers will register without an Anthropic key (LLM features degraded)"
     # shellcheck source=templates/mcp-servers.sh
     source "$MCP_CONF"
     for entry in "${MCP_SERVERS[@]}"; do

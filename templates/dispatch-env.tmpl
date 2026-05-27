@@ -61,7 +61,21 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # CLAUDE_CODE_OAUTH_TOKEN=
 
 # Knowledge base database URL — passed to agent subprocesses for KB access.
+# This points at the PERSONAL KB; personal-kb inherits it (empty MCP env block).
 # KB_DATABASE_URL=
+
+# Team KB database URL — injected into the team-kb MCP server's env block by
+# setup-dispatch-host.sh (Step 4.6). Required for team-kb registration; if unset,
+# team-kb is skipped. Same personal_kb package, different database.
+# TEAM_KB_DATABASE_URL=
+
+# Anthropic API key for the KB MCP servers' own LLM calls (query planning, graph
+# enrichment, summaries). Injected into the personal-kb AND team-kb MCP env blocks by
+# setup-dispatch-host.sh (Step 4.6). MUST NOT be named ANTHROPIC_API_KEY: that name
+# would reach Claude Code's launch env via the worker passthrough and flip billing from
+# the Max subscription to pay-per-token API (see engines.py / kb-01512). Value is the
+# same Anthropic key used elsewhere; the distinct name is the safety mechanism.
+# KB_ANTHROPIC_API_KEY=
 
 # Agent identity name — used for GTD comment attribution so comments appear
 # under a specific agent name (e.g. claude-build-abc12345) rather than the

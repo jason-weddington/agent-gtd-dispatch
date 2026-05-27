@@ -60,3 +60,29 @@ tests/
 
 - See `[tool.coverage.run] omit` in `pyproject.toml` for files excluded from the threshold.
 - Threshold lives in `[tool.coverage.report] fail_under` — ratchet it up when you add tests.
+
+## Deployment hosts & env files (two-user split)
+
+Runs on three hosts (`pironman01`, `ubuntu-pi-01`, `r7-research`). On each: the API
+runs as **`dispatch-svc`**; it launches the Claude Code agent as **`dispatch`** via
+`sudo -u dispatch -H`.
+
+- **`/home/dispatch-svc/.env` is the canonical (and only) env file.** It is the systemd
+  `EnvironmentFile` (→ the service's `os.environ`; `config.py` reads `os.environ` only,
+  no dotenv) *and* the file `setup-dispatch-host.sh` reads at provision time to inject
+  KB secrets into the agent's `~/.claude.json`.
+- **`/home/dispatch/.env` is vestigial** (pre-split leftover) — nothing reads it. Don't
+  put vars there; safe to delete where it lingers.
+- **`setup-dispatch-host.sh` runs as ROOT** (`sudo`, asserts `EUID==0`), not as
+  `dispatch-svc`. It creates both users, installs the unit + sudoers, and reads
+  `/home/dispatch-svc/.env` to register MCP servers (Step 4.6, driven by
+  `templates/mcp-servers.sh`).
+- **KB MCP secrets** live in `/home/dispatch-svc/.env` as `TEAM_KB_DATABASE_URL` and
+  `KB_ANTHROPIC_API_KEY` (NOT `ANTHROPIC_API_KEY` — that name would reach the agent's
+  env and flip Claude Code off Max/OAuth billing). They are injected into the per-server
+  `env` blocks of `personal-kb`/`team-kb` at provision time; `mcp-servers.sh` references
+  the env vars, never literals (gitleaks-safe).
+
+Full references: **`kb-01598`** (env-file + provisioning model — which var goes where),
+`kb-01583` (how env crosses the sudo boundary at runtime), `kb-01512` (OAuth vs API
+billing), `kb-01537` (install procedure).
