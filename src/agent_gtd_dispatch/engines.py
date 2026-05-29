@@ -97,6 +97,8 @@ def _build_claude_command(
 ) -> list[str]:
     cmd = [
         "claude",
+        "--model",
+        "opus",
         "--dangerously-skip-permissions",
         "--max-turns",
         str(max_turns),

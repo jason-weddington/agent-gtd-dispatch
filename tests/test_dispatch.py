@@ -182,6 +182,11 @@ class TestClaudeCommand:
         idx = cmd.index("--agent")
         assert cmd[idx + 1] == "my-agent"
 
+    def test_model_is_opus(self) -> None:
+        cmd = CLAUDE.build_command("sys prompt", "Fix bug", 20, None)
+        assert cmd[1] == "--model"
+        assert cmd[2] == "opus"
+
 
 class TestKiroCommand:
     def test_basic(self) -> None:
@@ -1584,9 +1589,10 @@ class TestClaudeOllamaEngine:
         assert "--print" in cmd
         assert cmd[-1] == "Fix bug"
 
-    def test_vanilla_claude_command_has_no_model_flag(self) -> None:
+    def test_vanilla_claude_command_uses_opus_model(self) -> None:
         cmd = CLAUDE.build_command("sys", "Fix bug", 20, None)
-        assert "--model" not in cmd
+        assert "--model" in cmd
+        assert cmd[cmd.index("--model") + 1] == "opus"
 
 
 class TestClaudeSonnetEngine:
