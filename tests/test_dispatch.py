@@ -1606,7 +1606,7 @@ class TestClaudeSonnetEngine:
         cmd = CLAUDE_SONNET.build_command("sys", "Fix bug", 20, None)
         assert cmd[0] == "claude"
         assert cmd[1] == "--model"
-        assert cmd[2] == "claude-sonnet-4-6"
+        assert cmd[2] == "sonnet"
         assert "--dangerously-skip-permissions" in cmd
         assert "--print" in cmd
         assert cmd[-1] == "Fix bug"
@@ -1642,7 +1642,7 @@ class TestClaudeHaikuEngine:
         cmd = CLAUDE_HAIKU.build_command("sys", "Fix bug", 20, None)
         assert cmd[0] == "claude"
         assert cmd[1] == "--model"
-        assert cmd[2] == "claude-haiku-4-5-20251001"
+        assert cmd[2] == "haiku"
         assert "--dangerously-skip-permissions" in cmd
         assert "--print" in cmd
         assert cmd[-1] == "Fix bug"

@@ -171,11 +171,11 @@ def _build_claude_sonnet_command(
     max_turns: int,
     agent_name: str | None,
 ) -> list[str]:
-    """Build command for claude-code-sonnet: same as CLAUDE but pinned to Sonnet 4.6."""
+    """Build command for claude-code-sonnet: same as CLAUDE but uses moving alias."""
     cmd = [
         "claude",
         "--model",
-        "claude-sonnet-4-6",
+        "sonnet",
         "--dangerously-skip-permissions",
         "--max-turns",
         str(max_turns),
@@ -195,11 +195,11 @@ def _build_claude_haiku_command(
     max_turns: int,
     agent_name: str | None,
 ) -> list[str]:
-    """Build command for claude-code-haiku: same as CLAUDE but pinned to Haiku 4.5."""
+    """Build command for claude-code-haiku: same as CLAUDE but uses moving alias."""
     cmd = [
         "claude",
         "--model",
-        "claude-haiku-4-5-20251001",
+        "haiku",
         "--dangerously-skip-permissions",
         "--max-turns",
         str(max_turns),
