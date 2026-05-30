@@ -2,6 +2,71 @@
 
 <!-- version list -->
 
+## v1.11.0 (2026-05-30)
+
+### Bug Fixes
+
+- **06b17687**: Watchdog to recover stale manage-agent rollouts
+  ([`e713a59`](https://github.com/repos/agent-gtd-dispatch/commit/e713a59b1cef36ad9b6b25a556abea71ef4de2a1))
+
+- **dispatch**: Atomic capacity check + queue for over-cap dispatches
+  ([`d33ba77`](https://github.com/repos/agent-gtd-dispatch/commit/d33ba7753e73c56c442918fef2fe48b5d793ef6b))
+
+- **dispatch**: Make set-head non-fatal in prepare_manage_workspace
+  ([`6a76af8`](https://github.com/repos/agent-gtd-dispatch/commit/6a76af8187f14bf2719c00d63058aa8f9bca7dbd))
+
+- **dispatch**: Propagate ~/.local/bin in PATH across sudo boundary
+  ([`5e2b5de`](https://github.com/repos/agent-gtd-dispatch/commit/5e2b5de29304515d2a23373c1e1774a5e67d1608))
+
+- **install**: Seed agent-user known_hosts + add MAX_CONCURRENT guidance
+  ([`991da21`](https://github.com/repos/agent-gtd-dispatch/commit/991da214a249356e292b7f6a02cd674182030615))
+
+- **sudoers**: Add agent-user claude path to NOPASSWD (hotfix for 605c3ad)
+  ([`f077b9f`](https://github.com/repos/agent-gtd-dispatch/commit/f077b9f8b1dd330a2e8e5b3dd51628d875546140))
+
+- **sudoers**: Override secure_path to include agent user's ~/.local/bin
+  ([`605c3ad`](https://github.com/repos/agent-gtd-dispatch/commit/605c3ad8e5ccf76d19f6cff981276de5553737a4))
+
+### Chores
+
+- **dispatch**: Remove _MANAGE_ALLOWED_TOOLS restriction
+  ([`c072c3b`](https://github.com/repos/agent-gtd-dispatch/commit/c072c3ba275fb477c8e4d9585efb93fde45aa5da))
+
+- **dispatch**: Remove dead 'crashed' rollout terminal state
+  ([`52006ea`](https://github.com/repos/agent-gtd-dispatch/commit/52006ea8e8092ce8e6aadd657e3711d705e71680))
+
+### Documentation
+
+- Bootstrap full docs/ scaffold for agent-gtd-dispatch
+  ([`eab28ac`](https://github.com/repos/agent-gtd-dispatch/commit/eab28ac12ee9268f911e26b3f3092be0c5db9243))
+
+- Explain how to generate DISPATCH_API_KEY
+  ([`1c71eb1`](https://github.com/repos/agent-gtd-dispatch/commit/1c71eb1cf137898eaaae9c012405b97682a58644))
+
+### Features
+
+- **461b2b8a**: Sonnet/haiku engines use moving aliases
+  ([`d9d112f`](https://github.com/repos/agent-gtd-dispatch/commit/d9d112f68806153d1b8095cb3f0cbcca04b6f272))
+
+- **c7ec87d5**: Register agent-gtd, personal-kb, aws-docs MCP for the agent user
+  ([`db70ca8`](https://github.com/repos/agent-gtd-dispatch/commit/db70ca86009260d564e0788646209f3867d531ce))
+
+- **c80859f8**: Claude-code engine explicitly dispatches to --model opus
+  ([`a47e579`](https://github.com/repos/agent-gtd-dispatch/commit/a47e5792bb5368a844085ddb07b2b80ec0122f5f))
+
+- **dispatch**: Plan-mode prompt — architectural awareness pre-grooming phase
+  ([`87ab94a`](https://github.com/repos/agent-gtd-dispatch/commit/87ab94a52ad8d462f8ca7b52a926f71cad72d83a))
+
+- **dispatch**: Promote DispatchMode to shared protocol package
+  ([`1045d53`](https://github.com/repos/agent-gtd-dispatch/commit/1045d535964d1d66968a6afa21c7b55c5734d2c1))
+
+- **planner**: Add cycle detection to rollout DAG
+  ([`240a780`](https://github.com/repos/agent-gtd-dispatch/commit/240a78019335f4b0fbefb1a9b3df9e260c29b38a))
+
+- **setup**: Provision team-kb and KB Anthropic key from dispatch-svc .env
+  ([`ef5c0fb`](https://github.com/repos/agent-gtd-dispatch/commit/ef5c0fbe9c0cbdb59e757f198ad4ea05f63766df))
+
+
 ## v1.10.0 (2026-05-21)
 
 ### Bug Fixes
