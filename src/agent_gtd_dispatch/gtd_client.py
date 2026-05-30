@@ -128,3 +128,15 @@ async def list_comments(item_id: str) -> list[dict[str, Any]]:
     """GET /items/{item_id}/comments → list of comment dicts."""
     result: list[dict[str, Any]] = await _request("GET", f"/items/{item_id}/comments")
     return result
+
+
+async def list_running_rollouts() -> list[dict[str, Any]]:
+    """GET /api/rollouts?status=running — returns list of running rollout dicts.
+
+    Passes status=running as a query param; also filters client-side as a
+    safety net in case the endpoint ignores the parameter.
+    """
+    result: list[dict[str, Any]] = await _request(
+        "GET", "/rollouts", params={"status": "running"}
+    )
+    return [r for r in result if r.get("status") == "running"]

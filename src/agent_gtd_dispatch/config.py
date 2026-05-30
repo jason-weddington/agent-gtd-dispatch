@@ -34,6 +34,10 @@ MAX_MANAGE_RETRIES: int = 2  # max auto-recovery relaunches for manage mode
 MAX_CONCURRENT_RUNS: int = 32  # thread-pool ceiling for run_in_executor
 CANCEL_GRACE_SECONDS: int = 5  # seconds between SIGTERM and SIGKILL on cancel
 
+# Watchdog (manage-agent staleness detection)
+MANAGE_STALE_THRESHOLD_SECONDS: int = 900  # 15 min; must stay < MANAGE_TIMEOUT_SECONDS
+WATCHDOG_INTERVAL_SECONDS: int = 180  # scan every 3 min
+
 # Planner (wave DAG)
 ANTHROPIC_API_KEY: str = ""
 PLANNER_MODEL: str = "claude-sonnet-4-6"
@@ -56,6 +60,7 @@ def load() -> None:
     global OLLAMA_BASE_URL, OLLAMA_API_KEY, OLLAMA_DEFAULT_MODEL
     global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS
     global AGENT_SUBPROCESS_USER
+    global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
@@ -93,3 +98,9 @@ def load() -> None:
         os.environ.get("OLLAMA_TIMEOUT_MULTIPLIER", "2.0")
     )
     CANCEL_GRACE_SECONDS = int(os.environ.get("DISPATCH_CANCEL_GRACE_SECONDS", "5"))
+    MANAGE_STALE_THRESHOLD_SECONDS = int(
+        os.environ.get("DISPATCH_MANAGE_STALE_THRESHOLD_SECONDS", "900")
+    )
+    WATCHDOG_INTERVAL_SECONDS = int(
+        os.environ.get("DISPATCH_WATCHDOG_INTERVAL_SECONDS", "180")
+    )

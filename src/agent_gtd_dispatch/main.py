@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import subprocess
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -115,6 +116,11 @@ class _PendingDispatch(NamedTuple):
 
 _pending_queue: list[_PendingDispatch] = []
 
+# Watchdog state
+_rollout_to_run: dict[str, Run] = {}  # rollout_id → active manage-mode Run
+_watchdog_task: asyncio.Task[None] | None = None  # handle for clean shutdown
+_watchdog_acted: dict[str, float] = {}  # rollout_id → monotonic() of last action
+
 
 def _publish_run_event(run_id: str, status: str, completed_at: str | None) -> None:
     """Publish a status-change event to the run's in-memory event queue."""
@@ -151,6 +157,7 @@ def _verify_api_key(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Initialize config and DB on startup, cancel tasks on shutdown."""
+    global _watchdog_task
     config.load()
     if config.AGENT_SUBPROCESS_USER:
         _check_service_repo()
@@ -162,8 +169,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             logger.warning("Reconciled orphaned run: %s", run_id)
     else:
         logger.info("No orphaned runs found on startup")
+    _watchdog_task = asyncio.create_task(_manage_watchdog())
     yield
-    # Cancel any active dispatch tasks on shutdown
+    # Cancel watchdog and active dispatch tasks on shutdown
+    if _watchdog_task is not None:
+        _watchdog_task.cancel()
     for task in _active_processes.values():
         task.cancel()
 
@@ -172,6 +182,96 @@ app = FastAPI(title="Agent GTD Dispatch", lifespan=lifespan)
 
 
 # --- Background dispatch worker ---
+
+
+async def _do_manage_recovery(
+    rollout_id: str,
+    run: Run | None,
+    max_turns: int,
+    engine: Engine,
+    timeout_seconds: int,
+    attribution: str | None,
+    *,
+    halt_reason: str,
+) -> None:
+    """Shared manage-recovery: kill stale subprocess (if any), increment retry, relaunch or halt.
+
+    Called from both _maybe_relaunch_manage (exit-path, run already finished) and
+    _manage_watchdog (stale-detection path, run still alive). When the existing run
+    is still in _active_processes the task is cancelled and its subprocess terminated
+    before spawning the replacement.
+
+    Args:
+        rollout_id: The rollout to recover.
+        run: The Run object for the stale/exited manage worker, or None if unknown.
+        max_turns: Forwarded to the new _dispatch_worker.
+        engine: Forwarded to the new _dispatch_worker.
+        timeout_seconds: Forwarded to the new _dispatch_worker.
+        attribution: Forwarded to the new _dispatch_worker.
+        halt_reason: Reason string for halt_rollout when cap is exceeded.
+    """
+    # Kill stale task/subprocess if still active (watchdog path)
+    if run is not None:
+        existing_task = _active_processes.pop(run.id, None)
+        if existing_task is not None:
+            existing_task.cancel()
+        existing_proc = _active_subprocesses.pop(run.id, None)
+        if existing_proc is not None:
+            with contextlib.suppress(ProcessLookupError):
+                existing_proc.terminate()
+
+    try:
+        updated = await gtd_client.relaunch_manage_rollout(rollout_id)
+    except Exception:
+        logger.exception(
+            "Failed to increment manage_retry_count for rollout %s — skipping recovery",
+            rollout_id,
+        )
+        return
+
+    retry_count = int(updated["manage_retry_count"])
+
+    if retry_count > MAX_MANAGE_RETRIES:
+        logger.warning(
+            "Manage retry cap exceeded for rollout %s (count=%d) — halting",
+            rollout_id,
+            retry_count,
+        )
+        try:
+            await gtd_client.halt_rollout(rollout_id, reason=halt_reason)
+        except Exception:
+            logger.exception("Failed to halt rollout %s after cap exceeded", rollout_id)
+        return
+
+    logger.info(
+        "Relaunching manage agent for rollout %s (retry %d/%d) after %ds",
+        rollout_id,
+        retry_count,
+        MAX_MANAGE_RETRIES,
+        MANAGE_RETRY_BACKOFF_SECONDS,
+    )
+    await asyncio.sleep(MANAGE_RETRY_BACKOFF_SECONDS)
+
+    new_run = Run(
+        item_id=run.item_id if run else None,
+        project_name=run.project_name if run else "",
+        mode=DispatchMode.MANAGE,
+        rollout_id=rollout_id,
+        engine=run.engine if run else engine.name,
+        agent_name=run.agent_name if run else None,
+    )
+    await db.insert_run(new_run)
+    task = asyncio.create_task(
+        _dispatch_worker(
+            new_run,
+            max_turns,
+            engine,
+            timeout_seconds,
+            attribution=attribution,
+            manage_retry_count=retry_count,
+        )
+    )
+    _active_processes[new_run.id] = task
 
 
 async def _maybe_relaunch_manage(
@@ -185,10 +285,9 @@ async def _maybe_relaunch_manage(
 
     Called from _dispatch_worker's finally block (skipped when human-cancelled).
     - If rollout is in a clean terminal state: do nothing.
-    - If rollout is still running/pending (unexpected exit): increment retry count.
-      - If count <= MAX_MANAGE_RETRIES: sleep and spawn a fresh _dispatch_worker.
-      - If count > MAX_MANAGE_RETRIES: halt the rollout with reason
-        'manage_relaunch_cap_exceeded'.
+    - If rollout is still running/pending (unexpected exit): delegate to
+      _do_manage_recovery which increments retry count and either relaunches
+      or halts.
     """
     assert run.rollout_id is not None  # noqa: S101 — caller guarantees this
     try:
@@ -204,62 +303,100 @@ async def _maybe_relaunch_manage(
         return  # clean exit — nothing to do
 
     # Unexpected exit: rollout still running or pending
-    try:
-        updated = await gtd_client.relaunch_manage_rollout(run.rollout_id)
-    except Exception:
-        logger.exception(
-            "Failed to increment manage_retry_count for rollout %s — skipping recovery",
-            run.rollout_id,
-        )
+    await _do_manage_recovery(
+        run.rollout_id,
+        run,
+        max_turns,
+        engine,
+        timeout_seconds,
+        attribution,
+        halt_reason="manage_relaunch_cap_exceeded",
+    )
+
+
+async def _watchdog_evaluate_rollout(
+    rollout: dict[str, Any], rollout_id: str, now: datetime
+) -> None:
+    """Evaluate one rollout for staleness and run recovery if needed.
+
+    Skips rollouts in clean terminal states or with a fresh timestamp.
+    Idempotency: rollouts acted on within the current staleness window are skipped.
+    """
+    status: str = rollout.get("status", "")
+    if status in _CLEAN_EXIT_STATUSES:
         return
 
-    retry_count = int(updated["manage_retry_count"])
+    updated_at_str: str | None = rollout.get("manager_state_updated_at")
+    if not updated_at_str:
+        return
 
-    if retry_count > MAX_MANAGE_RETRIES:
-        logger.warning(
-            "Manage retry cap exceeded for rollout %s (count=%d) — halting",
-            run.rollout_id,
-            retry_count,
-        )
+    try:
+        updated_at = datetime.fromisoformat(updated_at_str)
+    except ValueError:
+        return
+
+    age_seconds = (now - updated_at).total_seconds()
+    if age_seconds <= config.MANAGE_STALE_THRESHOLD_SECONDS:
+        return  # fresh enough
+
+    # Idempotency guard: skip if we already acted within the staleness window
+    last_acted = _watchdog_acted.get(rollout_id, 0.0)
+    if time.monotonic() - last_acted < config.MANAGE_STALE_THRESHOLD_SECONDS:
+        return
+
+    logger.warning(
+        "Watchdog: rollout %s stale (age=%.0fs) — triggering recovery",
+        rollout_id,
+        age_seconds,
+    )
+
+    # Mark acted-on BEFORE awaiting recovery (prevents a concurrent tick from double-acting)
+    _watchdog_acted[rollout_id] = time.monotonic()
+
+    existing_run = _rollout_to_run.get(rollout_id)
+    await _do_manage_recovery(
+        rollout_id,
+        existing_run,
+        config.MAX_TURNS,
+        get_engine("claude-code"),
+        config.MANAGE_TIMEOUT_SECONDS,
+        None,  # attribution unknown from watchdog context
+        halt_reason="manage_watchdog_stale",
+    )
+
+
+async def _watchdog_tick() -> None:
+    """One pass of the watchdog: scan running rollouts and recover stale ones.
+
+    Exposed at module level for direct invocation in tests.
+    """
+    try:
+        rollouts = await gtd_client.list_running_rollouts()
+    except Exception:
+        logger.exception("Watchdog failed to fetch running rollouts — skipping tick")
+        return
+
+    now = datetime.now(UTC)
+    for rollout in rollouts:
+        rollout_id: str | None = rollout.get("id")
+        if not rollout_id:
+            continue
         try:
-            await gtd_client.halt_rollout(
-                run.rollout_id, reason="manage_relaunch_cap_exceeded"
-            )
+            await _watchdog_evaluate_rollout(rollout, rollout_id, now)
         except Exception:
             logger.exception(
-                "Failed to halt rollout %s after cap exceeded", run.rollout_id
+                "Watchdog failed to evaluate rollout %s — continuing", rollout_id
             )
-        return
 
-    logger.info(
-        "Relaunching manage agent for rollout %s (retry %d/%d) after %ds",
-        run.rollout_id,
-        retry_count,
-        MAX_MANAGE_RETRIES,
-        MANAGE_RETRY_BACKOFF_SECONDS,
-    )
-    await asyncio.sleep(MANAGE_RETRY_BACKOFF_SECONDS)
 
-    new_run = Run(
-        item_id=run.item_id,
-        project_name=run.project_name,
-        mode=DispatchMode.MANAGE,
-        rollout_id=run.rollout_id,
-        engine=run.engine,
-        agent_name=run.agent_name,
-    )
-    await db.insert_run(new_run)
-    task = asyncio.create_task(
-        _dispatch_worker(
-            new_run,
-            max_turns,
-            engine,
-            timeout_seconds,
-            attribution=attribution,
-            manage_retry_count=retry_count,
-        )
-    )
-    _active_processes[new_run.id] = task
+async def _manage_watchdog() -> None:
+    """Background coroutine: periodically scan for stale manage-agent rollouts."""
+    while True:
+        await asyncio.sleep(config.WATCHDOG_INTERVAL_SECONDS)
+        try:
+            await _watchdog_tick()
+        except Exception:
+            logger.exception("Watchdog scan iteration failed — continuing")
 
 
 def _try_start_pending() -> None:
@@ -296,6 +433,10 @@ async def _dispatch_worker(
     now = datetime.now(UTC).isoformat()
     await db.update_run(run.id, status=RunStatus.running, started_at=now)
     _publish_run_event(run.id, "running", None)
+
+    # Register manage-mode run so the watchdog can find it
+    if run.mode == DispatchMode.MANAGE and run.rollout_id:
+        _rollout_to_run[run.rollout_id] = run
 
     # --- Ollama health check + fallback ---
     engine_used = engine  # may be replaced below
@@ -505,6 +646,8 @@ async def _dispatch_worker(
         _try_start_pending()  # wake up a queued dispatch now that a slot freed
         _active_subprocesses.pop(run.id, None)
         _run_event_queues.pop(run.id, None)
+        if run.mode == DispatchMode.MANAGE and run.rollout_id:
+            _rollout_to_run.pop(run.rollout_id, None)
         if workspace is not None and should_cleanup:
             dispatch.cleanup_workspace(workspace)
         if run.mode == DispatchMode.MANAGE and run.rollout_id and not _human_cancelled:
