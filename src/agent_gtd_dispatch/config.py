@@ -35,7 +35,11 @@ MAX_CONCURRENT_RUNS: int = 32  # thread-pool ceiling for run_in_executor
 CANCEL_GRACE_SECONDS: int = 5  # seconds between SIGTERM and SIGKILL on cancel
 
 # Watchdog (manage-agent staleness detection)
-MANAGE_STALE_THRESHOLD_SECONDS: int = 900  # 15 min; must stay < MANAGE_TIMEOUT_SECONDS
+# Set above the longest build a manager may wait on: a manager has no polling
+# heartbeat, so its state timestamp only advances on real progress. Too low and
+# the watchdog kills a healthy manager mid-wait, burning MAX_MANAGE_RETRIES.
+# Must stay < MANAGE_TIMEOUT_SECONDS.
+MANAGE_STALE_THRESHOLD_SECONDS: int = 2100  # 35 min
 WATCHDOG_INTERVAL_SECONDS: int = 180  # scan every 3 min
 
 # Planner (wave DAG)
@@ -99,7 +103,7 @@ def load() -> None:
     )
     CANCEL_GRACE_SECONDS = int(os.environ.get("DISPATCH_CANCEL_GRACE_SECONDS", "5"))
     MANAGE_STALE_THRESHOLD_SECONDS = int(
-        os.environ.get("DISPATCH_MANAGE_STALE_THRESHOLD_SECONDS", "900")
+        os.environ.get("DISPATCH_MANAGE_STALE_THRESHOLD_SECONDS", "2100")
     )
     WATCHDOG_INTERVAL_SECONDS = int(
         os.environ.get("DISPATCH_WATCHDOG_INTERVAL_SECONDS", "180")

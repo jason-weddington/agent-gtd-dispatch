@@ -34,9 +34,17 @@ def _env(tmp_path):
 def _stale_rollout(
     rollout_id: str = "rollout-stale",
     status: str = "running",
-    seconds_ago: int = 1800,
+    seconds_ago: int | None = None,
 ) -> dict:
-    """Build a rollout dict whose manager_state_updated_at is stale."""
+    """Build a rollout dict whose manager_state_updated_at is stale.
+
+    Default age is twice the configured staleness threshold so the helper
+    stays correct if MANAGE_STALE_THRESHOLD_SECONDS is retuned.
+    """
+    if seconds_ago is None:
+        from agent_gtd_dispatch import config
+
+        seconds_ago = config.MANAGE_STALE_THRESHOLD_SECONDS * 2
     old_time = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
     return {
         "id": rollout_id,
