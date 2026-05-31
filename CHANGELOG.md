@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v1.12.0 (2026-05-31)
+
+### Features
+
+- **996682e2**: Structured logging for manage-recovery / watchdog / lifecycle
+  ([`775d2ef`](https://github.com/repos/agent-gtd-dispatch/commit/775d2ef5a2100a7bcaffb81dd1f1071b67a149af))
+
+- **f87043c1**: Watchdog skips a manager healthily waiting on a running build
+  ([`5886630`](https://github.com/repos/agent-gtd-dispatch/commit/5886630bba6185ce0a931b542b546daf271477b1))
+
+### Refactoring
+
+- **28e9bc43**: Drop redundant dispatch-side terminal-run filter
+  ([`484b1ec`](https://github.com/repos/agent-gtd-dispatch/commit/484b1ecea20590ec16d4e305600375f864a8567e))
+
+
 ## v1.11.1 (2026-05-30)
 
 ### Bug Fixes
