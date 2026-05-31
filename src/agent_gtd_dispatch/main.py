@@ -210,15 +210,29 @@ async def _do_manage_recovery(
         attribution: Forwarded to the new _dispatch_worker.
         halt_reason: Reason string for halt_rollout when cap is exceeded.
     """
+    source = "watchdog" if halt_reason == "manage_watchdog_stale" else "exit-path"
+    run_id = run.id if run is not None else "none"
+
     # Kill stale task/subprocess if still active (watchdog path)
+    run_killed = False
     if run is not None:
         existing_task = _active_processes.pop(run.id, None)
         if existing_task is not None:
             existing_task.cancel()
+            run_killed = True
         existing_proc = _active_subprocesses.pop(run.id, None)
         if existing_proc is not None:
             with contextlib.suppress(ProcessLookupError):
                 existing_proc.terminate()
+            run_killed = True
+
+    logger.info(
+        "manage-recovery: entry rollout_id=%s run_id=%s source=%s run_killed=%s",
+        rollout_id,
+        run_id,
+        source,
+        run_killed,
+    )
 
     try:
         updated = await gtd_client.relaunch_manage_rollout(rollout_id)
@@ -230,6 +244,13 @@ async def _do_manage_recovery(
         return
 
     retry_count = int(updated["manage_retry_count"])
+    logger.info(
+        "manage-recovery: retry_count rollout_id=%s run_id=%s retry_count=%d cap=%d",
+        rollout_id,
+        run_id,
+        retry_count,
+        MAX_MANAGE_RETRIES,
+    )
 
     if retry_count > MAX_MANAGE_RETRIES:
         logger.warning(
@@ -300,8 +321,20 @@ async def _maybe_relaunch_manage(
         return
 
     if rollout["status"] in _CLEAN_EXIT_STATUSES:
+        logger.info(
+            "manage-recovery: clean-exit rollout_id=%s run_id=%s rollout_status=%s",
+            run.rollout_id,
+            run.id,
+            rollout["status"],
+        )
         return  # clean exit — nothing to do
 
+    logger.info(
+        "manage-recovery: unexpected-exit rollout_id=%s run_id=%s rollout_status=%s",
+        run.rollout_id,
+        run.id,
+        rollout["status"],
+    )
     # Unexpected exit: rollout still running or pending
     await _do_manage_recovery(
         run.rollout_id,
@@ -323,7 +356,14 @@ async def _watchdog_evaluate_rollout(
     Idempotency: rollouts acted on within the current staleness window are skipped.
     """
     status: str = rollout.get("status", "")
+    manager_phase: str = rollout.get("manager_phase", "unknown")
     if status in _CLEAN_EXIT_STATUSES:
+        logger.info(
+            "watchdog: rollout_id=%s manager_phase=%s status=%s decision=skipped-terminal",
+            rollout_id,
+            manager_phase,
+            status,
+        )
         return
 
     updated_at_str: str | None = rollout.get("manager_state_updated_at")
@@ -337,17 +377,37 @@ async def _watchdog_evaluate_rollout(
 
     age_seconds = (now - updated_at).total_seconds()
     if age_seconds <= config.MANAGE_STALE_THRESHOLD_SECONDS:
+        logger.info(
+            "watchdog: rollout_id=%s manager_phase=%s age_seconds=%.0f threshold=%d decision=fresh",
+            rollout_id,
+            manager_phase,
+            age_seconds,
+            config.MANAGE_STALE_THRESHOLD_SECONDS,
+        )
         return  # fresh enough
 
     # Idempotency guard: skip if we already acted within the staleness window
     last_acted = _watchdog_acted.get(rollout_id, 0.0)
     if time.monotonic() - last_acted < config.MANAGE_STALE_THRESHOLD_SECONDS:
+        logger.info(
+            "watchdog: rollout_id=%s manager_phase=%s age_seconds=%.0f decision=skipped-idempotency",
+            rollout_id,
+            manager_phase,
+            age_seconds,
+        )
         return
 
     logger.warning(
         "Watchdog: rollout %s stale (age=%.0fs) — triggering recovery",
         rollout_id,
         age_seconds,
+    )
+    logger.info(
+        "watchdog: rollout_id=%s manager_phase=%s age_seconds=%.0f threshold=%d decision=triggering-recovery",
+        rollout_id,
+        manager_phase,
+        age_seconds,
+        config.MANAGE_STALE_THRESHOLD_SECONDS,
     )
 
     # Mark acted-on BEFORE awaiting recovery (prevents a concurrent tick from double-acting)
@@ -376,6 +436,8 @@ async def _watchdog_tick() -> None:
         logger.exception("Watchdog failed to fetch running rollouts — skipping tick")
         return
 
+    count = len(rollouts)
+    logger.info("watchdog: tick start rollout_count=%d", count)
     now = datetime.now(UTC)
     for rollout in rollouts:
         rollout_id: str | None = rollout.get("id")
@@ -387,6 +449,7 @@ async def _watchdog_tick() -> None:
             logger.exception(
                 "Watchdog failed to evaluate rollout %s — continuing", rollout_id
             )
+    logger.info("watchdog: tick done rollout_count=%d", count)
 
 
 async def _manage_watchdog() -> None:
@@ -437,6 +500,13 @@ async def _dispatch_worker(
     # Register manage-mode run so the watchdog can find it
     if run.mode == DispatchMode.MANAGE and run.rollout_id:
         _rollout_to_run[run.rollout_id] = run
+        logger.info(
+            "manage: spawn rollout_id=%s run_id=%s engine=%s retry_count=%d",
+            run.rollout_id,
+            run.id,
+            engine.name,
+            manage_retry_count,
+        )
 
     # --- Ollama health check + fallback ---
     engine_used = engine  # may be replaced below
@@ -479,6 +549,7 @@ async def _dispatch_worker(
     # For build/plan mode: always clean up.
     should_cleanup = True
     _human_cancelled = False
+    _exit_code: int | None = None
 
     try:
         # Fetch item and project.
@@ -568,6 +639,7 @@ async def _dispatch_worker(
             attribution=attribution,
             popen_callback=_register_subprocess,
         )
+        _exit_code = result.returncode
 
         completed = datetime.now(UTC).isoformat()
         if result.returncode == 0:
@@ -648,6 +720,13 @@ async def _dispatch_worker(
         _run_event_queues.pop(run.id, None)
         if run.mode == DispatchMode.MANAGE and run.rollout_id:
             _rollout_to_run.pop(run.rollout_id, None)
+            logger.info(
+                "manage: exit rollout_id=%s run_id=%s exit_code=%s human_cancelled=%s",
+                run.rollout_id,
+                run.id,
+                _exit_code,
+                _human_cancelled,
+            )
         if workspace is not None and should_cleanup:
             dispatch.cleanup_workspace(workspace)
         if run.mode == DispatchMode.MANAGE and run.rollout_id and not _human_cancelled:

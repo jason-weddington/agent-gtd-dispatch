@@ -1,8 +1,9 @@
-"""Tests for the manage-agent staleness watchdog (AC-1 through AC-7)."""
+"""Tests for the manage-agent staleness watchdog (AC-1 through AC-8)."""
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -451,3 +452,126 @@ class TestAC7ErrorIsolation:
             await main._watchdog_tick()
 
             mock_gtd.relaunch_manage_rollout.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# AC-8: Structured INFO logging for watchdog-triggered recovery
+# ---------------------------------------------------------------------------
+
+
+class TestAC8StructuredLogging:
+    async def test_watchdog_triggered_recovery_emits_info_records(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-8: watchdog recovery emits structured INFO records (relaunch decision + retry_count)."""
+        from agent_gtd_dispatch import main
+
+        stale = _stale_rollout()
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._active_processes", {}),
+            patch("agent_gtd_dispatch.main._rollout_to_run", {}),
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+            patch("agent_gtd_dispatch.main.db") as mock_db,
+            patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()),
+            patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[stale])
+            mock_gtd.relaunch_manage_rollout = AsyncMock(
+                return_value={**stale, "manage_retry_count": 1}
+            )
+            mock_db.insert_run = AsyncMock()
+            mock_create_task.return_value = MagicMock()
+
+            await main._watchdog_tick()
+
+        rollout_id = stale["id"]
+        info_messages = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+        ]
+
+        # Tick start/done are emitted
+        assert any("watchdog: tick start" in m for m in info_messages), (
+            "Expected 'watchdog: tick start' INFO log"
+        )
+        assert any("watchdog: tick done" in m for m in info_messages), (
+            "Expected 'watchdog: tick done' INFO log"
+        )
+
+        # Relaunch decision: decision=triggering-recovery with rollout_id
+        assert any(
+            f"rollout_id={rollout_id}" in m and "decision=triggering-recovery" in m
+            for m in info_messages
+        ), f"Expected decision=triggering-recovery INFO log for rollout_id={rollout_id}"
+
+        # manage-recovery entry log with source=watchdog
+        assert any(
+            "manage-recovery: entry" in m
+            and f"rollout_id={rollout_id}" in m
+            and "source=watchdog" in m
+            for m in info_messages
+        ), "Expected manage-recovery: entry INFO log with source=watchdog"
+
+        # retry_count log showing retry_count=1
+        assert any(
+            "manage-recovery: retry_count" in m
+            and f"rollout_id={rollout_id}" in m
+            and "retry_count=1" in m
+            for m in info_messages
+        ), "Expected manage-recovery: retry_count INFO log with retry_count=1"
+
+    async def test_fresh_rollout_emits_decision_fresh(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-8: fresh rollout emits decision=fresh INFO log."""
+        from agent_gtd_dispatch import main
+
+        fresh = _fresh_rollout()
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[fresh])
+
+            await main._watchdog_tick()
+
+        rollout_id = fresh["id"]
+        info_messages = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+        ]
+
+        assert any(
+            f"rollout_id={rollout_id}" in m and "decision=fresh" in m
+            for m in info_messages
+        ), f"Expected decision=fresh INFO log for rollout_id={rollout_id}"
+
+    async def test_terminal_rollout_emits_skipped_terminal(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-8: terminal-status rollout emits decision=skipped-terminal INFO log."""
+        from agent_gtd_dispatch import main
+
+        terminal = _stale_rollout(rollout_id="rollout-done", status="completed")
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[terminal])
+
+            await main._watchdog_tick()
+
+        rollout_id = terminal["id"]
+        info_messages = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+        ]
+
+        assert any(
+            f"rollout_id={rollout_id}" in m and "decision=skipped-terminal" in m
+            for m in info_messages
+        ), f"Expected decision=skipped-terminal INFO log for rollout_id={rollout_id}"
