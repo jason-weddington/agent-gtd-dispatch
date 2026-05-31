@@ -685,38 +685,6 @@ class TestInFlightBuildPredicate:
             mock_gtd.relaunch_manage_rollout.assert_called_once_with(stale["id"])
             mock_create_task.assert_called_once()
 
-    async def test_polling_with_only_terminal_runs_in_field_recovers(self) -> None:
-        """(b') defensive: in-flight field carries only terminal-status runs → recovery."""
-        from agent_gtd_dispatch import main
-
-        stale = _stale_rollout(
-            in_flight_builds=[
-                {"id": "run-1", "status": "succeeded"},
-                {"id": "run-2", "status": "failed"},
-            ],
-        )
-
-        with (
-            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
-            patch("agent_gtd_dispatch.main._active_processes", {}),
-            patch("agent_gtd_dispatch.main._rollout_to_run", {}),
-            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
-            patch("agent_gtd_dispatch.main.db") as mock_db,
-            patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()),
-            patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
-        ):
-            mock_gtd.list_running_rollouts = AsyncMock(return_value=[stale])
-            mock_gtd.relaunch_manage_rollout = AsyncMock(
-                return_value={**stale, "manage_retry_count": 1}
-            )
-            mock_db.insert_run = AsyncMock()
-            mock_create_task.return_value = MagicMock()
-
-            await main._watchdog_tick()
-
-            mock_gtd.relaunch_manage_rollout.assert_called_once_with(stale["id"])
-            mock_create_task.assert_called_once()
-
     async def test_polling_with_running_build_past_manage_timeout_backstop(
         self,
     ) -> None:

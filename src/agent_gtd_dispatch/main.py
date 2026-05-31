@@ -143,46 +143,14 @@ MANAGE_RETRY_BACKOFF_SECONDS = 30
 # Frozenset of rollout statuses that indicate a clean/terminal manage exit
 _CLEAN_EXIT_STATUSES: frozenset[str] = frozenset({"completed", "halted", "cancelled"})
 
-# Build-run statuses that indicate a terminal (finished) run. Any run not in
-# this set is treated as in-flight by the watchdog's polling predicate (so an
-# unknown status errs toward "still running" → don't recover, the safe
-# direction). inFlightBuildRuns is sourced from the GTD service, whose terminal
-# status is "success"; "succeeded" et al. cover the dispatch-side RunStatus
-# vocabulary defensively in case the field ever carries those instead.
-_TERMINAL_RUN_STATUSES: frozenset[str] = frozenset(
-    {
-        "success",
-        "succeeded",
-        "failed",
-        "timed_out",
-        "cancelled",
-        "completed",
-        "halted",
-        "done",
-        "error",
-    }
-)
-
 
 def _in_flight_build_runs(rollout: dict[str, Any]) -> list[Any]:
     """Return the rollout's in-flight (non-terminal) build runs.
 
-    Reads the server-derived ``inFlightBuildRuns`` field straight off the
-    rollout dict (no per-run status polling). Defensively filters out any
-    entry that carries a terminal status, so the predicate is correct whether
-    the server pre-filters the list or includes terminal runs. Bare (non-dict)
-    entries are treated as in-flight.
+    The GTD service (rollout_service._fetch_in_flight_build_runs) contractually
+    pre-filters this field to non-terminal runs only — no dispatch-side filtering needed.
     """
-    runs = rollout.get("inFlightBuildRuns") or []
-    in_flight: list[Any] = []
-    for run in runs:
-        if isinstance(run, dict):
-            status = str(run.get("status", "")).lower()
-            if status not in _TERMINAL_RUN_STATUSES:
-                in_flight.append(run)
-        else:
-            in_flight.append(run)
-    return in_flight
+    return rollout.get("inFlightBuildRuns") or []
 
 
 security = HTTPBearer()
