@@ -36,11 +36,17 @@ def _stale_rollout(
     rollout_id: str = "rollout-stale",
     status: str = "running",
     seconds_ago: int | None = None,
+    manager_phase: str = "polling",
+    in_flight_builds: list | None = None,
 ) -> dict:
     """Build a rollout dict whose manager_state_updated_at is stale.
 
     Default age is twice the configured staleness threshold so the helper
     stays correct if MANAGE_STALE_THRESHOLD_SECONDS is retuned.
+
+    ``in_flight_builds`` populates the server-derived ``inFlightBuildRuns``
+    field. It defaults to an empty list so the existing stuck-path tests keep
+    exercising the timestamp-staleness recovery trigger.
     """
     if seconds_ago is None:
         from agent_gtd_dispatch import config
@@ -50,23 +56,29 @@ def _stale_rollout(
     return {
         "id": rollout_id,
         "status": status,
-        "manager_phase": "polling",
+        "manager_phase": manager_phase,
         "manager_state_updated_at": old_time,
         "manage_retry_count": 0,
         "project_id": "proj-1",
+        "inFlightBuildRuns": in_flight_builds if in_flight_builds is not None else [],
     }
 
 
-def _fresh_rollout(rollout_id: str = "rollout-fresh") -> dict:
+def _fresh_rollout(
+    rollout_id: str = "rollout-fresh",
+    manager_phase: str = "polling",
+    in_flight_builds: list | None = None,
+) -> dict:
     """Build a rollout dict whose manager_state_updated_at is recent."""
     fresh_time = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
     return {
         "id": rollout_id,
         "status": "running",
-        "manager_phase": "polling",
+        "manager_phase": manager_phase,
         "manager_state_updated_at": fresh_time,
         "manage_retry_count": 0,
         "project_id": "proj-1",
+        "inFlightBuildRuns": in_flight_builds if in_flight_builds is not None else [],
     }
 
 
@@ -575,3 +587,197 @@ class TestAC8StructuredLogging:
             f"rollout_id={rollout_id}" in m and "decision=skipped-terminal" in m
             for m in info_messages
         ), f"Expected decision=skipped-terminal INFO log for rollout_id={rollout_id}"
+
+
+# ---------------------------------------------------------------------------
+# In-flight-build predicate (item f87043c1): a polling manager waiting on a
+# still-running child build must NOT be recovered just because its heartbeat
+# went stale. The build's real status is the signal — not the heartbeat.
+# ---------------------------------------------------------------------------
+
+
+class TestInFlightBuildPredicate:
+    async def test_polling_with_running_build_and_stale_ts_no_recovery(self) -> None:
+        """(a) polling + running build + stale ts → NO recovery."""
+        from agent_gtd_dispatch import main
+
+        # Stale heartbeat, but a build is genuinely in flight.
+        stale = _stale_rollout(
+            in_flight_builds=[{"id": "run-1", "status": "running"}],
+        )
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._active_processes", {}),
+            patch("agent_gtd_dispatch.main._rollout_to_run", {}),
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+            patch("agent_gtd_dispatch.main.db") as mock_db,
+            patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()),
+            patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[stale])
+            mock_gtd.relaunch_manage_rollout = AsyncMock()
+            mock_gtd.halt_rollout = AsyncMock()
+            mock_db.insert_run = AsyncMock()
+            mock_create_task.return_value = MagicMock()
+
+            await main._watchdog_tick()
+
+            mock_gtd.relaunch_manage_rollout.assert_not_called()
+            mock_gtd.halt_rollout.assert_not_called()
+            mock_create_task.assert_not_called()
+
+    async def test_polling_with_running_build_emits_skipped_decision(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """(a) the skip emits decision=skipped-build-in-flight for observability."""
+        from agent_gtd_dispatch import main
+
+        stale = _stale_rollout(
+            in_flight_builds=[{"id": "run-1", "status": "running"}],
+        )
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[stale])
+            mock_gtd.relaunch_manage_rollout = AsyncMock()
+            mock_gtd.halt_rollout = AsyncMock()
+
+            await main._watchdog_tick()
+
+        rollout_id = stale["id"]
+        info_messages = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+        ]
+        assert any(
+            f"rollout_id={rollout_id}" in m and "decision=skipped-build-in-flight" in m
+            for m in info_messages
+        ), "Expected decision=skipped-build-in-flight INFO log"
+
+    async def test_polling_with_all_terminal_builds_and_stale_ts_recovers(self) -> None:
+        """(b) polling + all-terminal builds (empty in-flight) + stale ts → recovery."""
+        from agent_gtd_dispatch import main
+
+        # All builds finished → nothing in flight → genuinely stuck after build.
+        stale = _stale_rollout(in_flight_builds=[])
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._active_processes", {}),
+            patch("agent_gtd_dispatch.main._rollout_to_run", {}),
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+            patch("agent_gtd_dispatch.main.db") as mock_db,
+            patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()),
+            patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[stale])
+            mock_gtd.relaunch_manage_rollout = AsyncMock(
+                return_value={**stale, "manage_retry_count": 1}
+            )
+            mock_db.insert_run = AsyncMock()
+            mock_create_task.return_value = MagicMock()
+
+            await main._watchdog_tick()
+
+            mock_gtd.relaunch_manage_rollout.assert_called_once_with(stale["id"])
+            mock_create_task.assert_called_once()
+
+    async def test_polling_with_only_terminal_runs_in_field_recovers(self) -> None:
+        """(b') defensive: in-flight field carries only terminal-status runs → recovery."""
+        from agent_gtd_dispatch import main
+
+        stale = _stale_rollout(
+            in_flight_builds=[
+                {"id": "run-1", "status": "succeeded"},
+                {"id": "run-2", "status": "failed"},
+            ],
+        )
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._active_processes", {}),
+            patch("agent_gtd_dispatch.main._rollout_to_run", {}),
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+            patch("agent_gtd_dispatch.main.db") as mock_db,
+            patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()),
+            patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[stale])
+            mock_gtd.relaunch_manage_rollout = AsyncMock(
+                return_value={**stale, "manage_retry_count": 1}
+            )
+            mock_db.insert_run = AsyncMock()
+            mock_create_task.return_value = MagicMock()
+
+            await main._watchdog_tick()
+
+            mock_gtd.relaunch_manage_rollout.assert_called_once_with(stale["id"])
+            mock_create_task.assert_called_once()
+
+    async def test_polling_with_running_build_past_manage_timeout_backstop(
+        self,
+    ) -> None:
+        """(c) polling + running build + age > MANAGE_TIMEOUT → backstop recovery fires."""
+        from agent_gtd_dispatch import config, main
+
+        # Age exceeds the absolute backstop even though a build is in flight.
+        stale = _stale_rollout(
+            seconds_ago=config.MANAGE_TIMEOUT_SECONDS + 600,
+            in_flight_builds=[{"id": "run-1", "status": "running"}],
+        )
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._active_processes", {}),
+            patch("agent_gtd_dispatch.main._rollout_to_run", {}),
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+            patch("agent_gtd_dispatch.main.db") as mock_db,
+            patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()),
+            patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[stale])
+            mock_gtd.relaunch_manage_rollout = AsyncMock(
+                return_value={**stale, "manage_retry_count": 1}
+            )
+            mock_db.insert_run = AsyncMock()
+            mock_create_task.return_value = MagicMock()
+
+            await main._watchdog_tick()
+
+            mock_gtd.relaunch_manage_rollout.assert_called_once_with(stale["id"])
+            mock_create_task.assert_called_once()
+
+    async def test_non_polling_with_stale_ts_recovers_unchanged(self) -> None:
+        """(d) non-polling phase + stale ts → recovery unchanged (in-flight ignored)."""
+        from agent_gtd_dispatch import main
+
+        # Even with an in-flight build, a non-polling phase uses the existing
+        # timestamp-staleness predicate (there is no build to wait on).
+        stale = _stale_rollout(
+            manager_phase="reviewing",
+            in_flight_builds=[{"id": "run-1", "status": "running"}],
+        )
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._active_processes", {}),
+            patch("agent_gtd_dispatch.main._rollout_to_run", {}),
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+            patch("agent_gtd_dispatch.main.db") as mock_db,
+            patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()),
+            patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[stale])
+            mock_gtd.relaunch_manage_rollout = AsyncMock(
+                return_value={**stale, "manage_retry_count": 1}
+            )
+            mock_db.insert_run = AsyncMock()
+            mock_create_task.return_value = MagicMock()
+
+            await main._watchdog_tick()
+
+            mock_gtd.relaunch_manage_rollout.assert_called_once_with(stale["id"])
+            mock_create_task.assert_called_once()

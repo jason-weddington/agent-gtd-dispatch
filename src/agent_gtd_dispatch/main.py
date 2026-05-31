@@ -143,6 +143,48 @@ MANAGE_RETRY_BACKOFF_SECONDS = 30
 # Frozenset of rollout statuses that indicate a clean/terminal manage exit
 _CLEAN_EXIT_STATUSES: frozenset[str] = frozenset({"completed", "halted", "cancelled"})
 
+# Build-run statuses that indicate a terminal (finished) run. Any run not in
+# this set is treated as in-flight by the watchdog's polling predicate (so an
+# unknown status errs toward "still running" → don't recover, the safe
+# direction). inFlightBuildRuns is sourced from the GTD service, whose terminal
+# status is "success"; "succeeded" et al. cover the dispatch-side RunStatus
+# vocabulary defensively in case the field ever carries those instead.
+_TERMINAL_RUN_STATUSES: frozenset[str] = frozenset(
+    {
+        "success",
+        "succeeded",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "completed",
+        "halted",
+        "done",
+        "error",
+    }
+)
+
+
+def _in_flight_build_runs(rollout: dict[str, Any]) -> list[Any]:
+    """Return the rollout's in-flight (non-terminal) build runs.
+
+    Reads the server-derived ``inFlightBuildRuns`` field straight off the
+    rollout dict (no per-run status polling). Defensively filters out any
+    entry that carries a terminal status, so the predicate is correct whether
+    the server pre-filters the list or includes terminal runs. Bare (non-dict)
+    entries are treated as in-flight.
+    """
+    runs = rollout.get("inFlightBuildRuns") or []
+    in_flight: list[Any] = []
+    for run in runs:
+        if isinstance(run, dict):
+            status = str(run.get("status", "")).lower()
+            if status not in _TERMINAL_RUN_STATUSES:
+                in_flight.append(run)
+        else:
+            in_flight.append(run)
+    return in_flight
+
+
 security = HTTPBearer()
 
 
@@ -385,6 +427,38 @@ async def _watchdog_evaluate_rollout(
             config.MANAGE_STALE_THRESHOLD_SECONDS,
         )
         return  # fresh enough
+
+    # Polling + in-flight build short-circuit: a manager in the 'polling' phase
+    # with at least one non-terminal child build run is presumed to be healthily
+    # waiting on that build. The build's real status (which we own) — not the
+    # manager's heartbeat (which we don't) — is the signal, so a stale
+    # manager_state_updated_at does NOT mean stuck. Skip recovery regardless of
+    # timestamp age, bounded only by MANAGE_TIMEOUT_SECONDS as the absolute
+    # backstop (anchored on manager_state age) so a genuinely-wedged build can't
+    # defer recovery forever. Non-polling phases fall straight through to the
+    # existing timestamp-staleness recovery path below.
+    if manager_phase == "polling":
+        in_flight = _in_flight_build_runs(rollout)
+        if in_flight:
+            if age_seconds <= config.MANAGE_TIMEOUT_SECONDS:
+                logger.info(
+                    "watchdog: rollout_id=%s manager_phase=polling age_seconds=%.0f "
+                    "in_flight_builds=%d decision=skipped-build-in-flight",
+                    rollout_id,
+                    age_seconds,
+                    len(in_flight),
+                )
+                return  # healthily waiting on a still-running build
+            logger.warning(
+                "watchdog: rollout_id=%s manager_phase=polling age_seconds=%.0f "
+                "in_flight_builds=%d exceeds MANAGE_TIMEOUT_SECONDS=%d "
+                "decision=backstop-recovery",
+                rollout_id,
+                age_seconds,
+                len(in_flight),
+                config.MANAGE_TIMEOUT_SECONDS,
+            )
+            # Absolute backstop exceeded — fall through to recovery below.
 
     # Idempotency guard: skip if we already acted within the staleness window
     last_acted = _watchdog_acted.get(rollout_id, 0.0)
