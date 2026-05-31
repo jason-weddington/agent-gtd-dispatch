@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.11.1 (2026-05-30)
+
+### Bug Fixes
+
+- Raise manage watchdog stale threshold to 35 min
+  ([`87b325f`](https://github.com/repos/agent-gtd-dispatch/commit/87b325fe61f487dc4fdc5f5159a128ec04a6c116))
+
+
 ## v1.11.0 (2026-05-30)
 
 ### Bug Fixes
