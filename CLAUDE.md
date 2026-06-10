@@ -63,7 +63,8 @@ tests/
 
 ## Deployment hosts & env files (two-user split)
 
-Runs on three hosts (`pironman01`, `ubuntu-pi-01`, `r7-research`). On each: the API
+Runs on two hosts (`pironman01`, `r7-research`; `ubuntu-pi-01` was removed from the
+rotation 2026-06-10 — too slow). On each: the API
 runs as **`dispatch-svc`**; it launches the Claude Code agent as **`dispatch`** via
 `sudo -u dispatch -H`.
 

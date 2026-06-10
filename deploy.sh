@@ -7,7 +7,7 @@ set -euo pipefail
 # Called by release.sh after cutting a version tag.
 #
 # Environment variables:
-#   DISPATCH_HOSTS  Space-separated SSH targets (default: "pironman01 r7-research ubuntu-pi-01")
+#   DISPATCH_HOSTS  Space-separated SSH targets (default: "pironman01 r7-research")
 #   DISPATCH_HOST   Single SSH target — if set, overrides DISPATCH_HOSTS (back-compat)
 #   SERVICE_USER    Service account owning the working copy (default: dispatch-svc)
 #   SERVICE_NAME    Systemd service unit name (default: dispatch-api)
@@ -18,7 +18,7 @@ set -euo pipefail
 if [ -n "${DISPATCH_HOST:-}" ]; then
     HOSTS="${DISPATCH_HOST}"
 else
-    HOSTS="${DISPATCH_HOSTS:-pironman01 r7-research ubuntu-pi-01}"
+    HOSTS="${DISPATCH_HOSTS:-pironman01 r7-research}"
 fi
 SERVICE_USER="${SERVICE_USER:-dispatch-svc}"
 SERVICE_NAME="${SERVICE_NAME:-dispatch-api}"
