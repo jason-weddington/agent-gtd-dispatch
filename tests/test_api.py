@@ -1049,3 +1049,247 @@ class TestBoundaryErrors:
         data = resp.json()
         assert isinstance(data["detail"], dict)
         assert "malformed" in data["detail"]["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Workspace dispatch tests (AC-6, AC-7, AC-10)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceDispatch:
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_workspace_happy_path_no_git_origin_required(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ) -> None:
+        """Workspace project (no git_origin) dispatches successfully — route layer accepts
+        and worker is invoked, proving the git_origin guard is bypassed in workspace mode."""
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix workspace bug",
+                "project_id": "proj-ws",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj-ws",
+                "name": "WorkspaceProject",
+                # deliberately no git_origin key — workspace dispatch must not require it
+                "repo_mode": "workspace",
+                "workspace_repos": [
+                    "git@host:org/repo-a.git",
+                    "git@host:org/repo-b.git",
+                ],
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix"
+
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc12345-6789", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["item_id"] == "abc12345-6789"
+        assert data["status"] == "pending"
+        # Worker must have been invoked (proves route layer did not 400)
+        mock_worker.assert_called_once()
+
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_workspace_project_empty_workspace_repos_returns_400(
+        self, mock_client, client, auth_headers
+    ) -> None:
+        """Workspace project with empty workspace_repos returns 400 containing 'workspace_repos'."""
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc123",
+                "title": "Test item",
+                "project_id": "proj-ws",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj-ws",
+                "name": "WorkspaceProject",
+                "repo_mode": "workspace",
+                # workspace_repos absent → treated as empty
+            }
+        )
+
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc123", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+        assert "workspace_repos" in resp.json()["detail"]
+
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_manage_workspace_project_returns_400_with_workspace_and_manage(
+        self, mock_client, client, auth_headers
+    ) -> None:
+        """Manage dispatch targeting a workspace project is rejected (defense-in-depth)."""
+        mock_client.get_rollout = AsyncMock(
+            return_value={
+                "id": "rollout-ws",
+                "project_id": "proj-ws",
+                "status": "running",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj-ws",
+                "name": "WorkspaceProject",
+                "repo_mode": "workspace",
+                "workspace_repos": ["git@host:org/repo-a.git"],
+            }
+        )
+
+        resp = client.post(
+            "/dispatch",
+            json={"rollout_id": "rollout-ws", "mode": "manage", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"].lower()
+        assert "workspace" in detail
+        assert "manage" in detail
+
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_no_repo_mode_key_follows_monorepo_path(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ) -> None:
+        """Regression: project with no repo_mode key dispatches exactly as before."""
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "MonorepoProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+                # no repo_mode key at all
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc12345-6789", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "pending"
+
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_unknown_repo_mode_value_follows_monorepo_path(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ) -> None:
+        """Regression: unrecognized repo_mode value (not 'workspace') uses monorepo path."""
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "SomeProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+                "repo_mode": "something-else",  # unknown value → monorepo
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc12345-6789", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "pending"
+
+    async def test_workspace_worker_calls_prepare_workspace_multi(
+        self, client, auth_headers
+    ) -> None:
+        """_dispatch_worker calls prepare_workspace_multi for workspace projects,
+        proving the git_origin guard is bypassed — run reaches prepare_workspace_multi."""
+        import subprocess
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.engines import get_engine
+        from agent_gtd_dispatch.main import _dispatch_worker
+        from agent_gtd_dispatch.models import Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-ws",
+            project_name="WorkspaceProject",
+            branch_name="feat/item-ws-fix",
+        )
+        await db.insert_run(run)
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_client,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_client.get_item = AsyncMock(
+                return_value={
+                    "id": "item-ws",
+                    "title": "Fix workspace bug",
+                    "project_id": "proj-ws",
+                }
+            )
+            mock_client.get_project = AsyncMock(
+                return_value={
+                    "id": "proj-ws",
+                    "name": "WorkspaceProject",
+                    # NO git_origin key — proves independence
+                    "repo_mode": "workspace",
+                    "workspace_repos": [
+                        "git@host:org/repo-a.git",
+                        "git@host:org/repo-b.git",
+                    ],
+                }
+            )
+            mock_client.post_comment = AsyncMock()
+            mock_client.list_attachments = AsyncMock(return_value=[])
+
+            from pathlib import Path
+
+            fake_workspace = Path("/tmp/ws-item-ws")  # noqa: S108
+            mock_dispatch.prepare_workspace_multi.return_value = fake_workspace
+            mock_dispatch.repo_dir_from_url.side_effect = lambda url: url.rsplit(
+                "/", 1
+            )[-1].replace(".git", "")
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt.return_value = "test prompt"
+            mock_dispatch.branch_name_for_item.return_value = "feat/item-ws-fix"
+            mock_dispatch.run_agent = AsyncMock(
+                return_value=subprocess.CompletedProcess([], 0, "", "")
+            )
+            mock_dispatch.cleanup_workspace.return_value = None
+
+            engine = get_engine("claude-code")
+            await _dispatch_worker(run, 50, engine, 1800)
+
+        mock_dispatch.prepare_workspace_multi.assert_called_once_with(
+            ["git@host:org/repo-a.git", "git@host:org/repo-b.git"],
+            run.id,
+            "feat/item-ws-fix",
+        )

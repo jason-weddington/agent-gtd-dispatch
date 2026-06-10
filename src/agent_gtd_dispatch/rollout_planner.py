@@ -100,7 +100,7 @@ def _assert_acyclic(nodes: list[str], edges: list[DagEdge]) -> None:
     Raises:
         ValueError: If a cyclic dependency is detected.
     """
-    in_degree: dict[str, int] = {node: 0 for node in nodes}
+    in_degree: dict[str, int] = dict.fromkeys(nodes, 0)
     adjacency: defaultdict[str, list[str]] = defaultdict(list)
 
     for edge in edges:

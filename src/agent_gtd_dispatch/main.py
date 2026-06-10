@@ -612,17 +612,41 @@ async def _dispatch_worker(
             project = await gtd_client.get_project(project_id)
 
         # Build workspace
-        git_origin = project.get("git_origin", "")
-        if not git_origin:
-            raise ValueError(f"Project '{project['name']}' has no git_origin")
+        is_workspace_mode = (project.get("repo_mode") or "") == "workspace"
+        workspace_repo_dirs: list[str] | None = None
 
         if mode == DispatchMode.MANAGE:
-            # Clone the project's default branch for quality gates + git operations
+            # Manage mode always uses the monorepo/single-repo path
+            git_origin = project.get("git_origin", "")
+            if not git_origin:
+                raise ValueError(f"Project '{project['name']}' has no git_origin")
             workspace = dispatch.prepare_manage_workspace(git_origin, run.id)
             await db.update_run(run.id, workspace_path=str(workspace))
             attachments = []
+        elif is_workspace_mode:
+            # Multi-repo workspace path
+            if run.branch_name is None:  # pragma: no cover
+                raise ValueError("branch_name must be set for non-manage mode runs")
+            workspace_repos: list[str] = project.get("workspace_repos") or []
+            if not workspace_repos:
+                raise ValueError("workspace_repos must be non-empty for workspace mode")
+            workspace = dispatch.prepare_workspace_multi(
+                workspace_repos, run.id, run.branch_name
+            )
+            await db.update_run(run.id, workspace_path=str(workspace))
+            workspace_repo_dirs = [
+                dispatch.repo_dir_from_url(url) for url in workspace_repos
+            ]
+            # Stage attachments — item_id guaranteed non-None for non-manage modes
+            assert run.item_id is not None  # noqa: S101
+            attachments = await dispatch.stage_attachments(
+                workspace, run.id, run.item_id
+            )
         else:
-            # Prepare workspace (fresh clone on feature branch)
+            # Monorepo path (default — absent/None/empty/unrecognized repo_mode)
+            git_origin = project.get("git_origin", "")
+            if not git_origin:
+                raise ValueError(f"Project '{project['name']}' has no git_origin")
             if run.branch_name is None:  # pragma: no cover
                 raise ValueError("branch_name must be set for non-manage mode runs")
             workspace = dispatch.prepare_workspace(git_origin, run.id, run.branch_name)
@@ -645,6 +669,7 @@ async def _dispatch_worker(
             run_id=run.id,
             rollout_id=run.rollout_id,
             manage_retry_count=manage_retry_count,
+            workspace_repo_dirs=workspace_repo_dirs,
         )
 
         item_title = item.get("title", f"rollout:{run.rollout_id}")
@@ -941,6 +966,14 @@ async def dispatch_item(
                 },
             ) from exc
 
+        if (project.get("repo_mode") or "") == "workspace":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Project '{project['name']}' is a workspace project; "
+                    "manage dispatch is not supported for workspace projects"
+                ),
+            )
         if not project.get("git_origin"):
             raise HTTPException(
                 status_code=400,
@@ -1021,11 +1054,21 @@ async def dispatch_item(
                 },
             ) from exc
 
-        if not project.get("git_origin"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Project '{project['name']}' has no git_origin configured",
-            )
+        if (project.get("repo_mode") or "") == "workspace":
+            _ws_repos = project.get("workspace_repos") or []
+            if not _ws_repos:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Project '{project['name']}' has workspace_repos empty or missing"
+                    ),
+                )
+        else:
+            if not project.get("git_origin"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Project '{project['name']}' has no git_origin configured",
+                )
 
         branch_name = dispatch.branch_name_for_item(body.item_id, item["title"])
         item_id_for_run = body.item_id

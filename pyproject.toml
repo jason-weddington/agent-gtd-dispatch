@@ -101,7 +101,7 @@ filterwarnings = [
 source = ["agent_gtd_dispatch", "agent_gtd_dispatch_protocol"]
 
 [tool.coverage.report]
-fail_under = 84
+fail_under = 88
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]

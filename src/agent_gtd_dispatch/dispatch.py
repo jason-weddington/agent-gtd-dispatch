@@ -67,6 +67,33 @@ def repo_name_from_origin(origin: str) -> str:
 branch_name_for_item = make_branch_name
 
 
+def repo_dir_from_url(url: str) -> str:
+    """Extract a directory name from a git clone URL.
+
+    Takes the segment after the last '/' or ':' (whichever appears later),
+    strips a trailing '.git', and returns the result.  Raises ValueError if
+    the result is empty.
+
+    Examples::
+
+        repo_dir_from_url('git@host:org/repo.git')          → 'repo'
+        repo_dir_from_url('https://host/org/repo.git')      → 'repo'
+        repo_dir_from_url('ssh://git@ubuntu-vm01/~/repos/agent_gtd') → 'agent_gtd'
+        repo_dir_from_url('git@host:repo.git')              → 'repo'  (SCP, no slash)
+    """
+    # Tolerate a single trailing slash (e.g. from user copy-paste)
+    url = url.rstrip("/")
+    last_slash = url.rfind("/")
+    last_colon = url.rfind(":")
+    sep_pos = max(last_slash, last_colon)
+    segment = url[sep_pos + 1 :] if sep_pos >= 0 else url
+    if segment.endswith(".git"):
+        segment = segment[:-4]
+    if not segment:
+        raise ValueError(f"Cannot determine repo directory from URL: {url!r}")
+    return segment
+
+
 def prepare_workspace(origin: str, run_id: str, branch_name: str) -> Path:
     """Clone the repo and check out a feature branch for this run."""
     name = repo_name_from_origin(origin)
@@ -86,6 +113,76 @@ def prepare_workspace(origin: str, run_id: str, branch_name: str) -> Path:
     )
 
     return workspace
+
+
+def prepare_workspace_multi(
+    repo_urls: list[str], run_id: str, branch_name: str
+) -> Path:
+    """Clone multiple repos and create a feature branch in each for this run.
+
+    Workspace root is ``config.WORKSPACE_ROOT / f'ws-{run_id}'``.
+
+    - Python-mkdirs only ``config.WORKSPACE_ROOT`` (not the workspace root).
+    - Creates the workspace root via a sudo-wrapped ``mkdir -p`` so that under
+      the two-user split (``AGENT_SUBPROCESS_USER`` set) the agent user owns it
+      and the subsequent clones can write into it.
+    - Clones each URL **in order** into ``<root>/<repo_dir_from_url(url)>``.
+    - Checks out ``branch_name`` in every repo (service-side branch creation).
+    - Returns the workspace root ``Path``.
+
+    Raises ``ValueError`` before any subprocess if *repo_urls* is empty, if two
+    URLs map to the same directory name, or if any URL produces an empty
+    basename.  Raises ``RuntimeError`` on clone or checkout failure.
+    """
+    if not repo_urls:
+        raise ValueError("workspace_repos must not be empty")
+
+    # Validate / resolve directory names before touching the filesystem
+    dir_names: list[str] = []
+    for url in repo_urls:
+        dir_names.append(repo_dir_from_url(url))  # raises ValueError on empty basename
+
+    seen: set[str] = set()
+    for name in dir_names:
+        if name in seen:
+            raise ValueError(f"Duplicate workspace repo directory: '{name}'")
+        seen.add(name)
+
+    # Python-mkdirs ONLY config.WORKSPACE_ROOT (mirrors prepare_workspace)
+    config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+
+    root = config.WORKSPACE_ROOT / f"ws-{run_id}"
+
+    # Create workspace root via subprocess so the agent user owns it
+    subprocess.run(
+        _sudo_wrap(["mkdir", "-p", str(root)]),
+        check=True,
+        capture_output=True,
+    )
+
+    for url, dir_name in zip(repo_urls, dir_names, strict=False):
+        dest = root / dir_name
+
+        result = subprocess.run(
+            _sudo_wrap(["git", "clone", url, str(dest)]),
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            stderr_tail = result.stderr.decode("utf-8", errors="replace")[-300:]
+            raise RuntimeError(f"workspace clone failed for {url}: {stderr_tail}")
+
+        result = subprocess.run(
+            _sudo_wrap(["git", "checkout", "-b", branch_name]),
+            cwd=dest,
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            stderr_tail = result.stderr.decode("utf-8", errors="replace")[-300:]
+            raise RuntimeError(f"workspace checkout failed for {url}: {stderr_tail}")
+
+    return root
 
 
 def prepare_manage_workspace(git_origin: str, run_id: str) -> Path:
@@ -253,6 +350,49 @@ def _build_supporting_files_section(
     )
 
 
+def _build_workspace_layout_section_build(
+    workspace_repo_dirs: list[str], branch_name: str
+) -> str:
+    """'## Workspace Layout' section for build-mode workspace runs."""
+    repo_bullets = "\n".join(f"- `{d}/`" for d in workspace_repo_dirs)
+    return textwrap.dedent(
+        f"""\
+        ## Workspace Layout
+
+        Your working directory is a **workspace root** containing these cloned repos:
+
+        {repo_bullets}
+
+        Branch `{branch_name}` is already created and checked out in every repo —
+        the service did this before launching. **Never create branches.**
+
+        - **Commit** your changes in whichever repos you modify.
+        - **Push `{branch_name}` to origin ONLY in repos where you made commits.**
+        - After each push, verify the remote ref advanced. Run in that repo's directory:
+          ```bash
+          git ls-remote origin refs/heads/{branch_name}
+          ```
+          Compare the returned SHA against `git rev-parse HEAD`. If the SHAs do not match
+          (or no SHA is returned), post a failure comment and do NOT set item status to `review`.
+        - Your final success comment **MUST list exactly which repos you pushed to**."""
+    )
+
+
+def _build_workspace_layout_section_plan(workspace_repo_dirs: list[str]) -> str:
+    """'## Workspace Layout' section for plan-mode workspace runs (read-only)."""
+    repo_bullets = "\n".join(f"- `{d}/`" for d in workspace_repo_dirs)
+    return textwrap.dedent(
+        f"""\
+        ## Workspace Layout
+
+        Your working directory is a **workspace root** containing these cloned repos:
+
+        {repo_bullets}
+
+        Explore across all of them as needed to understand the codebase."""
+    )
+
+
 def build_system_prompt(
     item: dict[str, Any],
     project: dict[str, Any],
@@ -263,11 +403,17 @@ def build_system_prompt(
     run_id: str = "",
     rollout_id: str | None = None,
     manage_retry_count: int = 0,
+    workspace_repo_dirs: list[str] | None = None,
 ) -> str:
     """Build the headless agent system prompt."""
     if mode == DispatchMode.PLAN:
         return _build_plan_prompt(
-            item, project, max_turns, attachments=attachments, run_id=run_id
+            item,
+            project,
+            max_turns,
+            attachments=attachments,
+            run_id=run_id,
+            workspace_repo_dirs=workspace_repo_dirs,
         )
     if mode == DispatchMode.MANAGE:
         return _build_manage_prompt(
@@ -280,6 +426,7 @@ def build_system_prompt(
         max_turns,
         attachments=attachments,
         run_id=run_id,
+        workspace_repo_dirs=workspace_repo_dirs,
     )
 
 
@@ -289,6 +436,7 @@ def _build_plan_prompt(
     max_turns: int,
     attachments: list[dict[str, Any]] | None = None,
     run_id: str = "",
+    workspace_repo_dirs: list[str] | None = None,
 ) -> str:
     """System prompt for plan mode — groom a task, don't build it."""
     item_id = item["id"]
@@ -323,6 +471,11 @@ def _build_plan_prompt(
 
     if files_section:
         prompt += "\n" + files_section + "\n"
+
+    if workspace_repo_dirs:
+        prompt += (
+            "\n" + _build_workspace_layout_section_plan(workspace_repo_dirs) + "\n"
+        )
 
     prompt += textwrap.dedent(
         f"""\
@@ -866,6 +1019,7 @@ def _build_build_prompt(
     max_turns: int,
     attachments: list[dict[str, Any]] | None = None,
     run_id: str = "",
+    workspace_repo_dirs: list[str] | None = None,
 ) -> str:
     """System prompt for build mode — implement and push a branch."""
     item_id = item["id"]
@@ -895,6 +1049,13 @@ def _build_build_prompt(
 
     if files_section:
         prompt += "\n" + files_section + "\n"
+
+    if workspace_repo_dirs:
+        prompt += (
+            "\n"
+            + _build_workspace_layout_section_build(workspace_repo_dirs, branch_name)
+            + "\n"
+        )
 
     prompt += textwrap.dedent(
         f"""\

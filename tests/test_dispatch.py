@@ -20,6 +20,8 @@ from agent_gtd_dispatch.dispatch import (
     init_executor,
     prepare_manage_workspace,
     prepare_workspace,
+    prepare_workspace_multi,
+    repo_dir_from_url,
     repo_name_from_origin,
     run_agent,
 )
@@ -1759,3 +1761,372 @@ class TestOllamaConfig:
             pytest.raises(ValueError, match="OLLAMA_BASE_URL"),
         ):
             config.load()
+
+
+# ---------------------------------------------------------------------------
+# repo_dir_from_url tests (AC-2)
+# ---------------------------------------------------------------------------
+
+
+class TestRepoDirFromUrl:
+    def test_ssh_with_org_and_slash(self) -> None:
+        assert repo_dir_from_url("git@host:org/repo.git") == "repo"
+
+    def test_https_with_org_path(self) -> None:
+        assert repo_dir_from_url("https://host/org/repo.git") == "repo"
+
+    def test_ssh_url_multi_segment(self) -> None:
+        assert (
+            repo_dir_from_url("ssh://git@ubuntu-vm01/~/repos/agent_gtd") == "agent_gtd"
+        )
+
+    def test_scp_style_no_slash(self) -> None:
+        assert repo_dir_from_url("git@host:repo.git") == "repo"
+
+    def test_trailing_slash_tolerated(self) -> None:
+        # URL with one trailing '/' yields same name as without
+        assert repo_dir_from_url("git@host:org/repo.git/") == repo_dir_from_url(
+            "git@host:org/repo.git"
+        )
+
+    def test_empty_basename_raises_value_error(self) -> None:
+        with pytest.raises(ValueError):
+            repo_dir_from_url("git@host:")
+
+
+# ---------------------------------------------------------------------------
+# prepare_workspace_multi tests (AC-3/4/5)
+# ---------------------------------------------------------------------------
+
+
+class TestPrepareWorkspaceMulti:
+    @pytest.fixture
+    def workspace_root(self, tmp_path, monkeypatch) -> Path:
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+        return tmp_path
+
+    def _make_mock_result(self, returncode: int = 0) -> MagicMock:
+        result = MagicMock()
+        result.returncode = returncode
+        result.stderr = b""
+        return result
+
+    def test_workspace_root_is_ws_run_id(self, workspace_root, tmp_path) -> None:
+        repo_urls = ["git@host:org/repo-a.git"]
+        run_id = "abc123"
+        branch = "feat/abc123-fix"
+
+        mock_result = self._make_mock_result(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub:
+            mock_sub.run.return_value = mock_result
+            result = prepare_workspace_multi(repo_urls, run_id, branch)
+
+        assert result == tmp_path / f"ws-{run_id}"
+
+    def test_clones_repos_in_order(self, workspace_root, tmp_path) -> None:
+        repo_urls = [
+            "git@host:org/repo-a.git",
+            "git@host:org/repo-b.git",
+        ]
+        run_id = "abc123"
+        branch = "feat/abc123-fix"
+        root = tmp_path / f"ws-{run_id}"
+
+        mock_result = self._make_mock_result(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub:
+            mock_sub.run.return_value = mock_result
+            prepare_workspace_multi(repo_urls, run_id, branch)
+
+        calls = mock_sub.run.call_args_list
+        # calls: mkdir, clone-a, checkout-a, clone-b, checkout-b
+        # Filter by checking the actual command list, not the string representation
+        clone_calls = [c for c in calls if "clone" in c.args[0]]
+        assert len(clone_calls) == 2
+        assert str(root / "repo-a") in str(clone_calls[0])
+        assert str(root / "repo-b") in str(clone_calls[1])
+
+    def test_dir_names_derived_from_urls(self, workspace_root, tmp_path) -> None:
+        repo_urls = [
+            "https://host/org/my-service.git",
+            "ssh://git@server/repos/core-lib",
+        ]
+        run_id = "xyz999"
+        branch = "feat/xyz999-feature"
+        root = tmp_path / f"ws-{run_id}"
+
+        mock_result = self._make_mock_result(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub:
+            mock_sub.run.return_value = mock_result
+            prepare_workspace_multi(repo_urls, run_id, branch)
+
+        calls = mock_sub.run.call_args_list
+        clone_cmds = [c.args[0] for c in calls if "clone" in str(c.args[0])]
+        assert any(str(root / "my-service") in str(cmd) for cmd in clone_cmds)
+        assert any(str(root / "core-lib") in str(cmd) for cmd in clone_cmds)
+
+    def test_checkout_b_called_per_repo(self, workspace_root, tmp_path) -> None:
+        repo_urls = [
+            "git@host:org/repo-a.git",
+            "git@host:org/repo-b.git",
+        ]
+        run_id = "abc123"
+        branch = "feat/abc123-fix"
+
+        mock_result = self._make_mock_result(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub:
+            mock_sub.run.return_value = mock_result
+            prepare_workspace_multi(repo_urls, run_id, branch)
+
+        calls = mock_sub.run.call_args_list
+        # Filter by checking the actual command list
+        checkout_calls = [c for c in calls if "checkout" in c.args[0]]
+        assert len(checkout_calls) == 2
+        for c in checkout_calls:
+            cmd = c.args[0]
+            assert "checkout" in cmd
+            assert "-b" in cmd
+            assert branch in cmd
+
+    def test_duplicate_dir_name_raises_before_subprocess(self, workspace_root) -> None:
+        # Both URLs resolve to 'repo' — must raise before any subprocess call
+        repo_urls = [
+            "git@host:org/repo.git",
+            "https://other-host/path/repo.git",
+        ]
+        with (
+            patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub,
+            pytest.raises(ValueError, match="repo"),
+        ):
+            prepare_workspace_multi(repo_urls, "run1", "feat/x")
+        mock_sub.run.assert_not_called()
+
+    def test_empty_list_raises_before_subprocess(self, workspace_root) -> None:
+        with (
+            patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub,
+            pytest.raises(ValueError),
+        ):
+            prepare_workspace_multi([], "run1", "feat/x")
+        mock_sub.run.assert_not_called()
+
+    def test_clone_failure_raises_runtime_error_with_clone_and_url(
+        self, workspace_root
+    ) -> None:
+        repo_urls = [
+            "git@host:org/repo-a.git",
+            "git@host:org/repo-b.git",
+        ]
+        run_id = "abc123"
+        branch = "feat/abc123-fix"
+
+        success = self._make_mock_result(0)
+        failure = self._make_mock_result(1)
+        failure.stderr = b"fatal: repository not found\n"
+
+        call_count = 0
+
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # mkdir (1), clone-a (2), checkout-a (3), clone-b fails (4)
+            if call_count == 4:
+                return failure
+            return success
+
+        with (
+            patch(
+                "agent_gtd_dispatch.dispatch.subprocess.run", side_effect=side_effect
+            ),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            prepare_workspace_multi(repo_urls, run_id, branch)
+
+        msg = str(exc_info.value)
+        assert "clone" in msg
+        assert "git@host:org/repo-b.git" in msg
+
+    def test_checkout_failure_raises_runtime_error_with_checkout_and_url(
+        self, workspace_root
+    ) -> None:
+        repo_urls = ["git@host:org/repo-a.git"]
+        run_id = "abc123"
+        branch = "feat/abc123-fix"
+
+        success = self._make_mock_result(0)
+        failure = self._make_mock_result(1)
+        failure.stderr = b"error: branch already exists\n"
+
+        call_count = 0
+
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # mkdir (1), clone (2) succeeds, checkout (3) fails
+            if call_count == 3:
+                return failure
+            return success
+
+        with (
+            patch(
+                "agent_gtd_dispatch.dispatch.subprocess.run", side_effect=side_effect
+            ),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            prepare_workspace_multi(repo_urls, run_id, branch)
+
+        msg = str(exc_info.value)
+        assert "checkout" in msg
+        assert "git@host:org/repo-a.git" in msg
+
+    def test_sudo_prefix_when_user_set(self, tmp_path, monkeypatch) -> None:
+        """All subprocess calls (mkdir, every clone, every checkout) are sudo-wrapped."""
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+        repo_urls = [
+            "git@host:org/repo-a.git",
+            "git@host:org/repo-b.git",
+        ]
+        run_id = "abc123"
+        branch = "feat/abc123-fix"
+
+        mock_result = self._make_mock_result(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub:
+            mock_sub.run.return_value = mock_result
+            prepare_workspace_multi(repo_urls, run_id, branch)
+
+        sudo_prefix = ["sudo", "-u", "dispatch", "-H"]
+        for c in mock_sub.run.call_args_list:
+            cmd = c.args[0]
+            assert cmd[:4] == sudo_prefix, f"Expected sudo prefix on call {cmd!r}"
+
+
+# ---------------------------------------------------------------------------
+# Workspace prompt tests (AC-8a / AC-8b)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspacePrompts:
+    _item: ClassVar[dict] = {
+        "id": "abc12345-0000-0000-0000-000000000000",
+        "title": "Fix workspace bug",
+        "description": "Something needs fixing.",
+    }
+    _project: ClassVar[dict] = {"name": "my-cool-project"}
+    _branch = "feat/abc12345-fix-workspace-bug"
+    _max_turns = 42
+    _repo_dirs: ClassVar[list[str]] = ["repo-a", "repo-b"]
+
+    # --- build prompt with workspace_repo_dirs ---
+
+    def test_build_workspace_section_contains_header(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            self._branch,
+            self._max_turns,
+            workspace_repo_dirs=self._repo_dirs,
+        )
+        assert "## Workspace Layout" in prompt
+
+    def test_build_workspace_section_contains_both_dir_names(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            self._branch,
+            self._max_turns,
+            workspace_repo_dirs=self._repo_dirs,
+        )
+        assert "repo-a" in prompt
+        assert "repo-b" in prompt
+
+    def test_build_workspace_section_contains_branch_name(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            self._branch,
+            self._max_turns,
+            workspace_repo_dirs=self._repo_dirs,
+        )
+        assert self._branch in prompt
+
+    def test_build_workspace_section_contains_ls_remote(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            self._branch,
+            self._max_turns,
+            workspace_repo_dirs=self._repo_dirs,
+        )
+        assert "ls-remote" in prompt
+
+    # --- plan prompt with workspace_repo_dirs ---
+
+    def test_plan_workspace_section_contains_header(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="plan",
+            workspace_repo_dirs=self._repo_dirs,
+        )
+        assert "## Workspace Layout" in prompt
+
+    def test_plan_workspace_section_contains_both_dir_names(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="plan",
+            workspace_repo_dirs=self._repo_dirs,
+        )
+        assert "repo-a" in prompt
+        assert "repo-b" in prompt
+
+    def test_plan_workspace_section_no_ls_remote(self) -> None:
+        """Plan layout section must NOT include push/verification instructions."""
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="plan",
+            workspace_repo_dirs=self._repo_dirs,
+        )
+        assert "ls-remote" not in prompt
+
+    def test_plan_workspace_section_no_branch_name(self) -> None:
+        """Plan layout section must NOT reference a branch name."""
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="plan",
+            workspace_repo_dirs=self._repo_dirs,
+        )
+        # branch_name is not a param of _build_plan_prompt — must not appear
+        assert self._branch not in prompt
+
+    # --- None → no workspace section (regression) ---
+
+    def test_build_no_workspace_section_when_none(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            self._branch,
+            self._max_turns,
+            workspace_repo_dirs=None,
+        )
+        assert "## Workspace Layout" not in prompt
+
+    def test_plan_no_workspace_section_when_none(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="plan",
+            workspace_repo_dirs=None,
+        )
+        assert "## Workspace Layout" not in prompt
