@@ -20,6 +20,7 @@ from agent_gtd_dispatch_protocol.models import DispatchMode
 
 from . import config, gtd_client
 from .engines import Engine, build_env
+from .models import PushStatus, RepoPushStatus
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,131 @@ def prepare_workspace_multi(
             raise RuntimeError(f"workspace checkout failed for {url}: {stderr_tail}")
 
     return root
+
+
+def get_head_sha(repo_path: Path) -> str:
+    """Return the current HEAD SHA in repo_path (stripped)."""
+    result = subprocess.run(
+        _sudo_wrap(["git", "rev-parse", "HEAD"]),
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def verify_pushes(
+    repos: list[tuple[str, Path, str]],
+    branch_name: str,
+) -> list[RepoPushStatus]:
+    """Verify that each repo has pushed its branch to origin.
+
+    Args:
+        repos: List of (repo_name, repo_path, base_sha) tuples.
+        branch_name: The feature branch to check.
+
+    Returns:
+        Per-repo RepoPushStatus in the same order as *repos*.
+
+    Classification order (fail-closed):
+    1. Any git subprocess failure → unpushed (local_sha=None, remote_sha=None,
+       commits_ahead=0, dirty=False)
+    2. commits_ahead == 0 → no_changes
+    3. remote_sha == local_sha → pushed
+    4. else → unpushed
+    """
+    results: list[RepoPushStatus] = []
+    for repo_name, repo_path, base_sha in repos:
+        try:
+            # local HEAD SHA
+            local_proc = subprocess.run(
+                _sudo_wrap(["git", "rev-parse", "HEAD"]),
+                cwd=repo_path,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if local_proc.returncode != 0:
+                raise RuntimeError(f"git rev-parse HEAD failed: {local_proc.stderr}")
+            local_sha = local_proc.stdout.strip()
+
+            # commits ahead of base_sha
+            ahead_proc = subprocess.run(
+                _sudo_wrap(["git", "rev-list", f"{base_sha}..HEAD", "--count"]),
+                cwd=repo_path,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if ahead_proc.returncode != 0:
+                raise RuntimeError(f"git rev-list failed: {ahead_proc.stderr}")
+            commits_ahead = int(ahead_proc.stdout.strip())
+
+            # remote SHA for the branch (empty output → branch not on remote)
+            remote_proc = subprocess.run(
+                _sudo_wrap(["git", "ls-remote", "origin", f"refs/heads/{branch_name}"]),
+                cwd=repo_path,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if remote_proc.returncode != 0:
+                raise RuntimeError(f"git ls-remote failed: {remote_proc.stderr}")
+            remote_sha: str | None = None
+            ls_output = remote_proc.stdout.strip()
+            if ls_output:
+                # output format: "<sha>\trefs/heads/<branch>"
+                remote_sha = ls_output.split()[0]
+
+            # dirty check — only tracked-file modifications (untracked files ignored)
+            dirty_proc = subprocess.run(
+                _sudo_wrap(["git", "status", "--porcelain", "--untracked-files=no"]),
+                cwd=repo_path,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if dirty_proc.returncode != 0:
+                raise RuntimeError(f"git status failed: {dirty_proc.stderr}")
+            dirty = bool(dirty_proc.stdout.strip())
+
+            # Classification
+            if commits_ahead == 0:
+                status = PushStatus.no_changes
+            elif remote_sha == local_sha:
+                status = PushStatus.pushed
+            else:
+                status = PushStatus.unpushed
+
+        except Exception:
+            logger.exception("verify_pushes: git command failed for repo %s", repo_name)
+            results.append(
+                RepoPushStatus(
+                    repo_name=repo_name,
+                    branch=branch_name,
+                    status=PushStatus.unpushed,
+                    local_sha=None,
+                    remote_sha=None,
+                    commits_ahead=0,
+                    dirty=False,
+                )
+            )
+            continue
+
+        results.append(
+            RepoPushStatus(
+                repo_name=repo_name,
+                branch=branch_name,
+                status=status,
+                local_sha=local_sha,
+                remote_sha=remote_sha,
+                commits_ahead=commits_ahead,
+                dirty=dirty,
+            )
+        )
+
+    return results
 
 
 def prepare_manage_workspace(git_origin: str, run_id: str) -> Path:

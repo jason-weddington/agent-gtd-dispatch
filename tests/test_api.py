@@ -718,6 +718,51 @@ class TestGetRun:
         resp = client.get("/runs/nonexistent", headers=auth_headers)
         assert resp.status_code == 404
 
+    async def test_get_run_returns_push_results(self, client, auth_headers) -> None:
+        """GET /runs/{run_id} returns persisted push_results (full DB round-trip)."""
+        import json
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import PushStatus, RepoPushStatus, Run, RunStatus
+
+        await db.init_db()
+        run = Run(
+            item_id="item-push-test",
+            project_name="proj",
+            branch_name="feat/push-test",
+        )
+        await db.insert_run(run)
+
+        results = [
+            RepoPushStatus(
+                repo_name="repos-myrepo",
+                branch="feat/push-test",
+                status=PushStatus.pushed,
+                local_sha="deadbeef",
+                remote_sha="deadbeef",
+                commits_ahead=1,
+                dirty=False,
+            )
+        ]
+        push_results_json = json.dumps([r.model_dump(mode="json") for r in results])
+        await db.update_run(
+            run.id,
+            status=RunStatus.succeeded,
+            push_results=push_results_json,
+        )
+
+        resp = client.get(f"/runs/{run.id}", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["push_results"] is not None
+        assert len(data["push_results"]) == 1
+        pr = data["push_results"][0]
+        assert pr["repo_name"] == "repos-myrepo"
+        assert pr["status"] == "pushed"
+        assert pr["local_sha"] == "deadbeef"
+        assert pr["commits_ahead"] == 1
+        assert pr["dirty"] is False
+
 
 class TestCancelRun:
     def test_cancel_not_found(self, client, auth_headers):

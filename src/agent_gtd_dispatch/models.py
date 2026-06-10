@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from enum import StrEnum
 from uuid import uuid4
 
 from agent_gtd_dispatch_protocol.models import DagEdge as DagEdge
@@ -38,6 +39,26 @@ class InfoResponse(BaseModel):
     agents: list[str]
 
 
+class PushStatus(StrEnum):
+    """Per-repo push verification outcome."""
+
+    pushed = "pushed"
+    no_changes = "no_changes"
+    unpushed = "unpushed"
+
+
+class RepoPushStatus(BaseModel):
+    """Push verification result for a single repository."""
+
+    repo_name: str
+    branch: str
+    status: PushStatus
+    local_sha: str | None
+    remote_sha: str | None
+    commits_ahead: int
+    dirty: bool
+
+
 class Run(BaseModel):
     """A single dispatch run record."""
 
@@ -51,6 +72,7 @@ class Run(BaseModel):
     mode: DispatchMode = DispatchMode.BUILD
     rollout_id: str | None = None
     workspace_path: str | None = None
+    push_results: list[RepoPushStatus] | None = None
     status: RunStatus = RunStatus.pending
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -64,3 +86,4 @@ class RunResponse(_BaseRunResponse):
 
     engine_actual: str | None = None
     engine_swap: EngineSwap | None = None
+    push_results: list[RepoPushStatus] | None = None

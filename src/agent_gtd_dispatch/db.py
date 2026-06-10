@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC
 
 import aiosqlite
 
 from . import config
-from .models import Run, RunStatus
+from .models import RepoPushStatus, Run, RunStatus
 
 _DB_PATH = "dispatch.db"
 
@@ -63,7 +64,8 @@ async def _make_branch_name_nullable(db: aiosqlite.Connection) -> None:
             engine_actual TEXT,
             agent_name TEXT,
             mode TEXT NOT NULL DEFAULT 'build',
-            rollout_id TEXT
+            rollout_id TEXT,
+            push_results TEXT
         )
     """)
     # Copy only columns that exist in the current (old) table
@@ -101,7 +103,8 @@ async def _make_item_id_nullable(db: aiosqlite.Connection) -> None:
             agent_name TEXT,
             mode TEXT NOT NULL DEFAULT 'build',
             rollout_id TEXT,
-            workspace_path TEXT
+            workspace_path TEXT,
+            push_results TEXT
         )
     """)
     # Copy only columns that exist in the current (old) table
@@ -156,6 +159,8 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE runs ADD COLUMN workspace_path TEXT")
     if "engine_actual" not in existing:
         await db.execute("ALTER TABLE runs ADD COLUMN engine_actual TEXT")
+    if "push_results" not in existing:
+        await db.execute("ALTER TABLE runs ADD COLUMN push_results TEXT")
     # Idempotent rename: migrate any legacy 'claude' engine rows to 'claude-code'
     await db.execute("UPDATE runs SET engine = 'claude-code' WHERE engine = 'claude'")
     await db.commit()
@@ -228,6 +233,7 @@ async def update_run(
     error: str | None = None,
     workspace_path: str | None = None,
     engine_actual: str | None = None,
+    push_results: str | None = None,
 ) -> None:
     """Update fields on an existing run."""
     parts: list[str] = []
@@ -253,6 +259,9 @@ async def update_run(
     if engine_actual is not None:
         parts.append("engine_actual = ?")
         values.append(engine_actual)
+    if push_results is not None:
+        parts.append("push_results = ?")
+        values.append(push_results)
 
     if not parts:
         return
@@ -321,6 +330,11 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
             return None
         return datetime.fromisoformat(val).replace(tzinfo=UTC)
 
+    push_results_raw: str | None = row["push_results"]
+    push_results = None
+    if push_results_raw is not None:
+        push_results = [RepoPushStatus(**d) for d in json.loads(push_results_raw)]
+
     return Run(
         id=row["id"],
         item_id=row["item_id"],
@@ -332,6 +346,7 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         mode=row["mode"],
         rollout_id=row["rollout_id"],
         workspace_path=row["workspace_path"],
+        push_results=push_results,
         status=RunStatus(row["status"]),
         started_at=_parse_dt(row["started_at"]),
         completed_at=_parse_dt(row["completed_at"]),

@@ -29,6 +29,8 @@ from .models import (
     EngineSwap,
     InfoResponse,
     PlanRequest,
+    PushStatus,
+    RepoPushStatus,
     RolloutPlan,
     Run,
     RunResponse,
@@ -614,6 +616,10 @@ async def _dispatch_worker(
         # Build workspace
         is_workspace_mode = (project.get("repo_mode") or "") == "workspace"
         workspace_repo_dirs: list[str] | None = None
+        # For BUILD mode: list of (repo_name, repo_path, base_sha) passed to
+        # verify_pushes after the agent exits.  None means skip verification
+        # (manage/plan mode or exceptions during workspace prep).
+        _verify_repos: list[tuple[str, Path, str]] | None = None
 
         if mode == DispatchMode.MANAGE:
             # Manage mode always uses the monorepo/single-repo path
@@ -637,6 +643,18 @@ async def _dispatch_worker(
             workspace_repo_dirs = [
                 dispatch.repo_dir_from_url(url) for url in workspace_repos
             ]
+            # Capture base SHAs for BUILD mode verification — BEFORE stage_attachments
+            if mode == DispatchMode.BUILD:
+                _verify_repos = [
+                    (
+                        dispatch.repo_dir_from_url(url),
+                        workspace / dispatch.repo_dir_from_url(url),
+                        dispatch.get_head_sha(
+                            workspace / dispatch.repo_dir_from_url(url)
+                        ),
+                    )
+                    for url in workspace_repos
+                ]
             # Stage attachments — item_id guaranteed non-None for non-manage modes
             assert run.item_id is not None  # noqa: S101
             attachments = await dispatch.stage_attachments(
@@ -651,6 +669,15 @@ async def _dispatch_worker(
                 raise ValueError("branch_name must be set for non-manage mode runs")
             workspace = dispatch.prepare_workspace(git_origin, run.id, run.branch_name)
             await db.update_run(run.id, workspace_path=str(workspace))
+            # Capture base SHA for BUILD mode verification — BEFORE stage_attachments
+            if mode == DispatchMode.BUILD:
+                _verify_repos = [
+                    (
+                        dispatch.repo_name_from_origin(git_origin),
+                        workspace,
+                        dispatch.get_head_sha(workspace),
+                    )
+                ]
 
             # Stage any attachments into {run_id}-attachments/ inside the workspace
             # item_id is guaranteed non-None for non-manage modes (validated at route layer)
@@ -710,11 +737,90 @@ async def _dispatch_worker(
 
         completed = datetime.now(UTC).isoformat()
         if result.returncode == 0:
+            # BUILD mode: verify that the agent pushed its work before marking succeeded.
+            # Plan and manage modes are exempt (_verify_repos is None for those).
+            push_results_list: list[RepoPushStatus] | None = None
+            _push_results_json: str | None = None
+            if _verify_repos is not None:
+                push_results_list = dispatch.verify_pushes(
+                    _verify_repos, run.branch_name or ""
+                )
+                unpushed = [
+                    r for r in push_results_list if r.status == PushStatus.unpushed
+                ]
+                if unpushed:
+                    # Build error string: prefix once, one fragment per unpushed repo
+                    fragments = []
+                    for r in unpushed:
+                        if r.local_sha is not None:
+                            fragments.append(
+                                f"{r.repo_name}: {r.commits_ahead} unpushed commit(s)"
+                                f" on {r.branch}"
+                            )
+                        else:
+                            fragments.append(
+                                f"{r.repo_name}: verification error on {r.branch}"
+                            )
+                    error_str = "push verification failed: " + "; ".join(fragments)
+                    _push_results_json = json.dumps(
+                        [r.model_dump(mode="json") for r in push_results_list]
+                    )
+                    await db.update_run(
+                        run.id,
+                        status=RunStatus.failed,
+                        completed_at=completed,
+                        exit_code=result.returncode,
+                        error=error_str,
+                        push_results=_push_results_json,
+                    )
+                    _publish_run_event(run.id, "failed", completed)
+                    should_cleanup = (
+                        False  # preserve workspace — commits only exist in clone
+                    )
+                    # Post per-repo comment
+                    if run.item_id is not None:
+                        comment_lines = [f"Push verification failed (run `{run.id}`):"]
+                        for r in push_results_list:
+                            if r.status == PushStatus.pushed:
+                                line = (
+                                    f"- {r.repo_name}: pushed"
+                                    f" ({r.commits_ahead} commit(s),"
+                                    f" {(r.local_sha or '')[:8]})"
+                                )
+                            elif r.status == PushStatus.no_changes:
+                                line = f"- {r.repo_name}: no changes"
+                            else:
+                                # unpushed
+                                if r.local_sha is not None:
+                                    line = (
+                                        f"- {r.repo_name}: UNPUSHED —"
+                                        f" {r.commits_ahead} local commit(s) not on origin"
+                                    )
+                                else:
+                                    line = f"- {r.repo_name}: UNPUSHED — verification error"
+                            if r.dirty:
+                                line += " [dirty working tree]"
+                            comment_lines.append(line)
+                        if workspace is not None:
+                            comment_lines.append(f"Workspace preserved at {workspace}")
+                        await gtd_client.post_comment(
+                            run.item_id,
+                            "\n".join(comment_lines),
+                            created_by=attribution or "agent-gtd-dispatch",
+                        )
+                    return  # exit early — do not mark succeeded
+
+            # All pushed (or no BUILD verification needed) — mark succeeded
+            if push_results_list is not None:
+                _push_results_json = json.dumps(
+                    [r.model_dump(mode="json") for r in push_results_list]
+                )
             await db.update_run(
                 run.id,
                 status=RunStatus.succeeded,
                 completed_at=completed,
                 exit_code=result.returncode,
+                push_results=_push_results_json,
             )
             _publish_run_event(run.id, "succeeded", completed)
         else:
