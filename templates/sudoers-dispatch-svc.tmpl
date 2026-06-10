@@ -26,4 +26,4 @@ Defaults:{{SERVICE_USER}} secure_path="/home/{{AGENT_USER}}/.local/bin:/usr/loca
 # target /home/{{AGENT_USER}}/.local/bin/claude when secure_path is searched —
 # sudo matches the resolved path, not the symlink. Both paths must be
 # authorised so NOPASSWD survives whichever order secure_path resolves first.
-{{SERVICE_USER}} ALL=({{AGENT_USER}}) NOPASSWD: /usr/bin/git, /home/{{AGENT_USER}}/.local/bin/uv, /home/{{AGENT_USER}}/.local/bin/claude, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash
+{{SERVICE_USER}} ALL=({{AGENT_USER}}) NOPASSWD: /usr/bin/git, /home/{{AGENT_USER}}/.local/bin/uv, /home/{{AGENT_USER}}/.local/bin/claude, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash, /usr/bin/mkdir
