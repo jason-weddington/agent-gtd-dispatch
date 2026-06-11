@@ -16,6 +16,10 @@ This guide covers bootstrapping a fresh Ubuntu host and migrating an existing si
 
 > **Note**: `uv` is the only non-system dependency the script installs automatically.
 > All other tooling (`python3`, `visudo`, `systemctl`) ships with standard Ubuntu.
+>
+> **Single-user mode** (`DISPATCH_SINGLE_USER=1`) does **not** require creating extra
+> system users or installing a sudoers fragment — it runs the service and agent under
+> your own login account.
 
 ---
 
@@ -127,6 +131,81 @@ curl -sf http://localhost:8100/health | python3 -m json.tool
 The old service unit (`dispatch` user) will be replaced by a new unit
 (`dispatch-svc` user). The `dispatch` user remains but is no longer the
 service account.
+
+---
+
+## Single-user mode
+
+On personal machines where a POSIX two-user split is unavailable or unwanted — such as a
+developer workstation where everything must run under your own login account — install in
+**single-user mode** by setting `DISPATCH_SINGLE_USER=1`:
+
+```bash
+# Canonical form: name the var explicitly so sudo's env-stripping policy doesn't drop it
+sudo --preserve-env=DISPATCH_SINGLE_USER DISPATCH_SINGLE_USER=1 ./setup-dispatch-host.sh \
+    --env-file /tmp/dispatch.env
+```
+
+> **Note**: The env var must be set **before** invoking `sudo`. The canonical form is
+> `sudo --preserve-env=DISPATCH_SINGLE_USER`. Do **not** rely on `sudo -E` (which
+> preserves all env vars and may violate site policy) — name the variable explicitly.
+
+### What changes in single-user mode
+
+| | Two-user split (default) | Single-user mode |
+|---|---|---|
+| Service user | `dispatch-svc` | `$SUDO_USER` (your login) |
+| Agent user | `dispatch` | `$SUDO_USER` (same) |
+| Service home | `/home/dispatch-svc` | Your home directory |
+| Sudoers fragment | `/etc/sudoers.d/dispatch-svc` installed | Not installed |
+| `DISPATCH_AGENT_SUBPROCESS_USER` | Set to `dispatch` | Stripped from `.env` |
+| POSIX isolation | `dispatch-svc` cannot read agent files and vice-versa | **None** |
+| User creation | `dispatch-svc` and `dispatch` created | Skipped (user already exists) |
+
+### Security trade-off
+
+> ⚠️ **No POSIX isolation between service and agent.** In single-user mode the dispatched
+> Claude Code subprocess runs with full access to the dispatch service's `.env` file
+> (including `ANTHROPIC_API_KEY`, `AGENT_GTD_API_KEY`, `DISPATCH_API_KEY`) and can
+> modify `/etc/systemd/system/dispatch-api.service` if the account has sudo access.
+
+- Accept this trade-off only on personal machines where you trust all processes running
+  under your account.
+- **The default mode remains the two-user split** — single-user is opt-in via
+  `DISPATCH_SINGLE_USER=1`.
+
+### Mode mismatch protection
+
+The installer refuses to create a mixed state. If you run single-user mode on a host
+already configured for two-user mode (or vice versa), it exits immediately with a clear
+explanation listing the conflicting artifacts. To switch modes, perform a full rollback
+first (see [Rollback procedure](#rollback-procedure)), then re-run with the new mode.
+
+### Dry-run preview
+
+```bash
+sudo --preserve-env=DISPATCH_SINGLE_USER DISPATCH_SINGLE_USER=1 ./setup-dispatch-host.sh --dry-run
+```
+
+The banner will show `Mode: SINGLE-USER (user=<your-login>)` followed by `Would:` lines
+for every step. Note: mode-mismatch checks **do fire** under `--dry-run` — if the host
+has two-user artifacts, the dry run exits non-zero (same as a real run would).
+
+### Architecture — single-user layout
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ personal-box                                            │
+│                                                         │
+│  alice (service + agent — same account)                 │
+│    /home/alice/agent-gtd-dispatch/       ← working      │
+│    /home/alice/.env                      ← secrets      │
+│    /home/alice/workspace/{run_id}/       ← agent work   │
+│    systemd: dispatch-api.service         ← FastAPI      │
+│                                                         │
+│  (no /etc/sudoers.d/dispatch-svc)                       │
+└─────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -613,6 +692,8 @@ sudo chown dispatch:dispatch /home/dispatch/workspace/dispatch.db
 
 ## Architecture overview
 
+### Two-user split (default)
+
 ```
 ┌─────────────────────────────────────────────────────────┐
 │ pironman01                                              │
@@ -634,6 +715,28 @@ The `dispatch-svc` user runs the FastAPI process. When a dispatch request
 arrives, the service calls `sudo -u dispatch -H <agent-cli>` to spawn the
 agent subprocess. The sudoers fragment limits which commands `dispatch-svc`
 may run as `dispatch` — no `ALL=(ALL)` escalation.
+
+### Single-user mode (`DISPATCH_SINGLE_USER=1`)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ personal-box                                            │
+│                                                         │
+│  alice (service + agent — same account)                 │
+│    /home/alice/agent-gtd-dispatch/          ← working   │
+│    /home/alice/.env                         ← secrets   │
+│    /home/alice/workspace/{run_id}/          ← agent work│
+│    systemd: dispatch-api.service            ← FastAPI   │
+│                                                         │
+│  (no /etc/sudoers.d/dispatch-svc)                       │
+│  (no separate dispatch/dispatch-svc users)              │
+└─────────────────────────────────────────────────────────┘
+```
+
+The login user runs both the FastAPI process and agent subprocesses directly
+— no `sudo -u` boundary. All files (service config, agent workspaces) are
+owned by the same account. See [## Single-user mode](#single-user-mode) for
+the security trade-offs.
 
 See the `## Process model` section of `README.md` for the full explanation.
 

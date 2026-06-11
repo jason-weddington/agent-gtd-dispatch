@@ -27,6 +27,11 @@ ANTHROPIC_API_KEY=sk-ant-...
 # Must match the --agent-user argument used when running setup-dispatch-host.sh.
 # When set, the service spawns agent subprocesses via `sudo -u <value> -H`.
 # Leave empty to disable user-switching (dev/test only).
+#
+# In single-user mode (DISPATCH_SINGLE_USER=1 at setup time), this MUST be left
+# empty — the runtime _sudo_wrap shortcut is what gates single-user behaviour.
+# setup-dispatch-host.sh strips this line from the .env if it appears under
+# single-user mode.
 DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 
 # =============================================================================

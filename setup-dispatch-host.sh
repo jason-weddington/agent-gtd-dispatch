@@ -67,9 +67,11 @@ Options:
   --smoke                After install, run a smoke test (POST /dispatch, check isolation)
   -h, --help             Show this help text
 
-Environment variables (override git remote URLs):
+Environment variables:
   DISPATCH_REPO_URL      Git remote for agent-gtd-dispatch repo
   AGENT_GTD_REPO_URL     Git remote for agent_gtd repo
+  DISPATCH_SINGLE_USER   Set to '1' for single-user mode (no sudoers, no user split;
+                         see docs/install.md ## Single-user mode for details)
 
 Examples:
   # Fresh install (interactive .env generation from template):
@@ -121,6 +123,7 @@ _render_unit() {
         -e "s|{{AGENT_USER}}|${AGENT_USER}|g" \
         -e "s|{{WORKING_DIR}}|${SERVICE_REPO}|g" \
         -e "s|{{ENV_FILE}}|${SERVICE_ENV}|g" \
+        -e "s|{{SERVICE_HOME}}|${SERVICE_HOME}|g" \
         "$tmpl"
 }
 
@@ -203,9 +206,42 @@ done
 
 [[ $EUID -ne 0 ]] && die "This script must be run as root (use sudo)."
 
-# Derived paths (set after argument parsing)
-AGENT_HOME="/home/${AGENT_USER}"
-SERVICE_HOME="/home/${SERVICE_USER}"
+# ===========================================================================
+# Single-user mode detection (runs after argument parsing, before derived paths)
+# The mode is captured ONCE here; no later step re-reads $DISPATCH_SINGLE_USER.
+# ===========================================================================
+if [[ "${DISPATCH_SINGLE_USER:-}" == "1" ]]; then
+    SINGLE_USER=true
+elif [[ -n "${DISPATCH_SINGLE_USER:-}" ]]; then
+    die "DISPATCH_SINGLE_USER must be '1' if set; got '${DISPATCH_SINGLE_USER}'. Unset it for two-user mode or set it to '1' for single-user mode."
+else
+    SINGLE_USER=false
+fi
+
+if $SINGLE_USER; then
+    if [[ -z "${SUDO_USER:-}" ]] || [[ "${SUDO_USER}" == "root" ]]; then
+        die "DISPATCH_SINGLE_USER=1 requires invocation via sudo from a non-root login user; got SUDO_USER=${SUDO_USER:-<unset>}. Re-run as: sudo DISPATCH_SINGLE_USER=1 ./setup-dispatch-host.sh"
+    fi
+    TARGET_USER="$SUDO_USER"
+    TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+    if [[ -z "$TARGET_HOME" ]]; then
+        die "Could not resolve home directory for user '${TARGET_USER}' via getent passwd"
+    fi
+    if [[ ! -d "$TARGET_HOME" ]]; then
+        die "Home directory for '${TARGET_USER}' does not exist on disk: ${TARGET_HOME}"
+    fi
+    # In single-user mode both agent and service run as the same user
+    AGENT_USER="$TARGET_USER"
+    SERVICE_USER="$TARGET_USER"
+    AGENT_HOME="$TARGET_HOME"
+    SERVICE_HOME="$TARGET_HOME"
+fi
+
+# Derived paths (set after argument parsing and single-user detection)
+if ! $SINGLE_USER; then
+    AGENT_HOME="/home/${AGENT_USER}"
+    SERVICE_HOME="/home/${SERVICE_USER}"
+fi
 SERVICE_REPO="${SERVICE_HOME}/${REPO_NAME}"
 SERVICE_ENV="${SERVICE_HOME}/.env"
 AGENT_WORKSPACE="${AGENT_HOME}/workspace"
@@ -224,7 +260,49 @@ echo "  Service user: ${SERVICE_USER}  (${SERVICE_HOME})"
 echo "  Repo:         ${SERVICE_REPO}"
 echo "  Service unit: ${SYSTEMD_UNIT}"
 $DRY_RUN && echo "  Mode:         DRY RUN — no mutations"
+if $SINGLE_USER; then
+    echo "  Mode:         SINGLE-USER (user=${TARGET_USER})"
+else
+    echo "  Mode:         TWO-USER SPLIT"
+fi
 echo ""
+
+# ===========================================================================
+# Mode mismatch guard (read-only check; runs before any mutations, incl. --dry-run)
+# ===========================================================================
+_mismatch_errors=()
+if $SINGLE_USER; then
+    # AC-3: die if two-user-split artifacts are present on this host
+    if id -u dispatch-svc &>/dev/null; then
+        _mismatch_errors+=("system user 'dispatch-svc' exists")
+    fi
+    if [[ -f /etc/sudoers.d/dispatch-svc ]]; then
+        _mismatch_errors+=("/etc/sudoers.d/dispatch-svc exists")
+    fi
+    if [[ -f "$SYSTEMD_UNIT" ]]; then
+        _unit_user="$(grep -E '^User=' "$SYSTEMD_UNIT" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' ')"
+        if [[ -n "$_unit_user" ]] && [[ "$_unit_user" != "$TARGET_USER" ]]; then
+            _mismatch_errors+=("${SYSTEMD_UNIT} has User=${_unit_user} (expected ${TARGET_USER})")
+        fi
+    fi
+    if [[ ${#_mismatch_errors[@]} -gt 0 ]]; then
+        printf "${RED}[ERROR]${RESET} mode mismatch: this host appears to be configured for the two-user split;\n" >&2
+        printf "${RED}[ERROR]${RESET} refusing to create a mixed state. To switch modes, manually rollback per docs/install.md.\n" >&2
+        printf "${RED}[ERROR]${RESET} Conflicting artifacts found:\n" >&2
+        for _e in "${_mismatch_errors[@]}"; do
+            printf "${RED}[ERROR]${RESET}   - %s\n" "$_e" >&2
+        done
+        exit 1
+    fi
+else
+    # AC-4: die if existing unit has User= that doesn't match the configured $SERVICE_USER
+    if [[ -f "$SYSTEMD_UNIT" ]]; then
+        _unit_user="$(grep -E '^User=' "$SYSTEMD_UNIT" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' ')"
+        if [[ -n "$_unit_user" ]] && [[ "$_unit_user" != "$SERVICE_USER" ]]; then
+            die "mode mismatch: this host appears to be configured for single-user mode (${SYSTEMD_UNIT} has User=${_unit_user}, expected ${SERVICE_USER}); refusing to create a mixed state. To switch modes, manually rollback per docs/install.md."
+        fi
+    fi
+fi
 
 # ===========================================================================
 # Step 1: User creation
@@ -244,8 +322,12 @@ _create_user() {
     fi
 }
 
-_create_user "$SERVICE_USER" "$SERVICE_HOME" "Dispatch service account (agent-gtd-dispatch API)"
-_create_user "$AGENT_USER"   "$AGENT_HOME"   "Dispatch agent subprocess user"
+if $SINGLE_USER; then
+    skip "single-user mode — skipping user creation (running as ${TARGET_USER})"
+else
+    _create_user "$SERVICE_USER" "$SERVICE_HOME" "Dispatch service account (agent-gtd-dispatch API)"
+    _create_user "$AGENT_USER"   "$AGENT_HOME"   "Dispatch agent subprocess user"
+fi
 
 # Guard: neither user may be in the sudo group
 for u in "$AGENT_USER" "$SERVICE_USER"; do
@@ -306,7 +388,9 @@ else
 fi
 
 # --- SSH setup for SERVICE_USER (needed for git clone in step 2) ---
-if $DRY_RUN; then
+if $SINGLE_USER; then
+    skip "single-user mode — skipping dispatch-svc SSH key copy (same user)"
+elif $DRY_RUN; then
     would "create ${SERVICE_HOME}/.ssh/ (mode 700)"
     would "ssh-keyscan ubuntu-vm01 >> ${SERVICE_HOME}/.ssh/known_hosts"
     would "copy ${AGENT_HOME}/.ssh/id_* keys to ${SERVICE_HOME}/.ssh/ if present"
@@ -332,7 +416,9 @@ else
 fi
 
 # --- Group membership (dispatch-svc needs read access to dispatch group resources) ---
-if id -u "$SERVICE_USER" &>/dev/null && id -u "$AGENT_USER" &>/dev/null; then
+if $SINGLE_USER; then
+    skip "single-user mode — skipping group membership setup (same user)"
+elif id -u "$SERVICE_USER" &>/dev/null && id -u "$AGENT_USER" &>/dev/null; then
     if getent group "$AGENT_USER" | grep -qw "$SERVICE_USER"; then
         skip "${SERVICE_USER} already in group ${AGENT_USER} — already configured"
     elif $DRY_RUN; then
@@ -404,6 +490,20 @@ else
     chmod 0600 "$SERVICE_ENV"
     chown "${SERVICE_USER}:${SERVICE_USER}" "$SERVICE_ENV"
     info "Env file installed: ${SERVICE_ENV} (mode 0600)"
+fi
+
+# In single-user mode, DISPATCH_AGENT_SUBPROCESS_USER must NOT be set —
+# the runtime _sudo_wrap already no-ops when it is empty (dispatch.py:34).
+if $SINGLE_USER && [[ -f "$SERVICE_ENV" ]]; then
+    if grep -q '^DISPATCH_AGENT_SUBPROCESS_USER=' "$SERVICE_ENV" 2>/dev/null; then
+        if $DRY_RUN; then
+            would "strip DISPATCH_AGENT_SUBPROCESS_USER from ${SERVICE_ENV} (not valid in single-user mode)"
+        else
+            warn "DISPATCH_AGENT_SUBPROCESS_USER found in ${SERVICE_ENV} — stripping (not applicable in single-user mode; runtime uses direct invocation)"
+            sed -i '/^DISPATCH_AGENT_SUBPROCESS_USER=/d' "$SERVICE_ENV"
+            info "Stripped DISPATCH_AGENT_SUBPROCESS_USER from ${SERVICE_ENV}"
+        fi
+    fi
 fi
 
 # ===========================================================================
@@ -493,7 +593,9 @@ _ensure_uv() {
 }
 
 _ensure_uv "$SERVICE_USER" "$SERVICE_HOME"
-_ensure_uv "$AGENT_USER"   "$AGENT_HOME"
+if ! $SINGLE_USER; then
+    _ensure_uv "$AGENT_USER" "$AGENT_HOME"
+fi
 
 # uv sync the service repo
 SERVICE_UV="${SERVICE_HOME}/.local/bin/uv"
@@ -558,17 +660,17 @@ else
         mcp_args="${entry#*|}"
         # Idempotent: remove first (tolerate "not registered"), then add
         sudo -u "$AGENT_USER" -H bash -lc \
-            "cd /home/${AGENT_USER} && ${CLAUDE_SRC} mcp remove ${mcp_name} --scope user 2>/dev/null || true"
+            "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp remove ${mcp_name} --scope user 2>/dev/null || true"
         # word-split mcp_args intentionally — they are space-separated CLI flags
         # shellcheck disable=SC2086
         sudo -u "$AGENT_USER" -H bash -lc \
-            "cd /home/${AGENT_USER} && ${CLAUDE_SRC} mcp add ${mcp_name} ${mcp_args}"
+            "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp add ${mcp_name} ${mcp_args}"
         info "Registered MCP server '${mcp_name}' for ${AGENT_USER}"
     done
     # Smoke test: verify agent-gtd is listed (name presence only — cold uvx cache
     # makes the "✓ Connected" health check unreliable on first invocation)
     if sudo -u "$AGENT_USER" -H bash -lc \
-            "cd /home/${AGENT_USER} && ${CLAUDE_SRC} mcp list" 2>/dev/null \
+            "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp list" 2>/dev/null \
             | grep -q "^agent-gtd:"; then
         info "Smoke test passed: 'agent-gtd' MCP server registered for ${AGENT_USER}"
     else
@@ -623,7 +725,9 @@ echo "--- Step 5a: Claude symlink ---"
 
 CLAUDE_LINK="/usr/local/bin/claude"
 
-if [[ -L "$CLAUDE_LINK" ]] && [[ "$(readlink -f "$CLAUDE_LINK" 2>/dev/null)" == "$(readlink -f "$CLAUDE_SRC" 2>/dev/null)" ]]; then
+if $SINGLE_USER; then
+    skip "single-user mode — no sudoers boundary; skipping claude symlink at ${CLAUDE_LINK}"
+elif [[ -L "$CLAUDE_LINK" ]] && [[ "$(readlink -f "$CLAUDE_LINK" 2>/dev/null)" == "$(readlink -f "$CLAUDE_SRC" 2>/dev/null)" ]]; then
     skip "${CLAUDE_LINK} already points to ${CLAUDE_SRC} — already configured"
 elif $DRY_RUN; then
     would "create symlink ${CLAUDE_LINK} -> ${CLAUDE_SRC}"
@@ -642,7 +746,9 @@ fi
 echo ""
 echo "--- Step 5b: Sudoers ---"
 
-if [[ -f "$SUDOERS_FILE" ]]; then
+if $SINGLE_USER; then
+    skip "single-user mode — no sudoers boundary; skipping sudoers fragment (${SUDOERS_FILE} not created)"
+elif [[ -f "$SUDOERS_FILE" ]]; then
     current_sudoers="$(cat "$SUDOERS_FILE")"
     rendered_sudoers="$(_render_sudoers)"
     if [[ "$current_sudoers" == "$rendered_sudoers" ]]; then
