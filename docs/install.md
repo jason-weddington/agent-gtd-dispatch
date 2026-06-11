@@ -28,7 +28,7 @@ cd agent-gtd-dispatch
 
 # 2. Prepare an env file (copy the template and fill in real values)
 cp templates/dispatch-env.tmpl /tmp/dispatch.env
-$EDITOR /tmp/dispatch.env    # set DISPATCH_API_KEY, AGENT_GTD_*, ANTHROPIC_API_KEY
+$EDITOR /tmp/dispatch.env    # set AGENT_GTD_*, ANTHROPIC_API_KEY  (DISPATCH_API_KEY is auto-minted by Step 3.5 if you leave it empty)
 
 # 3. Run the installer
 sudo ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
@@ -136,7 +136,7 @@ All variables documented in `templates/dispatch-env.tmpl`. Key variables:
 
 | Variable | Required | Description |
 |---|---|---|
-| `DISPATCH_API_KEY` | ✓ | Bearer token callers must supply to the REST API |
+| `DISPATCH_API_KEY` | ✓ | Bearer token callers must supply to the REST API (auto-minted by Step 3.5 if absent; see below) |
 | `AGENT_GTD_URL` | ✓ | Agent GTD API base URL (e.g. `https://r7-research:8443`) |
 | `AGENT_GTD_API_KEY` | ✓ | Agent GTD API key (`agtd_…` prefix) |
 | `ANTHROPIC_API_KEY` | ✓ | Anthropic API key for Claude Code subprocesses |
@@ -204,6 +204,53 @@ ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && claude mcp list"'
 ssh <HOST> 'sudo cat /home/dispatch/.claude.json' | jq '.mcpServers | keys'
 # → ["agent-gtd", "aws-documentation-mcp-server", "personal-kb"]
 ```
+
+---
+
+## DISPATCH_API_KEY auto-minting (Step 3.5)
+
+Step 3.5 of the installer mints a fresh `DISPATCH_API_KEY` into `/home/dispatch-svc/.env` if the value is absent or empty — and **always skips if a value is already present**.
+
+### Why this matters
+
+`DISPATCH_API_KEY` is the Bearer token the REST API checks on every incoming dispatch request. Without it, the service starts but rejects all calls with HTTP 401. Previously, operators had to mint the key by hand and remember to paste it into the GTD UI's dispatch-host settings. Forgetting either step left hosts unreachable.
+
+The never-clobber rule is equally important: silently rotating the key on a true-up run would break the app-side pairing until the operator manually re-registers the new value in the GTD UI. Step 3.5 refuses to clobber an existing value — rotation is always intentional and manual.
+
+### What the step does
+
+1. **Checks** that `$SERVICE_ENV` (`/home/dispatch-svc/.env`) exists — dies if not (Step 3 invariant).
+2. **Reads** the current value of `DISPATCH_API_KEY` from the env file (using the shared `_read_env_var` helper, which strips surrounding quotes).
+3. **Skips** if the value is non-empty (any non-empty string, including legacy `changeme` placeholders). Prints a `[SKIP]` message.
+4. **Mints** if absent or empty: generates a 43-char URL-safe key via `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`, rewrites the file atomically via `mktemp` + `install -m 0600`, then prints an **ACTION REQUIRED** banner with the minted key value and instructions to register it in the GTD UI before the service restarts in Step 6.
+5. **Dry-run**: prints a `[DRY] Would: mint DISPATCH_API_KEY …` line and makes zero mutations (no key is generated).
+
+### Verifying the minted key
+
+```bash
+sudo grep '^DISPATCH_API_KEY=' /home/dispatch-svc/.env
+# → DISPATCH_API_KEY=<43-char-url-safe-value>
+```
+
+### Rotating the key
+
+To rotate `DISPATCH_API_KEY` on an existing host:
+
+```bash
+# 1. Clear the line (leave the key name, empty the value):
+sudo sed -i 's/^DISPATCH_API_KEY=.*/DISPATCH_API_KEY=/' /home/dispatch-svc/.env
+
+# 2. Re-run the installer — Step 3.5 will mint a new key and print the banner:
+sudo ./setup-dispatch-host.sh
+
+# 3. Copy the printed key and re-register it in:
+#    Agent GTD Settings → Dispatch hosts → this host's API Key
+
+# 4. Restart the service to pick up the new key:
+sudo systemctl restart dispatch-api
+```
+
+Do **not** clear the value while the service is handling live traffic without immediately completing steps 3–4, or dispatches will return 401 during the window.
 
 ---
 
@@ -304,6 +351,13 @@ sudo -u dispatch -H uv tool uninstall pre-commit
 ```bash
 sudo -u dispatch-svc rm -rf /home/dispatch-svc/.local
 sudo -u dispatch rm -rf /home/dispatch/.local
+```
+
+### Step 3.5 — DISPATCH_API_KEY
+```bash
+# No separate rollback — the key lives inside ${SERVICE_ENV}; removing the env file (Step 3 rollback) deletes it.
+# To rotate without full rollback:
+sed -i 's/^DISPATCH_API_KEY=.*/DISPATCH_API_KEY=/' /home/dispatch-svc/.env && sudo ./setup-dispatch-host.sh
 ```
 
 ### Step 3 — Env file

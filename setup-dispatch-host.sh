@@ -179,6 +179,13 @@ _smoke_test() {
     info "Smoke test complete"
 }
 
+_read_env_var() {  # $1=var name in $SERVICE_ENV; strips surrounding single/double quotes
+    local v
+    v="$(sed -n "s/^$1=//p" "$SERVICE_ENV" | tail -n1)"
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    printf '%s' "$v"
+}
+
 # ===========================================================================
 # Argument parsing
 # ===========================================================================
@@ -400,6 +407,73 @@ else
 fi
 
 # ===========================================================================
+# Step 3.5: DISPATCH_API_KEY (service env)
+# ===========================================================================
+echo ""
+echo "--- Step 3.5: DISPATCH_API_KEY (service env) ---"
+
+if [[ ! -f "$SERVICE_ENV" ]]; then
+    die "DISPATCH_API_KEY mint: ${SERVICE_ENV} does not exist — Step 3 should have created it"
+fi
+
+_api_key_existing="$(_read_env_var DISPATCH_API_KEY)"
+
+if [[ -n "$_api_key_existing" && "$_api_key_existing" != "changeme" ]]; then
+    skip "DISPATCH_API_KEY already set in ${SERVICE_ENV} — preserving existing value (re-run after clearing the line to rotate)"
+elif $DRY_RUN; then
+    would "mint DISPATCH_API_KEY (python3 secrets.token_urlsafe(32)) and append/replace line in ${SERVICE_ENV} preserving content/owner/0600"
+else
+    _minted_key="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    _tmpfile="$(mktemp /tmp/dispatch-env.XXXXXX)"
+    _MINT_ENV_FILE="$SERVICE_ENV" _MINT_NEW_KEY="$_minted_key" \
+    python3 - <<'PYEOF' > "$_tmpfile"
+import re, os, sys
+env_file = os.environ['_MINT_ENV_FILE']
+new_key  = os.environ['_MINT_NEW_KEY']
+with open(env_file, 'r') as f:
+    content = f.read()
+lines = content.splitlines(keepends=True)
+replaced = False
+out = []
+for line in lines:
+    if re.match(r'^DISPATCH_API_KEY=(changeme)?\s*$', line.rstrip('\r\n')):
+        out.append('DISPATCH_API_KEY=' + new_key + '\n')
+        replaced = True
+    else:
+        out.append(line)
+if not replaced:
+    if out and not out[-1].endswith('\n'):
+        out[-1] += '\n'
+    out.append('DISPATCH_API_KEY=' + new_key + '\n')
+sys.stdout.write(''.join(out))
+PYEOF
+    install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "$_tmpfile" "$SERVICE_ENV"
+    rm -f "$_tmpfile"
+    echo ""
+    printf "${RED}========================================${RESET}\n"
+    printf "${RED}  ACTION REQUIRED: Register API key    ${RESET}\n"
+    printf "${RED}========================================${RESET}\n"
+    echo ""
+    echo "  A new DISPATCH_API_KEY was minted and written to:"
+    echo "    ${SERVICE_ENV}"
+    echo ""
+    echo "  Minted key value:"
+    echo ""
+    echo "    ${_minted_key}"
+    echo ""
+    echo "  BEFORE Step 6 restarts the service, register this key in:"
+    echo "    Agent GTD Settings → Dispatch hosts → this host's API Key"
+    echo "  Dispatches will return 401 until this is done."
+    echo ""
+    echo "  The key takes effect on:"
+    echo "    systemctl restart ${SERVICE_NAME}"
+    echo "  (Step 6 will do this — finish app-side registration first, or"
+    echo "   accept a brief 401 window if Step 6 runs before you register.)"
+    echo ""
+    info "Minted and installed DISPATCH_API_KEY in ${SERVICE_ENV}"
+fi
+
+# ===========================================================================
 # Step 4: Install dependencies (uv sync)
 # ===========================================================================
 echo ""
@@ -471,12 +545,6 @@ else
     #   KB_ANTHROPIC_API_KEY  → ANTHROPIC_API_KEY for both KB servers' LLM calls.
     #     Deliberately NOT named ANTHROPIC_API_KEY: that name would reach Claude Code's
     #     launch env and flip billing off the Max subscription (engines.py / kb-01512).
-    _read_env_var() {  # $1=var name in .env; strips surrounding single/double quotes
-        local v
-        v="$(sed -n "s/^$1=//p" "$SERVICE_ENV" | tail -n1)"
-        v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
-        printf '%s' "$v"
-    }
     if [[ -f "$SERVICE_ENV" ]]; then
         TEAM_KB_DATABASE_URL="$(_read_env_var TEAM_KB_DATABASE_URL)"; export TEAM_KB_DATABASE_URL
         KB_ANTHROPIC_API_KEY="$(_read_env_var KB_ANTHROPIC_API_KEY)"; export KB_ANTHROPIC_API_KEY
@@ -666,7 +734,7 @@ echo "  Repo:         ${SERVICE_REPO}"
 echo "  Env file:     ${SERVICE_ENV}"
 echo "  Service:      ${SERVICE_NAME}  (port ${API_PORT})"
 echo ""
-if [[ ! -f "$SERVICE_ENV" ]] || grep -qE '^(DISPATCH_API_KEY=changeme|ANTHROPIC_API_KEY=sk-ant-\.\.\.|AGENT_GTD_API_KEY=agtd_\.\.\.)' "$SERVICE_ENV" 2>/dev/null; then
+if [[ ! -f "$SERVICE_ENV" ]] || grep -qE '^(ANTHROPIC_API_KEY=sk-ant-\.\.\.|AGENT_GTD_API_KEY=agtd_\.\.\.)' "$SERVICE_ENV" 2>/dev/null; then
     echo "  NEXT STEPS:"
     echo "  1. Fill in real values in ${SERVICE_ENV}"
     echo "  2. systemctl restart ${SERVICE_NAME}"

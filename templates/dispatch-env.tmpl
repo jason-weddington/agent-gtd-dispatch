@@ -7,7 +7,10 @@
 # =============================================================================
 
 # Dispatch API auth — callers must provide this as a Bearer token.
-DISPATCH_API_KEY=changeme
+# Auto-minted by setup-dispatch-host.sh Step 3.5 if left empty. Leave blank for fresh installs;
+# do NOT clear an existing value on a true-up run (would silently break app-side pairing —
+# re-register the new value in the GTD UI manually if rotating).
+DISPATCH_API_KEY=
 
 # Agent GTD API (for fetching items/projects and posting comments).
 AGENT_GTD_URL=https://r7-research:8443
