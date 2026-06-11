@@ -190,15 +190,15 @@ developer workstation where everything must run under your own login account —
 **single-user mode** by setting `DISPATCH_SINGLE_USER=1`:
 
 ```bash
-# Canonical form (matches the installer's own guidance): set the var as a sudo argument
-sudo DISPATCH_SINGLE_USER=1 ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
+# Canonical form (matches README.md and setup.md): name the var explicitly so
+# sudo's env-stripping doesn't drop it
+sudo --preserve-env=DISPATCH_SINGLE_USER DISPATCH_SINGLE_USER=1 ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
 ```
 
-> **Note**: Setting `VAR=1` as a `sudo` argument passes it through sudo's env-stripping
-> policy — no `--preserve-env` or `sudo -E` needed. Single-user mode must be invoked
-> **via `sudo` from your non-root login account**: the installer resolves the target
-> user from `SUDO_USER` and dies with `requires invocation via sudo from a non-root
-> login user` if run from a root shell or via direct root SSH.
+> **Note**: Single-user mode must be invoked **via `sudo` from your non-root login
+> account**: the installer resolves the target user from `SUDO_USER` and dies with
+> `requires invocation via sudo from a non-root login user` if run from a root shell
+> or via direct root SSH.
 
 ### What changes in single-user mode
 
@@ -234,12 +234,37 @@ first (see [Rollback procedure](#rollback-procedure)), then re-run with the new 
 ### Dry-run preview
 
 ```bash
-sudo DISPATCH_SINGLE_USER=1 ./setup-dispatch-host.sh --dry-run
+sudo --preserve-env=DISPATCH_SINGLE_USER DISPATCH_SINGLE_USER=1 ./setup-dispatch-host.sh --dry-run
 ```
 
 The banner will show `Mode: SINGLE-USER (user=<your-login>)` followed by `Would:` lines
 for every step. Note: mode-mismatch checks **do fire** under `--dry-run` — if the host
 has two-user artifacts, the dry run exits non-zero (same as a real run would).
+
+### Side effects on your account
+
+The following actions are applied to the **login user's own home directory** when the
+installer runs in single-user mode. Review them before the first run; use `--dry-run` to
+preview exactly what the script would touch.
+
+**(a) Workspace directory permissions.** The installer may `chmod` and adjust group
+ownership of `~/workspace` (creating it if absent). Specifically, it sets mode `2775`
+(group-writable + setgid) on the workspace directory so that any service process can
+read run artifacts. Verify the expected mutations with
+`sudo --preserve-env=DISPATCH_SINGLE_USER DISPATCH_SINGLE_USER=1 ./setup-dispatch-host.sh --dry-run`
+before applying.
+
+**(b) Env file placement — `~/.env` is NOT read.** The installer writes secrets to
+`${HOME}/.config/agent-gtd-dispatch/env` (mode `0600`, directory mode `0700`). This file
+is what the systemd unit loads via `EnvironmentFile=`. Any pre-existing `~/.env` in your
+home directory is **not** consulted and will not collide — but if you previously stored
+service variables there you will need to migrate them to the new path.
+
+**(c) Phase 1 SSH halt also fires in single-user mode.** On a truly fresh box, the
+installer generates a fresh `ed25519` keypair under `~/.ssh/` for your login account and
+halts with an ACTION REQUIRED banner — identical to the two-user flow described in
+[Fresh box install](#fresh-box-install) above. Authorize the printed public key on your
+git host, then re-run the installer with the same arguments to complete Phase 2.
 
 ### Architecture — single-user layout
 
@@ -256,6 +281,91 @@ has two-user artifacts, the dry run exits non-zero (same as a real run would).
 │  (no /etc/sudoers.d/dispatch-svc)                       │
 └─────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Authentication & pairing
+
+Before the service can dispatch agents, three credentials must be present in the env file.
+
+### `CLAUDE_CODE_OAUTH_TOKEN` — agent subprocess auth
+
+**What it is**: The OAuth token Claude Code uses to authenticate against Anthropic's API.
+Dispatched agents run as unattended headless subprocesses — `claude login` cannot be
+called interactively at dispatch time — so the token must be pre-populated in the service
+env file.
+
+**How to obtain it**: On a machine with a browser (your workstation, not the dispatch
+host), run:
+
+```bash
+claude setup-token
+```
+
+This opens a browser to complete OAuth, then prints the token. Copy the token value
+(begins with a long opaque string, not `sk-ant-…`).
+
+**Why only this token — not `ANTHROPIC_API_KEY`?** The `engines.py` module allowlists
+only `CLAUDE_CODE_OAUTH_TOKEN` for the subprocess environment of Claude Code engines
+(`src/agent_gtd_dispatch/engines.py`, lines 218–263). `ANTHROPIC_API_KEY` is deliberately
+excluded from the subprocess env: if it reached the subprocess, Claude Code would switch
+from the user's Max subscription to pay-as-you-go API billing (see kb-01512).
+`ANTHROPIC_API_KEY` is read in-process by the rollout planner only and never forwarded to
+agent subprocesses.
+
+**Where to paste it** — depends on your install mode:
+
+| Mode | Env file path |
+|---|---|
+| Two-user split (default) | `/home/dispatch-svc/.env` |
+| Single-user | `${HOME}/.config/agent-gtd-dispatch/env` |
+
+```bash
+# Example line in the env file (either mode):
+CLAUDE_CODE_OAUTH_TOKEN=<your-oauth-token>
+```
+
+**Token expiry**: OAuth tokens issued via `claude setup-token` expire around February 2027
+(kb-01318). Refresh by re-running `claude setup-token` on a browser-capable machine and
+updating the env file, then restarting the service (`sudo systemctl restart dispatch-api`).
+
+---
+
+### `AGENT_GTD_API_KEY` — GTD API auth
+
+**What it is**: The API key that authorises the dispatch service to call the Agent GTD API
+(fetch items, post comments, update run status). All values carry the `agtd_` prefix.
+
+**Where to mint it**: In the Agent GTD web app, go to **Settings → API keys** and click
+**New key**. Copy the displayed value — it is shown only once. On a fresh Agent GTD
+install where the web UI is not yet accessible, the database seed script prints an initial
+key to stdout during first setup.
+
+**Worked example**:
+
+```bash
+# 1. Mint the key in the GTD app: Settings → API keys → New key
+#    You will see something like:
+#    agtd_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# 2. Paste it into the service env file:
+#    Two-user:   /home/dispatch-svc/.env
+#    Single-user: ~/.config/agent-gtd-dispatch/env
+AGENT_GTD_API_KEY=agtd_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+Do **not** commit this value to git. The env file has mode `0600` and is listed in
+`.gitignore` by default.
+
+---
+
+### `DISPATCH_API_KEY` — REST API bearer token
+
+This key authorises callers (the GTD system, your shell) to make requests to *this*
+dispatch service. It is auto-minted by Step 3.5 of the installer if absent — you do not
+need to generate it manually on installed hosts. See
+[DISPATCH_API_KEY auto-minting (Step 3.5)](#dispatch_api_key-auto-minting-step-35) for
+how it is generated, how to register it in the GTD UI, and how to rotate it.
 
 ---
 

@@ -69,6 +69,12 @@ the mode-mismatch guards.
 | `AGENT_GTD_API_KEY` | Agent GTD API key (`agtd_…` prefix) |
 | `ANTHROPIC_API_KEY` | Anthropic API key — used by the rollout planner in-process; **not** exposed to Claude Code subprocesses |
 
+> **Where to obtain `CLAUDE_CODE_OAUTH_TOKEN` and `AGENT_GTD_API_KEY`**: see
+> [docs/install.md — Authentication & pairing](install.md#authentication--pairing) for
+> step-by-step instructions on running `claude setup-token`, minting an `agtd_…` key in
+> the Agent GTD Settings UI, and which env file each value belongs in (two-user vs
+> single-user).
+
 ### Optional — Agent Subprocess Behavior
 
 | Variable | Default | Description |

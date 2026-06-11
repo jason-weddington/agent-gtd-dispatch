@@ -35,6 +35,9 @@ export DISPATCH_WORKSPACE_ROOT="/path/to/workspaces" # default: ~/workspace
 > `CLAUDE_CODE_OAUTH_TOKEN` or an interactive `claude login`. See
 > "Notes on `ANTHROPIC_API_KEY`" in [docs/setup.md](docs/setup.md).
 
+For how to obtain `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) and where to mint
+`AGENT_GTD_API_KEY`, see [docs/install.md — Authentication & pairing](docs/install.md#authentication--pairing).
+
 Then start the API:
 
 ```bash

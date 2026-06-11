@@ -169,7 +169,7 @@ An **Engine** is a headless AI coding agent backend. Each engine has:
 
 | Name | Binary | Model / Route | Auth |
 |---|---|---|---|
-| `claude-code` | `claude` | Moving alias `opus` (`--model opus`) via Anthropic | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` |
+| `claude-code` | `claude` | Moving alias `opus` (`--model opus`) via Anthropic | `CLAUDE_CODE_OAUTH_TOKEN` (subprocess auth; `ANTHROPIC_API_KEY` is service-side only, see kb-01512) |
 | `claude-code-sonnet` | `claude` | Moving alias `sonnet` (`--model sonnet`) via Anthropic | same |
 | `claude-code-haiku` | `claude` | Moving alias `haiku` (`--model haiku`) via Anthropic | same |
 | `claude-code-ollama` | `claude` | Local Ollama endpoint (model from `OLLAMA_DEFAULT_MODEL`) | Injected via `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` |

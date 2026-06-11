@@ -188,7 +188,7 @@ the run row. The `RunResponse` includes an `engine_swap` field describing the su
 
 | Engine name | Binary | Auth | Notes |
 |---|---|---|---|
-| `claude-code` | `claude` | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | Default; moving alias `opus` (`--model opus`) |
+| `claude-code` | `claude` | `CLAUDE_CODE_OAUTH_TOKEN` (subprocess auth; `ANTHROPIC_API_KEY` is service-side only, see kb-01512) | Default; moving alias `opus` (`--model opus`) |
 | `claude-code-sonnet` | `claude` | same as above | Moving alias `sonnet` (`--model sonnet`) |
 | `claude-code-haiku` | `claude` | same as above | Moving alias `haiku` (`--model haiku`) |
 | `claude-code-ollama` | `claude` | `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` | Routes to local Ollama endpoint |
