@@ -207,6 +207,69 @@ ssh <HOST> 'sudo cat /home/dispatch/.claude.json' | jq '.mcpServers | keys'
 
 ---
 
+## Pre-commit template directory (Step 4.7)
+
+Step 4.7 of the installer sets up git's template directory for the `dispatch` (agent) user so that every repository the agent clones inherits pre-commit hook shims automatically.
+
+### Why this matters
+
+Dispatched build agents clone repositories fresh for every run. Without hook shims, they bypass the same lint/format/typecheck gates (`ruff`, `ruff-format`, `mypy`) that the lead developer's squash-merge triggers. This divergence surfaced in two consecutive overnight dispatch waves (kb-01785, kb-01790): a mypy redefinition error the agent could not see, and a `noqa: S603` comment removed as "unused" (RUF100 in the agent's environment) that was load-bearing under the repo's hook configuration.
+
+The fix is applied at the **host provisioning level** — not per-repo scripts and not dispatch-service code — so it covers every present and future repository the agent works in.
+
+### What the step does
+
+Three sub-actions, all targeting the `dispatch` (AGENT_USER) account:
+
+1. **Install pre-commit** — `uv tool install pre-commit` places the binary at `/home/dispatch/.local/bin/pre-commit`. Skipped if already installed.
+2. **Set `init.templateDir`** — writes the absolute path `/home/dispatch/.git-template` into `dispatch`'s global git config. Every subsequent `git clone` or `git init` by the agent user copies hooks from this directory. Skipped if already set to the correct value.
+3. **Render hook shims** — `pre-commit init-templatedir -t pre-commit -t commit-msg -t pre-push /home/dispatch/.git-template` writes the shim files. The three `-t` flags are the union of hook types used across the fleet. Always runs (idempotent re-render of the shims).
+
+### Safety: `--skip-on-missing-config`
+
+The shim files written by `init-templatedir` include a `--skip-on-missing-config` flag by default. This means:
+
+- Repositories that **have** `.pre-commit-config.yaml` → hooks run normally.
+- Repositories that **do not** have `.pre-commit-config.yaml` (e.g. scratch repos, probe dirs) → hooks exit 0 silently, commit succeeds untouched.
+
+### Known cost: first-commit venv build
+
+The first `git commit` in a fresh clone on a newly-provisioned host triggers pre-commit to build its per-hook virtual environments. On a Raspberry Pi this can take 30–60 seconds. After that, `~/.cache/pre-commit` is warm and shared across all clones on the same host, so subsequent commits are fast. Do not attempt to pre-warm the cache in the script — the build happens automatically on first use.
+
+### Verifying the pre-commit template install
+
+After re-running the installer on a host, paste these commands to confirm all three sub-actions took effect:
+
+```bash
+# (a) pre-commit binary is accessible as the dispatch user
+sudo -u dispatch -H bash -lc 'pre-commit --version'
+# → pre-commit X.Y.Z  (RC 0)
+
+# (b) init.templateDir is set to the correct absolute path
+sudo -u dispatch -H git config --global --get init.templateDir
+# → /home/dispatch/.git-template
+
+# (c) hook shim files are present in the template directory
+ls /home/dispatch/.git-template/hooks/
+# → contains pre-commit, commit-msg, pre-push
+
+# (d) a new git init picks up the shims (confirms init.templateDir is honoured)
+sudo -u dispatch -H bash -lc 'cd /tmp && rm -rf hook-probe && git init hook-probe && ls hook-probe/.git/hooks/'
+# → contains pre-commit, commit-msg, pre-push
+
+# (e) a fresh clone of agent_gtd (which has .pre-commit-config.yaml) has the shims
+sudo -u dispatch -H bash -lc 'cd /tmp && rm -rf agent_gtd_probe && git clone git@ubuntu-vm01:repos/agent_gtd agent_gtd_probe && ls agent_gtd_probe/.git/hooks/'
+# → contains pre-commit, commit-msg, pre-push
+
+# (f) a commit in a config-less repo succeeds — shims no-op via --skip-on-missing-config
+sudo -u dispatch -H bash -lc 'cd /tmp/hook-probe && git commit --allow-empty -m "probe"'
+# → exits 0; also confirm the shim body contains the flag:
+grep -l skip-on-missing-config /home/dispatch/.git-template/hooks/*
+# → lists pre-commit, commit-msg, pre-push (all shims carry it)
+```
+
+---
+
 ## Rollback procedure
 
 To undo the installer step by step (in reverse order):
@@ -228,6 +291,13 @@ sudo systemctl daemon-reload
 ### Step 5 — Sudoers fragment
 ```bash
 sudo rm /etc/sudoers.d/dispatch-svc
+```
+
+### Step 4.7 — Pre-commit template
+```bash
+sudo -u dispatch -H git config --global --unset init.templateDir
+sudo -u dispatch -H rm -rf /home/dispatch/.git-template
+sudo -u dispatch -H uv tool uninstall pre-commit
 ```
 
 ### Step 4 — Dependencies (uv)

@@ -509,6 +509,44 @@ else
 fi
 
 # ===========================================================================
+# Step 4.7: Pre-commit template directory (agent user)
+# ===========================================================================
+echo ""
+echo "--- Step 4.7: Pre-commit template (agent user) ---"
+
+PRECOMMIT_BIN="${AGENT_HOME}/.local/bin/pre-commit"
+GIT_TEMPLATE_DIR="${AGENT_HOME}/.git-template"
+
+# Sub-action A: install pre-commit as a uv tool for AGENT_USER
+if [[ -f "$PRECOMMIT_BIN" ]] && sudo -u "$AGENT_USER" -H pre-commit --version &>/dev/null; then
+    skip "pre-commit already installed for ${AGENT_USER} — already configured"
+elif $DRY_RUN; then
+    would "install pre-commit as a uv tool for ${AGENT_USER}"
+else
+    sudo -u "$AGENT_USER" -H bash -lc 'uv tool install pre-commit'
+    info "Installed pre-commit for ${AGENT_USER}"
+fi
+
+# Sub-action B: set init.templateDir in AGENT_USER's global git config
+current_templatedir="$(sudo -u "$AGENT_USER" -H git config --global --get init.templateDir 2>/dev/null || true)"
+if [[ "$current_templatedir" == "$GIT_TEMPLATE_DIR" ]]; then
+    skip "init.templateDir already set to ${GIT_TEMPLATE_DIR} for ${AGENT_USER} — already configured"
+elif $DRY_RUN; then
+    would "set init.templateDir = ${GIT_TEMPLATE_DIR} in ${AGENT_USER} global git config"
+else
+    sudo -u "$AGENT_USER" -H git config --global init.templateDir "${GIT_TEMPLATE_DIR}"
+    info "Set init.templateDir = ${GIT_TEMPLATE_DIR} for ${AGENT_USER}"
+fi
+
+# Sub-action C: render hook shims into the template directory (idempotent re-render; always run)
+if $DRY_RUN; then
+    would "pre-commit init-templatedir -t pre-commit -t commit-msg -t pre-push ${GIT_TEMPLATE_DIR} (as ${AGENT_USER})"
+else
+    sudo -u "$AGENT_USER" -H bash -lc "pre-commit init-templatedir -t pre-commit -t commit-msg -t pre-push ${GIT_TEMPLATE_DIR}"
+    info "Rendered pre-commit hook shims into ${GIT_TEMPLATE_DIR} for ${AGENT_USER}"
+fi
+
+# ===========================================================================
 # Step 5a: Claude symlink (must precede sudoers so the path exists when
 #           visudo validates the fragment)
 # ===========================================================================
