@@ -620,20 +620,36 @@ async def _dispatch_worker(
         # verify_pushes after the agent exits.  None means skip verification
         # (manage/plan mode or exceptions during workspace prep).
         _verify_repos: list[tuple[str, Path, str]] | None = None
+        workspace_repos: list[str]
 
         if mode == DispatchMode.MANAGE:
-            # Manage mode always uses the monorepo/single-repo path
-            git_origin = project.get("git_origin", "")
-            if not git_origin:
-                raise ValueError(f"Project '{project['name']}' has no git_origin")
-            workspace = dispatch.prepare_manage_workspace(git_origin, run.id)
-            await db.update_run(run.id, workspace_path=str(workspace))
+            if is_workspace_mode:
+                # Multi-repo workspace manage path
+                workspace_repos = project.get("workspace_repos") or []
+                if not workspace_repos:
+                    raise ValueError(
+                        "workspace_repos must be non-empty for workspace mode"
+                    )
+                workspace = dispatch.prepare_manage_workspace_multi(
+                    workspace_repos, run.id
+                )
+                await db.update_run(run.id, workspace_path=str(workspace))
+                workspace_repo_dirs = [
+                    dispatch.repo_dir_from_url(url) for url in workspace_repos
+                ]
+            else:
+                # Monorepo/single-repo manage path
+                git_origin = project.get("git_origin", "")
+                if not git_origin:
+                    raise ValueError(f"Project '{project['name']}' has no git_origin")
+                workspace = dispatch.prepare_manage_workspace(git_origin, run.id)
+                await db.update_run(run.id, workspace_path=str(workspace))
             attachments = []
         elif is_workspace_mode:
             # Multi-repo workspace path
             if run.branch_name is None:  # pragma: no cover
                 raise ValueError("branch_name must be set for non-manage mode runs")
-            workspace_repos: list[str] = project.get("workspace_repos") or []
+            workspace_repos = project.get("workspace_repos") or []
             if not workspace_repos:
                 raise ValueError("workspace_repos must be non-empty for workspace mode")
             workspace = dispatch.prepare_workspace_multi(
@@ -1073,18 +1089,20 @@ async def dispatch_item(
             ) from exc
 
         if (project.get("repo_mode") or "") == "workspace":
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Project '{project['name']}' is a workspace project; "
-                    "manage dispatch is not supported for workspace projects"
-                ),
-            )
-        if not project.get("git_origin"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Project '{project['name']}' has no git_origin configured",
-            )
+            _ws_repos = project.get("workspace_repos") or []
+            if not _ws_repos:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Project '{project['name']}' has workspace_repos empty or missing"
+                    ),
+                )
+        else:
+            if not project.get("git_origin"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Project '{project['name']}' has no git_origin configured",
+                )
 
         branch_name = None
         item_id_for_run: str | None = None

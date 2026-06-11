@@ -311,6 +311,49 @@ def verify_pushes(
     return results
 
 
+def _detect_default_branch(repo_path: Path) -> str:
+    """Detect the default branch for a cloned repo (detection only, no checkout).
+
+    Steps:
+    1. git remote set-head origin --auto  (non-fatal if it fails)
+    2. git symbolic-ref --short refs/remotes/origin/HEAD  → extract branch name
+    3. If step 2 fails, probe remote branches via git branch -r against
+       _DEFAULT_BRANCH_CANDIDATES (defaults to _DEFAULT_BRANCH_CANDIDATES[0])
+
+    Returns the detected default branch name (e.g. 'main' or 'master').
+    """
+    subprocess.run(
+        _sudo_wrap(["git", "remote", "set-head", "origin", "--auto"]),
+        cwd=repo_path,
+        check=False,
+        capture_output=True,
+    )
+    result = subprocess.run(
+        _sudo_wrap(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"]),
+        cwd=repo_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        branches_result = subprocess.run(
+            _sudo_wrap(["git", "branch", "-r", "--format=%(refname:short)"]),
+            cwd=repo_path,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        remote_branches = branches_result.stdout.splitlines()
+        default_branch = _DEFAULT_BRANCH_CANDIDATES[0]
+        for candidate in _DEFAULT_BRANCH_CANDIDATES:
+            if f"origin/{candidate}" in remote_branches:
+                default_branch = candidate
+                break
+    else:
+        default_branch = result.stdout.strip().removeprefix("origin/")
+    return default_branch
+
+
 def prepare_manage_workspace(git_origin: str, run_id: str) -> Path:
     """Clone the repo for manage mode and detect the default branch.
 
@@ -332,35 +375,7 @@ def prepare_manage_workspace(git_origin: str, run_id: str) -> Path:
         check=True,
         capture_output=True,
     )
-    subprocess.run(
-        _sudo_wrap(["git", "remote", "set-head", "origin", "--auto"]),
-        cwd=workspace,
-        check=False,
-        capture_output=True,
-    )
-    result = subprocess.run(
-        _sudo_wrap(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"]),
-        cwd=workspace,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        branches_result = subprocess.run(
-            _sudo_wrap(["git", "branch", "-r", "--format=%(refname:short)"]),
-            cwd=workspace,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        remote_branches = branches_result.stdout.splitlines()
-        default_branch = _DEFAULT_BRANCH_CANDIDATES[0]
-        for candidate in _DEFAULT_BRANCH_CANDIDATES:
-            if f"origin/{candidate}" in remote_branches:
-                default_branch = candidate
-                break
-    else:
-        default_branch = result.stdout.strip().removeprefix("origin/")
+    default_branch = _detect_default_branch(workspace)
     subprocess.run(
         _sudo_wrap(["git", "checkout", default_branch]),
         cwd=workspace,
@@ -369,6 +384,76 @@ def prepare_manage_workspace(git_origin: str, run_id: str) -> Path:
     )
 
     return workspace
+
+
+def prepare_manage_workspace_multi(repo_urls: list[str], run_id: str) -> Path:
+    """Clone multiple repos for manage mode, each checked out on its default branch.
+
+    Workspace root is ``config.WORKSPACE_ROOT / f'repos-{run_id}'``.
+
+    - Python-mkdirs only ``config.WORKSPACE_ROOT`` (not the workspace root).
+    - Creates the workspace root via a sudo-wrapped ``mkdir -p`` so that under
+      the two-user split (``AGENT_SUBPROCESS_USER`` set) the agent user owns it.
+    - Clones each URL **in order** with ``--depth=50`` into
+      ``<root>/<repo_dir_from_url(url)>``.
+    - Detects and checks out each repo's default branch (no feature branch).
+    - Returns the workspace root ``Path``.
+
+    Raises ``ValueError`` before any subprocess if *repo_urls* is empty, if two
+    URLs map to the same directory name, or if any URL produces an empty
+    basename.  Raises ``RuntimeError`` on clone or checkout failure.
+    """
+    if not repo_urls:
+        raise ValueError("workspace_repos must not be empty")
+
+    # Validate / resolve directory names before touching the filesystem
+    dir_names: list[str] = []
+    for url in repo_urls:
+        dir_names.append(repo_dir_from_url(url))  # raises ValueError on empty basename
+
+    seen: set[str] = set()
+    for name in dir_names:
+        if name in seen:
+            raise ValueError(f"Duplicate workspace repo directory: '{name}'")
+        seen.add(name)
+
+    # Python-mkdirs ONLY config.WORKSPACE_ROOT (mirrors prepare_workspace_multi)
+    config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+
+    root = config.WORKSPACE_ROOT / f"repos-{run_id}"
+
+    # Create workspace root via subprocess so the agent user owns it
+    subprocess.run(
+        _sudo_wrap(["mkdir", "-p", str(root)]),
+        check=True,
+        capture_output=True,
+    )
+
+    for url, dir_name in zip(repo_urls, dir_names, strict=False):
+        dest = root / dir_name
+
+        result = subprocess.run(
+            _sudo_wrap(["git", "clone", "--depth=50", url, str(dest)]),
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            stderr_tail = result.stderr.decode("utf-8", errors="replace")[-300:]
+            raise RuntimeError(f"workspace clone failed for {url}: {stderr_tail}")
+
+        default_branch = _detect_default_branch(dest)
+
+        result = subprocess.run(
+            _sudo_wrap(["git", "checkout", default_branch]),
+            cwd=dest,
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            stderr_tail = result.stderr.decode("utf-8", errors="replace")[-300:]
+            raise RuntimeError(f"workspace checkout failed for {url}: {stderr_tail}")
+
+    return root
 
 
 def cleanup_workspace(workspace: Path) -> None:

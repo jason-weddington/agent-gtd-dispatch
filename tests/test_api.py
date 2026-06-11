@@ -1172,11 +1172,51 @@ class TestWorkspaceDispatch:
         assert resp.status_code == 400
         assert "workspace_repos" in resp.json()["detail"]
 
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
     @patch("agent_gtd_dispatch.main.gtd_client")
-    def test_manage_workspace_project_returns_400_with_workspace_and_manage(
+    def test_manage_workspace_project_accepted(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ) -> None:
+        """Manage dispatch targeting a workspace project with workspace_repos returns 200."""
+        mock_client.get_rollout = AsyncMock(
+            return_value={
+                "id": "rollout-ws",
+                "project_id": "proj-ws",
+                "status": "running",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj-ws",
+                "name": "WorkspaceProject",
+                # deliberately no git_origin key — workspace manage must not require it
+                "repo_mode": "workspace",
+                "workspace_repos": [
+                    "git@host:org/repo-a.git",
+                    "git@host:org/repo-b.git",
+                ],
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc123"
+
+        resp = client.post(
+            "/dispatch",
+            json={"rollout_id": "rollout-ws", "mode": "manage", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "pending"
+        assert data["mode"] == "manage"
+        # Worker must have been invoked (proves the guard was removed)
+        mock_worker.assert_called_once()
+
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_manage_workspace_project_empty_repos_returns_400(
         self, mock_client, client, auth_headers
     ) -> None:
-        """Manage dispatch targeting a workspace project is rejected (defense-in-depth)."""
+        """Manage dispatch targeting a workspace project with empty workspace_repos returns 400."""
         mock_client.get_rollout = AsyncMock(
             return_value={
                 "id": "rollout-ws",
@@ -1189,7 +1229,7 @@ class TestWorkspaceDispatch:
                 "id": "proj-ws",
                 "name": "WorkspaceProject",
                 "repo_mode": "workspace",
-                "workspace_repos": ["git@host:org/repo-a.git"],
+                # workspace_repos absent → treated as empty
             }
         )
 
@@ -1199,9 +1239,7 @@ class TestWorkspaceDispatch:
             headers=auth_headers,
         )
         assert resp.status_code == 400
-        detail = resp.json()["detail"].lower()
-        assert "workspace" in detail
-        assert "manage" in detail
+        assert "workspace_repos" in resp.json()["detail"]
 
     @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.dispatch")
@@ -1338,3 +1376,148 @@ class TestWorkspaceDispatch:
             run.id,
             "feat/item-ws-fix",
         )
+
+    async def test_manage_workspace_worker_calls_prepare_manage_workspace_multi(
+        self, client, auth_headers
+    ) -> None:
+        """_dispatch_worker calls prepare_manage_workspace_multi for manage+workspace runs."""
+        import subprocess
+
+        from agent_gtd_dispatch_protocol.models import DispatchMode
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.engines import get_engine
+        from agent_gtd_dispatch.main import _dispatch_worker
+        from agent_gtd_dispatch.models import Run
+
+        await db.init_db()
+        run = Run(
+            item_id=None,
+            project_name="WorkspaceProject",
+            branch_name=None,
+            mode=DispatchMode.MANAGE,
+            rollout_id="rollout-ws-mgr",
+        )
+        await db.insert_run(run)
+
+        workspace_repos = [
+            "git@host:org/repo-a.git",
+            "git@host:org/repo-b.git",
+        ]
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_client,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_client.get_rollout = AsyncMock(
+                return_value={
+                    "id": "rollout-ws-mgr",
+                    "project_id": "proj-ws",
+                    "status": "running",
+                }
+            )
+            mock_client.get_project = AsyncMock(
+                return_value={
+                    "id": "proj-ws",
+                    "name": "WorkspaceProject",
+                    # NO git_origin key
+                    "repo_mode": "workspace",
+                    "workspace_repos": workspace_repos,
+                }
+            )
+            mock_client.post_comment = AsyncMock()
+
+            from pathlib import Path
+
+            fake_workspace = Path("/tmp/repos-manage-ws")  # noqa: S108
+            mock_dispatch.prepare_manage_workspace_multi.return_value = fake_workspace
+            mock_dispatch.repo_dir_from_url.side_effect = lambda url: url.rsplit(
+                "/", 1
+            )[-1].replace(".git", "")
+            mock_dispatch.build_system_prompt.return_value = "manage prompt"
+            mock_dispatch.run_agent = AsyncMock(
+                return_value=subprocess.CompletedProcess([], 0, "", "")
+            )
+            mock_dispatch.cleanup_workspace.return_value = None
+            mock_dispatch.verify_pushes = None  # Should never be called
+
+            engine = get_engine("claude-code")
+            await _dispatch_worker(run, 200, engine, 3600)
+
+        # AC-10(b): prepare_manage_workspace_multi was called with the workspace_repos
+        mock_dispatch.prepare_manage_workspace_multi.assert_called_once_with(
+            workspace_repos,
+            run.id,
+        )
+        # AC-10(b): build_system_prompt received workspace_repo_dirs
+        _call = mock_dispatch.build_system_prompt.call_args
+        assert _call is not None
+        workspace_repo_dirs_arg = _call.kwargs.get("workspace_repo_dirs")
+        assert workspace_repo_dirs_arg == ["repo-a", "repo-b"]
+        # AC-8: cleanup_workspace called with the workspace root on success
+        mock_dispatch.cleanup_workspace.assert_called_once_with(fake_workspace)
+
+    async def test_manage_workspace_worker_verify_pushes_not_called(
+        self, client, auth_headers
+    ) -> None:
+        """verify_pushes is never called for manage mode runs (AC-6)."""
+        import subprocess
+
+        from agent_gtd_dispatch_protocol.models import DispatchMode
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.engines import get_engine
+        from agent_gtd_dispatch.main import _dispatch_worker
+        from agent_gtd_dispatch.models import Run
+
+        await db.init_db()
+        run = Run(
+            item_id=None,
+            project_name="WorkspaceProject",
+            branch_name=None,
+            mode=DispatchMode.MANAGE,
+            rollout_id="rollout-ws-nv",
+        )
+        await db.insert_run(run)
+
+        workspace_repos = ["git@host:org/repo-a.git"]
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_client,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_client.get_rollout = AsyncMock(
+                return_value={
+                    "id": "rollout-ws-nv",
+                    "project_id": "proj-ws-nv",
+                    "status": "running",
+                }
+            )
+            mock_client.get_project = AsyncMock(
+                return_value={
+                    "id": "proj-ws-nv",
+                    "name": "WorkspaceProject",
+                    "repo_mode": "workspace",
+                    "workspace_repos": workspace_repos,
+                }
+            )
+            mock_client.post_comment = AsyncMock()
+
+            from pathlib import Path
+
+            fake_workspace = Path("/tmp/repos-manage-nv")  # noqa: S108
+            mock_dispatch.prepare_manage_workspace_multi.return_value = fake_workspace
+            mock_dispatch.repo_dir_from_url.side_effect = lambda url: url.rsplit(
+                "/", 1
+            )[-1].replace(".git", "")
+            mock_dispatch.build_system_prompt.return_value = "manage prompt"
+            mock_dispatch.run_agent = AsyncMock(
+                return_value=subprocess.CompletedProcess([], 0, "", "")
+            )
+            mock_dispatch.cleanup_workspace.return_value = None
+
+            engine = get_engine("claude-code")
+            await _dispatch_worker(run, 200, engine, 3600)
+
+        # AC-6: verify_pushes must not be called for manage runs
+        mock_dispatch.verify_pushes.assert_not_called()

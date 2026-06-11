@@ -19,6 +19,7 @@ from agent_gtd_dispatch.dispatch import (
     cleanup_workspace,
     init_executor,
     prepare_manage_workspace,
+    prepare_manage_workspace_multi,
     prepare_workspace,
     prepare_workspace_multi,
     repo_dir_from_url,
@@ -2130,3 +2131,236 @@ class TestWorkspacePrompts:
             workspace_repo_dirs=None,
         )
         assert "## Workspace Layout" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# prepare_manage_workspace_multi tests (AC-10a)
+# ---------------------------------------------------------------------------
+
+
+class TestPrepareManageWorkspaceMulti:
+    @pytest.fixture
+    def workspace_root(self, tmp_path, monkeypatch) -> Path:
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+        return tmp_path
+
+    def _make_mock_result(self, returncode: int = 0, stdout: str = "") -> MagicMock:
+        result = MagicMock()
+        result.returncode = returncode
+        result.stdout = stdout
+        result.stderr = b""
+        return result
+
+    def test_workspace_root_is_repos_run_id(self, workspace_root, tmp_path) -> None:
+        """Root is repos-{run_id} (not ws-{run_id})."""
+        repo_urls = ["git@host:org/repo-a.git"]
+        run_id = "abc123"
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "symbolic-ref" in cmd:
+                return self._make_mock_result(0, stdout="origin/main\n")
+            return self._make_mock_result(0)
+
+        with patch(
+            "agent_gtd_dispatch.dispatch.subprocess.run", side_effect=side_effect
+        ):
+            result = prepare_manage_workspace_multi(repo_urls, run_id)
+
+        assert result == tmp_path / f"repos-{run_id}"
+
+    def test_happy_path_two_repos(self, workspace_root, tmp_path) -> None:
+        """Happy path: 2 repos cloned with --depth=50 and default-branch checkout."""
+        repo_urls = [
+            "git@host:org/repo-a.git",
+            "git@host:org/repo-b.git",
+        ]
+        run_id = "abc123"
+        root = tmp_path / f"repos-{run_id}"
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "symbolic-ref" in cmd:
+                return self._make_mock_result(0, stdout="origin/main\n")
+            return self._make_mock_result(0)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub:
+            mock_sub.side_effect = side_effect
+            result = prepare_manage_workspace_multi(repo_urls, run_id)
+
+        assert result == root
+
+        calls = mock_sub.call_args_list
+        clone_calls = [c for c in calls if "clone" in c.args[0]]
+        assert len(clone_calls) == 2
+        # Each clone uses --depth=50
+        for c in clone_calls:
+            assert "--depth=50" in c.args[0]
+        # Each clone targets the correct destination
+        assert str(root / "repo-a") in str(clone_calls[0])
+        assert str(root / "repo-b") in str(clone_calls[1])
+
+        checkout_calls = [c for c in calls if "checkout" in c.args[0]]
+        assert len(checkout_calls) == 2
+        for c in checkout_calls:
+            cmd = c.args[0]
+            assert "main" in cmd
+            # Must NOT be a -b flag (no branch creation)
+            assert "-b" not in cmd
+
+    def test_returned_path_is_workspace_root(self, workspace_root, tmp_path) -> None:
+        """Function returns the workspace root path, not a sub-repo path."""
+        repo_urls = ["git@host:org/repo-a.git"]
+        run_id = "xyz789"
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "symbolic-ref" in cmd:
+                return self._make_mock_result(0, stdout="origin/main\n")
+            return self._make_mock_result(0)
+
+        with patch(
+            "agent_gtd_dispatch.dispatch.subprocess.run", side_effect=side_effect
+        ):
+            result = prepare_manage_workspace_multi(repo_urls, run_id)
+
+        assert result == tmp_path / f"repos-{run_id}"
+        assert result.name == f"repos-{run_id}"
+
+    def test_empty_list_raises_value_error_before_subprocess(
+        self, workspace_root
+    ) -> None:
+        with (
+            patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub,
+            pytest.raises(ValueError, match="workspace_repos must not be empty"),
+        ):
+            prepare_manage_workspace_multi([], "run1")
+        mock_sub.assert_not_called()
+
+    def test_duplicate_dir_raises_value_error_before_subprocess(
+        self, workspace_root
+    ) -> None:
+        repo_urls = [
+            "git@host:org/repo.git",
+            "https://other-host/path/repo.git",
+        ]
+        with (
+            patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub,
+            pytest.raises(ValueError, match="Duplicate workspace repo directory"),
+        ):
+            prepare_manage_workspace_multi(repo_urls, "run1")
+        mock_sub.assert_not_called()
+
+    def test_clone_failure_raises_runtime_error(self, workspace_root) -> None:
+        repo_urls = ["git@host:org/repo-a.git"]
+        run_id = "abc123"
+
+        failure = self._make_mock_result(1)
+        failure.stderr = b"fatal: repository not found\n"
+
+        call_count = 0
+
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # mkdir (1), clone fails (2)
+            if call_count == 2:
+                return failure
+            return self._make_mock_result(0)
+
+        with (
+            patch(
+                "agent_gtd_dispatch.dispatch.subprocess.run", side_effect=side_effect
+            ),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            prepare_manage_workspace_multi(repo_urls, run_id)
+
+        msg = str(exc_info.value)
+        assert "clone" in msg
+        assert "git@host:org/repo-a.git" in msg
+
+    def test_checkout_failure_raises_runtime_error(self, workspace_root) -> None:
+        repo_urls = ["git@host:org/repo-a.git"]
+        run_id = "abc123"
+
+        success = self._make_mock_result(0, stdout="origin/main\n")
+        failure = self._make_mock_result(1)
+        failure.stderr = b"error: pathspec 'main' did not match\n"
+
+        call_count = 0
+
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            cmd = args[0]
+            if "symbolic-ref" in cmd:
+                return self._make_mock_result(0, stdout="origin/main\n")
+            # mkdir (1), clone (2) ok, set-head (3) ok, symbolic-ref → counted above
+            # checkout is after detection, fails
+            if "checkout" in cmd:
+                return failure
+            return success
+
+        with (
+            patch(
+                "agent_gtd_dispatch.dispatch.subprocess.run", side_effect=side_effect
+            ),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            prepare_manage_workspace_multi(repo_urls, run_id)
+
+        msg = str(exc_info.value)
+        assert "checkout" in msg
+        assert "git@host:org/repo-a.git" in msg
+
+    def test_symbolic_ref_fallback_to_master(self, workspace_root, tmp_path) -> None:
+        """When symbolic-ref fails and only 'master' is in remote branches, checks out master."""
+        repo_urls = ["git@host:org/repo-a.git"]
+        run_id = "abc123"
+        root = tmp_path / f"repos-{run_id}"
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "set-head" in cmd:
+                return self._make_mock_result(1)
+            if "symbolic-ref" in cmd:
+                return self._make_mock_result(1)
+            if "branch" in cmd and "-r" in cmd:
+                return self._make_mock_result(0, stdout="origin/master\n")
+            return self._make_mock_result(0)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub:
+            mock_sub.side_effect = side_effect
+            prepare_manage_workspace_multi(repo_urls, run_id)
+
+        checkout_calls = [c for c in mock_sub.call_args_list if "checkout" in c.args[0]]
+        assert len(checkout_calls) == 1
+        assert checkout_calls[0] == call(
+            ["git", "checkout", "master"],
+            cwd=root / "repo-a",
+            check=False,
+            capture_output=True,
+        )
+
+    def test_sudo_prefix_when_user_set(self, tmp_path, monkeypatch) -> None:
+        """All subprocess calls (mkdir, clone, detection, checkout) are sudo-wrapped."""
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+        repo_urls = ["git@host:org/repo-a.git"]
+        run_id = "abc123"
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if "symbolic-ref" in cmd:
+                return self._make_mock_result(0, stdout="origin/main\n")
+            return self._make_mock_result(0)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub:
+            mock_sub.side_effect = side_effect
+            prepare_manage_workspace_multi(repo_urls, run_id)
+
+        sudo_prefix = ["sudo", "-u", "dispatch", "-H"]
+        for c in mock_sub.call_args_list:
+            cmd = c.args[0]
+            assert cmd[:4] == sudo_prefix, f"Expected sudo prefix on call {cmd!r}"
