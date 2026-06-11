@@ -14,8 +14,10 @@ This guide covers bootstrapping a fresh Ubuntu host and migrating an existing si
 | `curl` | `sudo apt install curl` |
 | `uv` | Installed automatically by the script if absent |
 
-> **Note**: `uv` is the only non-system dependency the script installs automatically.
-> All other tooling (`python3`, `visudo`, `systemctl`) ships with standard Ubuntu.
+> **Note**: The script auto-installs `uv`, Claude Code for the agent user (Step 4.5,
+> via the official `claude.ai/install.sh` installer), and `pre-commit` (Step 4.7, via
+> `uv tool install`). All other tooling (`python3`, `visudo`, `systemctl`) ships with
+> standard Ubuntu.
 >
 > **Single-user mode** (`DISPATCH_SINGLE_USER=1`) does **not** require creating extra
 > system users or installing a sudoers fragment — it runs the service and agent under
@@ -25,8 +27,15 @@ This guide covers bootstrapping a fresh Ubuntu host and migrating an existing si
 
 ## Quick start — fresh host
 
+> **Installing on a personal/dev machine** where everything should run under your own
+> account? Use single-user mode (`DISPATCH_SINGLE_USER=1`) — read
+> [Single-user mode](#single-user-mode) **before** running step 3. Running the default
+> two-user installer first creates system users and a sudoers fragment that trip the
+> mode-mismatch guard on every later single-user attempt until you do a full rollback.
+
 ```bash
 # 1. Clone the repo
+#    (this example uses our internal git server, ubuntu-vm01 — substitute your git remote)
 git clone git@ubuntu-vm01:repos/agent-gtd-dispatch
 cd agent-gtd-dispatch
 
@@ -43,6 +52,40 @@ sudo ./setup-dispatch-host.sh --env-file /tmp/dispatch.env --smoke
 
 The installer is idempotent — re-running it on a configured host prints
 `[SKIP] already configured` for every completed step and exits 0.
+
+### Adapting to your own git host
+
+The clone URLs in this guide default to our homelab git server (`ubuntu-vm01`). The
+installer reads two environment-variable overrides (also listed in `--help`) that
+point Step 2's clones at your own git host:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DISPATCH_REPO_URL` | `git@ubuntu-vm01:repos/agent-gtd-dispatch` | Remote for the dispatch service repo |
+| `AGENT_GTD_REPO_URL` | `git@ubuntu-vm01:repos/agent_gtd` | Remote for the agent_gtd repo |
+
+Pass them on the installer command line:
+
+```bash
+sudo DISPATCH_REPO_URL=git@your-git-host:you/agent-gtd-dispatch \
+     AGENT_GTD_REPO_URL=git@your-git-host:you/agent_gtd \
+     ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
+```
+
+> ⚠️ **known_hosts is only seeded for ubuntu-vm01.** Step 1 hardcodes
+> `ssh-keyscan ubuntu-vm01` regardless of the overrides above, so when your repos live
+> elsewhere you must seed `known_hosts` for your actual git host manually — once the
+> installer has created the users and their `.ssh` directories (i.e. after the Phase 1
+> halt, or after Step 2 fails with `Host key verification failed`):
+>
+> ```bash
+> # Two-user mode — seed both users, then re-run the installer:
+> sudo mkdir -p /home/dispatch/.ssh /home/dispatch-svc/.ssh
+> ssh-keyscan <your-git-host> | sudo tee -a /home/dispatch/.ssh/known_hosts /home/dispatch-svc/.ssh/known_hosts
+>
+> # Single-user mode — your own account:
+> ssh-keyscan <your-git-host> >> ~/.ssh/known_hosts
+> ```
 
 ### Preview mode (dry run)
 
@@ -77,22 +120,28 @@ Run the installer once. It will:
 ========================================
 
   A new ed25519 keypair was generated for the 'dispatch' agent user.
-  Authorize it on the git server before re-running this installer:
+  Put the public key wherever you host your repos —
+  e.g. authorized_keys on a local git server, or GitHub Settings → SSH keys.
 
-  Public key to add to ubuntu-vm01:~/repos/.ssh/authorized_keys :
+  Public key:
 
-  ssh-ed25519 AAAA... dispatch@r7-research
+  ssh-ed25519 AAAA... dispatch@<hostname>
 
   Then re-run this installer with the same arguments:
     sudo ./setup-dispatch-host.sh [your original options]
 ```
 
-Add the printed public key to the git server:
+(The key comment is `dispatch@$(hostname -s)` — your host's short name.)
+
+Authorize the printed public key on your git host. On the homelab git server
+(`ubuntu-vm01`) that means appending it to the repo user's `authorized_keys`:
 
 ```bash
-# On ubuntu-vm01:
-echo "ssh-ed25519 AAAA... dispatch@r7-research" >> ~/repos/.ssh/authorized_keys
+# Homelab-specific example — on ubuntu-vm01:
+echo "ssh-ed25519 AAAA... dispatch@<hostname>" >> ~/repos/.ssh/authorized_keys
 ```
+
+On GitHub or another forge, add it as a deploy key / account SSH key instead.
 
 ### Phase 2 — complete install
 
@@ -141,14 +190,15 @@ developer workstation where everything must run under your own login account —
 **single-user mode** by setting `DISPATCH_SINGLE_USER=1`:
 
 ```bash
-# Canonical form: name the var explicitly so sudo's env-stripping policy doesn't drop it
-sudo --preserve-env=DISPATCH_SINGLE_USER DISPATCH_SINGLE_USER=1 ./setup-dispatch-host.sh \
-    --env-file /tmp/dispatch.env
+# Canonical form (matches the installer's own guidance): set the var as a sudo argument
+sudo DISPATCH_SINGLE_USER=1 ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
 ```
 
-> **Note**: The env var must be set **before** invoking `sudo`. The canonical form is
-> `sudo --preserve-env=DISPATCH_SINGLE_USER`. Do **not** rely on `sudo -E` (which
-> preserves all env vars and may violate site policy) — name the variable explicitly.
+> **Note**: Setting `VAR=1` as a `sudo` argument passes it through sudo's env-stripping
+> policy — no `--preserve-env` or `sudo -E` needed. Single-user mode must be invoked
+> **via `sudo` from your non-root login account**: the installer resolves the target
+> user from `SUDO_USER` and dies with `requires invocation via sudo from a non-root
+> login user` if run from a root shell or via direct root SSH.
 
 ### What changes in single-user mode
 
@@ -184,7 +234,7 @@ first (see [Rollback procedure](#rollback-procedure)), then re-run with the new 
 ### Dry-run preview
 
 ```bash
-sudo --preserve-env=DISPATCH_SINGLE_USER DISPATCH_SINGLE_USER=1 ./setup-dispatch-host.sh --dry-run
+sudo DISPATCH_SINGLE_USER=1 ./setup-dispatch-host.sh --dry-run
 ```
 
 The banner will show `Mode: SINGLE-USER (user=<your-login>)` followed by `Would:` lines
@@ -224,7 +274,9 @@ All variables documented in `templates/dispatch-env.tmpl`. Key variables:
 | `DISPATCH_MAX_TURNS` | – | Claude Code turn cap (default: 100) |
 | `DISPATCH_TIMEOUT_SECONDS` | – | Agent subprocess wall-clock timeout in seconds (default: 1800) |
 | `OLLAMA_BASE_URL` | – | Root URL of an Ollama instance for `claude-code-ollama` engine dispatches |
-| `OLLAMA_DEFAULT_MODEL` | – | Default Ollama model (default: `qwen3:35b`) |
+| `OLLAMA_DEFAULT_MODEL` | – | Default Ollama model (default: `qwen3.6:35b`) |
+| `TEAM_KB_DATABASE_URL` | – | Team KB Postgres connection string. Read by installer Step 4.6 (not the service) and injected into the `team-kb` MCP server's per-server env; if unset, `team-kb` registration is skipped |
+| `KB_ANTHROPIC_API_KEY` | – | Anthropic key for the KB MCP servers' own LLM calls. Read by installer Step 4.6 and injected per-server as `ANTHROPIC_API_KEY` — deliberately NOT named `ANTHROPIC_API_KEY` in `.env`, so it never reaches the agent's process env (which would flip Claude Code billing off the Max subscription) |
 
 The env file is installed at `/home/dispatch-svc/.env` with mode `0600`,
 owned by `dispatch-svc`. Never commit it to git.
@@ -233,19 +285,37 @@ owned by `dispatch-svc`. Never commit it to git.
 
 ## MCP servers for the agent user
 
-Step 4.6 of the installer registers three MCP servers for the `dispatch` (agent) user.
-This gives dispatched Claude Code agents tool access to GTD, the personal knowledge
-base, and AWS documentation — enabling proper attribution on GTD comments instead of
+Step 4.6 of the installer registers up to four MCP servers for the `dispatch` (agent)
+user. This gives dispatched Claude Code agents tool access to GTD, the knowledge
+bases, and AWS documentation — enabling proper attribution on GTD comments instead of
 falling back to raw `curl` calls.
 
 | Server | Purpose |
 |---|---|
 | `agent-gtd` | GTD items, comments, and dispatch (prevents `created_by="human"` regression) |
 | `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) |
+| `team-kb` | Team knowledge base — **conditional**: only registered when `TEAM_KB_DATABASE_URL` is set in the service `.env` |
 | `aws-documentation-mcp-server` | AWS docs for any AWS-related implementation work |
 
+Step 4.6 reads `TEAM_KB_DATABASE_URL` and `KB_ANTHROPIC_API_KEY` out of the installed
+service `.env` and exports them before sourcing `templates/mcp-servers.sh`, so the KB
+servers get their secrets in their **per-server** MCP env blocks (see the
+[environment file reference](#environment-file-reference)). If either is unset the
+installer prints a `[WARN]` and continues — `team-kb` is skipped entirely, and the KB
+servers register without an Anthropic key (LLM features degraded).
+
 Registration is **per-host and per-user** using `--scope user`, which writes to
-`/home/dispatch/.claude.json`.
+`/home/dispatch/.claude.json` in the two-user split. **In single-user mode the agent
+user is your own login account, so `--scope user` writes to YOUR `~/.claude.json`.**
+
+> ⚠️ **Adapt this to your environment.** The entries in `templates/mcp-servers.sh`
+> hardcode homelab-specific values: `uvx` sources pointing at
+> `git+ssh://git@ubuntu-vm01/home/git/repos/...` and KB identities
+> (`KB_CONTRIBUTOR=jason`, `KB_TEAM=grit-mile`). On any other environment these
+> register successfully but **fail at runtime** — the Step 4.6 smoke test only greps
+> for the server name in `claude mcp list`, so it passes regardless. Edit
+> `templates/mcp-servers.sh` to point at your git host and KB identities (or trim the
+> array to just the servers you need) **before** running the installer.
 
 ### Config file
 
@@ -278,17 +348,19 @@ ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && claude mcp list"'
 # → agent-gtd: ...
 # → aws-documentation-mcp-server: ...
 # → personal-kb: ...
+# → team-kb: ...                (only if TEAM_KB_DATABASE_URL was set at install time)
 
 # Inspect ~/.claude.json directly:
 ssh <HOST> 'sudo cat /home/dispatch/.claude.json' | jq '.mcpServers | keys'
 # → ["agent-gtd", "aws-documentation-mcp-server", "personal-kb"]
+# → (plus "team-kb" on hosts where TEAM_KB_DATABASE_URL was set)
 ```
 
 ---
 
 ## DISPATCH_API_KEY auto-minting (Step 3.5)
 
-Step 3.5 of the installer mints a fresh `DISPATCH_API_KEY` into `/home/dispatch-svc/.env` if the value is absent or empty — and **always skips if a value is already present**.
+Step 3.5 of the installer mints a fresh `DISPATCH_API_KEY` into `/home/dispatch-svc/.env` if the value is absent, empty, or the legacy `changeme` placeholder — and **skips if any other value is already present**.
 
 ### Why this matters
 
@@ -300,8 +372,8 @@ The never-clobber rule is equally important: silently rotating the key on a true
 
 1. **Checks** that `$SERVICE_ENV` (`/home/dispatch-svc/.env`) exists — dies if not (Step 3 invariant).
 2. **Reads** the current value of `DISPATCH_API_KEY` from the env file (using the shared `_read_env_var` helper, which strips surrounding quotes).
-3. **Skips** if the value is non-empty (any non-empty string, including legacy `changeme` placeholders). Prints a `[SKIP]` message.
-4. **Mints** if absent or empty: generates a 43-char URL-safe key via `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`, rewrites the file atomically via `mktemp` + `install -m 0600`, then prints an **ACTION REQUIRED** banner with the minted key value and instructions to register it in the GTD UI before the service restarts in Step 6.
+3. **Skips** if the value is non-empty AND not the legacy `changeme` placeholder. Prints a `[SKIP]` message. `changeme` is treated as absent and replaced with a freshly minted key (so old-template hosts migrate automatically).
+4. **Mints** if absent, empty, or `changeme`: generates a 43-char URL-safe key via `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`, rewrites the file atomically via `mktemp` + `install -m 0600`, then prints an **ACTION REQUIRED** banner with the minted key value and instructions to register it in the GTD UI before the service restarts in Step 6.
 5. **Dry-run**: prints a `[DRY] Would: mint DISPATCH_API_KEY …` line and makes zero mutations (no key is generated).
 
 ### Verifying the minted key
@@ -383,7 +455,10 @@ ls /home/dispatch/.git-template/hooks/
 sudo -u dispatch -H bash -lc 'cd /tmp && rm -rf hook-probe && git init hook-probe && ls hook-probe/.git/hooks/'
 # → contains pre-commit, commit-msg, pre-push
 
-# (e) a fresh clone of agent_gtd (which has .pre-commit-config.yaml) has the shims
+# (e) OPTIONAL — a fresh clone has the shims. Step (d)'s local `git init` probe is the
+#     canonical check; this one additionally proves clone-over-SSH works. The example
+#     uses the homelab git server — replace with any repo on your git host that
+#     contains .pre-commit-config.yaml (requires the dispatch key authorized there):
 sudo -u dispatch -H bash -lc 'cd /tmp && rm -rf agent_gtd_probe && git clone git@ubuntu-vm01:repos/agent_gtd agent_gtd_probe && ls agent_gtd_probe/.git/hooks/'
 # → contains pre-commit, commit-msg, pre-push
 
@@ -414,17 +489,36 @@ sudo rm /etc/systemd/system/dispatch-api.service
 sudo systemctl daemon-reload
 ```
 
-### Step 5 — Sudoers fragment
+### Step 5b — Sudoers fragment
 ```bash
 sudo rm /etc/sudoers.d/dispatch-svc
+```
+
+### Step 5a — Claude symlink
+```bash
+sudo rm /usr/local/bin/claude
 ```
 
 ### Step 4.7 — Pre-commit template
 ```bash
 sudo -u dispatch -H git config --global --unset init.templateDir
 sudo -u dispatch -H rm -rf /home/dispatch/.git-template
-sudo -u dispatch -H uv tool uninstall pre-commit
+sudo -u dispatch -H bash -lc 'uv tool uninstall pre-commit'
 ```
+(`uv` lives at `/home/dispatch/.local/bin/uv`, which is not on sudo's search path —
+the `bash -lc` login shell is required, same as the installer itself uses.)
+
+### Step 4.6 — MCP servers
+```bash
+# Per server (agent-gtd, personal-kb, aws-documentation-mcp-server, and team-kb if registered):
+sudo -u dispatch -H bash -lc 'claude mcp remove <name> --scope user'
+# Or remove all registrations at once:
+sudo rm /home/dispatch/.claude.json
+```
+
+### Step 4.5 — Claude Code
+No separate rollback — Step 4's removal of `/home/dispatch/.local` also deletes the
+`claude` binary (and the `pre-commit` tool from Step 4.7).
 
 ### Step 4 — Dependencies (uv)
 ```bash
@@ -436,7 +530,7 @@ sudo -u dispatch rm -rf /home/dispatch/.local
 ```bash
 # No separate rollback — the key lives inside ${SERVICE_ENV}; removing the env file (Step 3 rollback) deletes it.
 # To rotate without full rollback:
-sed -i 's/^DISPATCH_API_KEY=.*/DISPATCH_API_KEY=/' /home/dispatch-svc/.env && sudo ./setup-dispatch-host.sh
+sudo sed -i 's/^DISPATCH_API_KEY=.*/DISPATCH_API_KEY=/' /home/dispatch-svc/.env && sudo ./setup-dispatch-host.sh
 ```
 
 ### Step 3 — Env file
@@ -456,6 +550,40 @@ sudo deluser --remove-home dispatch-svc
 # Only remove 'dispatch' if it was created by this installer and you want a full teardown:
 # sudo deluser --remove-home dispatch
 ```
+
+### Rollback — single-user mode
+
+The steps above are two-user specific (`/home/dispatch-svc/...`, `deluser`, sudoers).
+On a single-user host none of those paths exist — the artifacts live under **your own
+account** instead. To fully roll back (e.g. before switching to two-user mode):
+
+```bash
+# Systemd unit (Step 6) — same as two-user
+sudo systemctl stop dispatch-api
+sudo systemctl disable dispatch-api
+sudo rm /etc/systemd/system/dispatch-api.service
+sudo systemctl daemon-reload
+
+# MCP registrations (Step 4.6) — registered in YOUR ~/.claude.json
+claude mcp remove agent-gtd --scope user
+claude mcp remove personal-kb --scope user
+claude mcp remove aws-documentation-mcp-server --scope user
+claude mcp remove team-kb --scope user   # only if it was registered
+
+# Pre-commit template (Step 4.7)
+git config --global --unset init.templateDir
+rm -rf ~/.git-template
+uv tool uninstall pre-commit
+
+# Env file, repos, workspace (Steps 3 / 2 / 1)
+rm ~/.env
+rm -rf ~/agent-gtd-dispatch ~/agent_gtd ~/workspace
+```
+
+There is no sudoers fragment, no `/usr/local/bin/claude` symlink (Step 5a is skipped
+in single-user mode), and no system users to delete. Do **not** `rm -rf ~/.local` —
+unlike the dedicated `dispatch` user's home, your `~/.local` holds your own tools
+(`uv` and Claude Code were installed there and you likely want to keep them).
 
 > **Tip**: Use `sudo ./setup-dispatch-host.sh --dry-run` before rollback to
 > confirm what state the installer created.
@@ -523,7 +651,7 @@ sudo cat /etc/sudoers.d/dispatch-svc
 ```bash
 sudo cat /etc/sudoers.d/dispatch-svc
 # Should contain (among other lines):
-# dispatch-svc ALL=(dispatch) NOPASSWD: /usr/bin/git, /home/dispatch/.local/bin/uv, /home/dispatch/.local/bin/claude, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash
+# dispatch-svc ALL=(dispatch) NOPASSWD: /usr/bin/git, /home/dispatch/.local/bin/uv, /home/dispatch/.local/bin/claude, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash, /usr/bin/mkdir
 ```
 
 If missing or wrong, re-run:
@@ -539,13 +667,15 @@ The installer will detect the mismatch and reinstall the correct fragment.
 
 **Symptom**: Step 2 (Repos) fails with `Host key verification failed` or `The authenticity of host 'ubuntu-vm01' can't be established`.
 
-**Cause**: The `dispatch-svc` user has an empty `~/.ssh/known_hosts` — the new service account has not connected to the git server before.
+**Cause**: The `dispatch-svc` user has an empty `~/.ssh/known_hosts` — the new service account has not connected to the git server before. The installer only seeds `known_hosts` for `ubuntu-vm01` (the keyscan is hardcoded), so on any other git host this is the expected first-run failure.
 
-**Fix**: Re-run the installer (it seeds `known_hosts` in step 1) or manually:
+**Fix**: If your repos are on `ubuntu-vm01`, re-run the installer (it seeds `known_hosts` in step 1). For any other git host, seed `known_hosts` manually — the installer will NOT do it for you:
 ```bash
-sudo -u dispatch-svc ssh-keyscan ubuntu-vm01 >> /home/dispatch-svc/.ssh/known_hosts
-sudo -u dispatch-svc git clone git@ubuntu-vm01:repos/agent-gtd-dispatch /home/dispatch-svc/agent-gtd-dispatch
+# Substitute your git host and clone URL (ubuntu-vm01 shown as the homelab example):
+ssh-keyscan <your-git-host> | sudo tee -a /home/dispatch-svc/.ssh/known_hosts
+sudo -u dispatch-svc git clone git@<your-git-host>:<path>/agent-gtd-dispatch /home/dispatch-svc/agent-gtd-dispatch
 ```
+See [Adapting to your own git host](#adapting-to-your-own-git-host) for the `DISPATCH_REPO_URL` / `AGENT_GTD_REPO_URL` overrides.
 
 ---
 
@@ -640,8 +770,10 @@ ls -la /home/dispatch/.local/bin/claude   # verify binary exists
 sudo ./setup-dispatch-host.sh             # re-run to create symlink + sudoers
 ```
 
-If Claude Code requires a different install path, set `ANTHROPIC_CLAUDE_PATH` or check the
-output of `sudo -u dispatch bash -c 'which claude 2>/dev/null || echo not found'`.
+The installer expects the binary at exactly `/home/dispatch/.local/bin/claude` (no
+override exists). If it installed elsewhere, check the actual location with
+`sudo -u dispatch bash -c 'which claude 2>/dev/null || echo not found'` and symlink it
+to the expected path.
 
 ---
 
@@ -654,7 +786,7 @@ SSH keypair, so the installer generated one and is waiting for you to authorize 
 
 **Fix**: This is expected — follow the [Fresh box install](#fresh-box-install) two-phase flow above:
 1. Copy the printed public key.
-2. Append it to `ubuntu-vm01:~/repos/.ssh/authorized_keys`.
+2. Authorize it on your git host (homelab: append to `ubuntu-vm01:~/repos/.ssh/authorized_keys`; GitHub: add as a deploy key / account SSH key).
 3. Re-run the installer with the same arguments.
 
 If you want to use an existing keypair instead of the generated one, place it at

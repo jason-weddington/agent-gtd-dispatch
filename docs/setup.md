@@ -38,6 +38,24 @@ uv run uvicorn agent_gtd_dispatch.main:app --reload --port 8100
 
 The `--reload` flag enables hot-reload for development. Omit it for a production-like run.
 
+### Installing as a service on your own machine (single-user mode)
+
+Running uvicorn by hand is fine for hacking on the code, but if you want a real
+installed service on a developer/engineer machine — systemd unit, auto-minted
+`DISPATCH_API_KEY`, MCP server registration, pre-commit template directory — without
+the production two-user split, use **single-user mode**:
+
+```bash
+# Canonical form: name the var explicitly so sudo's env-stripping doesn't drop it
+sudo --preserve-env=DISPATCH_SINGLE_USER DISPATCH_SINGLE_USER=1 \
+    ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
+```
+
+Everything runs under your own login account (no extra users, no sudoers fragment —
+and therefore no POSIX isolation between service and agents). See
+[install.md — Single-user mode](install.md#single-user-mode) for details, including
+the mode-mismatch guards.
+
 ---
 
 ## Environment Variables
@@ -47,7 +65,7 @@ The `--reload` flag enables hot-reload for development. Omit it for a production
 | Variable | Description |
 |---|---|
 | `DISPATCH_API_KEY` | Bearer token that callers must supply to the REST API |
-| `AGENT_GTD_URL` | Agent GTD API base URL (e.g. `https://r7-research:8443`) |
+| `AGENT_GTD_URL` | Agent GTD API base URL — replace with your own Agent GTD instance, e.g. `https://<your-agent-gtd-host>:8443` (the maintainer's deployment uses `https://r7-research:8443`) |
 | `AGENT_GTD_API_KEY` | Agent GTD API key (`agtd_…` prefix) |
 | `ANTHROPIC_API_KEY` | Anthropic API key — used by the rollout planner in-process; **not** exposed to Claude Code subprocesses |
 
@@ -61,6 +79,8 @@ The `--reload` flag enables hot-reload for development. Omit it for a production
 | `DISPATCH_TIMEOUT_SECONDS` | `1800` | Build/plan agent wall-clock timeout in seconds (30 minutes) |
 | `DISPATCH_MANAGE_TIMEOUT_SECONDS` | `14400` | Manage agent wall-clock timeout in seconds (4 hours) |
 | `DISPATCH_CANCEL_GRACE_SECONDS` | `5` | Seconds between SIGTERM and SIGKILL on cancel |
+| `DISPATCH_MANAGE_STALE_THRESHOLD_SECONDS` | `2100` | Manage-watchdog staleness threshold (35 minutes) — a manage run with no activity for this long is considered stale. Must stay below `DISPATCH_MANAGE_TIMEOUT_SECONDS`. |
+| `DISPATCH_WATCHDOG_INTERVAL_SECONDS` | `180` | How often the manage watchdog scans for stale manage runs (3 minutes) |
 
 ### Optional — Concurrency
 
@@ -124,7 +144,7 @@ uv run pre-commit run --all-files
 - Commit messages must follow Conventional Commits on main (`feat:`, `fix:`, `chore:`, etc.)
 - Feature branches are free-form (hook is enforced only on merge to main)
 - Squash merge to main: `git checkout main && git merge --squash feat/x && git commit`
-- Push to origin freely; `./deploy.sh` deploys current main to pironman01
+- Push to origin freely; `./deploy.sh` deploys current main to all dispatch hosts (`DISPATCH_HOSTS`, default: `pironman01 r7-research`; set `DISPATCH_HOST` to target a single host)
 - `./release.sh` cuts a semantic-release version, pushes main + tags, and deploys
 
 ---
@@ -132,4 +152,7 @@ uv run pre-commit run --all-files
 ## Full Host Deployment
 
 For production installation on a Linux host (systemd unit, two-user split, SSH keypair
-generation, sudoers fragment), see [docs/install.md](install.md).
+generation, sudoers fragment), see [docs/install.md](install.md). For an installed
+service on a personal/dev machine without the two-user split, use single-user mode
+(`DISPATCH_SINGLE_USER=1`) — see [install.md — Single-user mode](install.md#single-user-mode)
+and the subsection above.

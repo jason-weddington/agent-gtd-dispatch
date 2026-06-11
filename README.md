@@ -14,7 +14,7 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 git clone <repo-url>
 cd agent-gtd-dispatch
 uv sync
-uv run pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type post-commit --hook-type pre-push
+uv run pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type pre-push
 ```
 
 ## Running locally
@@ -25,33 +25,47 @@ The API requires these environment variables:
 export DISPATCH_API_KEY="your-api-key"
 export AGENT_GTD_URL="https://your-gtd-instance"
 export AGENT_GTD_API_KEY="your-gtd-api-key"
-export ANTHROPIC_API_KEY="your-anthropic-key"       # optional if using OAuth
+export ANTHROPIC_API_KEY="your-anthropic-key"        # required — see note below
 export DISPATCH_WORKSPACE_ROOT="/path/to/workspaces" # default: ~/workspace
+```
+
+> **`ANTHROPIC_API_KEY` is required** — the service raises at startup without it. It
+> powers the in-process rollout planner (`POST /plan`) and is deliberately **not**
+> forwarded to Claude Code subprocesses; those authenticate via
+> `CLAUDE_CODE_OAUTH_TOKEN` or an interactive `claude login`. See
+> "Notes on `ANTHROPIC_API_KEY`" in [docs/setup.md](docs/setup.md).
+
+Then start the API:
+
+```bash
+uv run uvicorn agent_gtd_dispatch.main:app --host 0.0.0.0 --port 8100
 ```
 
 ### Generating `DISPATCH_API_KEY`
 
 `DISPATCH_API_KEY` is a shared secret — any high-entropy string the dispatch
-service and its callers both know. Generate one with:
+service and its callers both know.
+
+**Local dev**: mint one by hand and export it in your shell:
 
 ```bash
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
 
-Put the same value in:
+**Installed hosts**: leave `DISPATCH_API_KEY` empty (or absent) in the env file —
+Step 3.5 of `setup-dispatch-host.sh` auto-mints it into the service `.env` and
+prints it in an ACTION REQUIRED banner for registration in the GTD UI. It never
+clobbers an existing value. See
+[docs/install.md](docs/install.md#dispatch_api_key-auto-minting-step-35).
 
-- the dispatch service's env (`/home/dispatch-svc/.env` in production, or the
-  shell environment in dev)
-- every caller's config (e.g. the **Agent Dispatch** host entries in the
-  Agent GTD Settings page — paste this into the API Key field for each host)
+Put the same value in every caller's config (e.g. the **Agent Dispatch** host
+entries in the Agent GTD Settings page — paste it into the API Key field for
+each host).
 
-Rotating: pick a new value, update the dispatch service env + restart, then
-update each caller. Mismatches show up as `401 Not authenticated` on Bearer
-endpoints.
-
-```bash
-uv run uvicorn agent_gtd_dispatch.main:app --host 0.0.0.0 --port 8001
-```
+Rotating: on an installed host, clear the value in the service `.env` and re-run
+the installer (Step 3.5 mints a fresh key); in dev, just pick a new value and
+restart. Then update each caller. Mismatches show up as `401 Not authenticated`
+on Bearer endpoints.
 
 ## Ollama local inference
 
@@ -59,7 +73,7 @@ Set `OLLAMA_BASE_URL` to route `claude-code-ollama` dispatches through a local O
 
 ```bash
 export OLLAMA_BASE_URL="http://192.168.1.52:11434"   # root URL — no /v1 suffix
-export OLLAMA_DEFAULT_MODEL="qwen3.5:35b"            # default if omitted
+export OLLAMA_DEFAULT_MODEL="qwen3.6:35b"            # default if omitted
 ```
 
 The URL must be the **root** Ollama URL (e.g. `http://host:11434`). Do **not** append `/v1` or any path — Ollama 0.14+ exposes the Anthropic Messages API at the root path, while `/v1` is the OpenAI-compatible surface which Claude Code does not speak.
@@ -88,22 +102,64 @@ To bootstrap a fresh host or migrate an existing one:
 sudo ./setup-dispatch-host.sh --env-file /path/to/.env
 ```
 
+> **Adapt this: the git remotes default to the maintainer's homelab git server.**
+> `setup-dispatch-host.sh` clones two repos and defaults both remotes to
+> `git@ubuntu-vm01:repos/...`. On any other machine, override them with
+> `DISPATCH_REPO_URL` (this repo) and `AGENT_GTD_REPO_URL` (the agent_gtd repo):
+>
+> ```bash
+> sudo DISPATCH_REPO_URL=git@your-git:org/agent-gtd-dispatch \
+>      AGENT_GTD_REPO_URL=git@your-git:org/agent_gtd \
+>      ./setup-dispatch-host.sh --env-file /path/to/.env
+> ```
+>
+> Known limitation: Step 1/2 of the script run `ssh-keyscan ubuntu-vm01`
+> unconditionally to populate `known_hosts` — that host is not overridable via env
+> var. On a non-homelab git server the keyscan fails with a warning; pre-populate
+> the service and agent users' `~/.ssh/known_hosts` with your git server's host key
+> (or edit the script) before the clone steps run.
+
 See **[docs/install.md](docs/install.md)** for the full install guide, env-file reference, rollback procedure, and troubleshooting.
+
+### Single-user install (developer machines)
+
+The two-user split needs dedicated `dispatch-svc`/`dispatch` accounts plus a sudoers
+fragment. On a personal/developer machine where everything should run under your own
+login account, install in **single-user mode** instead:
+
+```bash
+# Canonical form: name the var explicitly so sudo's env-stripping doesn't drop it
+sudo --preserve-env=DISPATCH_SINGLE_USER DISPATCH_SINGLE_USER=1 \
+    ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
+```
+
+Trade-off: no extra users are created and no sudoers fragment is installed — which also
+means **no POSIX isolation** between the service and the agent subprocesses it spawns.
+You still get the systemd unit, auto-minted `DISPATCH_API_KEY`, MCP registration, and
+pre-commit template setup. The installer guards against mixing modes on one host. Full
+details: [docs/install.md — Single-user mode](docs/install.md#single-user-mode).
 
 ### MCP servers for the agent user
 
-The installer registers three MCP servers for the `dispatch` (agent) user so that
-dispatched Claude Code agents have tool access to GTD, the personal knowledge base,
+The installer registers three MCP servers for the `dispatch` (agent) user — plus a
+fourth, `team-kb`, when `TEAM_KB_DATABASE_URL` is set in the service `.env` — so that
+dispatched Claude Code agents have tool access to GTD, the knowledge bases,
 and AWS documentation:
 
 | Server | Purpose |
 |---|---|
 | `agent-gtd` | GTD items, comments, and dispatch — lets agents post comments and update items via MCP rather than raw `curl` |
 | `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) |
+| `team-kb` | Team knowledge base (same package, team database) — registered only when `TEAM_KB_DATABASE_URL` is present in the service `.env` |
 | `aws-documentation-mcp-server` | AWS docs for any AWS-related implementation work |
 
 Registration is **per-host and per-user** (`--scope user`, writes to
 `/home/dispatch/.claude.json`). Step 4.6 of the installer handles this automatically.
+It also injects `KB_ANTHROPIC_API_KEY` (from the service `.env`) into both KB servers'
+per-server `env` blocks as their `ANTHROPIC_API_KEY` — the KB servers make their own
+LLM calls. Never name this variable `ANTHROPIC_API_KEY` in the service `.env` itself:
+that name would reach the agent subprocess env and flip Claude Code off OAuth/Max
+billing onto pay-as-you-go API billing.
 
 **Config file**: `templates/mcp-servers.sh`
 
@@ -126,7 +182,7 @@ sudo -u dispatch -H bash -lc "claude mcp add <name> --scope user <args>"
 **To verify registration on a host:**
 ```bash
 ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && claude mcp list"'
-# → all three servers listed
+# → all registered servers listed (three, or four with team-kb)
 ```
 
 ## Tests
@@ -143,9 +199,11 @@ uv run pytest --cov --cov-report=term-missing
 | GET | `/health` | None | Health check + active run count |
 | GET | `/info` | None | Engine identity and service version |
 | GET | `/agents` | Bearer | List agents advertised by `list_agents.sh` |
-| POST | `/dispatch` | Bearer | Start a dispatch run (body: `item_id`, `max_turns`) |
+| POST | `/plan` | Bearer | Plan a rollout DAG for a set of items (body: `PlanRequest`) |
+| POST | `/dispatch` | Bearer | Start a dispatch run (body: protocol `DispatchRequest` — `item_id?` (null for manage runs), `max_turns`, `engine`, `mode`, `agent_name?`, `timeout_minutes?`, `rollout_id?`, `attribution?`) |
 | GET | `/runs` | Bearer | List runs (query: `item_id`, `status`, `limit`) |
 | GET | `/runs/{run_id}` | Bearer | Get a specific run |
+| GET | `/runs/{run_id}/transcript` | Bearer | Get a run's agent transcript |
 | POST | `/runs/{run_id}/cancel` | Bearer | Cancel a running dispatch |
 
 All endpoints marked **Bearer** require an `Authorization: Bearer <DISPATCH_API_KEY>` header.
@@ -315,14 +373,16 @@ around.
 
 ## Protocol package
 
-The `agent_gtd_dispatch_protocol` package lives in `packages/protocol/` and is the single source of truth for the dispatch wire contract. It exports six names:
+The `agent_gtd_dispatch_protocol` package lives in `packages/protocol/` and is the single source of truth for the dispatch wire contract. It exports eight names:
 
 - `RunStatus` — run lifecycle enum
+- `DispatchMode` — run mode enum (`plan` / `build` / `manage`)
 - `DispatchRequest` — `POST /dispatch` request body
 - `RunResponse` — run read model returned by run endpoints
 - `PlanRequest` — `POST /plan` request body
 - `DagEdge` — directed dependency edge in a rollout DAG
 - `RolloutPlan` — planner output: nodes + edges + model name
+- `make_branch_name` — canonical `feat/<id>-<slug>` branch naming helper
 
 ### Using from agent-gtd (or any external caller)
 

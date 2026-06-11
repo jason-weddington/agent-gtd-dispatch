@@ -179,10 +179,14 @@ package first.
 because the worker was passing the build timeout instead of the manage timeout.
 
 **Fix**: The dispatch handler now reads `MANAGE_TIMEOUT_SECONDS` (default 4 hours) for
-`mode=manage`:
+`mode=manage` — after first honoring a per-request `timeout_minutes` override
+(`DispatchRequest.timeout_minutes` in the protocol package), which takes precedence over
+both config values:
 
 ```python
-elif body.mode == "manage":
+if body.timeout_minutes:
+    timeout_seconds = body.timeout_minutes * 60
+elif body.mode == DispatchMode.MANAGE:
     timeout_seconds = config.MANAGE_TIMEOUT_SECONDS
 else:
     timeout_seconds = config.TIMEOUT_SECONDS
@@ -216,7 +220,7 @@ queuing, both would create tasks — exceeding the capacity limit by one.
 
 ### The Fix
 
-The fix (at `main.py` line ~805) moves `db.insert_run()` **before** the capacity check
+The fix (in the `POST /dispatch` handler in `main.py`) moves `db.insert_run()` **before** the capacity check
 and places the check immediately before `asyncio.create_task()` with no `await` between:
 
 ```python
@@ -251,7 +255,7 @@ or `_pending_queue`. Inserting an `await` in that gap re-introduces the race.
 | Module | Responsibility |
 |---|---|
 | `main.py` | FastAPI app, endpoints, lifespan, `_dispatch_worker`, capacity logic |
-| `dispatch.py` | Workspace prep, prompt building, `run_agent()`, attachment staging |
+| `dispatch.py` | Workspace prep (single- and multi-repo: `prepare_workspace_multi`, `prepare_manage_workspace_multi`, `repo_dir_from_url`), push verification (`verify_pushes`, `get_head_sha`), prompt building, `run_agent()`, attachment staging |
 | `engines.py` | Engine registry, command builders, env filtering, availability checks |
 | `models.py` | `Run`, `RunStatus`, `RunResponse`, `EngineSwap`, `InfoResponse` |
 | `db.py` | SQLite persistence (aiosqlite), migrations, `reconcile_orphans()` |
@@ -259,3 +263,4 @@ or `_pending_queue`. Inserting an `await` in that gap re-introduces the race.
 | `config.py` | Env-var config with module-level globals + `load()` |
 | `rollout_planner.py` | LLM-based wave DAG planner for `POST /plan` |
 | `agent_discovery.py` | Runs `list_agents.sh`, exposes `ENGINE_NAME` and `SERVICE_VERSION` |
+| `show_run_transcript.py` | CLI helper: print a run's transcript (`python -m agent_gtd_dispatch.show_run_transcript <run_id>`) |

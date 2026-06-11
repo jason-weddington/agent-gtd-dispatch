@@ -46,16 +46,18 @@ All `async def test_*` functions are collected and run as coroutines automatical
 
 ```toml
 [tool.coverage.report]
-fail_under = 84
+fail_under = 88   # current value as of this writing — pyproject.toml is the source of truth
 ```
 
-The pre-push hook runs `uv run pytest --cov` and will fail if coverage drops below 84%.
+The pre-push hook runs `uv run pytest --cov` and will fail if coverage drops below the
+current `fail_under` value in `pyproject.toml` (the threshold ratchets up over time, so
+check the file rather than trusting any number written in docs).
 **Ratchet the threshold up** when you add tests that increase coverage — never edit it
 downward. The manage rollout agent enforces this rule and will halt a rollout if it detects
 a commit that lowers `fail_under`.
 
-Files excluded from the coverage measurement are listed under `[tool.coverage.run] omit` in
-`pyproject.toml`.
+Coverage scope is controlled by `[tool.coverage.run] source` in `pyproject.toml`
+(`agent_gtd_dispatch` + `agent_gtd_dispatch_protocol`); there is currently no `omit` list.
 
 ---
 
@@ -70,6 +72,8 @@ Files excluded from the coverage measurement are listed under `[tool.coverage.ru
 | `test_db.py` | Database migration and CRUD tests |
 | `test_engine_fallback.py` | Ollama health-check failure → `claude-code` fallback |
 | `test_manage_recovery.py` | Manage-mode auto-recovery: retry cap, relaunch, halt |
+| `test_manage_watchdog.py` | Stale-manager watchdog: stale detection, kill + shared recovery path |
+| `test_push_verification.py` | Build-mode per-repo push verification: `verify_pushes` classification (`pushed`/`no_changes`/`unpushed`), failure handling, workspace preservation |
 | `test_capabilities.py` | `GET /info` and `GET /agents` endpoint tests |
 | `test_attachments_staging.py` | Attachment download, sanitization, and staging |
 | `test_branches.py` | Branch name generation (via protocol package) |
@@ -202,8 +206,10 @@ threshold, the push is rejected:
 
 ```
 FAILED tests/ ... (1 failed)
-FAILED required test coverage of 84% not reached. Total coverage: 83.2%
+FAILED required test coverage of 88% not reached. Total coverage: 87.2%
 ```
+
+(The percentage in the message reflects the current `fail_under` in `pyproject.toml`.)
 
 To check coverage before pushing:
 

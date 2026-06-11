@@ -97,8 +97,9 @@ git checkout -b <branch_name>
 - Attachments are staged into `<run_id>-attachments/` inside the workspace.
 - On success: `cleanup_workspace()` removes the directory with `rm -rf` (via `sudo` in
   production, via `shutil.rmtree` in dev).
-- On failure: also cleaned up, **except for manage-mode failures** where the workspace is
-  preserved for debugging.
+- On failure: also cleaned up, **except for manage-mode failures** and **build-mode
+  push-verification failures** (see Push Verification below), where the workspace is
+  preserved — in the push-verification case the unpushed commits exist only in the clone.
 
 ### Manage Mode — `prepare_manage_workspace()`
 
@@ -114,10 +115,58 @@ git checkout <default_branch>
 The manage agent uses this workspace to run quality gates (`git fetch`, `git checkout branch`,
 test suite) and to execute squash merges before pushing to the default branch.
 
+### Workspace (Multi-Repo) Projects
+
+The single-clone paths above are the **default** (`repo_mode` absent/`None`/unrecognized on
+the project). Projects with `repo_mode == "workspace"` carry a `workspace_repos` list of git
+URLs instead of a single `git_origin`, and the dispatch worker (`main.py`) selects the
+multi-repo variants in `dispatch.py`:
+
+- **Build / plan** — `prepare_workspace_multi(repo_urls, run_id, branch_name)`:
+  - Workspace root is `<WORKSPACE_ROOT>/ws-<run_id>/`; created via a sudo-wrapped
+    `mkdir -p` so the agent user owns it under the two-user split.
+  - Each URL is cloned in order into `<root>/<repo_dir_from_url(url)>`.
+  - The **same feature branch** is created service-side (`git checkout -b`) in every repo.
+  - Raises `ValueError` before touching the filesystem if `workspace_repos` is empty, any
+    URL yields an empty basename, or two URLs map to the same directory name.
+- **Manage** — `prepare_manage_workspace_multi(repo_urls, run_id)`:
+  - Workspace root is `<WORKSPACE_ROOT>/repos-<run_id>/`.
+  - Each repo is cloned `--depth=50` into `<root>/<dir>` and checked out on its detected
+    default branch (no feature branch). Same `ValueError` pre-validation as above.
+
+The derived `workspace_repo_dirs` list is threaded into `build_system_prompt`, so build,
+plan, **and** manage prompts each get a workspace-layout section describing the per-repo
+directory structure (and, for manage, per-repo merge/halt semantics).
+
 ### `cleanup_workspace()`
 
 Removes the workspace directory after a run completes. Guards against escaping the workspace
 root with a `config.WORKSPACE_ROOT in workspace.parents` check before deleting.
+
+---
+
+## Push Verification (Build Mode)
+
+A build run that exits 0 is **not** automatically `succeeded`. Before the agent starts, the
+dispatch worker captures the base HEAD SHA of each cloned repo (`dispatch.get_head_sha()`).
+After a build-mode agent exits 0, `dispatch.verify_pushes()` classifies each repo:
+
+| `PushStatus` | Meaning |
+|---|---|
+| `no_changes` | `git rev-list <base_sha>..HEAD --count` is 0 — agent made no commits |
+| `pushed` | Local HEAD SHA matches `origin`'s SHA for the feature branch (`git ls-remote`) |
+| `unpushed` | Local commits exist but the remote branch is missing or behind — **or any git command failed** (fail-closed) |
+
+If **any** repo is `unpushed`:
+
+- The run is flipped to `RunStatus.failed` with error `"push verification failed: ..."`.
+- The per-repo results are serialized as JSON into the `push_results` column on the run row.
+- The workspace is **preserved** (the commits exist only in the clone).
+- A per-repo status comment is posted to the GTD item (including a `[dirty working tree]`
+  marker when tracked files were left modified).
+
+Plan and manage modes are exempt — `_verify_repos` is `None` for those, so verification is
+skipped entirely. See `tests/test_push_verification.py` for the full behavior matrix.
 
 ---
 
@@ -139,14 +188,16 @@ the run row. The `RunResponse` includes an `engine_swap` field describing the su
 
 | Engine name | Binary | Auth | Notes |
 |---|---|---|---|
-| `claude-code` | `claude` | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | Default; uses Opus model |
-| `claude-code-sonnet` | `claude` | same as above | Pinned to `claude-sonnet-4-6` |
-| `claude-code-haiku` | `claude` | same as above | Pinned to `claude-haiku-4-5-20251001` |
+| `claude-code` | `claude` | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | Default; moving alias `opus` (`--model opus`) |
+| `claude-code-sonnet` | `claude` | same as above | Moving alias `sonnet` (`--model sonnet`) |
+| `claude-code-haiku` | `claude` | same as above | Moving alias `haiku` (`--model haiku`) |
 | `claude-code-ollama` | `claude` | `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` | Routes to local Ollama endpoint |
 | `kiro` | `kiro-cli` | `KIRO_API_KEY` | Writes system prompt to `system_prompt.md` |
 
-Engine availability is checked at startup via `is_engine_available()` — only engines with
-credentials present in the environment are returned by `GET /info` and `GET /agents`.
+Engine availability is evaluated **per request**, not at startup: `GET /info` calls
+`get_available_engine_names()` (which runs `is_engine_available()` against the current
+environment) at request time, so only engines with credentials present are returned.
+Nothing in `lifespan` checks engine credentials.
 
 ---
 
@@ -176,6 +227,20 @@ When a manage-mode `_dispatch_worker` exits (for any reason except human cancell
 5. Otherwise: sleeps `MANAGE_RETRY_BACKOFF_SECONDS` (30 s) then spawns a new `_dispatch_worker`
    with `manage_retry_count` set so the recovery prompt includes a warning header.
 
+### Stale-Manager Watchdog
+
+Exit-path recovery alone cannot catch a manage agent that is alive but stuck. `lifespan`
+also starts a background `_manage_watchdog()` task that scans every
+`WATCHDOG_INTERVAL_SECONDS` (default 180 s, `DISPATCH_WATCHDOG_INTERVAL_SECONDS` env) for
+manage runs whose rollout state has not advanced in `MANAGE_STALE_THRESHOLD_SECONDS`
+(default 2100 s / 35 min, `DISPATCH_MANAGE_STALE_THRESHOLD_SECONDS` env). When it finds a
+stale manager it kills the task/subprocess and routes into the shared
+`_do_manage_recovery()` — the same path used by `_maybe_relaunch_manage()` on exit — so
+watchdog-triggered relaunches count against the same `MAX_MANAGE_RETRIES` cap. The stale
+threshold is deliberately set above the longest build a manager may legitimately wait on
+(its state timestamp only advances on real progress) and must stay below
+`MANAGE_TIMEOUT_SECONDS`. See `tests/test_manage_watchdog.py`.
+
 See [docs/rollouts.md](rollouts.md) for the full rollout orchestration protocol.
 
 ---
@@ -199,8 +264,10 @@ uvicorn start
       → dispatch.init_executor() # size ThreadPoolExecutor
       → db.init_db()            # create/migrate dispatch.db
       → db.reconcile_orphans()  # mark stuck runs as failed
+      → asyncio.create_task(_manage_watchdog())  # stale-manager scan loop
   → yield  (service accepting requests)
   → lifespan.__aexit__
+      → cancel the watchdog task
       → cancel all _active_processes tasks
 ```
 
@@ -217,3 +284,8 @@ sudo -u dispatch -H <claude-binary> ...
 The sudoers fragment (`/etc/sudoers.d/dispatch-svc`) enumerates exactly which commands
 `dispatch-svc` may run as `dispatch`. See [docs/install.md](install.md) for the full
 security model and the two-user architecture.
+
+For a single-machine / development install (no two-user split, no sudo wrapping of agent
+subprocesses), use **single-user mode**: run the setup script with `DISPATCH_SINGLE_USER=1`.
+See [docs/install.md — Single-user mode](install.md#single-user-mode). This is the
+recommended path for an engineer's workstation.
