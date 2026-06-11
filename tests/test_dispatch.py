@@ -2364,3 +2364,277 @@ class TestPrepareManageWorkspaceMulti:
         for c in mock_sub.call_args_list:
             cmd = c.args[0]
             assert cmd[:4] == sudo_prefix, f"Expected sudo prefix on call {cmd!r}"
+
+
+# ---------------------------------------------------------------------------
+# Workspace manage-prompt tests (AC-9)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceManagePrompt:
+    _project: ClassVar[dict] = {
+        "name": "wave-project",
+        "id": "proj-abc123",
+        "git_origin": "git@host:repos/wp",
+    }
+    _rollout_id = "wr-abc123"
+    _max_turns = 100
+    _repo_dirs: ClassVar[list[str]] = ["agent_gtd", "agent-gtd-dispatch"]
+
+    def _ws_prompt(
+        self,
+        repo_dirs: list[str] | None = None,
+        manage_retry_count: int = 0,
+    ) -> str:
+        return build_system_prompt(
+            item={"id": "item-1", "title": "ignored for manage mode"},
+            project=self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="manage",
+            rollout_id=self._rollout_id,
+            workspace_repo_dirs=repo_dirs if repo_dirs is not None else self._repo_dirs,
+            manage_retry_count=manage_retry_count,
+        )
+
+    def _mono_prompt(self) -> str:
+        return build_system_prompt(
+            item={"id": "item-1", "title": "ignored for manage mode"},
+            project=self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="manage",
+            rollout_id=self._rollout_id,
+        )
+
+    # --- AC-2: monorepo unchanged — workspace tokens absent ---
+
+    def test_monorepo_lacks_workspace_tokens(self) -> None:
+        prompt = self._mono_prompt()
+        for tok in [
+            "Workspace Repos",
+            "workspace root",
+            "Per-repo state:",
+            "merged+pushed",
+            "untouched",
+            "ls-remote",
+        ]:
+            assert tok not in prompt, f"Monorepo prompt must not contain {tok!r}"
+
+    def test_monorepo_has_git_origin(self) -> None:
+        prompt = self._mono_prompt()
+        assert "**Git Origin:**" in prompt
+
+    def test_monorepo_has_git_clone_sentence(self) -> None:
+        prompt = self._mono_prompt()
+        assert "git clone of the project's default branch" in prompt
+
+    # --- AC-3: workspace header ---
+
+    def test_workspace_has_workspace_repos_header(self) -> None:
+        prompt = self._ws_prompt()
+        assert "**Workspace Repos:**" in prompt
+
+    def test_workspace_repo_bullets_in_order(self) -> None:
+        prompt = self._ws_prompt()
+        assert "- `agent_gtd/`" in prompt
+        assert "- `agent-gtd-dispatch/`" in prompt
+        assert prompt.index("agent_gtd") < prompt.index("agent-gtd-dispatch")
+
+    def test_workspace_lacks_git_origin(self) -> None:
+        prompt = self._ws_prompt()
+        assert "**Git Origin:**" not in prompt
+
+    def test_workspace_pinned_sentence_present(self) -> None:
+        prompt = self._ws_prompt()
+        assert "workspace root" in prompt
+
+    def test_workspace_monorepo_sentence_absent(self) -> None:
+        prompt = self._ws_prompt()
+        assert "git clone of the project's default branch" not in prompt
+
+    # --- AC-4: per-repo warm-up ---
+
+    def test_per_repo_default_branch_recording(self) -> None:
+        prompt = self._ws_prompt()
+        assert "rev-parse --abbrev-ref HEAD" in prompt
+
+    def test_per_repo_install_conditionals(self) -> None:
+        prompt = self._ws_prompt()
+        assert "uv sync" in prompt
+        assert "npm install" in prompt
+
+    def test_per_repo_precommit_install(self) -> None:
+        prompt = self._ws_prompt()
+        assert "pre-commit install" in prompt
+
+    def test_no_test_command_fallback_none(self) -> None:
+        prompt = self._ws_prompt()
+        # 'none' fallback for repos with no discoverable test command
+        assert "none" in prompt.lower()
+
+    def test_warmup_halt_template(self) -> None:
+        prompt = self._ws_prompt()
+        assert "warm-up failure in" in prompt
+
+    # --- AC-5: pushed-repo discovery ---
+
+    def test_ls_remote_discovery_present(self) -> None:
+        prompt = self._ws_prompt()
+        assert "ls-remote" in prompt
+        assert "refs/heads/" in prompt
+
+    def test_build_comment_crosscheck_both_directions(self) -> None:
+        prompt = self._ws_prompt()
+        # Both disagreement directions must be named
+        assert "build comment" in prompt.lower() or "build agent" in prompt.lower()
+        # Direction 1: comment claims but ls-remote disagrees
+        assert "NOT confirm" in prompt or "does not confirm" in prompt.lower()
+        # Direction 2: ls-remote shows but comment didn't list
+        assert "did NOT list" in prompt or "not list" in prompt.lower()
+
+    def test_no_push_verification_via_get_run_status(self) -> None:
+        prompt = self._ws_prompt()
+        # Must explicitly say NOT to use get_run_status for push verification
+        assert "Do NOT use" in prompt
+        push_section_idx = prompt.find("Do NOT use")
+        push_section = prompt[push_section_idx : push_section_idx + 300]
+        assert "get_run_status" in push_section
+
+    # --- AC-6: review-all-then-merge ordering ---
+
+    def test_review_all_before_merge(self) -> None:
+        prompt = self._ws_prompt()
+        assert "ALL" in prompt or "all pushed repos" in prompt.lower()
+        # Review section appears before merge section
+        review_idx = prompt.find("quality gates")
+        merge_idx = prompt.find("Squash merge")
+        assert review_idx != -1
+        assert merge_idx != -1
+        assert review_idx < merge_idx
+
+    def test_per_repo_commit_count_guard(self) -> None:
+        prompt = self._ws_prompt()
+        assert "commit_count" in prompt
+        assert "rev-list" in prompt
+        # Per-repo default branch (not a global value)
+        assert (
+            "repo_default_branch" in prompt
+            or "THAT repo" in prompt
+            or "that repo" in prompt.lower()
+        )
+
+    # --- AC-7: inline-fix phase boundary + halt template ---
+
+    def test_inline_fix_allowed_before_first_merge(self) -> None:
+        prompt = self._ws_prompt()
+        lower = prompt.lower()
+        assert "inline" in lower
+        assert "zero repos" in lower or "0 repos" in lower or "zero" in lower
+
+    def test_inline_fix_prohibited_after_first_merge(self) -> None:
+        prompt = self._ws_prompt()
+        lower = prompt.lower()
+        # Must say no inline fixes after first merge
+        assert "no inline fix" in lower or "halt immediately" in lower
+
+    def test_halt_template_per_repo_state_literal(self) -> None:
+        prompt = self._ws_prompt()
+        assert "Per-repo state:" in prompt
+        assert "merged+pushed" in prompt
+        assert "FAILED" in prompt
+        assert "untouched" in prompt
+
+    def test_halt_template_step_enumeration(self) -> None:
+        prompt = self._ws_prompt()
+        # <step> enumeration must be present
+        for step in (
+            "fetch",
+            "gates",
+            "commit-count-guard",
+            "squash-merge",
+            "push",
+            "branch-cleanup",
+        ):
+            assert step in prompt, f"Step {step!r} must be in halt template enumeration"
+
+    def test_halt_prohibitions(self) -> None:
+        prompt = self._ws_prompt()
+        lower = prompt.lower()
+        assert (
+            "do not roll back" in lower
+            or "not roll back" in lower
+            or "not revert" in lower
+        )
+        assert "force-push" in lower or "force push" in lower
+        assert "do not continue" in lower or "not continue merging" in lower
+
+    # --- AC-8: cleanup ---
+
+    def test_per_repo_feature_branch_deletion(self) -> None:
+        prompt = self._ws_prompt()
+        assert "git push origin --delete <branch_name>" in prompt or (
+            "git push origin --delete" in prompt and "git branch -D" in prompt
+        )
+
+    def test_manage_branch_cleanup_exactly_once(self) -> None:
+        rollout_id = self._rollout_id
+        prompt = self._ws_prompt()
+        expected = f"feat/{rollout_id[:8]}-manage"
+        assert prompt.count(expected) == 1, (
+            f"Manage-branch cleanup string {expected!r} must appear exactly once"
+        )
+
+    def test_manage_branch_cleanup_in_first_repo(self) -> None:
+        prompt = self._ws_prompt()
+        first_repo = self._repo_dirs[0]
+        cleanup_idx = prompt.find(f"feat/{self._rollout_id[:8]}-manage")
+        assert cleanup_idx != -1
+        # The first_repo directory reference should appear near the cleanup
+        nearby = prompt[max(0, cleanup_idx - 200) : cleanup_idx + 200]
+        assert first_repo in nearby
+
+    # --- Recovery block in workspace mode (AC-9) ---
+
+    def test_recovery_block_renders_in_workspace_mode(self) -> None:
+        prompt = self._ws_prompt(manage_retry_count=1)
+        assert "Recovery Context" in prompt
+        assert "retry attempt 1" in prompt
+        assert prompt.find("Recovery Context") < prompt.find("Phase 1"), (
+            "Recovery block must appear before Phase 1"
+        )
+
+    # --- AC-2 workspace variant must lack monorepo-only tokens ---
+
+    def test_workspace_variant_lacks_all_monorepo_tokens(self) -> None:
+        prompt = self._ws_prompt()
+        assert "**Git Origin:**" not in prompt
+        assert "git clone of the project's default branch" not in prompt
+
+    # --- None/empty → no workspace-only tokens (AC-2 regression) ---
+
+    def test_none_workspace_repo_dirs_is_monorepo_variant(self) -> None:
+        prompt = build_system_prompt(
+            item={"id": "item-1", "title": "ignored"},
+            project=self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="manage",
+            rollout_id=self._rollout_id,
+            workspace_repo_dirs=None,
+        )
+        assert "**Git Origin:**" in prompt
+        assert "workspace root" not in prompt
+
+    def test_empty_workspace_repo_dirs_is_monorepo_variant(self) -> None:
+        prompt = build_system_prompt(
+            item={"id": "item-1", "title": "ignored"},
+            project=self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="manage",
+            rollout_id=self._rollout_id,
+            workspace_repo_dirs=[],
+        )
+        assert "**Git Origin:**" in prompt
+        assert "workspace root" not in prompt
