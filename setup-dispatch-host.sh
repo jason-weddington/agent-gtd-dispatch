@@ -15,7 +15,7 @@ set -euo pipefail
 #   --service-user USER    Service account user (default: dispatch-svc)
 #   --env-file PATH        Path to a pre-filled .env file to install
 #   --dry-run              Print 'Would: <action>' for every step; no mutations
-#   --smoke                After install, dispatch a no-op job and verify isolation
+#   --smoke                After install, verify the API is reachable (GET /health and GET /info return HTTP 200)
 #   -h, --help             Show this help text
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,7 +64,7 @@ Options:
   --service-user USER    Service account user                (default: dispatch-svc)
   --env-file PATH        Pre-filled .env file to install
   --dry-run              Print 'Would: <action>' for every step; make no changes
-  --smoke                After install, run a smoke test (POST /dispatch, check isolation)
+  --smoke                After install, verify the API is reachable (GET /health and GET /info return HTTP 200)
   -h, --help             Show this help text
 
 Environment variables:
@@ -124,6 +124,7 @@ _render_unit() {
         -e "s|{{WORKING_DIR}}|${SERVICE_REPO}|g" \
         -e "s|{{ENV_FILE}}|${SERVICE_ENV}|g" \
         -e "s|{{SERVICE_HOME}}|${SERVICE_HOME}|g" \
+        -e "s|{{UV_BIN}}|${UV_BIN}|g" \
         "$tmpl"
 }
 
@@ -243,7 +244,11 @@ if ! $SINGLE_USER; then
     SERVICE_HOME="/home/${SERVICE_USER}"
 fi
 SERVICE_REPO="${SERVICE_HOME}/${REPO_NAME}"
-SERVICE_ENV="${SERVICE_HOME}/.env"
+if $SINGLE_USER; then
+    SERVICE_ENV="${SERVICE_HOME}/.config/agent-gtd-dispatch/env"
+else
+    SERVICE_ENV="${SERVICE_HOME}/.env"
+fi
 AGENT_WORKSPACE="${AGENT_HOME}/workspace"
 CLAUDE_SRC="${AGENT_HOME}/.local/bin/claude"
 
@@ -337,12 +342,20 @@ for u in "$AGENT_USER" "$SERVICE_USER"; do
 done
 
 # Create workspace directory for agent user
+# In single-user mode: only touch $AGENT_WORKSPACE — never $AGENT_HOME (operator's
+# own home). A group-writable setgid (2775) operator $HOME triggers sshd StrictModes
+# pubkey rejection → SSH lockout risk on a dev box.
 if $DRY_RUN; then
     would "create ${AGENT_WORKSPACE} owned by ${AGENT_USER} (mode 2775)"
 else
     mkdir -p "$AGENT_WORKSPACE"
-    chown -R "${AGENT_USER}:${AGENT_USER}" "$AGENT_HOME"
-    chmod 2775 "$AGENT_HOME" "$AGENT_WORKSPACE"
+    if $SINGLE_USER; then
+        chown "${AGENT_USER}:${AGENT_USER}" "$AGENT_WORKSPACE"
+        chmod 2775 "$AGENT_WORKSPACE"
+    else
+        chown -R "${AGENT_USER}:${AGENT_USER}" "$AGENT_HOME"
+        chmod 2775 "$AGENT_HOME" "$AGENT_WORKSPACE"
+    fi
     info "Agent workspace ready: ${AGENT_WORKSPACE}"
 fi
 
@@ -468,6 +481,29 @@ _clone_repo "$AGENT_GTD_REMOTE_URL" "${SERVICE_HOME}/agent_gtd"       "$SERVICE_
 # ===========================================================================
 echo ""
 echo "--- Step 3: Environment file ---"
+
+# AC-2: In single-user mode, ensure the XDG-style parent directory exists before
+# writing SERVICE_ENV. Two-user mode's $SERVICE_HOME already exists (user was just
+# created above), so no extra mkdir is needed for the two-user path.
+if $SINGLE_USER && [[ ! -f "$SERVICE_ENV" ]]; then
+    _senv_dir="$(dirname "$SERVICE_ENV")"
+    if [[ ! -d "$_senv_dir" ]]; then
+        if $DRY_RUN; then
+            would "create ${_senv_dir}/ (mode 0700, owner ${SERVICE_USER})"
+        else
+            install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "$_senv_dir"
+            info "Created env dir: ${_senv_dir}"
+        fi
+    fi
+fi
+
+# AC-3: In single-user mode, warn if a legacy ~/.env with DISPATCH_API_KEY exists —
+# the new XDG path is used from now on; the old file is unrelated (do not auto-migrate).
+if $SINGLE_USER && [[ ! -f "$SERVICE_ENV" ]] && [[ -f "${SERVICE_HOME}/.env" ]]; then
+    if grep -q '^DISPATCH_API_KEY=' "${SERVICE_HOME}/.env" 2>/dev/null; then
+        warn "Found legacy ${SERVICE_HOME}/.env with DISPATCH_API_KEY — single-user mode now uses ${SERVICE_ENV}. Either move it manually (mv ${SERVICE_HOME}/.env ${SERVICE_ENV}) and re-run, or ignore this warning if the existing ~/.env is unrelated."
+    fi
+fi
 
 if [[ -f "$SERVICE_ENV" ]]; then
     skip "${SERVICE_ENV} already exists — already configured"
@@ -597,8 +633,17 @@ if ! $SINGLE_USER; then
     _ensure_uv "$AGENT_USER" "$AGENT_HOME"
 fi
 
+# AC-4: Resolve the real uv binary path for SERVICE_USER (may be brew/apt uv at
+# /usr/local/bin/uv rather than the user-local ~/.local/bin/uv). This path is
+# substituted into the systemd unit's ExecStart= via the {{UV_BIN}} placeholder.
+# Fall back to the user-local path when uv is not yet installed (e.g. --dry-run).
+UV_BIN="$(sudo -u "$SERVICE_USER" -H bash -lc 'command -v uv' 2>/dev/null || true)"
+if [[ -z "$UV_BIN" ]]; then
+    UV_BIN="${SERVICE_HOME}/.local/bin/uv"
+fi
+
 # uv sync the service repo
-SERVICE_UV="${SERVICE_HOME}/.local/bin/uv"
+SERVICE_UV="${UV_BIN}"
 if $DRY_RUN; then
     would "run 'uv sync' in ${SERVICE_REPO} as ${SERVICE_USER}"
 else

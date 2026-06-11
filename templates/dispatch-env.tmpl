@@ -1,5 +1,5 @@
 # dispatch-env.tmpl — environment file template for the dispatch service.
-# Copy to /home/dispatch-svc/.env and fill in real values.
+# Two-user: copy to /home/dispatch-svc/.env. Single-user: copy to ~/.config/agent-gtd-dispatch/env. Fill in real values.
 # All lines beginning with # are comments.
 
 # =============================================================================
@@ -16,7 +16,11 @@ DISPATCH_API_KEY=
 AGENT_GTD_URL=https://r7-research:8443
 AGENT_GTD_API_KEY=agtd_...
 
-# Anthropic API key (passed to Claude Code subprocess).
+# Anthropic API key — used ONLY by the in-process rollout planner (POST /plan).
+# NOT forwarded to the dispatched Claude Code subprocess: engines.py allowlists only
+# CLAUDE_CODE_OAUTH_TOKEN for the claude engine, so this key never reaches the agent
+# process. Forwarding it would flip billing off the Max/OAuth subscription onto
+# pay-per-token API (see kb-01512).
 ANTHROPIC_API_KEY=sk-ant-...
 
 # =============================================================================
@@ -57,7 +61,7 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # Root URL, no /v1 suffix (e.g. http://192.168.1.52:11434).
 # OLLAMA_BASE_URL=
 # OLLAMA_API_KEY=ollama
-# OLLAMA_DEFAULT_MODEL=qwen3:35b
+# OLLAMA_DEFAULT_MODEL=qwen3.6:35b
 
 # =============================================================================
 # Authentication extras (must survive sudo boundary — listed in sudoers env_keep)

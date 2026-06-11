@@ -249,7 +249,7 @@ has two-user artifacts, the dry run exits non-zero (same as a real run would).
 │                                                         │
 │  alice (service + agent — same account)                 │
 │    /home/alice/agent-gtd-dispatch/       ← working      │
-│    /home/alice/.env                      ← secrets      │
+│    /home/alice/.config/agent-gtd-dispatch/env ← secrets │
 │    /home/alice/workspace/{run_id}/       ← agent work   │
 │    systemd: dispatch-api.service         ← FastAPI      │
 │                                                         │
@@ -279,7 +279,9 @@ All variables documented in `templates/dispatch-env.tmpl`. Key variables:
 | `KB_ANTHROPIC_API_KEY` | – | Anthropic key for the KB MCP servers' own LLM calls. Read by installer Step 4.6 and injected per-server as `ANTHROPIC_API_KEY` — deliberately NOT named `ANTHROPIC_API_KEY` in `.env`, so it never reaches the agent's process env (which would flip Claude Code billing off the Max subscription) |
 
 The env file is installed at `/home/dispatch-svc/.env` with mode `0600`,
-owned by `dispatch-svc`. Never commit it to git.
+owned by `dispatch-svc`. In single-user mode it is installed at
+`${HOME}/.config/agent-gtd-dispatch/env` instead (mode `0700` on the directory,
+`0600` on the file). Never commit it to git.
 
 ---
 
@@ -576,7 +578,7 @@ rm -rf ~/.git-template
 uv tool uninstall pre-commit
 
 # Env file, repos, workspace (Steps 3 / 2 / 1)
-rm ~/.env
+rm -rf ~/.config/agent-gtd-dispatch
 rm -rf ~/agent-gtd-dispatch ~/agent_gtd ~/workspace
 ```
 
@@ -856,7 +858,7 @@ may run as `dispatch` — no `ALL=(ALL)` escalation.
 │                                                         │
 │  alice (service + agent — same account)                 │
 │    /home/alice/agent-gtd-dispatch/          ← working   │
-│    /home/alice/.env                         ← secrets   │
+│    /home/alice/.config/agent-gtd-dispatch/env ← secrets │
 │    /home/alice/workspace/{run_id}/          ← agent work│
 │    systemd: dispatch-api.service            ← FastAPI   │
 │                                                         │
