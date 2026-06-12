@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.14.0 (2026-06-12)
+
+### Features
+
+- **6eeb9550**: Bedrock provider option for the rollout planner
+  ([`7cd72c6`](https://github.com/repos/agent-gtd-dispatch/commit/7cd72c66c3ee898a0da19db068ce666cfd899780))
+
+
 ## v1.13.0 (2026-06-12)
 
 ### Bug Fixes
