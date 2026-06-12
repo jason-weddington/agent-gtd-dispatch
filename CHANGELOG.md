@@ -2,6 +2,53 @@
 
 <!-- version list -->
 
+## v1.13.0 (2026-06-12)
+
+### Bug Fixes
+
+- Allowlist /usr/bin/mkdir in dispatch-svc sudoers
+  ([`8dc85e0`](https://github.com/repos/agent-gtd-dispatch/commit/8dc85e0954384ce14862539f80be09ba0868ff16))
+
+- **b4268031**: Harden single-user mode — scope home-dir mutations, XDG env path
+  ([`7f806c9`](https://github.com/repos/agent-gtd-dispatch/commit/7f806c95fe58e5318c926ba1a91822dc7f3cf473))
+
+### Chores
+
+- Drop ubuntu-pi-01 from dispatch host rotation
+  ([`61e3edf`](https://github.com/repos/agent-gtd-dispatch/commit/61e3edf5bd41db0c994badd500c657e3b2690db7))
+
+### Documentation
+
+- Setup-audit fixes — verified against current code (workflow wf_8865dd55)
+  ([`579ccd9`](https://github.com/repos/agent-gtd-dispatch/commit/579ccd98b35667b866233772abd5352aca291e3f))
+
+- **bf37cec6**: Authentication + key pairing end-to-end
+  ([`9af8355`](https://github.com/repos/agent-gtd-dispatch/commit/9af8355ae4a99fb97295f47c8c9f08b1ecc51f2b))
+
+### Features
+
+- **315819e4**: Workspace dispatch — multi-repo clone, service-side branch creation
+  ([`bf1d298`](https://github.com/repos/agent-gtd-dispatch/commit/bf1d29832aa4d19aba69950d2961a73512285ee0))
+
+- **8aa67eae**: Service-side push verification, multi-repo aware
+  ([`c87eca8`](https://github.com/repos/agent-gtd-dispatch/commit/c87eca8692c84038309c5b0d275f2c373d95f93e))
+
+- **ccc7aa17**: Single-user mode for setup-dispatch-host.sh via DISPATCH_SINGLE_USER=1
+  ([`2ae294e`](https://github.com/repos/agent-gtd-dispatch/commit/2ae294e0fead24bc5d32ebd7018ace83e06c2752))
+
+- **d31388bf**: Provision pre-commit template directory for the agent user
+  ([`67781bb`](https://github.com/repos/agent-gtd-dispatch/commit/67781bb1a9ad36f023bf76f9c041e4375f657f79))
+
+- **d9c20967**: Mint DISPATCH_API_KEY in setup-dispatch-host.sh when absent
+  ([`c52e807`](https://github.com/repos/agent-gtd-dispatch/commit/c52e807c71bf904d00ac579e860ba8c5caa86973))
+
+- **dc673fb4**: Multi-repo workspace prep for manage-mode runs
+  ([`029d7fe`](https://github.com/repos/agent-gtd-dispatch/commit/029d7fe834aeb2dbd6bec96503f0c032b7b24bb5))
+
+- **f9212037**: Workspace-aware manage prompt with per-repo merge + halt semantics
+  ([`da235ea`](https://github.com/repos/agent-gtd-dispatch/commit/da235ea0c28ae2793a648cca17794979d9423a02))
+
+
 ## v1.12.0 (2026-05-31)
 
 ### Features
