@@ -360,6 +360,225 @@ class TestExtractEdges:
         assert edges == []
 
 
+class TestProviderSelection:
+    """Tests for DISPATCH_PLANNER_PROVIDER env-gating.
+
+    All bedrock-path tests patch `agent_gtd_dispatch.rollout_planner.anthropic`
+    so that AsyncAnthropicBedrock is a MagicMock — no live AWS calls are made.
+    """
+
+    async def test_provider_unset_uses_async_anthropic(self, tmp_path) -> None:
+        items = [
+            {"id": "id1", "title": "A", "description": "", "blockers": []},
+        ]
+        mock_response = _make_tool_response([])
+        mock_gtd = _make_gtd_client(items)
+        mock_anthropic = _make_anthropic_module(mock_response)
+
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "sk-ant-test",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+        }
+        # DISPATCH_PLANNER_PROVIDER intentionally absent
+        with patch.dict(os.environ, env, clear=False):
+            from agent_gtd_dispatch import config as cfg
+
+            cfg.load()
+            with (
+                patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+                patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
+            ):
+                from agent_gtd_dispatch.rollout_planner import plan_rollout
+
+                await plan_rollout(["id1"])
+
+        mock_anthropic.AsyncAnthropic.assert_called_once()
+        mock_anthropic.AsyncAnthropicBedrock.assert_not_called()
+
+    async def test_provider_anthropic_explicit_uses_async_anthropic(
+        self, tmp_path
+    ) -> None:
+        items = [
+            {"id": "id1", "title": "A", "description": "", "blockers": []},
+        ]
+        mock_response = _make_tool_response([])
+        mock_gtd = _make_gtd_client(items)
+        mock_anthropic = _make_anthropic_module(mock_response)
+
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "sk-ant-test",
+            "DISPATCH_PLANNER_PROVIDER": "anthropic",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            from agent_gtd_dispatch import config as cfg
+
+            cfg.load()
+            with (
+                patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+                patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
+            ):
+                from agent_gtd_dispatch.rollout_planner import plan_rollout
+
+                await plan_rollout(["id1"])
+
+        mock_anthropic.AsyncAnthropic.assert_called_once()
+        mock_anthropic.AsyncAnthropicBedrock.assert_not_called()
+
+    async def test_provider_bedrock_uses_async_anthropic_bedrock(
+        self, tmp_path
+    ) -> None:
+        # No live AWS calls — anthropic module is fully mocked.
+        items = [
+            {"id": "id1", "title": "A", "description": "", "blockers": []},
+            {"id": "id2", "title": "B", "description": "", "blockers": []},
+        ]
+        mock_response = _make_tool_response(
+            [{"from_item_id": "id1", "to_item_id": "id2"}]
+        )
+        mock_gtd = _make_gtd_client(items)
+        # Build bedrock-capable mock
+        mock_api_client = MagicMock()
+        mock_api_client.messages.create = AsyncMock(return_value=mock_response)
+        mock_anthropic = MagicMock()
+        mock_anthropic.AsyncAnthropicBedrock.return_value = mock_api_client
+
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "k",
+            "DISPATCH_PLANNER_PROVIDER": "bedrock",
+            "DISPATCH_PLANNER_BEDROCK_MODEL": "global.anthropic.claude-sonnet-4-6",
+            "AWS_REGION": "us-east-1",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+        }
+        # ANTHROPIC_API_KEY deliberately absent to prove bedrock path doesn't need it
+        with patch.dict(os.environ, env, clear=False):
+            # Remove ANTHROPIC_API_KEY from the patched env if it leaked from autouse
+            import os as _os
+
+            from agent_gtd_dispatch import config as cfg
+
+            _os.environ.pop("ANTHROPIC_API_KEY", None)
+            cfg.load()
+            with (
+                patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+                patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
+            ):
+                from agent_gtd_dispatch.rollout_planner import plan_rollout
+
+                result = await plan_rollout(["id1", "id2"])
+
+        # AsyncAnthropicBedrock called with aws_region kwarg
+        mock_anthropic.AsyncAnthropicBedrock.assert_called_once_with(
+            aws_region="us-east-1"
+        )
+        mock_anthropic.AsyncAnthropic.assert_not_called()
+
+        # messages.create called with the bedrock model id
+        call_kwargs = mock_api_client.messages.create.call_args.kwargs
+        assert call_kwargs["model"] == "global.anthropic.claude-sonnet-4-6"
+
+        # planner_model reflects the bedrock model id
+        assert result.planner_model == "global.anthropic.claude-sonnet-4-6"
+
+    async def test_provider_bedrock_shared_response_handling(self, tmp_path) -> None:
+        """Edge extraction and DAG acyclicity checks work on the bedrock path."""
+        items = [
+            {"id": "id1", "title": "A", "description": "", "blockers": []},
+            {"id": "id2", "title": "B", "description": "", "blockers": []},
+            {"id": "id3", "title": "C", "description": "", "blockers": []},
+        ]
+        # A linear chain: id1 -> id2 -> id3
+        mock_response = _make_tool_response(
+            [
+                {"from_item_id": "id1", "to_item_id": "id2"},
+                {"from_item_id": "id2", "to_item_id": "id3"},
+            ]
+        )
+        mock_gtd = _make_gtd_client(items)
+        mock_api_client = MagicMock()
+        mock_api_client.messages.create = AsyncMock(return_value=mock_response)
+        mock_anthropic = MagicMock()
+        mock_anthropic.AsyncAnthropicBedrock.return_value = mock_api_client
+
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "k",
+            "DISPATCH_PLANNER_PROVIDER": "bedrock",
+            "DISPATCH_PLANNER_BEDROCK_MODEL": "global.anthropic.claude-sonnet-4-6",
+            "AWS_REGION": "eu-west-1",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            import os as _os
+
+            _os.environ.pop("ANTHROPIC_API_KEY", None)
+            from agent_gtd_dispatch import config as cfg
+
+            cfg.load()
+            with (
+                patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+                patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
+            ):
+                from agent_gtd_dispatch.rollout_planner import plan_rollout
+
+                result = await plan_rollout(["id1", "id2", "id3"])
+
+        assert len(result.edges) == 2
+        assert result.edges[0].from_item_id == "id1"
+        assert result.edges[0].to_item_id == "id2"
+        assert result.edges[1].from_item_id == "id2"
+        assert result.edges[1].to_item_id == "id3"
+        assert result.planner_model == "global.anthropic.claude-sonnet-4-6"
+
+
+class TestProviderConfig:
+    """Tests for config.load() with DISPATCH_PLANNER_PROVIDER env var."""
+
+    def test_invalid_provider_raises_runtime_error(self, tmp_path) -> None:
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "sk-ant-test",
+            "DISPATCH_PLANNER_PROVIDER": "claude",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            from agent_gtd_dispatch import config as cfg
+
+            with pytest.raises(RuntimeError, match="must be 'anthropic' or 'bedrock'"):
+                cfg.load()
+
+    def test_bedrock_provider_load_succeeds_without_anthropic_api_key(
+        self, tmp_path
+    ) -> None:
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://localhost:9999",
+            "AGENT_GTD_API_KEY": "k",
+            "DISPATCH_PLANNER_PROVIDER": "bedrock",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            import os as _os
+
+            _os.environ.pop("ANTHROPIC_API_KEY", None)
+            from agent_gtd_dispatch import config as cfg
+
+            # Should not raise even though ANTHROPIC_API_KEY is absent
+            cfg.load()
+            assert cfg.PLANNER_PROVIDER == "bedrock"
+
+
 class TestAssertAcyclic:
     def _make_edges(self, pairs: list[tuple[str, str]]):
         from agent_gtd_dispatch.models import DagEdge

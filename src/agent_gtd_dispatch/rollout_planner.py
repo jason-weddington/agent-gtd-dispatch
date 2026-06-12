@@ -53,6 +53,17 @@ PRODUCE_DAG_TOOL = cast(
 )
 
 
+def _active_planner_model() -> str:
+    """Return the model id that the planner will use for the current provider.
+
+    Returns config.PLANNER_MODEL for the 'anthropic' provider and
+    config.PLANNER_BEDROCK_MODEL for the 'bedrock' provider.
+    """
+    if config.PLANNER_PROVIDER == "bedrock":
+        return config.PLANNER_BEDROCK_MODEL
+    return config.PLANNER_MODEL
+
+
 async def plan_rollout(item_ids: list[str]) -> RolloutPlan:
     """Fetch items concurrently and call Claude to produce a dependency DAG.
 
@@ -68,9 +79,16 @@ async def plan_rollout(item_ids: list[str]) -> RolloutPlan:
     """
     items = await asyncio.gather(*[gtd_client.get_item(iid) for iid in item_ids])
     context = _build_context(list(items))
-    client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+    active_model = _active_planner_model()
+    client: anthropic.AsyncAnthropicBedrock | anthropic.AsyncAnthropic
+    if config.PLANNER_PROVIDER == "bedrock":
+        # Empty string must become None so the SDK falls back to the AWS_REGION
+        # env var / us-east-1 default instead of a bogus empty region.
+        client = anthropic.AsyncAnthropicBedrock(aws_region=config.AWS_REGION or None)
+    else:
+        client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
     response = await client.messages.create(
-        model=config.PLANNER_MODEL,
+        model=active_model,
         max_tokens=1024,
         tools=[PRODUCE_DAG_TOOL],
         tool_choice={"type": "tool", "name": "produce_dag"},
@@ -80,9 +98,7 @@ async def plan_rollout(item_ids: list[str]) -> RolloutPlan:
     tool_input = cast("dict[str, Any]", tool_block.input)
     edges = _extract_edges(tool_input, set(item_ids))
     _assert_acyclic(list(item_ids), edges)
-    return RolloutPlan(
-        nodes=list(item_ids), edges=edges, planner_model=config.PLANNER_MODEL
-    )
+    return RolloutPlan(nodes=list(item_ids), edges=edges, planner_model=active_model)
 
 
 def _assert_acyclic(nodes: list[str], edges: list[DagEdge]) -> None:

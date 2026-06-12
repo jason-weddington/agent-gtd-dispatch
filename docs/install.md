@@ -385,6 +385,9 @@ All variables documented in `templates/dispatch-env.tmpl`. Key variables:
 | `DISPATCH_TIMEOUT_SECONDS` | – | Agent subprocess wall-clock timeout in seconds (default: 1800) |
 | `OLLAMA_BASE_URL` | – | Root URL of an Ollama instance for `claude-code-ollama` engine dispatches |
 | `OLLAMA_DEFAULT_MODEL` | – | Default Ollama model (default: `qwen3.6:35b`) |
+| `DISPATCH_PLANNER_PROVIDER` | – | Planner LLM provider: `anthropic` (default) or `bedrock`. See [Bedrock planner provider](#bedrock-planner-provider-corporateport-environments) below. |
+| `DISPATCH_PLANNER_BEDROCK_MODEL` | – | Bedrock model ID (default: `global.anthropic.claude-sonnet-4-6`). Only used when `DISPATCH_PLANNER_PROVIDER=bedrock`. |
+| `AWS_REGION` | – | AWS region for Bedrock API calls (default: `us-east-1` per SDK fallback). Only used when `DISPATCH_PLANNER_PROVIDER=bedrock`. |
 | `TEAM_KB_DATABASE_URL` | – | Team KB Postgres connection string. Read by installer Step 4.6 (not the service) and injected into the `team-kb` MCP server's per-server env; if unset, `team-kb` registration is skipped |
 | `KB_ANTHROPIC_API_KEY` | – | Anthropic key for the KB MCP servers' own LLM calls. Read by installer Step 4.6 and injected per-server as `ANTHROPIC_API_KEY` — deliberately NOT named `ANTHROPIC_API_KEY` in `.env`, so it never reaches the agent's process env (which would flip Claude Code billing off the Max subscription) |
 
@@ -392,6 +395,29 @@ The env file is installed at `/home/dispatch-svc/.env` with mode `0600`,
 owned by `dispatch-svc`. In single-user mode it is installed at
 `${HOME}/.config/agent-gtd-dispatch/env` instead (mode `0700` on the directory,
 `0600` on the file). Never commit it to git.
+
+### Bedrock planner provider (corporate/port environments)
+
+In environments where the Anthropic API is unreachable through corporate egress
+(e.g. internal ports where Claude access is routed through Amazon Bedrock),
+set `DISPATCH_PLANNER_PROVIDER=bedrock`. This affects the in-process rollout
+planner (`POST /plan`) only — Claude Code agent subprocess execution is
+unchanged.
+
+**Credential resolution:** AWS credentials are resolved from the standard AWS
+credential chain (`AWS_PROFILE`, environment variables, instance metadata, etc.).
+Set `AWS_PROFILE` in the service `.env` to select a named profile.
+
+**Region gotcha:** the anthropic SDK reads `AWS_REGION` for the Bedrock region;
+if unset it defaults to `us-east-1`. `AWS_PROFILE` alone does **NOT** supply the
+region — the SDK does not read `~/.aws/config` for the region. Set `AWS_REGION`
+explicitly in the service `.env`.
+
+**Model ID:** the default `global.anthropic.claude-sonnet-4-6` uses the Bedrock
+global cross-region inference endpoint. Use the `us.` regional CRIS variant
+(e.g. `us.anthropic.claude-sonnet-4-6`) if your environment requires data
+residency guarantees (+10% pricing applies). Do NOT reuse the Anthropic
+first-party model id (`claude-sonnet-4-6`) on the Bedrock client — it will error.
 
 ---
 

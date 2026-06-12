@@ -64,6 +64,29 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # OLLAMA_DEFAULT_MODEL=qwen3.6:35b
 
 # =============================================================================
+# Bedrock provider (corporate/port environments only)
+# =============================================================================
+# Use these when the Anthropic API is unreachable (e.g. corporate egress policy
+# routes Claude access through Amazon Bedrock instead). The planner only uses
+# these settings; build/manage agent subprocesses are unaffected.
+#
+# Provider gate: set to 'bedrock' to enable. Default 'anthropic' keeps the
+# existing Anthropic API path byte-for-byte unchanged.
+# DISPATCH_PLANNER_PROVIDER=anthropic
+#
+# Bedrock model ID. The global cross-region inference endpoint is the default;
+# use the us. regional CRIS variant (e.g. us.anthropic.claude-sonnet-4-6) if
+# your environment requires data-residency guarantees (+10% pricing applies).
+# DISPATCH_PLANNER_BEDROCK_MODEL=global.anthropic.claude-sonnet-4-6
+#
+# AWS region for Bedrock API calls. IMPORTANT: the anthropic SDK reads
+# AWS_REGION; if unset it defaults to us-east-1. AWS_PROFILE alone does NOT
+# supply the region — the SDK does not read ~/.aws/config for the region.
+# Credentials are resolved from the default AWS credential chain (AWS_PROFILE,
+# env vars, instance metadata, etc.).
+# AWS_REGION=us-east-1
+
+# =============================================================================
 # Authentication extras (must survive sudo boundary — listed in sudoers env_keep)
 # =============================================================================
 

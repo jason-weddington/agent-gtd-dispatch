@@ -868,6 +868,7 @@ class TestPlan:
     @patch("agent_gtd_dispatch.main.rollout_planner")
     def test_plan_rollout_raises_returns_502(self, mock_planner, client, auth_headers):
         mock_planner.plan_rollout = AsyncMock(side_effect=Exception("GTD API down"))
+        mock_planner._active_planner_model.return_value = "claude-sonnet-4-6"
         resp = client.post("/plan", json={"item_ids": ["id1"]}, headers=auth_headers)
         assert resp.status_code == 502
         detail = resp.json()["detail"]

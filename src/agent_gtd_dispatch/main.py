@@ -979,7 +979,7 @@ async def plan_rollout_endpoint(
             status_code=502,
             detail={
                 "detail": str(exc),
-                "planner_model": config.PLANNER_MODEL,
+                "planner_model": rollout_planner._active_planner_model(),
                 "item_count": len(body.item_ids),
             },
         ) from exc

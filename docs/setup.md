@@ -99,6 +99,9 @@ the mode-mismatch guards.
 | Variable | Default | Description |
 |---|---|---|
 | `DISPATCH_PLANNER_MODEL` | `claude-sonnet-4-6` | Anthropic model used by the rollout planner (`POST /plan`) |
+| `DISPATCH_PLANNER_PROVIDER` | `anthropic` | Planner LLM provider: `anthropic` (default, uses Anthropic API) or `bedrock` (routes through Amazon Bedrock for corporate/port environments where the Anthropic API is unreachable) |
+| `DISPATCH_PLANNER_BEDROCK_MODEL` | `global.anthropic.claude-sonnet-4-6` | Bedrock model ID (only used when `DISPATCH_PLANNER_PROVIDER=bedrock`). Use `us.anthropic.claude-sonnet-4-6` for the regional CRIS variant (+10% cost). Do NOT use the Anthropic model id format here. |
+| `AWS_REGION` | `""` (SDK falls back to `us-east-1`) | AWS region for Bedrock API calls. **Gotcha:** the anthropic SDK reads only `AWS_REGION` for the region — `AWS_PROFILE` alone does NOT supply it (the SDK does not read `~/.aws/config` for the region). Set this explicitly. |
 
 ### Optional — Ollama Backend
 

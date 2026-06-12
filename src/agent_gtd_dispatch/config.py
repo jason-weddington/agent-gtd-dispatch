@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import urllib.parse
 from pathlib import Path
+from typing import Literal
 
 
 def _require(name: str) -> str:
@@ -45,6 +46,9 @@ WATCHDOG_INTERVAL_SECONDS: int = 180  # scan every 3 min
 # Planner (wave DAG)
 ANTHROPIC_API_KEY: str = ""
 PLANNER_MODEL: str = "claude-sonnet-4-6"
+PLANNER_PROVIDER: Literal["anthropic", "bedrock"] = "anthropic"
+PLANNER_BEDROCK_MODEL: str = "global.anthropic.claude-sonnet-4-6"
+AWS_REGION: str = ""
 
 # Ollama local inference backend.
 # OLLAMA_BASE_URL is the Ollama root URL, e.g. "http://10.0.0.5:11434".
@@ -65,11 +69,25 @@ def load() -> None:
     global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS
     global AGENT_SUBPROCESS_USER
     global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
+    global PLANNER_PROVIDER, PLANNER_BEDROCK_MODEL, AWS_REGION
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
     AGENT_GTD_API_KEY = _require("AGENT_GTD_API_KEY")
-    ANTHROPIC_API_KEY = _require("ANTHROPIC_API_KEY")
+
+    _provider_raw = os.environ.get("DISPATCH_PLANNER_PROVIDER", "anthropic")
+    if _provider_raw not in {"anthropic", "bedrock"}:
+        msg = (
+            f"DISPATCH_PLANNER_PROVIDER={_provider_raw!r}: "
+            f"must be 'anthropic' or 'bedrock'"
+        )
+        raise RuntimeError(msg)
+    PLANNER_PROVIDER = _provider_raw  # type: ignore[assignment]
+
+    if PLANNER_PROVIDER == "anthropic":
+        ANTHROPIC_API_KEY = _require("ANTHROPIC_API_KEY")
+    else:
+        ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
     AGENT_SUBPROCESS_USER = os.environ.get("DISPATCH_AGENT_SUBPROCESS_USER", "")
     _workspace_env = os.environ.get("DISPATCH_WORKSPACE_ROOT", "")
@@ -85,6 +103,10 @@ def load() -> None:
         os.environ.get("DISPATCH_MANAGE_TIMEOUT_SECONDS", "14400")
     )
     PLANNER_MODEL = os.environ.get("DISPATCH_PLANNER_MODEL", "claude-sonnet-4-6")
+    PLANNER_BEDROCK_MODEL = os.environ.get(
+        "DISPATCH_PLANNER_BEDROCK_MODEL", "global.anthropic.claude-sonnet-4-6"
+    )
+    AWS_REGION = os.environ.get("AWS_REGION", "")
     MAX_CONCURRENT_RUNS = int(os.environ.get("DISPATCH_MAX_CONCURRENT_RUNS", "32"))
     OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "")
     if OLLAMA_BASE_URL:
