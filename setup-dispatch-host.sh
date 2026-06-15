@@ -413,7 +413,7 @@ else
             || warn "ssh-keyscan ${gh} failed — known_hosts may be incomplete"
     done
     if ! ls "${AGENT_HOME}/.ssh"/id_* &>/dev/null; then
-        sudo -u "$AGENT_USER" ssh-keygen -t ed25519 -N "" \
+        runuser -u "$AGENT_USER" -- ssh-keygen -t ed25519 -N "" \
             -f "${AGENT_HOME}/.ssh/id_ed25519" \
             -C "${AGENT_USER}@$(hostname -s)"
         chown "${AGENT_USER}:${AGENT_GROUP}" \
@@ -511,7 +511,7 @@ _clone_repo() {
     elif $DRY_RUN; then
         would "clone ${remote} → ${dest}"
     else
-        sudo -u "$owner" git clone "$remote" "$dest"
+        runuser -u "$owner" -- git clone "$remote" "$dest"
         info "Cloned ${remote} → ${dest}"
     fi
 }
@@ -661,12 +661,12 @@ echo "--- Step 4: Dependencies ---"
 _ensure_uv() {
     local user="$1" user_home="$2"
     local uv_bin="${user_home}/.local/bin/uv"
-    if sudo -u "$user" bash -c "[[ -x '${uv_bin}' ]] || command -v uv &>/dev/null"; then
+    if runuser -u "$user" -- bash -c "[[ -x '${uv_bin}' ]] || command -v uv &>/dev/null"; then
         skip "uv already installed for ${user} — already configured"
     elif $DRY_RUN; then
         would "install uv for ${user} via official installer (curl astral.sh/uv/install.sh)"
     else
-        sudo -u "$user" bash -c 'curl -fsSL https://astral.sh/uv/install.sh | sh'
+        runuser -u "$user" -- bash -c 'curl -fsSL https://astral.sh/uv/install.sh | sh'
         info "Installed uv for ${user}"
     fi
 }
@@ -680,7 +680,7 @@ fi
 # /usr/local/bin/uv rather than the user-local ~/.local/bin/uv). This path is
 # substituted into the systemd unit's ExecStart= via the {{UV_BIN}} placeholder.
 # Fall back to the user-local path when uv is not yet installed (e.g. --dry-run).
-UV_BIN="$(sudo -u "$SERVICE_USER" -H bash -lc 'command -v uv' 2>/dev/null || true)"
+UV_BIN="$(runuser -l "$SERVICE_USER" -c 'command -v uv' 2>/dev/null || true)"
 if [[ -z "$UV_BIN" ]]; then
     UV_BIN="${SERVICE_HOME}/.local/bin/uv"
 fi
@@ -690,7 +690,7 @@ SERVICE_UV="${UV_BIN}"
 if $DRY_RUN; then
     would "run 'uv sync' in ${SERVICE_REPO} as ${SERVICE_USER}"
 else
-    sudo -u "$SERVICE_USER" bash -c "cd '${SERVICE_REPO}' && '${SERVICE_UV}' sync"
+    runuser -u "$SERVICE_USER" -- bash -c "cd '${SERVICE_REPO}' && '${SERVICE_UV}' sync"
     info "uv sync complete in ${SERVICE_REPO}"
 fi
 
@@ -705,7 +705,7 @@ if [[ -f "$CLAUDE_SRC" ]]; then
 elif $DRY_RUN; then
     would "install Claude Code for ${AGENT_USER} via official installer (curl https://claude.ai/install.sh | bash)"
 else
-    sudo -u "$AGENT_USER" bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+    runuser -u "$AGENT_USER" -- bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
     if [[ -f "$CLAUDE_SRC" ]]; then
         info "Installed Claude Code for ${AGENT_USER}: ${CLAUDE_SRC}"
     else
@@ -747,17 +747,17 @@ else
         mcp_name="${entry%%|*}"
         mcp_args="${entry#*|}"
         # Idempotent: remove first (tolerate "not registered"), then add
-        sudo -u "$AGENT_USER" -H bash -lc \
+        runuser -l "$AGENT_USER" -c \
             "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp remove ${mcp_name} --scope user 2>/dev/null || true"
         # word-split mcp_args intentionally — they are space-separated CLI flags
         # shellcheck disable=SC2086
-        sudo -u "$AGENT_USER" -H bash -lc \
+        runuser -l "$AGENT_USER" -c \
             "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp add ${mcp_name} ${mcp_args}"
         info "Registered MCP server '${mcp_name}' for ${AGENT_USER}"
     done
     # Smoke test: verify agent-gtd is listed (name presence only — cold uvx cache
     # makes the "✓ Connected" health check unreliable on first invocation)
-    if sudo -u "$AGENT_USER" -H bash -lc \
+    if runuser -l "$AGENT_USER" -c \
             "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp list" 2>/dev/null \
             | grep -q "^agent-gtd:"; then
         info "Smoke test passed: 'agent-gtd' MCP server registered for ${AGENT_USER}"
@@ -776,23 +776,23 @@ PRECOMMIT_BIN="${AGENT_HOME}/.local/bin/pre-commit"
 GIT_TEMPLATE_DIR="${AGENT_HOME}/.git-template"
 
 # Sub-action A: install pre-commit as a uv tool for AGENT_USER
-if [[ -f "$PRECOMMIT_BIN" ]] && sudo -u "$AGENT_USER" -H pre-commit --version &>/dev/null; then
+if [[ -f "$PRECOMMIT_BIN" ]] && runuser -l "$AGENT_USER" -c 'pre-commit --version' &>/dev/null; then
     skip "pre-commit already installed for ${AGENT_USER} — already configured"
 elif $DRY_RUN; then
     would "install pre-commit as a uv tool for ${AGENT_USER}"
 else
-    sudo -u "$AGENT_USER" -H bash -lc 'uv tool install pre-commit'
+    runuser -l "$AGENT_USER" -c 'uv tool install pre-commit'
     info "Installed pre-commit for ${AGENT_USER}"
 fi
 
 # Sub-action B: set init.templateDir in AGENT_USER's global git config
-current_templatedir="$(sudo -u "$AGENT_USER" -H git config --global --get init.templateDir 2>/dev/null || true)"
+current_templatedir="$(runuser -l "$AGENT_USER" -c 'git config --global --get init.templateDir' 2>/dev/null || true)"
 if [[ "$current_templatedir" == "$GIT_TEMPLATE_DIR" ]]; then
     skip "init.templateDir already set to ${GIT_TEMPLATE_DIR} for ${AGENT_USER} — already configured"
 elif $DRY_RUN; then
     would "set init.templateDir = ${GIT_TEMPLATE_DIR} in ${AGENT_USER} global git config"
 else
-    sudo -u "$AGENT_USER" -H git config --global init.templateDir "${GIT_TEMPLATE_DIR}"
+    runuser -l "$AGENT_USER" -c "git config --global init.templateDir '${GIT_TEMPLATE_DIR}'"
     info "Set init.templateDir = ${GIT_TEMPLATE_DIR} for ${AGENT_USER}"
 fi
 
@@ -800,7 +800,7 @@ fi
 if $DRY_RUN; then
     would "pre-commit init-templatedir -t pre-commit -t commit-msg -t pre-push ${GIT_TEMPLATE_DIR} (as ${AGENT_USER})"
 else
-    sudo -u "$AGENT_USER" -H bash -lc "pre-commit init-templatedir -t pre-commit -t commit-msg -t pre-push ${GIT_TEMPLATE_DIR}"
+    runuser -l "$AGENT_USER" -c "pre-commit init-templatedir -t pre-commit -t commit-msg -t pre-push ${GIT_TEMPLATE_DIR}"
     info "Rendered pre-commit hook shims into ${GIT_TEMPLATE_DIR} for ${AGENT_USER}"
 fi
 
