@@ -216,6 +216,29 @@ sudo --preserve-env=DISPATCH_SINGLE_USER DISPATCH_SINGLE_USER=1 ./setup-dispatch
 - **The default mode remains the two-user split** — single-user is opt-in via
   `DISPATCH_SINGLE_USER=1`.
 
+### Run-as-self (enterprise: inherit your own auth)
+
+Single-user mode has a second, powerful use beyond a personal machine: running as
+**your real, already-authenticated developer identity**. This is often the cleanest
+setup behind a corporate boundary, because the dispatched agent inherits **both**:
+
+- your interactive **Claude Code login** — so you need neither `CLAUDE_CODE_OAUTH_TOKEN`
+  nor `ANTHROPIC_API_KEY` for the agent (the `claude` binary is authenticated out of
+  band by your login or your org's managed distribution); and
+- your **git auth to internal repos** (e.g. GitFarm) — so the agent clones and pushes
+  internal code *as you*, with no separate deploy key or service account.
+
+Pair it with a Bedrock planner (`DISPATCH_PLANNER_PROVIDER=bedrock` + `AWS_REGION`, AWS
+credentials via the standard chain) and the host needs **no Anthropic credentials at
+all** — every LLM call authenticates out of band.
+
+Because the installer then runs as *you*, it is deliberately conservative with your
+home directory: it touches only `$AGENT_WORKSPACE`, never your `$HOME` (a group-writable
+home trips sshd `StrictModes` → SSH lockout), and in single-user mode it does **not**
+chown/chmod or generate keys in your `~/.ssh` — it uses your existing ssh + git auth
+as-is. If a git host the agent must clone from is not yet in your `known_hosts`, seed it
+yourself: `ssh-keyscan <host> >> ~/.ssh/known_hosts`.
+
 ### Mode mismatch protection
 
 The installer refuses to create a mixed state. If you run single-user mode on a host
