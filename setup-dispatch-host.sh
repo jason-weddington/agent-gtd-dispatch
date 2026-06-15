@@ -592,8 +592,12 @@ echo ""
 echo "--- Step 3.5: DISPATCH_API_KEY (service env) ---"
 
 if [[ ! -f "$SERVICE_ENV" ]]; then
-    die "DISPATCH_API_KEY mint: ${SERVICE_ENV} does not exist — Step 3 should have created it"
-fi
+    if $DRY_RUN; then
+        would "mint DISPATCH_API_KEY (python3 secrets.token_urlsafe(32)) and append/replace line in ${SERVICE_ENV} preserving content/owner/0600"
+    else
+        die "DISPATCH_API_KEY mint: ${SERVICE_ENV} does not exist — Step 3 should have created it"
+    fi
+else
 
 _api_key_existing="$(_read_env_var DISPATCH_API_KEY)"
 
@@ -651,6 +655,7 @@ PYEOF
     echo ""
     info "Minted and installed DISPATCH_API_KEY in ${SERVICE_ENV}"
 fi
+fi  # end: if [[ ! -f "$SERVICE_ENV" ]]; else
 
 # ===========================================================================
 # Step 4: Install dependencies (uv sync)
