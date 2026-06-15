@@ -2,6 +2,39 @@
 
 <!-- version list -->
 
+## v1.15.0 (2026-06-15)
+
+### Bug Fixes
+
+- **0f657f97**: --dry-run no longer aborts at Step 3.5 when env file missing
+  ([`2e2c151`](https://github.com/repos/agent-gtd-dispatch/commit/2e2c1515c5253616f5e12f93d2fa7965257462b2))
+
+- **19656dc9**: Replace sudo -u with runuser to work under root-only sudoers
+  ([`a780b6e`](https://github.com/repos/agent-gtd-dispatch/commit/a780b6e224febc2db7e23ad6b4f7c13f78e7d9be))
+
+- **7ed48d77**: Portable mcp-servers.sh defaults + AGENT_GTD env injection
+  ([`67630fb`](https://github.com/repos/agent-gtd-dispatch/commit/67630fb9476a7d56b236f1352e22d56f1d6c35b0))
+
+- **afd91ed2**: Derive real primary group to fix AL2023/RHEL installer
+  ([`52f673a`](https://github.com/repos/agent-gtd-dispatch/commit/52f673ab271d318fe4ea12331369dc67c3865639))
+
+### Documentation
+
+- Document run-as-self single-user topology (inherit developer auth)
+  ([`05c6d38`](https://github.com/repos/agent-gtd-dispatch/commit/05c6d38a9889510663e0217fcae501f4490546bc))
+
+- Genericize ubuntu-vm01 references; document externally-authenticated
+  ([`df96ec5`](https://github.com/repos/agent-gtd-dispatch/commit/df96ec546b1a4e145078c2590dd0dda7040e35ae))
+
+### Features
+
+- Default installer git remotes to public GitHub
+  ([`dd6a412`](https://github.com/repos/agent-gtd-dispatch/commit/dd6a412fdd94def008c592cd8d7e0fb4beb687da))
+
+- Support externally-authenticated Claude Code + portability hardening
+  ([`df96ec5`](https://github.com/repos/agent-gtd-dispatch/commit/df96ec546b1a4e145078c2590dd0dda7040e35ae))
+
+
 ## v1.14.0 (2026-06-12)
 
 ### Features
