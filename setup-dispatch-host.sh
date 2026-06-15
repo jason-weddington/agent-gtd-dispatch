@@ -727,24 +727,44 @@ echo "--- Step 4.6: MCP servers (agent user) ---"
 if ! $DRY_RUN && [[ ! -f "$CLAUDE_SRC" ]]; then
     warn "Claude Code not found at ${CLAUDE_SRC} — skipping MCP server registration (install claude as ${AGENT_USER} first)"
 elif $DRY_RUN; then
-    would "read TEAM_KB_DATABASE_URL and KB_ANTHROPIC_API_KEY from ${SERVICE_ENV} (for KB MCP servers)"
+    would "read AGENT_GTD_URL, AGENT_GTD_API_KEY, AGENT_GTD_MCP_SRC, KB_DATABASE_URL, TEAM_KB_DATABASE_URL, KB_ANTHROPIC_API_KEY from ${SERVICE_ENV}"
     would "source ${TMPL_DIR}/mcp-servers.sh and register each MCP server for ${AGENT_USER} via claude mcp add --scope user"
 else
     MCP_CONF="${TMPL_DIR}/mcp-servers.sh"
     if [[ ! -f "$MCP_CONF" ]]; then
         die "MCP server config not found at ${MCP_CONF} — cannot register MCP servers"
     fi
-    # Secrets for the KB MCP servers are kept out of git. Pull them from the installed
-    # service .env and export so mcp-servers.sh can inject them per-server:
-    #   TEAM_KB_DATABASE_URL  → team-kb's DB connection string (skipped if unset)
+    # Pull secrets and config from the installed service .env and export so
+    # mcp-servers.sh can inject them per-server.  Variables exported here:
+    #
+    #   AGENT_GTD_URL         → GTD app base URL for the agent-gtd MCP server.
+    #   AGENT_GTD_API_KEY     → API key for the agent-gtd MCP server.
+    #     LOAD-BEARING: agent-gtd MCP must connect for Step 4 verification to pass.
+    #     If either var is unset, the agent can't comment back and dispatch will appear
+    #     to succeed while the step-4 verification stays stuck.
+    #
+    #   AGENT_GTD_MCP_SRC     → optional override for the agent-gtd package source
+    #     (e.g. git+ssh://git@<host>/path/agent_gtd for a homelab/private mirror).
+    #     Defaults to public GitHub when unset — no entry needed for standard installs.
+    #
+    #   KB_DATABASE_URL       → personal-kb connection string (skipped if unset).
+    #   TEAM_KB_DATABASE_URL  → team-kb DB connection string (skipped if unset).
     #   KB_ANTHROPIC_API_KEY  → ANTHROPIC_API_KEY for both KB servers' LLM calls.
     #     Deliberately NOT named ANTHROPIC_API_KEY: that name would reach Claude Code's
     #     launch env and flip billing off the Max subscription (engines.py / kb-01512).
     if [[ -f "$SERVICE_ENV" ]]; then
-        TEAM_KB_DATABASE_URL="$(_read_env_var TEAM_KB_DATABASE_URL)"; export TEAM_KB_DATABASE_URL
-        KB_ANTHROPIC_API_KEY="$(_read_env_var KB_ANTHROPIC_API_KEY)"; export KB_ANTHROPIC_API_KEY
+        AGENT_GTD_URL="$(_read_env_var AGENT_GTD_URL)";                 export AGENT_GTD_URL
+        AGENT_GTD_API_KEY="$(_read_env_var AGENT_GTD_API_KEY)";         export AGENT_GTD_API_KEY
+        AGENT_GTD_MCP_SRC="$(_read_env_var AGENT_GTD_MCP_SRC)";         export AGENT_GTD_MCP_SRC
+        KB_DATABASE_URL="$(_read_env_var KB_DATABASE_URL)";             export KB_DATABASE_URL
+        TEAM_KB_DATABASE_URL="$(_read_env_var TEAM_KB_DATABASE_URL)";   export TEAM_KB_DATABASE_URL
+        KB_ANTHROPIC_API_KEY="$(_read_env_var KB_ANTHROPIC_API_KEY)";   export KB_ANTHROPIC_API_KEY
     fi
+    # agent-gtd warnings are elevated (LOAD-BEARING for step-4 verification)
+    [[ -z "${AGENT_GTD_URL:-}" ]]     && warn "AGENT_GTD_URL not set in ${SERVICE_ENV} — agent-gtd MCP will launch without a URL; Step 4 verification will fail"
+    [[ -z "${AGENT_GTD_API_KEY:-}" ]] && warn "AGENT_GTD_API_KEY not set in ${SERVICE_ENV} — agent-gtd MCP will launch without credentials; Step 4 verification will fail"
     [[ -z "${TEAM_KB_DATABASE_URL:-}" ]] && warn "TEAM_KB_DATABASE_URL not set in ${SERVICE_ENV} — team-kb MCP server will be skipped"
+    [[ -z "${KB_DATABASE_URL:-}" ]]      && warn "KB_DATABASE_URL not set in ${SERVICE_ENV} — personal-kb MCP server will be skipped"
     [[ -z "${KB_ANTHROPIC_API_KEY:-}" ]] && warn "KB_ANTHROPIC_API_KEY not set in ${SERVICE_ENV} — KB servers will register without an Anthropic key (LLM features degraded)"
     # shellcheck source=templates/mcp-servers.sh
     source "$MCP_CONF"
