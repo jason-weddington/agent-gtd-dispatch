@@ -34,9 +34,8 @@ This guide covers bootstrapping a fresh Ubuntu host and migrating an existing si
 > mode-mismatch guard on every later single-user attempt until you do a full rollback.
 
 ```bash
-# 1. Clone the repo
-#    (substitute your own git remote for <your-git-host>)
-git clone git@<your-git-host>:repos/agent-gtd-dispatch
+# 1. Clone the repo (public GitHub; substitute your fork if you have one)
+git clone https://github.com/jason-weddington/agent-gtd-dispatch
 cd agent-gtd-dispatch
 
 # 2. Prepare an env file (copy the template and fill in real values)
@@ -55,14 +54,15 @@ The installer is idempotent — re-running it on a configured host prints
 
 ### Adapting to your own git host
 
-The clone URLs in this guide default to the maintainer's homelab git server. The
-installer reads two environment-variable overrides (also listed in `--help`) that
-point Step 2's clones at your own git host:
+Step 2's clones **default to public GitHub** (anonymous https) — no credentials or
+overrides needed to install the maintainer's published code. The installer reads two
+environment-variable overrides (also listed in `--help`) to point the clones at a fork
+or a self-hosted origin instead:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DISPATCH_REPO_URL` | `git@<homelab-git-host>:repos/agent-gtd-dispatch` | Remote for the dispatch service repo |
-| `AGENT_GTD_REPO_URL` | `git@<homelab-git-host>:repos/agent_gtd` | Remote for the agent_gtd repo |
+| `DISPATCH_REPO_URL` | `https://github.com/jason-weddington/agent-gtd-dispatch` | Remote for the dispatch service repo |
+| `AGENT_GTD_REPO_URL` | `https://github.com/jason-weddington/agent-gtd` | Remote for the agent_gtd repo |
 
 Pass them on the installer command line:
 
@@ -71,6 +71,10 @@ sudo DISPATCH_REPO_URL=git@your-git-host:you/agent-gtd-dispatch \
      AGENT_GTD_REPO_URL=git@your-git-host:you/agent_gtd \
      ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
 ```
+
+> ⚠️ **GitHub is release-cadence.** The public repos are pushed at release boundaries,
+> so a host that must run **tip-of-main** (e.g. a maintainer's own infra) should override
+> both variables to point at the origin that carries main, not rely on the GitHub default.
 
 > **known_hosts is seeded automatically for your configured git host(s).** The
 > installer derives the host from `DISPATCH_REPO_URL` / `AGENT_GTD_REPO_URL` (the

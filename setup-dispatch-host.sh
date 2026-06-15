@@ -20,8 +20,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_NAME="agent-gtd-dispatch"
-GIT_REMOTE_URL="${DISPATCH_REPO_URL:-git@ubuntu-vm01:repos/${REPO_NAME}}"
-AGENT_GTD_REMOTE_URL="${AGENT_GTD_REPO_URL:-git@ubuntu-vm01:repos/agent_gtd}"
+# Defaults clone from public GitHub (anonymous https). Point at a fork or a
+# self-hosted origin via DISPATCH_REPO_URL / AGENT_GTD_REPO_URL. NOTE: GitHub is
+# release-cadence; a host that must run tip-of-main should override to the origin
+# that carries it.
+GIT_REMOTE_URL="${DISPATCH_REPO_URL:-https://github.com/jason-weddington/${REPO_NAME}}"
+AGENT_GTD_REMOTE_URL="${AGENT_GTD_REPO_URL:-https://github.com/jason-weddington/agent-gtd}"
 
 # Derive the git host(s) to seed into known_hosts from the configured remotes,
 # so this works against any git server (homelab, GitHub, enterprise) — not just

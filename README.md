@@ -105,10 +105,10 @@ To bootstrap a fresh host or migrate an existing one:
 sudo ./setup-dispatch-host.sh --env-file /path/to/.env
 ```
 
-> **Adapt this: the git remotes default to the maintainer's homelab git server.**
-> `setup-dispatch-host.sh` clones two repos and defaults both remotes to the
-> maintainer's homelab git host. On any other machine, override them with
-> `DISPATCH_REPO_URL` (this repo) and `AGENT_GTD_REPO_URL` (the agent_gtd repo):
+> **Git remotes default to public GitHub.** `setup-dispatch-host.sh` clones two repos
+> from `https://github.com/jason-weddington/...` (anonymous https) by default. Point them
+> at a fork or a self-hosted origin with `DISPATCH_REPO_URL` (this repo) and
+> `AGENT_GTD_REPO_URL` (the agent_gtd repo):
 >
 > ```bash
 > sudo DISPATCH_REPO_URL=git@your-git:org/agent-gtd-dispatch \
@@ -119,7 +119,8 @@ sudo ./setup-dispatch-host.sh --env-file /path/to/.env
 > The installer derives the git host from those URLs and seeds `known_hosts` for it
 > automatically (via `ssh-keyscan`), so the overrides above are all you need. For a
 > git host on a non-standard SSH port, pre-seed `known_hosts` yourself with
-> `ssh-keyscan -p <port> <host>`.
+> `ssh-keyscan -p <port> <host>`. **GitHub is release-cadence** — override to your
+> origin if a host must run tip-of-main.
 
 See **[docs/install.md](docs/install.md)** for the full install guide, env-file reference, rollback procedure, and troubleshooting.
 
