@@ -136,6 +136,7 @@ _render_unit() {
     [[ -f "$tmpl" ]] || die "Template not found: ${tmpl}"
     sed \
         -e "s|{{SERVICE_USER}}|${SERVICE_USER}|g" \
+        -e "s|{{SERVICE_GROUP}}|${SERVICE_GROUP}|g" \
         -e "s|{{AGENT_USER}}|${AGENT_USER}|g" \
         -e "s|{{WORKING_DIR}}|${SERVICE_REPO}|g" \
         -e "s|{{ENV_FILE}}|${SERVICE_ENV}|g" \
@@ -268,6 +269,22 @@ fi
 AGENT_WORKSPACE="${AGENT_HOME}/workspace"
 CLAUDE_SRC="${AGENT_HOME}/.local/bin/claude"
 
+# --- Primary group derivation ---
+# On Debian/Ubuntu each user gets a matching private group (USER:USER convention).
+# On RHEL/AL2023 the primary group may differ (e.g. 'amazon', 'ec2-user').
+# Derive the real primary group once so all chown/install -g calls are portable.
+# In single-user mode TARGET_USER already exists, so id -gn is reliable.
+# In two-user mode adduser --group (Step 1) always creates a matching private group,
+# so AGENT_USER == AGENT_GROUP and SERVICE_USER == SERVICE_GROUP remain correct.
+if $SINGLE_USER; then
+    TARGET_GROUP="$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
+    AGENT_GROUP="$TARGET_GROUP"
+    SERVICE_GROUP="$TARGET_GROUP"
+else
+    AGENT_GROUP="$AGENT_USER"
+    SERVICE_GROUP="$SERVICE_USER"
+fi
+
 # ===========================================================================
 # Banner
 # ===========================================================================
@@ -366,10 +383,10 @@ if $DRY_RUN; then
 else
     mkdir -p "$AGENT_WORKSPACE"
     if $SINGLE_USER; then
-        chown "${AGENT_USER}:${AGENT_USER}" "$AGENT_WORKSPACE"
+        chown "${AGENT_USER}:${AGENT_GROUP}" "$AGENT_WORKSPACE"
         chmod 2775 "$AGENT_WORKSPACE"
     else
-        chown -R "${AGENT_USER}:${AGENT_USER}" "$AGENT_HOME"
+        chown -R "${AGENT_USER}:${AGENT_GROUP}" "$AGENT_HOME"
         chmod 2775 "$AGENT_HOME" "$AGENT_WORKSPACE"
     fi
     info "Agent workspace ready: ${AGENT_WORKSPACE}"
@@ -389,7 +406,7 @@ elif $DRY_RUN; then
 else
     mkdir -p "${AGENT_HOME}/.ssh"
     chmod 700 "${AGENT_HOME}/.ssh"
-    chown "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.ssh"
+    chown "${AGENT_USER}:${AGENT_GROUP}" "${AGENT_HOME}/.ssh"
     for gh in $GIT_HOSTS; do
         ssh-keyscan "$gh" >> "${AGENT_HOME}/.ssh/known_hosts" 2>/dev/null \
             && info "Populated ${AGENT_HOME}/.ssh/known_hosts via ssh-keyscan ${gh}" \
@@ -399,7 +416,7 @@ else
         sudo -u "$AGENT_USER" ssh-keygen -t ed25519 -N "" \
             -f "${AGENT_HOME}/.ssh/id_ed25519" \
             -C "${AGENT_USER}@$(hostname -s)"
-        chown "${AGENT_USER}:${AGENT_USER}" \
+        chown "${AGENT_USER}:${AGENT_GROUP}" \
             "${AGENT_HOME}/.ssh/id_ed25519" \
             "${AGENT_HOME}/.ssh/id_ed25519.pub"
         info "Generated SSH keypair for ${AGENT_USER}: ${AGENT_HOME}/.ssh/id_ed25519"
@@ -431,7 +448,7 @@ elif $DRY_RUN; then
     would "create ${SERVICE_HOME}/.ssh/ (mode 700)"
     would "ssh-keyscan ${GIT_HOSTS}>> ${SERVICE_HOME}/.ssh/known_hosts"
     would "copy ${AGENT_HOME}/.ssh/id_* keys to ${SERVICE_HOME}/.ssh/ if present"
-    would "chown -R ${SERVICE_USER}:${SERVICE_USER} ${SERVICE_HOME}/.ssh/"
+    would "chown -R ${SERVICE_USER}:${SERVICE_GROUP} ${SERVICE_HOME}/.ssh/"
 else
     mkdir -p "${SERVICE_HOME}/.ssh"
     chmod 700 "${SERVICE_HOME}/.ssh"
@@ -450,7 +467,7 @@ else
     done
     $key_copied && info "Copied SSH key(s) from ${AGENT_HOME}/.ssh/ to ${SERVICE_HOME}/.ssh/" \
         || warn "No id_* keys found in ${AGENT_HOME}/.ssh/ — git clone may fail without auth"
-    chown -R "${SERVICE_USER}:${SERVICE_USER}" "${SERVICE_HOME}/.ssh"
+    chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${SERVICE_HOME}/.ssh"
     info "SSH directory seeded for ${SERVICE_USER}"
 fi
 
@@ -517,7 +534,7 @@ if $SINGLE_USER && [[ ! -f "$SERVICE_ENV" ]]; then
         if $DRY_RUN; then
             would "create ${_senv_dir}/ (mode 0700, owner ${SERVICE_USER})"
         else
-            install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "$_senv_dir"
+            install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "$_senv_dir"
             info "Created env dir: ${_senv_dir}"
         fi
     fi
@@ -550,7 +567,7 @@ else
         warn "Generated .env from template — fill in real values at ${SERVICE_ENV}"
     fi
     chmod 0600 "$SERVICE_ENV"
-    chown "${SERVICE_USER}:${SERVICE_USER}" "$SERVICE_ENV"
+    chown "${SERVICE_USER}:${SERVICE_GROUP}" "$SERVICE_ENV"
     info "Env file installed: ${SERVICE_ENV} (mode 0600)"
 fi
 
@@ -609,7 +626,7 @@ if not replaced:
     out.append('DISPATCH_API_KEY=' + new_key + '\n')
 sys.stdout.write(''.join(out))
 PYEOF
-    install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "$_tmpfile" "$SERVICE_ENV"
+    install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "$_tmpfile" "$SERVICE_ENV"
     rm -f "$_tmpfile"
     echo ""
     printf "${RED}========================================${RESET}\n"

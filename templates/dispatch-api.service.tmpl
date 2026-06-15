@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 User={{SERVICE_USER}}
-Group={{SERVICE_USER}}
+Group={{SERVICE_GROUP}}
 WorkingDirectory={{WORKING_DIR}}
 EnvironmentFile={{ENV_FILE}}
 ExecStart={{UV_BIN}} run uvicorn agent_gtd_dispatch.main:app --host 0.0.0.0 --port 8100
