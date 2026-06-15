@@ -196,8 +196,12 @@ the run row. The `RunResponse` includes an `engine_swap` field describing the su
 
 Engine availability is evaluated **per request**, not at startup: `GET /info` calls
 `get_available_engine_names()` (which runs `is_engine_available()` against the current
-environment) at request time, so only engines with credentials present are returned.
-Nothing in `lifespan` checks engine credentials.
+environment) at request time. Claude Code engines are **always reported available** — the
+`claude` binary may be authenticated externally (enterprise/managed distribution, internal
+wrapper, Bedrock-backed login), so the gate does not require `CLAUDE_CODE_OAUTH_TOKEN` or
+`ANTHROPIC_API_KEY`; an unauthenticated host fails at exec time. Kiro and the Ollama-routed
+engine are still gated on their configured credentials. Nothing in `lifespan` checks engine
+credentials.
 
 ---
 

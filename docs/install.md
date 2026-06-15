@@ -35,8 +35,8 @@ This guide covers bootstrapping a fresh Ubuntu host and migrating an existing si
 
 ```bash
 # 1. Clone the repo
-#    (this example uses our internal git server, ubuntu-vm01 — substitute your git remote)
-git clone git@ubuntu-vm01:repos/agent-gtd-dispatch
+#    (substitute your own git remote for <your-git-host>)
+git clone git@<your-git-host>:repos/agent-gtd-dispatch
 cd agent-gtd-dispatch
 
 # 2. Prepare an env file (copy the template and fill in real values)
@@ -55,14 +55,14 @@ The installer is idempotent — re-running it on a configured host prints
 
 ### Adapting to your own git host
 
-The clone URLs in this guide default to our homelab git server (`ubuntu-vm01`). The
+The clone URLs in this guide default to the maintainer's homelab git server. The
 installer reads two environment-variable overrides (also listed in `--help`) that
 point Step 2's clones at your own git host:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DISPATCH_REPO_URL` | `git@ubuntu-vm01:repos/agent-gtd-dispatch` | Remote for the dispatch service repo |
-| `AGENT_GTD_REPO_URL` | `git@ubuntu-vm01:repos/agent_gtd` | Remote for the agent_gtd repo |
+| `DISPATCH_REPO_URL` | `git@<homelab-git-host>:repos/agent-gtd-dispatch` | Remote for the dispatch service repo |
+| `AGENT_GTD_REPO_URL` | `git@<homelab-git-host>:repos/agent_gtd` | Remote for the agent_gtd repo |
 
 Pass them on the installer command line:
 
@@ -72,20 +72,12 @@ sudo DISPATCH_REPO_URL=git@your-git-host:you/agent-gtd-dispatch \
      ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
 ```
 
-> ⚠️ **known_hosts is only seeded for ubuntu-vm01.** Step 1 hardcodes
-> `ssh-keyscan ubuntu-vm01` regardless of the overrides above, so when your repos live
-> elsewhere you must seed `known_hosts` for your actual git host manually — once the
-> installer has created the users and their `.ssh` directories (i.e. after the Phase 1
-> halt, or after Step 2 fails with `Host key verification failed`):
->
-> ```bash
-> # Two-user mode — seed both users, then re-run the installer:
-> sudo mkdir -p /home/dispatch/.ssh /home/dispatch-svc/.ssh
-> ssh-keyscan <your-git-host> | sudo tee -a /home/dispatch/.ssh/known_hosts /home/dispatch-svc/.ssh/known_hosts
->
-> # Single-user mode — your own account:
-> ssh-keyscan <your-git-host> >> ~/.ssh/known_hosts
-> ```
+> **known_hosts is seeded automatically for your configured git host(s).** The
+> installer derives the host from `DISPATCH_REPO_URL` / `AGENT_GTD_REPO_URL` (the
+> defaults above) and runs `ssh-keyscan` against each, so overriding the remotes is
+> sufficient — no manual `known_hosts` step. (Note: `ssh-keyscan` only handles SSH
+> remotes on the default port 22; for a non-standard SSH port, seed `known_hosts`
+> yourself with `ssh-keyscan -p <port> <host>`.)
 
 ### Preview mode (dry run)
 
@@ -133,11 +125,11 @@ Run the installer once. It will:
 
 (The key comment is `dispatch@$(hostname -s)` — your host's short name.)
 
-Authorize the printed public key on your git host. On the homelab git server
-(`ubuntu-vm01`) that means appending it to the repo user's `authorized_keys`:
+Authorize the printed public key on your git host. On a self-hosted git server
+that means appending it to the repo user's `authorized_keys`:
 
 ```bash
-# Homelab-specific example — on ubuntu-vm01:
+# Self-hosted git server example — on <your-git-host>:
 echo "ssh-ed25519 AAAA... dispatch@<hostname>" >> ~/repos/.ssh/authorized_keys
 ```
 
@@ -286,7 +278,9 @@ git host, then re-run the installer with the same arguments to complete Phase 2.
 
 ## Authentication & pairing
 
-Before the service can dispatch agents, three credentials must be present in the env file.
+Before the service can dispatch agents, two credentials must always be present in the env
+file (`AGENT_GTD_API_KEY` and `DISPATCH_API_KEY`, below), plus an agent-auth credential
+**unless Claude Code is already authenticated by the environment** (see the next section).
 
 ### `CLAUDE_CODE_OAUTH_TOKEN` — agent subprocess auth
 
@@ -294,6 +288,19 @@ Before the service can dispatch agents, three credentials must be present in the
 Dispatched agents run as unattended headless subprocesses — `claude login` cannot be
 called interactively at dispatch time — so the token must be pre-populated in the service
 env file.
+
+> **Environments where Claude Code is already authenticated.** If you run an
+> enterprise/managed Claude Code distribution, an internal wrapper, or a Bedrock-backed
+> login (e.g. corporate setups where `claude` "just works" with no token or API key),
+> **skip this token entirely** — leave both `CLAUDE_CODE_OAUTH_TOKEN` and
+> `ANTHROPIC_API_KEY` unset. The dispatch service no longer gates Claude Code engines on
+> these vars; it attempts the run and lets the binary authenticate however it normally
+> does. The trade-off: on a host where the binary is *not* externally authenticated and
+> neither var is set, the engine still reports available and the run fails at exec time —
+> so for a plain homelab install, set `CLAUDE_CODE_OAUTH_TOKEN` as below. If your wrapper
+> authenticates via its own environment variables, those are not forwarded to the agent
+> subprocess by default (only the keys in `engines.py::COMMON_ENV_KEYS` / the engine's
+> `env_keys` are) — file an issue if you need a passthrough allowlist.
 
 **How to obtain it**: On a machine with a browser (your workstation, not the dispatch
 host), run:
@@ -448,7 +455,7 @@ user is your own login account, so `--scope user` writes to YOUR `~/.claude.json
 
 > ⚠️ **Adapt this to your environment.** The entries in `templates/mcp-servers.sh`
 > hardcode homelab-specific values: `uvx` sources pointing at
-> `git+ssh://git@ubuntu-vm01/home/git/repos/...` and KB identities
+> `git+ssh://git@<your-git-host>/home/git/repos/...` and KB identities
 > (`KB_CONTRIBUTOR=jason`, `KB_TEAM=grit-mile`). On any other environment these
 > register successfully but **fail at runtime** — the Step 4.6 smoke test only greps
 > for the server name in `claude mcp list`, so it passes regardless. Edit
@@ -597,7 +604,7 @@ sudo -u dispatch -H bash -lc 'cd /tmp && rm -rf hook-probe && git init hook-prob
 #     canonical check; this one additionally proves clone-over-SSH works. The example
 #     uses the homelab git server — replace with any repo on your git host that
 #     contains .pre-commit-config.yaml (requires the dispatch key authorized there):
-sudo -u dispatch -H bash -lc 'cd /tmp && rm -rf agent_gtd_probe && git clone git@ubuntu-vm01:repos/agent_gtd agent_gtd_probe && ls agent_gtd_probe/.git/hooks/'
+sudo -u dispatch -H bash -lc 'cd /tmp && rm -rf agent_gtd_probe && git clone git@<your-git-host>:repos/agent_gtd agent_gtd_probe && ls agent_gtd_probe/.git/hooks/'
 # → contains pre-commit, commit-msg, pre-push
 
 # (f) a commit in a config-less repo succeeds — shims no-op via --skip-on-missing-config
@@ -803,14 +810,13 @@ The installer will detect the mismatch and reinstall the correct fragment.
 
 ### SSH host key verification failed during git clone
 
-**Symptom**: Step 2 (Repos) fails with `Host key verification failed` or `The authenticity of host 'ubuntu-vm01' can't be established`.
+**Symptom**: Step 2 (Repos) fails with `Host key verification failed` or `The authenticity of host '<git-host>' can't be established`.
 
-**Cause**: The `dispatch-svc` user has an empty `~/.ssh/known_hosts` — the new service account has not connected to the git server before. The installer only seeds `known_hosts` for `ubuntu-vm01` (the keyscan is hardcoded), so on any other git host this is the expected first-run failure.
+**Cause**: The `dispatch-svc` user's `~/.ssh/known_hosts` is missing your git server's host key — the new service account has not connected to it before. The installer seeds `known_hosts` for the host(s) derived from `DISPATCH_REPO_URL` / `AGENT_GTD_REPO_URL`, so this usually means those overrides weren't set (the clone pointed at the homelab default) or the host uses a non-standard SSH port.
 
-**Fix**: If your repos are on `ubuntu-vm01`, re-run the installer (it seeds `known_hosts` in step 1). For any other git host, seed `known_hosts` manually — the installer will NOT do it for you:
+**Fix**: Re-run the installer with the correct `DISPATCH_REPO_URL` / `AGENT_GTD_REPO_URL` — it seeds `known_hosts` for whatever host they resolve to. For a non-standard SSH port, seed it manually:
 ```bash
-# Substitute your git host and clone URL (ubuntu-vm01 shown as the homelab example):
-ssh-keyscan <your-git-host> | sudo tee -a /home/dispatch-svc/.ssh/known_hosts
+ssh-keyscan -p <port> <your-git-host> | sudo tee -a /home/dispatch-svc/.ssh/known_hosts
 sudo -u dispatch-svc git clone git@<your-git-host>:<path>/agent-gtd-dispatch /home/dispatch-svc/agent-gtd-dispatch
 ```
 See [Adapting to your own git host](#adapting-to-your-own-git-host) for the `DISPATCH_REPO_URL` / `AGENT_GTD_REPO_URL` overrides.
@@ -924,7 +930,7 @@ SSH keypair, so the installer generated one and is waiting for you to authorize 
 
 **Fix**: This is expected — follow the [Fresh box install](#fresh-box-install) two-phase flow above:
 1. Copy the printed public key.
-2. Authorize it on your git host (homelab: append to `ubuntu-vm01:~/repos/.ssh/authorized_keys`; GitHub: add as a deploy key / account SSH key).
+2. Authorize it on your git host (self-hosted: append to `<your-git-host>:~/repos/.ssh/authorized_keys`; GitHub: add as a deploy key / account SSH key).
 3. Re-run the installer with the same arguments.
 
 If you want to use an existing keypair instead of the generated one, place it at

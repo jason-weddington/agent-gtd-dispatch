@@ -270,26 +270,28 @@ ENGINES: dict[str, Engine] = {
     "claude-code-haiku": CLAUDE_HAIKU,
 }
 
-# Engine names that share the Claude Code auth path (OAuth token OR API key)
+# Engine names that run the `claude` binary (auth resolved by the binary itself)
 _CLAUDE_CODE_ENGINES: frozenset[str] = frozenset(
     {"claude-code", "claude-code-sonnet", "claude-code-haiku"}
 )
 
 
 def is_engine_available(engine: Engine) -> bool:
-    """Return True if the host env has credentials for this engine.
+    """Return True if this engine can be attempted on the host.
 
-    Claude Code engines accept either CLAUDE_CODE_OAUTH_TOKEN (Max
-    subscription) or ANTHROPIC_API_KEY (pay-as-you-go) — either presence
-    is sufficient. Kiro requires KIRO_API_KEY. The Ollama-routed Claude
-    engine requires OLLAMA_BASE_URL to be configured.
+    Claude Code engines are always considered available: the `claude` binary
+    may be authenticated by means we cannot observe from this process — an
+    enterprise/managed distribution, an internal wrapper, a Bedrock-backed
+    login, or per-user config under ~/.claude. We therefore do NOT gate on
+    CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY; if neither is set and the
+    binary is *not* externally authenticated, the run fails at exec time —
+    that is the operator's responsibility (in the homelab case, set
+    CLAUDE_CODE_OAUTH_TOKEN in the host env). Kiro requires KIRO_API_KEY.
+    The Ollama-routed Claude engine requires OLLAMA_BASE_URL to be configured.
     """
     name = engine.name
     if name in _CLAUDE_CODE_ENGINES:
-        return bool(
-            os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-            or os.environ.get("ANTHROPIC_API_KEY")
-        )
+        return True
     if name == "kiro":
         return bool(os.environ.get("KIRO_API_KEY"))
     if name == "claude-code-ollama":

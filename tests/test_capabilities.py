@@ -136,12 +136,15 @@ class TestEngineAvailability:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
         assert is_engine_available(CLAUDE) is True
 
-    def test_claude_code_unavailable_without_credentials(self, monkeypatch) -> None:
+    def test_claude_code_available_without_credentials(self, monkeypatch) -> None:
+        # Claude Code is always available — the binary may be authenticated
+        # externally (enterprise/managed distribution, internal wrapper,
+        # Bedrock-backed login). We do not gate on env credentials.
         from agent_gtd_dispatch.engines import CLAUDE, is_engine_available
 
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        assert is_engine_available(CLAUDE) is False
+        assert is_engine_available(CLAUDE) is True
 
     def test_kiro_requires_kiro_api_key(self, monkeypatch) -> None:
         from agent_gtd_dispatch.engines import KIRO, is_engine_available

@@ -106,8 +106,8 @@ sudo ./setup-dispatch-host.sh --env-file /path/to/.env
 ```
 
 > **Adapt this: the git remotes default to the maintainer's homelab git server.**
-> `setup-dispatch-host.sh` clones two repos and defaults both remotes to
-> `git@ubuntu-vm01:repos/...`. On any other machine, override them with
+> `setup-dispatch-host.sh` clones two repos and defaults both remotes to the
+> maintainer's homelab git host. On any other machine, override them with
 > `DISPATCH_REPO_URL` (this repo) and `AGENT_GTD_REPO_URL` (the agent_gtd repo):
 >
 > ```bash
@@ -116,11 +116,10 @@ sudo ./setup-dispatch-host.sh --env-file /path/to/.env
 >      ./setup-dispatch-host.sh --env-file /path/to/.env
 > ```
 >
-> Known limitation: Step 1/2 of the script run `ssh-keyscan ubuntu-vm01`
-> unconditionally to populate `known_hosts` — that host is not overridable via env
-> var. On a non-homelab git server the keyscan fails with a warning; pre-populate
-> the service and agent users' `~/.ssh/known_hosts` with your git server's host key
-> (or edit the script) before the clone steps run.
+> The installer derives the git host from those URLs and seeds `known_hosts` for it
+> automatically (via `ssh-keyscan`), so the overrides above are all you need. For a
+> git host on a non-standard SSH port, pre-seed `known_hosts` yourself with
+> `ssh-keyscan -p <port> <host>`.
 
 See **[docs/install.md](docs/install.md)** for the full install guide, env-file reference, rollback procedure, and troubleshooting.
 

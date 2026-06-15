@@ -182,9 +182,14 @@ subprocess only receives `CLAUDE_CODE_OAUTH_TOKEN`.
 
 ### Engine Availability
 
-`is_engine_available(engine)` checks whether the required credential is present in the
-environment. Availability is evaluated per request (not at startup): `GET /info` returns
-only the currently-available engines in its `engines` list.
+`is_engine_available(engine)` reports whether an engine can be attempted on the host.
+Claude Code engines (`claude-code`, `claude-code-sonnet`, `claude-code-haiku`) are
+**always available** — the `claude` binary may be authenticated externally (enterprise/
+managed distribution, internal wrapper, Bedrock-backed login), so the gate does not
+require `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`; a truly-unauthenticated host
+fails at exec time instead. Kiro and the Ollama-routed engine still gate on their
+configured credentials. Availability is evaluated per request (not at startup): `GET /info`
+returns only the currently-available engines in its `engines` list.
 
 ### Engine Swap
 

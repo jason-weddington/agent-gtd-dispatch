@@ -22,6 +22,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_NAME="agent-gtd-dispatch"
 GIT_REMOTE_URL="${DISPATCH_REPO_URL:-git@ubuntu-vm01:repos/${REPO_NAME}}"
 AGENT_GTD_REMOTE_URL="${AGENT_GTD_REPO_URL:-git@ubuntu-vm01:repos/agent_gtd}"
+
+# Derive the git host(s) to seed into known_hosts from the configured remotes,
+# so this works against any git server (homelab, GitHub, enterprise) — not just
+# the homelab default. Handles scp-style (git@host:path) and ssh:// URLs.
+git_host_from_url() {
+    local url="${1#ssh://}"   # drop ssh:// scheme if present
+    url="${url#*@}"           # drop user@ if present
+    printf '%s' "${url%%[:/]*}"  # take up to the first ':' or '/'
+}
+GIT_HOSTS="$(printf '%s\n%s\n' \
+    "$(git_host_from_url "$GIT_REMOTE_URL")" \
+    "$(git_host_from_url "$AGENT_GTD_REMOTE_URL")" | sort -u | tr '\n' ' ')"
 SERVICE_NAME="dispatch-api"
 API_PORT=8100
 SUDOERS_FILE="/etc/sudoers.d/dispatch-svc"
@@ -360,17 +372,25 @@ else
 fi
 
 # --- SSH key provisioning for AGENT_USER (needed for git auth on fresh box) ---
-if $DRY_RUN; then
+# In single-user mode the agent IS the operator, who already has a working ~/.ssh and
+# git auth (the premise of run-as-self: they reach internal repos as themselves). Never
+# chown/chmod the operator's ~/.ssh (A2 group mismatch + sshd StrictModes lockout risk)
+# or generate a key in their home — mirrors the $HOME scoping added in 7f806c9.
+if $SINGLE_USER; then
+    skip "single-user mode — using the operator's existing ~/.ssh and git auth as-is (no chown/keygen on your home). If a git host the agent must clone from isn't yet in your known_hosts, seed it: ssh-keyscan <host> >> ~/.ssh/known_hosts"
+elif $DRY_RUN; then
     would "create ${AGENT_HOME}/.ssh/ (mode 700, owner ${AGENT_USER}) if absent"
-    would "ssh-keyscan ubuntu-vm01 >> ${AGENT_HOME}/.ssh/known_hosts"
+    would "ssh-keyscan ${GIT_HOSTS}>> ${AGENT_HOME}/.ssh/known_hosts"
     would "generate ed25519 keypair for ${AGENT_USER} if no id_* key exists"
 else
     mkdir -p "${AGENT_HOME}/.ssh"
     chmod 700 "${AGENT_HOME}/.ssh"
     chown "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.ssh"
-    ssh-keyscan ubuntu-vm01 >> "${AGENT_HOME}/.ssh/known_hosts" 2>/dev/null \
-        && info "Populated ${AGENT_HOME}/.ssh/known_hosts via ssh-keyscan ubuntu-vm01" \
-        || warn "ssh-keyscan ubuntu-vm01 failed — known_hosts may be incomplete"
+    for gh in $GIT_HOSTS; do
+        ssh-keyscan "$gh" >> "${AGENT_HOME}/.ssh/known_hosts" 2>/dev/null \
+            && info "Populated ${AGENT_HOME}/.ssh/known_hosts via ssh-keyscan ${gh}" \
+            || warn "ssh-keyscan ${gh} failed — known_hosts may be incomplete"
+    done
     if ! ls "${AGENT_HOME}/.ssh"/id_* &>/dev/null; then
         sudo -u "$AGENT_USER" ssh-keygen -t ed25519 -N "" \
             -f "${AGENT_HOME}/.ssh/id_ed25519" \
@@ -405,15 +425,17 @@ if $SINGLE_USER; then
     skip "single-user mode — skipping dispatch-svc SSH key copy (same user)"
 elif $DRY_RUN; then
     would "create ${SERVICE_HOME}/.ssh/ (mode 700)"
-    would "ssh-keyscan ubuntu-vm01 >> ${SERVICE_HOME}/.ssh/known_hosts"
+    would "ssh-keyscan ${GIT_HOSTS}>> ${SERVICE_HOME}/.ssh/known_hosts"
     would "copy ${AGENT_HOME}/.ssh/id_* keys to ${SERVICE_HOME}/.ssh/ if present"
     would "chown -R ${SERVICE_USER}:${SERVICE_USER} ${SERVICE_HOME}/.ssh/"
 else
     mkdir -p "${SERVICE_HOME}/.ssh"
     chmod 700 "${SERVICE_HOME}/.ssh"
-    ssh-keyscan ubuntu-vm01 >> "${SERVICE_HOME}/.ssh/known_hosts" 2>/dev/null \
-        && info "Populated ${SERVICE_HOME}/.ssh/known_hosts via ssh-keyscan ubuntu-vm01" \
-        || warn "ssh-keyscan ubuntu-vm01 failed — known_hosts may be incomplete"
+    for gh in $GIT_HOSTS; do
+        ssh-keyscan "$gh" >> "${SERVICE_HOME}/.ssh/known_hosts" 2>/dev/null \
+            && info "Populated ${SERVICE_HOME}/.ssh/known_hosts via ssh-keyscan ${gh}" \
+            || warn "ssh-keyscan ${gh} failed — known_hosts may be incomplete"
+    done
     # Copy SSH key files from agent user if present (enables git auth for SERVICE_USER)
     key_copied=false
     for key in "${AGENT_HOME}/.ssh"/id_*; do
