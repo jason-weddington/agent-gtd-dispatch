@@ -44,7 +44,7 @@ def _dispatch_sudo_available() -> bool:
         pwd.getpwnam("dispatch")
     except KeyError:
         return False
-    result = subprocess.run(  # noqa: S603
+    result = subprocess.run(
         ["/usr/bin/sudo", "-n", "-u", "dispatch", "true"], capture_output=True
     )
     return result.returncode == 0
@@ -797,7 +797,7 @@ class TestSudoWrapping:
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
         env = build_env(CLAUDE)
         cmd = _sudo_wrap(["bash", "-c", "printf '%s' \"$PATH\""])
-        result = subprocess.run(  # noqa: S603
+        result = subprocess.run(
             cmd, env=env, capture_output=True, text=True, timeout=10
         )
         assert "/home/dispatch/.local/bin" in result.stdout
@@ -1998,6 +1998,314 @@ class TestPrepareWorkspaceMulti:
         for c in mock_sub.run.call_args_list:
             cmd = c.args[0]
             assert cmd[:4] == sudo_prefix, f"Expected sudo prefix on call {cmd!r}"
+
+
+# ---------------------------------------------------------------------------
+# Launch-time check-and-clean (crash-orphaned workspace recovery)
+# ---------------------------------------------------------------------------
+
+
+def _make_local_git_repo(path: Path) -> str:
+    """Init a git repo at *path* with one commit; return the HEAD SHA.
+
+    The default branch name is whatever git is configured to use locally
+    (typically 'main' or 'master') — callers should not assume either.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+    )
+    (path / "README.md").write_text("initial")
+    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+class TestPrepareWorkspaceLaunchClean:
+    """Verify launch-time check-and-clean for crash-orphaned workspaces."""
+
+    @pytest.fixture
+    def workspace_root(self, tmp_path, monkeypatch) -> Path:
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        return tmp_path
+
+    # --- Unit tests (mock-based): stale workspace removed before clone ---
+
+    def test_stale_single_repo_workspace_removed_before_clone(
+        self, workspace_root, tmp_path
+    ) -> None:
+        """Pre-existing workspace from a crashed run is removed before cloning."""
+        origin = "git@host:repos/myrepo"
+        run_id = "abc123"
+        branch = "feat/abc123-fix-bug"
+        expected_workspace = tmp_path / f"repos-myrepo-{run_id}"
+
+        # Pre-create a stale workspace simulating a prior crashed run
+        expected_workspace.mkdir(parents=True)
+        sentinel = expected_workspace / "stale_leftover.txt"
+        sentinel.write_text("crash artifact")
+        assert sentinel.exists()
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub:
+            prepare_workspace(origin, run_id, branch)
+
+        # Stale workspace (and its contents) should be gone
+        assert not sentinel.exists()
+        # A fresh git clone should still be invoked
+        clone_calls = [c for c in mock_sub.run.call_args_list if "clone" in c.args[0]]
+        assert len(clone_calls) == 1
+
+    def test_stale_multi_repo_workspace_removed_before_clone(
+        self, workspace_root, tmp_path
+    ) -> None:
+        """Pre-existing multi-repo workspace root is removed before cloning."""
+        repo_urls = ["git@host:org/repo-a.git"]
+        run_id = "abc123"
+        branch = "feat/abc123-fix"
+        root = tmp_path / f"ws-{run_id}"
+
+        # Pre-create a stale workspace root simulating a prior crashed run
+        root.mkdir(parents=True)
+        sentinel = root / "stale_leftover.txt"
+        sentinel.write_text("crash artifact")
+        assert sentinel.exists()
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stderr = b""
+        with patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub:
+            mock_sub.run.return_value = mock_result
+            prepare_workspace_multi(repo_urls, run_id, branch)
+
+        # Stale workspace root should be gone
+        assert not sentinel.exists()
+        # mkdir + fresh clone should still be invoked
+        clone_calls = [
+            c for c in mock_sub.run.call_args_list if "clone" in str(c.args[0])
+        ]
+        assert len(clone_calls) == 1
+
+    def test_no_stale_workspace_single_proceeds_normally(
+        self, workspace_root, tmp_path
+    ) -> None:
+        """When no stale workspace exists, prepare_workspace runs unchanged."""
+        origin = "git@host:repos/myrepo"
+        run_id = "abc123"
+        branch = "feat/abc123-fix-bug"
+        expected_workspace = tmp_path / f"repos-myrepo-{run_id}"
+        assert not expected_workspace.exists()
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub:
+            result = prepare_workspace(origin, run_id, branch)
+
+        assert result == expected_workspace
+        clone_calls = [c for c in mock_sub.run.call_args_list if "clone" in c.args[0]]
+        assert len(clone_calls) == 1
+
+    def test_no_stale_workspace_multi_proceeds_normally(
+        self, workspace_root, tmp_path
+    ) -> None:
+        """When no stale workspace root exists, prepare_workspace_multi runs unchanged."""
+        repo_urls = ["git@host:org/repo-a.git"]
+        run_id = "abc123"
+        branch = "feat/abc123-fix"
+        root = tmp_path / f"ws-{run_id}"
+        assert not root.exists()
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stderr = b""
+        with patch("agent_gtd_dispatch.dispatch.subprocess") as mock_sub:
+            mock_sub.run.return_value = mock_result
+            result = prepare_workspace_multi(repo_urls, run_id, branch)
+
+        assert result == root
+        clone_calls = [
+            c for c in mock_sub.run.call_args_list if "clone" in str(c.args[0])
+        ]
+        assert len(clone_calls) == 1
+
+    # --- Integration tests (real git): crash recovery + merge-base guarantee ---
+
+    def test_crash_relaunch_branch_based_on_current_main(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """After crash (cleanup skipped) + relaunch, branch is based on the current main tip.
+
+        Verifies AC: branch merge-base equals current origin HEAD, not a stale base.
+        """
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        ws_root = tmp_path / "workspaces"
+        ws_root.mkdir()
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", ws_root)
+
+        # Set up a local "remote" repo with an initial commit
+        remote = tmp_path / "origin_repo"
+        first_sha = _make_local_git_repo(remote)
+
+        origin = f"file://{remote}"
+        run_id = "crashtest01"
+        branch_name = f"feat/{run_id}-fix"
+        name = repo_name_from_origin(origin)
+        stale_workspace = ws_root / f"{name}-{run_id}"
+
+        # Simulate crash: manually pre-create a stale workspace
+        # (as if a prior run cloned and started working, then was OOM-killed)
+        stale_workspace.mkdir()
+        stale_marker = stale_workspace / "stale_crash_artifact.txt"
+        stale_marker.write_text("orphaned by crash")
+
+        # A sibling item merges in between — adds a new commit to origin/main
+        (remote / "sibling_file.txt").write_text("sibling feature")
+        subprocess.run(["git", "add", "."], cwd=remote, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "sibling merged"],
+            cwd=remote,
+            check=True,
+            capture_output=True,
+        )
+        second_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=remote,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert first_sha != second_sha
+
+        # Relaunch: prepare_workspace removes stale and clones fresh from current main
+        result = prepare_workspace(origin, run_id, branch_name)
+
+        # Stale content must be gone
+        assert not stale_marker.exists(), "Crash-orphaned artifact must be removed"
+        # Fresh clone must be present
+        assert (result / ".git").exists(), "Fresh clone must have .git directory"
+        # Branch is correctly checked out
+        current_branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=result,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert current_branch == branch_name
+        # HEAD in the workspace equals the current origin HEAD (second_sha)
+        workspace_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=result,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert workspace_head == second_sha, (
+            f"Workspace HEAD ({workspace_head}) != current origin HEAD ({second_sha}); "
+            "branch was not created from the current main tip"
+        )
+        # Merge-base of HEAD and origin default branch == second_sha
+        # (branch is rooted on current main, not the stale first_sha)
+        remote_default = (
+            subprocess.run(
+                ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                cwd=result,
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            or "origin/main"
+        )
+        merge_base = subprocess.run(
+            ["git", "merge-base", "HEAD", remote_default],
+            cwd=result,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert merge_base == second_sha, (
+            f"merge-base ({merge_base}) != current origin HEAD ({second_sha}); "
+            f"branch is rooted on a stale base instead of current main"
+        )
+
+    def test_crash_relaunch_multi_repo_produces_clean_workspace(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """After crash (cleanup skipped) + relaunch, multi-repo workspace is fresh."""
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        ws_root = tmp_path / "workspaces"
+        ws_root.mkdir()
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", ws_root)
+
+        remote = tmp_path / "origin_repo"
+        _make_local_git_repo(remote)
+        origin = f"file://{remote}"
+
+        run_id = "crashtest02"
+        branch_name = f"feat/{run_id}-fix"
+        root = ws_root / f"ws-{run_id}"
+
+        # Simulate crash: pre-create stale multi-repo workspace root
+        root.mkdir()
+        stale_marker = root / "stale_multi_artifact.txt"
+        stale_marker.write_text("crash orphan")
+
+        # Add a new commit to origin (happened while the crashed run was orphaned)
+        (remote / "new_feature.txt").write_text("new")
+        subprocess.run(["git", "add", "."], cwd=remote, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "post-crash"],
+            cwd=remote,
+            check=True,
+            capture_output=True,
+        )
+        latest_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=remote,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        # Relaunch
+        result = prepare_workspace_multi([origin], run_id, branch_name)
+
+        assert not stale_marker.exists(), "Crash-orphaned artifact must be removed"
+        assert result == root
+        # Per-repo clone must be present
+        dir_name = repo_dir_from_url(origin)
+        repo_path = result / dir_name
+        assert (repo_path / ".git").exists(), "Fresh clone must have .git directory"
+        # Branch is correctly created from current origin HEAD
+        repo_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert repo_head == latest_sha, (
+            f"Repo HEAD ({repo_head}) != current origin HEAD ({latest_sha})"
+        )
 
 
 # ---------------------------------------------------------------------------

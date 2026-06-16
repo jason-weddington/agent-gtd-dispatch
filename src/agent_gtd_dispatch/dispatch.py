@@ -96,11 +96,20 @@ def repo_dir_from_url(url: str) -> str:
 
 
 def prepare_workspace(origin: str, run_id: str, branch_name: str) -> Path:
-    """Clone the repo and check out a feature branch for this run."""
+    """Clone the repo and check out a feature branch for this run.
+
+    Launch-time check-and-clean: if a leftover workspace from a prior crashed
+    run exists at the expected path, it is removed before cloning so that the
+    build branch is always created from the current default-branch tip.
+    Exit-time cleanup_workspace remains best-effort; this call is the
+    crash-safe guarantee.
+    """
     name = repo_name_from_origin(origin)
     workspace = config.WORKSPACE_ROOT / f"{name}-{run_id}"
 
     config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+    # Remove any stale workspace from a prior crashed run before cloning fresh.
+    cleanup_workspace(workspace)
     subprocess.run(
         _sudo_wrap(["git", "clone", origin, str(workspace)]),
         check=True,
@@ -153,6 +162,10 @@ def prepare_workspace_multi(
     config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 
     root = config.WORKSPACE_ROOT / f"ws-{run_id}"
+
+    # Launch-time check-and-clean: remove any stale workspace root from a prior
+    # crashed run before cloning fresh (mirrors prepare_workspace guarantee).
+    cleanup_workspace(root)
 
     # Create workspace root via subprocess so the agent user owns it
     subprocess.run(
