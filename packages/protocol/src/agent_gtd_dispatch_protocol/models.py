@@ -48,6 +48,7 @@ class RunResponse(BaseModel):
     project_name: str
     branch_name: str | None
     engine: str
+    engine_actual: str | None = None
     agent_name: str | None
     mode: DispatchMode
     rollout_id: str | None

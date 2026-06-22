@@ -65,6 +65,14 @@ def build_env(
     if engine.extra_env_fn is not None:
         env.update(engine.extra_env_fn())
 
+    # Set git committer/author identity to reflect the engine being used.
+    # This overrides the static .gitconfig on the dispatch host so that commits
+    # are attributable to the actual engine rather than a fixed label.
+    env["GIT_AUTHOR_NAME"] = engine.name
+    env["GIT_COMMITTER_NAME"] = engine.name
+    env["GIT_AUTHOR_EMAIL"] = f"{engine.name}@agent-gtd-dispatch"
+    env["GIT_COMMITTER_EMAIL"] = f"{engine.name}@agent-gtd-dispatch"
+
     # Prepend ~/.local/bin for the agent user so uvx/MCP binaries (personal-kb,
     # agent-gtd) are discoverable after sudo's env_reset strips PATH.
     if config.AGENT_SUBPROCESS_USER:

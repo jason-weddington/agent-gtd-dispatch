@@ -293,6 +293,26 @@ class TestBuildEnv:
         parts = env["PATH"].split(":")
         assert parts.count(local_bin) == 1
 
+    def test_git_identity_reflects_engine_name_claude(self, monkeypatch) -> None:
+        """Git identity env vars should reflect the engine being used (AC3)."""
+        env = build_env(CLAUDE)
+        assert env["GIT_AUTHOR_NAME"] == "claude-code"
+        assert env["GIT_COMMITTER_NAME"] == "claude-code"
+        assert env["GIT_AUTHOR_EMAIL"] == "claude-code@agent-gtd-dispatch"
+        assert env["GIT_COMMITTER_EMAIL"] == "claude-code@agent-gtd-dispatch"
+
+    def test_git_identity_reflects_engine_name_sonnet(self, monkeypatch) -> None:
+        """Different engines get different git identities."""
+        env = build_env(CLAUDE_SONNET)
+        assert env["GIT_AUTHOR_NAME"] == "claude-code-sonnet"
+        assert env["GIT_COMMITTER_NAME"] == "claude-code-sonnet"
+
+    def test_git_identity_reflects_engine_name_haiku(self, monkeypatch) -> None:
+        """Haiku engine gets its own git identity."""
+        env = build_env(CLAUDE_HAIKU)
+        assert env["GIT_AUTHOR_NAME"] == "claude-code-haiku"
+        assert env["GIT_COMMITTER_NAME"] == "claude-code-haiku"
+
 
 class TestBuildSystemPrompt:
     _item: ClassVar[dict] = {
