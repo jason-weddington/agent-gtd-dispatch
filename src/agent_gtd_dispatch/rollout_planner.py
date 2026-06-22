@@ -53,6 +53,101 @@ PRODUCE_DAG_TOOL = cast(
 )
 
 
+def _is_directory_entry(path: str) -> bool:
+    """Return True if path looks like a directory entry.
+
+    Treats paths with a trailing slash, or whose last path component has no
+    file-extension dot, as directory entries (e.g. ``src/foo/`` or ``src/foo``).
+    """
+    if path.endswith("/"):
+        return True
+    last_component = path.rstrip("/").rsplit("/", 1)[-1]
+    return "." not in last_component
+
+
+def _paths_overlap(path_a: str, path_b: str) -> bool:
+    """Return True if *path_a* and *path_b* represent overlapping filesystem paths.
+
+    Two paths overlap when they are identical (after normalising trailing
+    slashes), or when one is a directory entry that is an ancestor of the
+    other (e.g. ``agent-gtd-dispatch/tests/`` overlaps with
+    ``agent-gtd-dispatch/tests/test_foo.py``).
+    """
+    norm_a = path_a.rstrip("/")
+    norm_b = path_b.rstrip("/")
+    if norm_a == norm_b:
+        return True
+    return (_is_directory_entry(path_a) and norm_b.startswith(norm_a + "/")) or (
+        _is_directory_entry(path_b) and norm_a.startswith(norm_b + "/")
+    )
+
+
+def _compute_overlap_edges(
+    items: list[dict[str, Any]], item_ids: list[str]
+) -> list[DagEdge]:
+    """Compute deterministic dependency edges for items with overlapping file paths.
+
+    For any pair of items *(earlier, later)* — in input order — whose
+    ``files_to_modify`` paths overlap, adds an edge ``earlier → later`` so
+    that they are always serialised, regardless of what the LLM planner decided.
+
+    Args:
+        items: Full GTD item dicts (each must contain ``'id'`` and
+            ``'files_to_modify'``).
+        item_ids: Ordered list of item IDs that defines input ordering.
+
+    Returns:
+        List of DagEdge representing deterministic overlap constraints.
+    """
+    # Build a map from item_id → list of file paths
+    id_to_paths: dict[str, list[str]] = {}
+    for item in items:
+        iid = str(item.get("id", ""))
+        files = item.get("files_to_modify", [])
+        paths: list[str] = []
+        if isinstance(files, list):
+            paths = [
+                str(f.get("path", ""))
+                for f in files
+                if isinstance(f, dict) and f.get("path")
+            ]
+        id_to_paths[iid] = paths
+
+    edges: list[DagEdge] = []
+    for i, id_a in enumerate(item_ids):
+        for id_b in item_ids[i + 1 :]:
+            paths_a = id_to_paths.get(id_a, [])
+            paths_b = id_to_paths.get(id_b, [])
+            if any(_paths_overlap(pa, pb) for pa in paths_a for pb in paths_b):
+                edges.append(DagEdge(from_item_id=id_a, to_item_id=id_b))
+    return edges
+
+
+def _merge_edges(
+    llm_edges: list[DagEdge], overlap_edges: list[DagEdge]
+) -> list[DagEdge]:
+    """Union LLM-produced edges with deterministic overlap edges, deduplicating.
+
+    LLM edges appear first in the result; overlap edges fill any gaps the LLM
+    missed.  Duplicate ``(from_id, to_id)`` pairs are silently dropped.
+
+    Args:
+        llm_edges: Edges produced by the LLM planner.
+        overlap_edges: Deterministic edges from file-path overlap analysis.
+
+    Returns:
+        Merged, deduplicated list of DagEdge.
+    """
+    seen: set[tuple[str, str]] = set()
+    result: list[DagEdge] = []
+    for edge in llm_edges + overlap_edges:
+        key = (edge.from_item_id, edge.to_item_id)
+        if key not in seen:
+            seen.add(key)
+            result.append(edge)
+    return result
+
+
 def _active_planner_model() -> str:
     """Return the model id that the planner will use for the current provider.
 
@@ -67,18 +162,27 @@ def _active_planner_model() -> str:
 async def plan_rollout(item_ids: list[str]) -> RolloutPlan:
     """Fetch items concurrently and call Claude to produce a dependency DAG.
 
+    After obtaining the LLM's semantic edges, the function deterministically
+    augments them with overlap edges derived from shared ``files_to_modify``
+    paths.  This guarantees that items touching the same file (or a directory
+    that contains another item's file) are always serialised — regardless of
+    whether the LLM detected the relationship.
+
     Args:
         item_ids: List of GTD item IDs to plan.
 
     Returns:
-        RolloutPlan with nodes, edges, and the model used.
+        RolloutPlan with nodes, edges, and the model used.  Edges are the
+        union of LLM semantic edges and deterministic overlap edges.
 
     Raises:
         Exception: If gtd_client.get_item fails for any item, the exception
             propagates to the caller.
     """
-    items = await asyncio.gather(*[gtd_client.get_item(iid) for iid in item_ids])
-    context = _build_context(list(items))
+    items_list = list(
+        await asyncio.gather(*[gtd_client.get_item(iid) for iid in item_ids])
+    )
+    context = _build_context(items_list)
     active_model = _active_planner_model()
     client: anthropic.AsyncAnthropicBedrock | anthropic.AsyncAnthropic
     if config.PLANNER_PROVIDER == "bedrock":
@@ -96,7 +200,9 @@ async def plan_rollout(item_ids: list[str]) -> RolloutPlan:
     )
     tool_block = next(b for b in response.content if b.type == "tool_use")
     tool_input = cast("dict[str, Any]", tool_block.input)
-    edges = _extract_edges(tool_input, set(item_ids))
+    llm_edges = _extract_edges(tool_input, set(item_ids))
+    overlap_edges = _compute_overlap_edges(items_list, item_ids)
+    edges = _merge_edges(llm_edges, overlap_edges)
     _assert_acyclic(list(item_ids), edges)
     return RolloutPlan(nodes=list(item_ids), edges=edges, planner_model=active_model)
 

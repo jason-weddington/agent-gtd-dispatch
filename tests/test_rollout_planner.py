@@ -360,6 +360,402 @@ class TestExtractEdges:
         assert edges == []
 
 
+class TestPathsOverlap:
+    def test_identical_paths_overlap(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _paths_overlap
+
+        assert _paths_overlap("src/foo.py", "src/foo.py") is True
+
+    def test_different_paths_do_not_overlap(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _paths_overlap
+
+        assert _paths_overlap("src/foo.py", "src/bar.py") is False
+
+    def test_trailing_slash_directory_overlaps_nested_file(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _paths_overlap
+
+        assert (
+            _paths_overlap(
+                "agent-gtd-dispatch/tests/", "agent-gtd-dispatch/tests/test_foo.py"
+            )
+            is True
+        )
+        assert (
+            _paths_overlap(
+                "agent-gtd-dispatch/tests/test_foo.py", "agent-gtd-dispatch/tests/"
+            )
+            is True
+        )
+
+    def test_no_extension_directory_overlaps_nested_file(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _paths_overlap
+
+        assert (
+            _paths_overlap(
+                "agent-gtd-dispatch/tests", "agent-gtd-dispatch/tests/test_foo.py"
+            )
+            is True
+        )
+        assert (
+            _paths_overlap(
+                "agent-gtd-dispatch/tests/test_foo.py", "agent-gtd-dispatch/tests"
+            )
+            is True
+        )
+
+    def test_directory_does_not_overlap_sibling_file(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _paths_overlap
+
+        # src/foo is a dir; src/foobar.py is NOT beneath it
+        assert _paths_overlap("src/foo", "src/foobar.py") is False
+
+    def test_file_with_extension_not_treated_as_directory(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _paths_overlap
+
+        # setup-dispatch-host.sh has an extension → not a directory
+        assert (
+            _paths_overlap(
+                "agent-gtd-dispatch/setup-dispatch-host.sh",
+                "agent-gtd-dispatch/setup-dispatch-host.sh/extra",
+            )
+            is False
+        )
+
+    def test_normalized_trailing_slash_matches(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _paths_overlap
+
+        # "src/foo/" vs "src/foo" — same after normalisation
+        assert _paths_overlap("src/foo/", "src/foo/") is True
+        assert _paths_overlap("src/foo/", "src/foo") is True
+
+
+class TestComputeOverlapEdges:
+    def test_two_items_same_exact_path(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _compute_overlap_edges
+
+        items = [
+            {
+                "id": "a",
+                "files_to_modify": [
+                    {"path": "agent-gtd-dispatch/setup.sh", "change": "add line"}
+                ],
+            },
+            {
+                "id": "b",
+                "files_to_modify": [
+                    {"path": "agent-gtd-dispatch/setup.sh", "change": "remove line"}
+                ],
+            },
+        ]
+        edges = _compute_overlap_edges(items, ["a", "b"])
+
+        assert len(edges) == 1
+        assert edges[0].from_item_id == "a"
+        assert edges[0].to_item_id == "b"
+
+    def test_no_shared_paths_no_edges(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _compute_overlap_edges
+
+        items = [
+            {"id": "a", "files_to_modify": [{"path": "src/foo.py", "change": "x"}]},
+            {"id": "b", "files_to_modify": [{"path": "src/bar.py", "change": "y"}]},
+        ]
+        edges = _compute_overlap_edges(items, ["a", "b"])
+
+        assert edges == []
+
+    def test_three_items_same_file_yields_chain(self) -> None:
+        """Regression: three items sharing the same file must be fully serialised."""
+        from agent_gtd_dispatch.rollout_planner import _compute_overlap_edges
+
+        items = [
+            {
+                "id": "a",
+                "files_to_modify": [{"path": "agent_gtd/README.md", "change": "A"}],
+            },
+            {
+                "id": "b",
+                "files_to_modify": [{"path": "agent_gtd/README.md", "change": "B"}],
+            },
+            {
+                "id": "c",
+                "files_to_modify": [{"path": "agent_gtd/README.md", "change": "C"}],
+            },
+        ]
+        edges = _compute_overlap_edges(items, ["a", "b", "c"])
+
+        edge_pairs = {(e.from_item_id, e.to_item_id) for e in edges}
+        # All three pairs must be present so the items are totally ordered
+        assert ("a", "b") in edge_pairs
+        assert ("a", "c") in edge_pairs
+        assert ("b", "c") in edge_pairs
+
+    def test_four_items_same_file_fully_serialised(self) -> None:
+        """Regression for AL2023-feedback wave: four items editing same shell script."""
+        from agent_gtd_dispatch.rollout_planner import _compute_overlap_edges
+
+        path = "agent-gtd-dispatch/setup-dispatch-host.sh"
+        items = [
+            {"id": str(i), "files_to_modify": [{"path": path, "change": ""}]}
+            for i in range(4)
+        ]
+        edges = _compute_overlap_edges(items, [str(i) for i in range(4)])
+
+        edge_pairs = {(e.from_item_id, e.to_item_id) for e in edges}
+        # Every earlier→later pair must have an edge
+        for i in range(4):
+            for j in range(i + 1, 4):
+                assert (str(i), str(j)) in edge_pairs, f"Missing edge {i}→{j}"
+
+    def test_directory_overlap_with_nested_file(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _compute_overlap_edges
+
+        items = [
+            {
+                "id": "a",
+                "files_to_modify": [
+                    {"path": "agent-gtd-dispatch/tests/", "change": "dir"}
+                ],
+            },
+            {
+                "id": "b",
+                "files_to_modify": [
+                    {"path": "agent-gtd-dispatch/tests/test_foo.py", "change": "file"}
+                ],
+            },
+        ]
+        edges = _compute_overlap_edges(items, ["a", "b"])
+
+        assert len(edges) == 1
+        assert edges[0].from_item_id == "a"
+        assert edges[0].to_item_id == "b"
+
+    def test_preserves_input_order_for_edge_direction(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _compute_overlap_edges
+
+        items = [
+            {"id": "b", "files_to_modify": [{"path": "shared.py", "change": ""}]},
+            {"id": "a", "files_to_modify": [{"path": "shared.py", "change": ""}]},
+        ]
+        # b comes before a in item_ids, so edge should be b→a
+        edges = _compute_overlap_edges(items, ["b", "a"])
+
+        assert len(edges) == 1
+        assert edges[0].from_item_id == "b"
+        assert edges[0].to_item_id == "a"
+
+    def test_empty_files_to_modify_no_edges(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _compute_overlap_edges
+
+        items = [
+            {"id": "a", "files_to_modify": []},
+            {"id": "b", "files_to_modify": []},
+        ]
+        edges = _compute_overlap_edges(items, ["a", "b"])
+
+        assert edges == []
+
+
+class TestMergeEdges:
+    def test_disjoint_edges_combined(self) -> None:
+        from agent_gtd_dispatch.models import DagEdge
+        from agent_gtd_dispatch.rollout_planner import _merge_edges
+
+        llm = [DagEdge(from_item_id="a", to_item_id="b")]
+        overlap = [DagEdge(from_item_id="b", to_item_id="c")]
+        result = _merge_edges(llm, overlap)
+
+        assert len(result) == 2
+
+    def test_duplicate_edges_deduplicated(self) -> None:
+        from agent_gtd_dispatch.models import DagEdge
+        from agent_gtd_dispatch.rollout_planner import _merge_edges
+
+        llm = [DagEdge(from_item_id="a", to_item_id="b")]
+        overlap = [DagEdge(from_item_id="a", to_item_id="b")]
+        result = _merge_edges(llm, overlap)
+
+        assert len(result) == 1
+
+    def test_llm_edge_preserved_first(self) -> None:
+        from agent_gtd_dispatch.models import DagEdge
+        from agent_gtd_dispatch.rollout_planner import _merge_edges
+
+        llm = [DagEdge(from_item_id="a", to_item_id="b")]
+        result = _merge_edges(llm, [])
+
+        assert result[0].from_item_id == "a"
+
+    def test_empty_inputs(self) -> None:
+        from agent_gtd_dispatch.rollout_planner import _merge_edges
+
+        assert _merge_edges([], []) == []
+
+
+class TestPlanRolloutOverlapRegression:
+    """Regression tests: same-file overlap edges appear regardless of LLM output."""
+
+    async def test_llm_misses_shared_file_overlap_edge_added_deterministically(
+        self,
+    ) -> None:
+        """LLM returns no edges; deterministic post-processing must add the edge."""
+        items = [
+            {
+                "id": "id1",
+                "title": "Item 1",
+                "description": "",
+                "blockers": [],
+                "files_to_modify": [
+                    {"path": "agent-gtd-dispatch/setup-dispatch-host.sh", "change": "A"}
+                ],
+                "acceptance_criteria": [],
+            },
+            {
+                "id": "id2",
+                "title": "Item 2",
+                "description": "",
+                "blockers": [],
+                "files_to_modify": [
+                    {"path": "agent-gtd-dispatch/setup-dispatch-host.sh", "change": "B"}
+                ],
+                "acceptance_criteria": [],
+            },
+        ]
+        # LLM deliberately returns no edges (simulates the bug)
+        mock_response = _make_tool_response([])
+        mock_gtd = _make_gtd_client(items)
+        mock_anthropic = _make_anthropic_module(mock_response)
+
+        with (
+            patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+            patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
+        ):
+            from agent_gtd_dispatch.rollout_planner import plan_rollout
+
+            result = await plan_rollout(["id1", "id2"])
+
+        # Must have the overlap edge despite LLM returning nothing
+        assert len(result.edges) == 1
+        assert result.edges[0].from_item_id == "id1"
+        assert result.edges[0].to_item_id == "id2"
+
+    async def test_four_items_same_file_all_serialised(self) -> None:
+        """Regression for AL2023-feedback wave: four items → no parallel execution."""
+        shared_path = "agent-gtd-dispatch/setup-dispatch-host.sh"
+        ids = ["i1", "i2", "i3", "i4"]
+        items = [
+            {
+                "id": iid,
+                "title": f"Item {iid}",
+                "description": "",
+                "blockers": [],
+                "files_to_modify": [{"path": shared_path, "change": ""}],
+                "acceptance_criteria": [],
+            }
+            for iid in ids
+        ]
+        # LLM returns only a partial chain — missing cross-pairs
+        mock_response = _make_tool_response(
+            [
+                {"from_item_id": "i1", "to_item_id": "i2"},
+                {"from_item_id": "i3", "to_item_id": "i4"},
+            ]
+        )
+        mock_gtd = _make_gtd_client(items)
+        mock_anthropic = _make_anthropic_module(mock_response)
+
+        with (
+            patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+            patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
+        ):
+            from agent_gtd_dispatch.rollout_planner import plan_rollout
+
+            result = await plan_rollout(ids)
+
+        edge_pairs = {(e.from_item_id, e.to_item_id) for e in result.edges}
+        # Every earlier→later pair must have an edge
+        for i, id_a in enumerate(ids):
+            for id_b in ids[i + 1 :]:
+                assert (id_a, id_b) in edge_pairs, f"Missing edge {id_a}→{id_b}"
+
+    async def test_llm_semantic_edge_preserved_when_no_file_overlap(self) -> None:
+        """LLM semantic edges are kept even when no file-path overlap exists."""
+        items = [
+            {
+                "id": "id1",
+                "title": "Item 1",
+                "description": "",
+                "blockers": [],
+                "files_to_modify": [{"path": "src/foo.py", "change": ""}],
+                "acceptance_criteria": [],
+            },
+            {
+                "id": "id2",
+                "title": "Item 2",
+                "description": "",
+                "blockers": [],
+                "files_to_modify": [{"path": "src/bar.py", "change": ""}],
+                "acceptance_criteria": [],
+            },
+        ]
+        # LLM detects a semantic dependency (no file overlap)
+        mock_response = _make_tool_response(
+            [{"from_item_id": "id1", "to_item_id": "id2"}]
+        )
+        mock_gtd = _make_gtd_client(items)
+        mock_anthropic = _make_anthropic_module(mock_response)
+
+        with (
+            patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+            patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
+        ):
+            from agent_gtd_dispatch.rollout_planner import plan_rollout
+
+            result = await plan_rollout(["id1", "id2"])
+
+        assert len(result.edges) == 1
+        assert result.edges[0].from_item_id == "id1"
+        assert result.edges[0].to_item_id == "id2"
+
+    async def test_llm_edge_and_overlap_edge_deduplicated(self) -> None:
+        """When LLM produces the overlap edge too, result contains it exactly once."""
+        items = [
+            {
+                "id": "id1",
+                "title": "Item 1",
+                "description": "",
+                "blockers": [],
+                "files_to_modify": [{"path": "shared.py", "change": ""}],
+                "acceptance_criteria": [],
+            },
+            {
+                "id": "id2",
+                "title": "Item 2",
+                "description": "",
+                "blockers": [],
+                "files_to_modify": [{"path": "shared.py", "change": ""}],
+                "acceptance_criteria": [],
+            },
+        ]
+        # LLM also returns the overlap edge
+        mock_response = _make_tool_response(
+            [{"from_item_id": "id1", "to_item_id": "id2"}]
+        )
+        mock_gtd = _make_gtd_client(items)
+        mock_anthropic = _make_anthropic_module(mock_response)
+
+        with (
+            patch("agent_gtd_dispatch.rollout_planner.gtd_client", mock_gtd),
+            patch("agent_gtd_dispatch.rollout_planner.anthropic", mock_anthropic),
+        ):
+            from agent_gtd_dispatch.rollout_planner import plan_rollout
+
+            result = await plan_rollout(["id1", "id2"])
+
+        # Should appear exactly once
+        assert len(result.edges) == 1
+
+
 class TestProviderSelection:
     """Tests for DISPATCH_PLANNER_PROVIDER env-gating.
 
