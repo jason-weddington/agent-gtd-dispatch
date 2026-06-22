@@ -762,6 +762,47 @@ class TestRunAgent:
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 200, mode="build")
             mock_proc.wait.assert_called_once_with(timeout=300)
 
+    async def test_headless_build_engine_set_in_subprocess_env(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """HEADLESS_BUILD_ENGINE is injected into the subprocess env with the engine name."""
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            _, kwargs = mock_popen.call_args
+            assert kwargs["env"]["HEADLESS_BUILD_ENGINE"] == "claude-code"
+
+    async def test_headless_build_engine_reflects_sonnet_engine(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """HEADLESS_BUILD_ENGINE uses the engine's own name string for sonnet."""
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE_SONNET, tmp_path, "sys", "Title", 20)
+            _, kwargs = mock_popen.call_args
+            assert kwargs["env"]["HEADLESS_BUILD_ENGINE"] == "claude-code-sonnet"
+
+    async def test_headless_build_engine_does_not_leak_to_os_environ(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """HEADLESS_BUILD_ENGINE must NOT be written into the dispatch service's os.environ."""
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        # Ensure the var is absent from the parent env before and after the call
+        monkeypatch.delenv("HEADLESS_BUILD_ENGINE", raising=False)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            # Subprocess env carries the var
+            _, kwargs = mock_popen.call_args
+            assert "HEADLESS_BUILD_ENGINE" in kwargs["env"]
+        # Parent process env must remain unaffected
+        assert "HEADLESS_BUILD_ENGINE" not in os.environ
+
 
 class TestSudoWrapping:
     async def test_run_agent_sudo_prefix_when_user_set(

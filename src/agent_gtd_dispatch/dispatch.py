@@ -1845,6 +1845,11 @@ async def run_agent(
     env = build_env(engine, mode=mode)
     if attribution:
         env["AGENT_GTD_AGENT_NAME"] = attribution
+    # Tag the subprocess env with the engine identifier so KB-side telemetry can
+    # distinguish headless build agents from interactive control-plane sessions and
+    # attribute which engine pulled a whispered map.  This var is set ONLY on the
+    # per-subprocess env dict — it is never written to os.environ.
+    env["HEADLESS_BUILD_ENGINE"] = engine.name
 
     cmd = _sudo_wrap(cmd)
     transcript_path = workspace / "transcript.txt"
