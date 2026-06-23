@@ -73,6 +73,7 @@ class Run(BaseModel):
     rollout_id: str | None = None
     workspace_path: str | None = None
     push_results: list[RepoPushStatus] | None = None
+    callback_token: str | None = None
     status: RunStatus = RunStatus.pending
     started_at: datetime | None = None
     completed_at: datetime | None = None

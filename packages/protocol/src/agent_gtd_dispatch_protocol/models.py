@@ -38,6 +38,7 @@ class DispatchRequest(BaseModel):
     timeout_minutes: int | None = None
     rollout_id: str | None = None
     attribution: str | None = None
+    callback_token: str | None = None
 
 
 class RunResponse(BaseModel):

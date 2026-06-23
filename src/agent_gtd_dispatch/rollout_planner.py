@@ -179,6 +179,7 @@ async def plan_rollout(item_ids: list[str]) -> RolloutPlan:
         Exception: If gtd_client.get_item fails for any item, the exception
             propagates to the caller.
     """
+    # /plan endpoint: deliberately uses the static service key — no owning run/user.
     items_list = list(
         await asyncio.gather(*[gtd_client.get_item(iid) for iid in item_ids])
     )

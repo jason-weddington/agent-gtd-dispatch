@@ -161,6 +161,8 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE runs ADD COLUMN engine_actual TEXT")
     if "push_results" not in existing:
         await db.execute("ALTER TABLE runs ADD COLUMN push_results TEXT")
+    if "callback_token" not in existing:
+        await db.execute("ALTER TABLE runs ADD COLUMN callback_token TEXT")
     # Idempotent rename: migrate any legacy 'claude' engine rows to 'claude-code'
     await db.execute("UPDATE runs SET engine = 'claude-code' WHERE engine = 'claude'")
     await db.commit()
@@ -199,8 +201,8 @@ async def insert_run(run: Run) -> None:
             """INSERT INTO runs
                (id, item_id, project_name, branch_name, engine, engine_actual,
                 agent_name, mode, rollout_id, workspace_path, status, started_at,
-                completed_at, exit_code, error, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                completed_at, exit_code, error, created_at, callback_token)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run.id,
                 run.item_id,
@@ -218,6 +220,7 @@ async def insert_run(run: Run) -> None:
                 run.exit_code,
                 run.error,
                 run.created_at.isoformat(),
+                run.callback_token,
             ),
         )
         await db.commit()
@@ -335,6 +338,16 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
     if push_results_raw is not None:
         push_results = [RepoPushStatus(**d) for d in json.loads(push_results_raw)]
 
+    # callback_token column was added in a post-v1.1.0 migration; pre-existing
+    # rows have NULL here, which is fine — gtd_client falls back to the static key.
+    callback_token: str | None
+    try:
+        callback_token = row["callback_token"]
+    except (KeyError, IndexError):
+        # Defensive: row may pre-date the migration (shouldn't happen since
+        # init_db runs the migration, but keep the read tolerant).
+        callback_token = None
+
     return Run(
         id=row["id"],
         item_id=row["item_id"],
@@ -347,6 +360,7 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         rollout_id=row["rollout_id"],
         workspace_path=row["workspace_path"],
         push_results=push_results,
+        callback_token=callback_token,
         status=RunStatus(row["status"]),
         started_at=_parse_dt(row["started_at"]),
         completed_at=_parse_dt(row["completed_at"]),

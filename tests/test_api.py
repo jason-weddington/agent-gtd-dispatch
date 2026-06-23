@@ -446,6 +446,168 @@ class TestDispatch:
         assert data["engine_swap"]["to_engine"] == "claude-code"
 
 
+class TestDispatchCallbackToken:
+    """Regression: per-run callback_token forwarded to handler-time get_item.
+
+    The bug (2026-06-22): a non-admin user dispatching an item in their own
+    project got 404 'Item not found' because the synchronous handler-time
+    get_item ran with the static admin key, which scope-fails for items
+    the admin does not own/share. Fix: forward body.callback_token to
+    gtd_client.get_item / get_project / get_rollout in the dispatch handler.
+    """
+
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_callback_token_passed_to_handler_get_item(
+        self, mock_client, mock_dispatch, client, auth_headers
+    ):
+        """POST /dispatch with callback_token → handler-time get_item gets token=<jwt>."""
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_client.post_comment = AsyncMock()
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={
+                "item_id": "abc12345-6789",
+                "max_turns": 50,
+                "callback_token": "eyJ-per-run-jwt",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        # The bug locus: handler-time get_item MUST be called with token=<jwt>
+        mock_client.get_item.assert_awaited_once_with(
+            "abc12345-6789", token="eyJ-per-run-jwt"
+        )
+        # And get_project should also forward the token
+        mock_client.get_project.assert_awaited_once_with(
+            "proj1", token="eyJ-per-run-jwt"
+        )
+
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_no_callback_token_passes_none(
+        self, mock_client, mock_dispatch, client, auth_headers
+    ):
+        """Back-compat: omitted callback_token → handler-time get_item gets token=None.
+
+        gtd_client._request then falls back to config.AGENT_GTD_API_KEY,
+        preserving today's admin-dispatch path byte-for-byte.
+        """
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_client.post_comment = AsyncMock()
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "abc12345-6789", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        mock_client.get_item.assert_awaited_once_with("abc12345-6789", token=None)
+        mock_client.get_project.assert_awaited_once_with("proj1", token=None)
+
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_callback_token_persisted_on_run(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ):
+        """The token is stored on the Run so worker-flow calls can use it."""
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={
+                "item_id": "abc12345-6789",
+                "max_turns": 50,
+                "callback_token": "eyJ-run-jwt-stored",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        # Run object passed to _dispatch_worker carries the callback token
+        run_arg = mock_worker.call_args.args[0]
+        assert run_arg.callback_token == "eyJ-run-jwt-stored"  # noqa: S105
+
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_manage_mode_callback_token_forwarded_to_get_rollout(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ):
+        """Manage-mode handler-time get_rollout/get_project forward callback_token too."""
+        mock_client.get_rollout = AsyncMock(
+            return_value={"id": "wr-abc", "project_id": "proj1", "status": "running"}
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+
+        resp = client.post(
+            "/dispatch",
+            json={
+                "max_turns": 200,
+                "mode": "manage",
+                "rollout_id": "wr-abc",
+                "callback_token": "eyJ-manage-jwt",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        mock_client.get_rollout.assert_awaited_once_with(
+            "wr-abc", token="eyJ-manage-jwt"
+        )
+        mock_client.get_project.assert_awaited_once_with(
+            "proj1", token="eyJ-manage-jwt"
+        )
+
+
 class TestMaxConcurrentRunsEnforcement:
     @patch("agent_gtd_dispatch.main.gtd_client")
     @patch("agent_gtd_dispatch.main.dispatch")

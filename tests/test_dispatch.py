@@ -1258,6 +1258,106 @@ class TestDbWorkspacePath:
         assert fetched.status.value == "pending"
 
 
+class TestDbCallbackToken:
+    """Phase 1 of the per-run callback-token rollout.
+
+    The Run model carries `callback_token`; db.py persists it via a
+    migrate-only ALTER (NOT in CREATE TABLE — backward-compat for v1.1.0
+    schemas). Verify round-trip + idempotent migration.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+
+    async def test_callback_token_column_exists(self) -> None:
+        await db.init_db()
+        async with aiosqlite.connect(db.db_path()) as conn:
+            cursor = await conn.execute("PRAGMA table_info(runs)")
+            cols = {row[1] for row in await cursor.fetchall()}
+        assert "callback_token" in cols
+
+    async def test_callback_token_round_trip(self) -> None:
+        await db.init_db()
+        run = Run(
+            item_id="i1",
+            project_name="p",
+            branch_name="b",
+            callback_token="eyJ-jwt-token-abc",
+        )
+        await db.insert_run(run)
+        fetched = await db.get_run(run.id)
+        assert fetched is not None
+        assert fetched.callback_token == "eyJ-jwt-token-abc"  # noqa: S105
+
+    async def test_callback_token_defaults_to_none(self) -> None:
+        await db.init_db()
+        run = Run(item_id="i1", project_name="p", branch_name="b")
+        # Default is None — back-compat for legacy senders + in-flight runs
+        await db.insert_run(run)
+        fetched = await db.get_run(run.id)
+        assert fetched is not None
+        assert fetched.callback_token is None
+
+    async def test_migrate_db_is_idempotent(self) -> None:
+        """Running init_db / _migrate_db twice must not raise (no duplicate ALTER)."""
+        await db.init_db()
+        # Run again — must be a no-op (column already exists)
+        await db.init_db()
+        async with aiosqlite.connect(db.db_path()) as conn:
+            cursor = await conn.execute("PRAGMA table_info(runs)")
+            cols = [row[1] for row in await cursor.fetchall()]
+        # Column appears exactly once
+        assert cols.count("callback_token") == 1
+
+    async def test_callback_token_not_in_minimal_create_table(self) -> None:
+        """callback_token must be migrate-only, NOT in the bootstrap CREATE TABLE.
+
+        Asserts the ACL constraint: a brand-new v1.1.0 schema is created by
+        CREATE TABLE without `callback_token`; the column is added by the
+        subsequent ALTER inside `_migrate_db`. This protects the documented
+        invariant that post-v1.1.0 columns are migrate-only.
+        """
+        import inspect
+
+        # Inspect db.init_db source to find the CREATE TABLE block — it must
+        # not mention callback_token (that's added by ALTER in _migrate_db).
+        init_src = inspect.getsource(db.init_db)
+        create_block_start = init_src.index("CREATE TABLE IF NOT EXISTS runs")
+        create_block_end = init_src.index('"""', create_block_start + 30)
+        create_block = init_src[create_block_start:create_block_end]
+        assert "callback_token" not in create_block, (
+            "callback_token must be added via ALTER in _migrate_db, "
+            "not in the bootstrap CREATE TABLE"
+        )
+
+    async def test_legacy_in_flight_row_resolves_to_none(self) -> None:
+        """A row created before the ALTER (NULL callback_token) reads back as None.
+
+        Simulates an in-flight v1.1.0 run that survived the upgrade — must
+        gracefully fall back to the static service key.
+        """
+        await db.init_db()
+        # Write a row directly with NULL callback_token (simulates legacy row)
+        async with aiosqlite.connect(db.db_path()) as conn:
+            await conn.execute(
+                "INSERT INTO runs (id, project_name, status, created_at, mode, engine)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "legacy-1",
+                    "p",
+                    "pending",
+                    "2026-06-22T00:00:00",
+                    "build",
+                    "claude-code",
+                ),
+            )
+            await conn.commit()
+        fetched = await db.get_run("legacy-1")
+        assert fetched is not None
+        assert fetched.callback_token is None
+
+
 def _completed(
     returncode: int = 0, stdout: str = "", stderr: str = ""
 ) -> subprocess.CompletedProcess:  # type: ignore[type-arg]

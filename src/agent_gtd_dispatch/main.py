@@ -246,6 +246,10 @@ async def _do_manage_recovery(
         run_killed,
     )
 
+    # manage-recovery deliberately uses the static service key: it can fire from
+    # the watchdog (no owning user/run) or from the post-exit relaunch path, and
+    # we want recovery to succeed even when the original Run's callback_token
+    # has expired. Do NOT thread a per-run token here.
     try:
         updated = await gtd_client.relaunch_manage_rollout(rollout_id)
     except Exception:
@@ -292,6 +296,7 @@ async def _do_manage_recovery(
         rollout_id=rollout_id,
         engine=run.engine if run else engine.name,
         agent_name=run.agent_name if run else None,
+        callback_token=run.callback_token if run else None,
     )
     await db.insert_run(new_run)
     task = asyncio.create_task(
@@ -323,6 +328,8 @@ async def _maybe_relaunch_manage(
       or halts.
     """
     assert run.rollout_id is not None  # noqa: S101 — caller guarantees this
+    # manage-recovery probe: deliberately on the static key (callback_token may
+    # have expired by the time we relaunch). See _do_manage_recovery comment.
     try:
         rollout = await gtd_client.get_rollout(run.rollout_id)
     except Exception:
@@ -474,6 +481,8 @@ async def _watchdog_tick() -> None:
 
     Exposed at module level for direct invocation in tests.
     """
+    # Watchdog deliberately uses the static service key: it has no owning user
+    # or run, and must function for all rollouts regardless of who dispatched them.
     try:
         rollouts = await gtd_client.list_running_rollouts()
     except Exception:
@@ -579,6 +588,7 @@ async def _dispatch_worker(
                         run.item_id,
                         fallback_msg,
                         created_by=attribution or "agent-gtd-dispatch",
+                        token=run.callback_token,
                     )
                 except Exception:
                     logger.warning(
@@ -600,18 +610,20 @@ async def _dispatch_worker(
         # manage-mode runs have item_id=None — derive project from the rollout instead.
         item: dict[str, Any] = {}
         if run.item_id is not None:
-            item = await gtd_client.get_item(run.item_id)
+            item = await gtd_client.get_item(run.item_id, token=run.callback_token)
             project_id = item.get("project_id")
             if not project_id:
                 raise ValueError("Item has no project assigned")
-            project = await gtd_client.get_project(project_id)
+            project = await gtd_client.get_project(project_id, token=run.callback_token)
         else:
             assert run.rollout_id is not None  # noqa: S101 — guaranteed by route handler
-            rollout_info = await gtd_client.get_rollout(run.rollout_id)
+            rollout_info = await gtd_client.get_rollout(
+                run.rollout_id, token=run.callback_token
+            )
             project_id = rollout_info.get("project_id")
             if not project_id:
                 raise ValueError("Rollout has no project assigned")
-            project = await gtd_client.get_project(project_id)
+            project = await gtd_client.get_project(project_id, token=run.callback_token)
 
         # Build workspace
         is_workspace_mode = (project.get("repo_mode") or "") == "workspace"
@@ -674,7 +686,7 @@ async def _dispatch_worker(
             # Stage attachments — item_id guaranteed non-None for non-manage modes
             assert run.item_id is not None  # noqa: S101
             attachments = await dispatch.stage_attachments(
-                workspace, run.id, run.item_id
+                workspace, run.id, run.item_id, token=run.callback_token
             )
         else:
             # Monorepo path (default — absent/None/empty/unrecognized repo_mode)
@@ -699,7 +711,7 @@ async def _dispatch_worker(
             # item_id is guaranteed non-None for non-manage modes (validated at route layer)
             assert run.item_id is not None  # noqa: S101
             attachments = await dispatch.stage_attachments(
-                workspace, run.id, run.item_id
+                workspace, run.id, run.item_id, token=run.callback_token
             )
 
         system_prompt = dispatch.build_system_prompt(
@@ -732,6 +744,7 @@ async def _dispatch_worker(
                 run.item_id,
                 dispatch_comment,
                 created_by=attribution or "agent-gtd-dispatch",
+                token=run.callback_token,
             )
 
         def _register_subprocess(proc: subprocess.Popen[bytes]) -> None:
@@ -823,6 +836,7 @@ async def _dispatch_worker(
                             run.item_id,
                             "\n".join(comment_lines),
                             created_by=attribution or "agent-gtd-dispatch",
+                            token=run.callback_token,
                         )
                     return  # exit early — do not mark succeeded
 
@@ -864,6 +878,7 @@ async def _dispatch_worker(
                     f"Agent exited with code {result.returncode} (run `{run.id}`)."
                     f"\n\n```\n{error_msg}\n```",
                     created_by=attribution or "agent-gtd-dispatch",
+                    token=run.callback_token,
                 )
 
     except subprocess.TimeoutExpired:
@@ -881,6 +896,7 @@ async def _dispatch_worker(
                 f"Agent timed out after {timeout_seconds // 60} minutes (run `{run.id}`). "
                 "The task may need to be broken down into smaller pieces.",
                 created_by=attribution or "agent-gtd-dispatch",
+                token=run.callback_token,
             )
         if mode == DispatchMode.MANAGE:
             should_cleanup = False
@@ -1017,7 +1033,13 @@ async def dispatch_item(
         # Derive project from rollout — item_id is None for manage-mode runs
         assert body.rollout_id is not None  # noqa: S101 — validated above
         try:
-            rollout = await gtd_client.get_rollout(body.rollout_id)
+            # Handler-time call: use the sender-supplied per-run callback token
+            # so authorization runs as the dispatching user (admin or member).
+            # Falls back to the static service key when body.callback_token is None
+            # (legacy senders + admin dispatch). See _request fallback in gtd_client.
+            rollout = await gtd_client.get_rollout(
+                body.rollout_id, token=body.callback_token
+            )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 raise HTTPException(
@@ -1056,7 +1078,11 @@ async def dispatch_item(
             )
 
         try:
-            project = await gtd_client.get_project(project_id)
+            # Handler-time call: see token-forwarding rationale at the get_rollout
+            # call above.
+            project = await gtd_client.get_project(
+                project_id, token=body.callback_token
+            )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 raise HTTPException(
@@ -1111,7 +1137,12 @@ async def dispatch_item(
         assert body.item_id is not None  # noqa: S101
         # Fetch item to validate and get project info
         try:
-            item = await gtd_client.get_item(body.item_id)
+            # THE BUG LOCUS: this synchronous handler-time get_item is the
+            # 404 site. agent_gtd scopes item reads to owner-or-member, so a
+            # non-admin dispatching against the static admin key gets 404 here.
+            # Forwarding body.callback_token authorizes the read as the
+            # dispatching user. Falls back to the static service key when None.
+            item = await gtd_client.get_item(body.item_id, token=body.callback_token)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 raise HTTPException(status_code=404, detail="Item not found") from exc
@@ -1146,7 +1177,10 @@ async def dispatch_item(
             raise HTTPException(status_code=400, detail="Item has no project assigned")
 
         try:
-            project = await gtd_client.get_project(project_id)
+            # Handler-time call: see token-forwarding rationale at get_item above.
+            project = await gtd_client.get_project(
+                project_id, token=body.callback_token
+            )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 raise HTTPException(
@@ -1214,6 +1248,7 @@ async def dispatch_item(
         agent_name=body.agent_name,
         mode=body.mode,
         rollout_id=body.rollout_id,
+        callback_token=body.callback_token,
     )
     await db.insert_run(run)
 
@@ -1379,6 +1414,7 @@ async def cancel_run(
                 run.item_id,
                 "Run cancelled by lead via agent-gtd",
                 created_by="agent-gtd-dispatch",
+                token=run.callback_token,
             )
         except Exception:
             logger.warning("Failed to post cancellation comment for run %s", run_id)

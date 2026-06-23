@@ -511,7 +511,7 @@ def _sanitize_filename(filename: str) -> str:
 
 
 async def stage_attachments(
-    workspace: Path, run_id: str, item_id: str
+    workspace: Path, run_id: str, item_id: str, *, token: str | None = None
 ) -> list[dict[str, Any]]:
     """Fetch attachments for the item, write them into {run_id}-attachments/.
 
@@ -519,9 +519,13 @@ async def stage_attachments(
     Empty list if the item has no attachments.
     Individual download failures are logged but don't abort the run — the failed
     entry is omitted from the returned list.
+
+    The optional ``token`` is forwarded to ``gtd_client`` so attachments are
+    fetched under the dispatching user's identity (when the sender provided a
+    per-run callback token). None falls back to the static service key.
     """
     try:
-        attachments = await gtd_client.list_attachments(item_id)
+        attachments = await gtd_client.list_attachments(item_id, token=token)
     except Exception as exc:
         logger.warning("Failed to list attachments for item %s: %s", item_id, exc)
         return []
@@ -538,7 +542,7 @@ async def stage_attachments(
         raw_filename = attachment.get("filename", "attachment")
         filename = _sanitize_filename(raw_filename)
         try:
-            data = await gtd_client.download_attachment(att_id)
+            data = await gtd_client.download_attachment(att_id, token=token)
             (attach_dir / filename).write_bytes(data)
             staged.append(attachment)
         except Exception as exc:

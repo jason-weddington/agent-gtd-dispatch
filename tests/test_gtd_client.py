@@ -398,3 +398,211 @@ class TestRolloutMethods:
             "http://localhost:9999/api/items/item-1/comments",
             headers={"Authorization": "Bearer test-gtd-key"},
         )
+
+
+class TestCallbackTokenAuthHeader:
+    """Phase 1 of the per-run callback-token rollout.
+
+    Every gtd_client public fn forwards an optional `token` keyword to the
+    Authorization header. None falls back to config.AGENT_GTD_API_KEY
+    (the static service key) so legacy senders and admin dispatch keep
+    working byte-identical to today.
+    """
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_get_item_token_explicit_used_as_bearer(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import get_item
+
+        mock_client, _ = _make_client_mock({"id": "item1"})
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await get_item("item1", token="eyJ-jwt-token")
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer eyJ-jwt-token"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_get_item_token_none_falls_back_to_static_key(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import get_item
+
+        mock_client, _ = _make_client_mock({"id": "item1"})
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await get_item("item1", token=None)
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer test-gtd-key"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_get_item_token_omitted_falls_back_to_static_key(
+        self, mock_cls
+    ) -> None:
+        from agent_gtd_dispatch.gtd_client import get_item
+
+        mock_client, _ = _make_client_mock({"id": "item1"})
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await get_item("item1")  # token kw omitted entirely
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer test-gtd-key"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_get_project_token_explicit(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import get_project
+
+        mock_client, _ = _make_client_mock({"id": "p1"})
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await get_project("p1", token="jwt-abc")
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer jwt-abc"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_post_comment_token_explicit(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import post_comment
+
+        mock_client, _ = _make_client_mock(content=b"")
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await post_comment("i1", "hi", created_by="x", token="jwt-pc")
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer jwt-pc"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_list_attachments_token_explicit(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import list_attachments
+
+        mock_client, _ = _make_client_mock(json_data=[])
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await list_attachments("i1", token="jwt-la")
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer jwt-la"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_download_attachment_token_explicit(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import download_attachment
+
+        mock_client, _ = _make_client_mock(content=b"data")
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await download_attachment("a1", token="jwt-da")
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer jwt-da"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_get_rollout_token_explicit(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import get_rollout
+
+        mock_client, _ = _make_client_mock({"id": "r1"})
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await get_rollout("r1", token="jwt-gr")
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer jwt-gr"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_advance_rollout_token_explicit(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import advance_rollout
+
+        mock_client, _ = _make_client_mock({"next_ready": []})
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await advance_rollout("r1", token="jwt-ar")
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer jwt-ar"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_complete_in_rollout_token_explicit(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import complete_in_rollout
+
+        mock_client, _ = _make_client_mock(content=b"")
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await complete_in_rollout("r1", "i1", outcome="completed", token="jwt-cir")
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer jwt-cir"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_relaunch_manage_rollout_token_explicit(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import relaunch_manage_rollout
+
+        mock_client, _ = _make_client_mock({"manage_retry_count": 1})
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await relaunch_manage_rollout("r1", token="jwt-rmr")
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer jwt-rmr"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_halt_rollout_token_explicit(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import halt_rollout
+
+        mock_client, _ = _make_client_mock(content=b"")
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await halt_rollout("r1", reason="ci-fail", token="jwt-hr")
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer jwt-hr"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_list_comments_token_explicit(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import list_comments
+
+        mock_client, _ = _make_client_mock(json_data=[])
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await list_comments("i1", token="jwt-lc")
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer jwt-lc"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_list_running_rollouts_token_explicit(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import list_running_rollouts
+
+        mock_client, _ = _make_client_mock(json_data=[])
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await list_running_rollouts(token="jwt-lrr")
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer jwt-lrr"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_post_comment_token_none_falls_back_to_static_key(
+        self, mock_cls
+    ) -> None:
+        from agent_gtd_dispatch.gtd_client import post_comment
+
+        mock_client, _ = _make_client_mock(content=b"")
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await post_comment("i1", "hi", created_by="x", token=None)
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer test-gtd-key"}
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_download_attachment_token_none_falls_back_to_static_key(
+        self, mock_cls
+    ) -> None:
+        from agent_gtd_dispatch.gtd_client import download_attachment
+
+        mock_client, _ = _make_client_mock(content=b"data")
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await download_attachment("a1", token=None)
+
+        _, kwargs = mock_client.request.call_args
+        assert kwargs["headers"] == {"Authorization": "Bearer test-gtd-key"}

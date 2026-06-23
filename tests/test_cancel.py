@@ -219,10 +219,13 @@ class TestCancelRun:
             resp = client.post(f"/runs/{run.id}/cancel", headers=auth_headers)
 
         assert resp.status_code == 200
+        # token=None: the test Run has no callback_token, so it falls back to
+        # config.AGENT_GTD_API_KEY inside gtd_client._request.
         mock_gtd.post_comment.assert_called_once_with(
             "item-xyz",
             "Run cancelled by lead via agent-gtd",
             created_by="agent-gtd-dispatch",
+            token=None,
         )
 
     # ------------------------------------------------------------------
