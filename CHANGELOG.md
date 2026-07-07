@@ -2,6 +2,31 @@
 
 <!-- version list -->
 
+## v1.16.0 (2026-07-07)
+
+### Bug Fixes
+
+- **dispatch**: Check-and-clean stale workspace at launch (crash-safe)
+  ([`9839909`](https://github.com/repos/agent-gtd-dispatch/commit/9839909a7ec6fdd7125feebacee090473a8126c2))
+
+### Features
+
+- Per-run callback token in dispatch service (Phase 1 of 2)
+  ([`40dedf1`](https://github.com/repos/agent-gtd-dispatch/commit/40dedf18b535f7b654e36f6bcc50ac62280d166b))
+
+- **176502fa**: Add engine_actual to protocol RunResponse and set git identity per engine
+  ([`3fe9af3`](https://github.com/repos/agent-gtd-dispatch/commit/3fe9af36a0633687c998877fa2f1f7771936ca28))
+
+- **5f9552d7**: Engine_actual truthful end-to-end (dispatch test matrix fill)
+  ([`0e8216b`](https://github.com/repos/agent-gtd-dispatch/commit/0e8216bf62cf3b7a41062f62b9a3f6140f6fee46))
+
+- **89e45f3b**: Rollout DAG planner deterministic same-file overlap edges
+  ([`3301b5e`](https://github.com/repos/agent-gtd-dispatch/commit/3301b5e116a135b06286ef337d108ef8bbb7be81))
+
+- **db559e9f**: Set HEADLESS_BUILD_ENGINE env var on dispatched CC subprocess
+  ([`53fa544`](https://github.com/repos/agent-gtd-dispatch/commit/53fa5442718d479883c3f0765ba6da787dbadf39))
+
+
 ## v1.15.0 (2026-06-15)
 
 ### Bug Fixes
