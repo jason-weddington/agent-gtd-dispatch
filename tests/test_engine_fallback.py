@@ -146,6 +146,118 @@ class TestPlanModeEngineSwap:
         assert run.engine == "claude-code-ollama"
         assert run.engine_actual == "claude-code-ollama"
 
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    async def test_build_mode_claude_code_no_swap(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers, tmp_path
+    ) -> None:
+        """Matrix cell (4): plain build + claude-code, no swap.
+
+        engine_actual must equal the effective engine ('claude-code'), never a
+        fabricated/placeholder value, and no engine_swap is emitted.
+        """
+        from agent_gtd_dispatch import db
+
+        await db.init_db()
+
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={
+                "item_id": "abc12345-6789",
+                "max_turns": 50,
+                "engine": "claude-code",
+                "mode": "build",
+            },
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["engine"] == "claude-code"
+        assert data["engine_actual"] == "claude-code"
+        assert data["engine_swap"] is None
+
+        run = await db.get_run(data["id"])
+        assert run is not None
+        assert run.engine == "claude-code"
+        assert run.engine_actual == "claude-code"
+
+
+class TestManageModeEngineSwap:
+    """Matrix cell (3): manage-mode POST /dispatch with engine=claude-code-ollama."""
+
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    async def test_manage_mode_ollama_response_fields(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers, tmp_path
+    ) -> None:
+        """Manage + claude-code-ollama swaps to claude-code (same rule as plan)."""
+        from agent_gtd_dispatch import db
+
+        await db.init_db()
+
+        mock_client.get_rollout = AsyncMock(
+            return_value={
+                "id": "wr-abc",
+                "project_id": "proj1",
+                "status": "running",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "WaveProject",
+                "git_origin": "git@ubuntu-vm01:repos/wave-project",
+            }
+        )
+        mock_client.post_comment = AsyncMock()
+        mock_dispatch.build_system_prompt.return_value = "manage prompt"
+        mock_dispatch.prepare_manage_workspace.return_value = None
+
+        resp = client.post(
+            "/dispatch",
+            json={
+                "max_turns": 200,
+                "mode": "manage",
+                "engine": "claude-code-ollama",
+                "rollout_id": "wr-abc",
+            },
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        # engine = requested (preserved), engine_actual = effective (rewritten)
+        assert data["engine"] == "claude-code-ollama"
+        assert data["engine_actual"] == "claude-code"
+        assert data["engine_swap"] is not None
+        assert data["engine_swap"]["from_engine"] == "claude-code-ollama"
+        assert data["engine_swap"]["to_engine"] == "claude-code"
+        assert "plan/manage" in data["engine_swap"]["reason"]
+
+        run = await db.get_run(data["id"])
+        assert run is not None
+        assert run.engine == "claude-code-ollama"
+        assert run.engine_actual == "claude-code"
+
 
 class TestOllamaFallbackDbUpdate:
     """AC-5b: _dispatch_worker persists engine_actual and error on Ollama fallback."""
