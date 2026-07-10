@@ -85,8 +85,11 @@ class TestInfoEndpoint:
         assert data["active_runs"] >= 0
 
     def test_engines_list_filtered_by_availability(self, client) -> None:
-        # Fixture sets ANTHROPIC_API_KEY → claude-code/sonnet/haiku available;
-        # KIRO_API_KEY and OLLAMA_BASE_URL not set → kiro and ollama excluded.
+        # Fixture sets ANTHROPIC_API_KEY → claude-code/sonnet/haiku available
+        # AND the three talos-anthropic engines available (they gate on
+        # ANTHROPIC_API_KEY, not on CLAUDE_CODE_OAUTH_TOKEN).  KIRO_API_KEY,
+        # OLLAMA_BASE_URL, and OLLAMA_CLOUD_API_KEY are not set → kiro,
+        # claude-code-ollama, talos-qwen, and talos-glm are excluded.
         resp = client.get("/info")
         engines = resp.json()["engines"]
         assert isinstance(engines, list)
@@ -95,6 +98,9 @@ class TestInfoEndpoint:
             "claude-code",
             "claude-code-sonnet",
             "claude-code-haiku",
+            "talos-haiku",
+            "talos-sonnet",
+            "talos-opus",
         }
 
     def test_agents_list_from_discovery_script(
@@ -169,13 +175,21 @@ class TestEngineAvailability:
 
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-ant-x")
         monkeypatch.delenv("KIRO_API_KEY", raising=False)
         monkeypatch.setattr(config, "OLLAMA_BASE_URL", "")
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "")
         names = get_available_engine_names()
+        # ANTHROPIC_API_KEY set → claude-code family AND talos-anthropic family
+        # available.  Ollama disabled → claude-code-ollama, talos-qwen, talos-glm
+        # excluded.  KIRO_API_KEY unset → kiro excluded.
         assert set(names) == {
             "claude-code",
             "claude-code-sonnet",
             "claude-code-haiku",
+            "talos-haiku",
+            "talos-sonnet",
+            "talos-opus",
         }
 
 

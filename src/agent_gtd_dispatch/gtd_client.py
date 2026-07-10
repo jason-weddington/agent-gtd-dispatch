@@ -168,6 +168,26 @@ async def list_comments(
     return result
 
 
+async def set_item_status(
+    item_id: str, status: str, *, token: str | None = None
+) -> None:
+    """PATCH /items/{item_id} to set only the status field.
+
+    Used by the worker on talos exit 0 to move the item to ``review``. Sends
+    the body ``{"status": <status>}`` with NO ``version`` field — the GTD
+    UpdateItemRequest.version is Optional (models.py:643) and the item service
+    only enforces optimistic locking when a version is supplied, so the
+    unversioned form is intentional: a status set from a worker that just
+    landed a real commit must not lose to a comment written concurrently.
+    """
+    await _request(
+        "PATCH",
+        f"/items/{item_id}",
+        token=token,
+        json={"status": status},
+    )
+
+
 async def list_running_rollouts(*, token: str | None = None) -> list[dict[str, Any]]:
     """GET /api/rollouts?status=running — returns list of running rollout dicts.
 

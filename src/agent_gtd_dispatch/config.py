@@ -59,6 +59,18 @@ OLLAMA_API_KEY: str = "ollama"  # dummy value; Ollama ignores auth
 OLLAMA_DEFAULT_MODEL: str = "qwen3.6:35b"
 OLLAMA_TIMEOUT_MULTIPLIER: float = 2.0
 
+# Ollama Cloud API key (https://ollama.com) — distinct from the LOCAL OLLAMA_API_KEY
+# above, which points at the operator's own Ollama server (dummy 'ollama' on
+# unauthenticated setups). Consumed ONLY by the talos-glm engine, which routes to
+# ollama.com. There is intentionally NO fallback to OLLAMA_API_KEY: mixing the two
+# would silently ship the operator's local-server key to the cloud.
+OLLAMA_CLOUD_API_KEY: str = ""
+
+# talos binary discovery: default 'talos', PATH-resolved by the subprocess machinery
+# (mirrors how the 'claude' binary is resolved for claude-code engines). Override via
+# TALOS_BIN env var when the binary lives at a non-default path on the host.
+TALOS_BIN: str = "talos"
+
 
 def load() -> None:
     """Load configuration from environment. Call once at startup."""
@@ -67,6 +79,7 @@ def load() -> None:
     global ANTHROPIC_API_KEY, PLANNER_MODEL, MAX_CONCURRENT_RUNS
     global OLLAMA_BASE_URL, OLLAMA_API_KEY, OLLAMA_DEFAULT_MODEL
     global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS
+    global OLLAMA_CLOUD_API_KEY, TALOS_BIN
     global AGENT_SUBPROCESS_USER
     global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
     global PLANNER_PROVIDER, PLANNER_BEDROCK_MODEL, AWS_REGION
@@ -119,6 +132,10 @@ def load() -> None:
             )
             raise ValueError(msg)
     OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "ollama")
+    # NO fallback to OLLAMA_API_KEY — cloud vs. local Ollama servers use distinct
+    # credentials and mixing them ships the local key to the cloud.
+    OLLAMA_CLOUD_API_KEY = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
+    TALOS_BIN = os.environ.get("TALOS_BIN", "talos")
     OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "qwen3.6:35b")
     OLLAMA_TIMEOUT_MULTIPLIER = float(
         os.environ.get("OLLAMA_TIMEOUT_MULTIPLIER", "2.0")

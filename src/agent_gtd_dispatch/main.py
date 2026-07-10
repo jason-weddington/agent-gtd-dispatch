@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -18,11 +19,17 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable
 
-from . import config, db, dispatch, gtd_client, rollout_planner
+from . import config, db, dispatch, gtd_client, rollout_planner, talos
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
-from .engines import Engine, get_available_engine_names, get_engine
+from .engines import (
+    COMMON_ENV_KEYS,
+    Engine,
+    get_available_engine_names,
+    get_engine,
+    is_talos_engine,
+)
 from .models import (
     DispatchMode,
     DispatchRequest,
@@ -536,6 +543,313 @@ def _try_start_pending() -> None:
         _active_processes[pending.run.id] = task
 
 
+async def _run_talos(
+    run: Run,
+    engine: Engine,
+    workspace: Path,
+    item: dict[str, Any],
+    project: dict[str, Any],
+    timeout_seconds: int,
+    *,
+    attribution: str | None,
+    register_cb: Callable[[subprocess.Popen[bytes]], None],
+) -> None:
+    """Talos execution branch: subprocess launch, commit/push, comment-back, status set.
+
+    Entered from :func:`_dispatch_worker` when the resolved engine is in
+    :data:`engines.TALOS_ENGINES`. Owns the full lifecycle:
+
+    - Build the sudo-wrapped ``talos run …`` argv and pipe the TaskSpec JSON on
+      stdin. Stdout and stderr are captured SEPARATELY (never merged like
+      ``run_agent``'s transcript — the RunSummary is unparseable if streams mix).
+    - Register the Popen so ``POST /runs/{id}/cancel`` can signal it.
+    - Time out at ``timeout_seconds`` (kill + mark timed_out).
+    - Missing-binary → engine-broke ``failed`` with ``'talos'`` in the error.
+    - Exit 0: worker commits (``feat: <title>`` verbatim, ``-c user.name=<engine>
+      -c user.email=<engine>@agent-gtd-dispatch``) and pushes, then verifies via
+      :func:`dispatch.verify_pushes`. On successful push it PATCHes item status
+      to ``review`` (best-effort; a failed status set does NOT flip the run to
+      failed — mirrors the ollama-fallback comment-post's tolerance).
+    - Exit 10/20/1 (or unpushed after exit 0): no commit, no push, no status set.
+    - Every terminal exit posts a comment describing the outcome.
+    """
+    item_id = run.item_id
+    branch_name = run.branch_name
+    assert item_id is not None  # noqa: S101 — talos is BUILD-only (validated at /dispatch)
+    assert branch_name is not None  # noqa: S101 — set for BUILD mode
+
+    # Serialize the TaskSpec — narrow projection (title, description,
+    # acceptance_criteria, files_to_modify, gate_command). See talos.py.
+    spec_json = talos.serialize_task_spec(item, project)
+
+    # Build env from a base-filtered parent env + the per-engine overlay. The
+    # overlay is the ONLY source of per-engine credentials; it never adds git
+    # identity/credential keys (worker owns commit).
+    filtered_base = {k: v for k, v in os.environ.items() if k in COMMON_ENV_KEYS}
+    env = {**filtered_base, "HOME": str(Path.home())}
+    env.update(talos.talos_env_overlay(engine.name))
+    if attribution:
+        env["AGENT_GTD_AGENT_NAME"] = attribution
+    env["HEADLESS_BUILD_ENGINE"] = engine.name
+
+    argv = talos.build_talos_argv(workspace, item_id, attempt=1)
+
+    stdout_text = ""
+    stderr_text = ""
+    exit_code: int
+    timed_out = False
+    file_not_found = False
+
+    def _launch_and_wait() -> tuple[int, str, str]:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(workspace),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        register_cb(proc)
+        try:
+            out, err = proc.communicate(
+                input=spec_json.encode("utf-8"), timeout=timeout_seconds
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise
+        return (
+            proc.returncode,
+            out.decode("utf-8", errors="replace"),
+            err.decode("utf-8", errors="replace"),
+        )
+
+    loop = asyncio.get_event_loop()
+    try:
+        exit_code, stdout_text, stderr_text = await loop.run_in_executor(
+            None, _launch_and_wait
+        )
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        exit_code = -1
+    except FileNotFoundError as exc:
+        # config.TALOS_BIN not resolvable on PATH — mark failed with distinct
+        # engine-broke wording naming the missing binary.
+        file_not_found = True
+        exit_code = -1
+        stderr_text = f"talos binary not found: {exc}"
+
+    now = datetime.now(UTC).isoformat()
+
+    if timed_out:
+        await db.update_run(
+            run.id,
+            status=RunStatus.timed_out,
+            completed_at=now,
+            error=f"Timed out after {timeout_seconds}s",
+        )
+        _publish_run_event(run.id, "timed_out", now)
+        try:
+            await gtd_client.post_comment(
+                item_id,
+                (
+                    f"talos timed out after {timeout_seconds // 60} minutes "
+                    f"(run `{run.id}`)."
+                ),
+                created_by=attribution or "agent-gtd-dispatch",
+                token=run.callback_token,
+            )
+        except Exception:
+            logger.warning("Failed to post talos timeout comment for run %s", run.id)
+        return
+
+    if file_not_found:
+        await db.update_run(
+            run.id,
+            status=RunStatus.failed,
+            completed_at=now,
+            error=f"talos binary not found: {config.TALOS_BIN!r}",
+        )
+        _publish_run_event(run.id, "failed", now)
+        try:
+            await gtd_client.post_comment(
+                item_id,
+                (
+                    "talos engine error (retryable/investigate): "
+                    f"talos binary not found ({config.TALOS_BIN!r})."
+                    f" run={run.id}"
+                ),
+                created_by=attribution or "agent-gtd-dispatch",
+                token=run.callback_token,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to post talos missing-binary comment for run %s", run.id
+            )
+        return
+
+    # Take the last non-empty line of each stream. Talos writes exactly one JSON
+    # RunSummary line on stdout on the success/blocked/failure paths and a
+    # {"error": ...} line on stderr on the pre-run infra-error exit-1 path.
+    def _last_line(text: str) -> str:
+        for line in reversed(text.splitlines()):
+            if line.strip():
+                return line
+        return ""
+
+    stdout_line = _last_line(stdout_text)
+    stderr_line = _last_line(stderr_text)
+
+    status, should_push, comment_header = talos.map_talos_result(
+        exit_code, stdout_line, stderr_line
+    )
+
+    if should_push:
+        # Verified Done — the worker commits, pushes, verifies, and (if push
+        # verification succeeds) PATCHes the item to review. Any failure below
+        # demotes the run to `failed` and posts an appropriate comment.
+        commit_msg = f"feat: {item['title']}"
+        engine_ident = engine.name
+        git_ident_flags = [
+            "-c",
+            f"user.name={engine_ident}",
+            "-c",
+            f"user.email={engine_ident}@agent-gtd-dispatch",
+        ]
+        # Stage every worktree change (talos-written files under workspace).
+        add_rc = subprocess.run(
+            dispatch._sudo_wrap(["git", "add", "-A"]),
+            cwd=str(workspace),
+            check=False,
+            capture_output=True,
+        )
+        if add_rc.returncode != 0:
+            _err = add_rc.stderr.decode("utf-8", errors="replace")[-300:]
+            await db.update_run(
+                run.id,
+                status=RunStatus.failed,
+                completed_at=now,
+                exit_code=exit_code,
+                error=f"git add failed: {_err}",
+            )
+            _publish_run_event(run.id, "failed", now)
+            try:
+                await gtd_client.post_comment(
+                    item_id,
+                    f"talos completed but `git add` failed: {_err}",
+                    created_by=attribution or "agent-gtd-dispatch",
+                    token=run.callback_token,
+                )
+            except Exception:
+                logger.warning("Failed to post git-add failure comment for %s", run.id)
+            return
+
+        commit_rc = subprocess.run(
+            dispatch._sudo_wrap(["git", *git_ident_flags, "commit", "-m", commit_msg]),
+            cwd=str(workspace),
+            check=False,
+            capture_output=True,
+        )
+        if commit_rc.returncode != 0:
+            _err = commit_rc.stderr.decode("utf-8", errors="replace")[-300:]
+            await db.update_run(
+                run.id,
+                status=RunStatus.failed,
+                completed_at=now,
+                exit_code=exit_code,
+                error=f"git commit failed: {_err}",
+            )
+            _publish_run_event(run.id, "failed", now)
+            try:
+                await gtd_client.post_comment(
+                    item_id,
+                    f"talos completed but `git commit` failed: {_err}",
+                    created_by=attribution or "agent-gtd-dispatch",
+                    token=run.callback_token,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to post git-commit failure comment for %s", run.id
+                )
+            return
+
+        push_rc = subprocess.run(
+            dispatch._sudo_wrap(["git", "push", "-u", "origin", branch_name]),
+            cwd=str(workspace),
+            check=False,
+            capture_output=True,
+        )
+        if push_rc.returncode != 0:
+            _err = push_rc.stderr.decode("utf-8", errors="replace")[-300:]
+            await db.update_run(
+                run.id,
+                status=RunStatus.failed,
+                completed_at=now,
+                exit_code=exit_code,
+                error=f"git push failed: {_err}",
+            )
+            _publish_run_event(run.id, "failed", now)
+            try:
+                await gtd_client.post_comment(
+                    item_id,
+                    f"talos completed but `git push` failed: {_err}",
+                    created_by=attribution or "agent-gtd-dispatch",
+                    token=run.callback_token,
+                )
+            except Exception:
+                logger.warning("Failed to post git-push failure comment for %s", run.id)
+            return
+
+        # Push succeeded — mark the run succeeded, set item status best-effort,
+        # then post the success comment.
+        await db.update_run(
+            run.id,
+            status=RunStatus.succeeded,
+            completed_at=now,
+            exit_code=exit_code,
+        )
+        _publish_run_event(run.id, "succeeded", now)
+
+        # Status-set is deliberately tolerant: a PATCH failure does NOT flip the
+        # run to failed (mirrors the ollama-fallback comment-post's try/except).
+        try:
+            await gtd_client.set_item_status(
+                item_id, "review", token=run.callback_token
+            )
+        except Exception:
+            logger.warning(
+                "Failed to set item %s status=review (run %s) — run stays succeeded",
+                item_id,
+                run.id,
+            )
+    else:
+        # Every non-success terminal exit: mark failed with exit_code + error.
+        await db.update_run(
+            run.id,
+            status=status,
+            completed_at=now,
+            exit_code=exit_code,
+            error=comment_header,
+        )
+        _publish_run_event(run.id, status.value, now)
+
+    # Comment-back on every terminal exit — talos has no GTD access so this
+    # comment is the reviewer's only surface for the mechanical verification
+    # evidence embedded in the RunSummary.
+    try:
+        body = talos.build_comment_body(
+            exit_code, stdout_line, stderr_line, branch_name
+        )
+        await gtd_client.post_comment(
+            item_id,
+            body,
+            created_by=attribution or "agent-gtd-dispatch",
+            token=run.callback_token,
+        )
+    except Exception:
+        logger.warning("Failed to post talos outcome comment for run %s", run.id)
+
+
 async def _dispatch_worker(
     run: Run,
     max_turns: int,
@@ -749,6 +1063,23 @@ async def _dispatch_worker(
 
         def _register_subprocess(proc: subprocess.Popen[bytes]) -> None:
             _active_subprocesses[run.id] = proc
+
+        # Talos branch: separate execution path that owns git + comment-back
+        # inline. Enters INSTEAD of run_agent + verify_pushes because talos has
+        # no GTD access (by design) and never runs `git commit` itself — the
+        # worker mints commit + push + status on exit 0 only.
+        if is_talos_engine(engine_used.name):
+            await _run_talos(
+                run,
+                engine_used,
+                workspace,
+                item,
+                project,
+                timeout_seconds,
+                attribution=attribution,
+                register_cb=_register_subprocess,
+            )
+            return
 
         result = await dispatch.run_agent(
             engine_used,
@@ -1007,10 +1338,18 @@ async def dispatch_item(
     _: str = Depends(_verify_api_key),
 ) -> RunResponse:
     """Start a new dispatch run for a GTD item."""
-    # Plan-mode and manage-mode always use Anthropic, regardless of requested engine
+    # Plan-mode and manage-mode always use Anthropic, regardless of requested engine.
+    # Both claude-code-ollama and the talos-* family are BUILD-only; plan/manage
+    # dispatches swap to claude-code so the existing planner/manager code path
+    # runs untouched (talos itself does not implement plan/manage modes).
     effective_engine_name = body.engine
+    _engine_swap_reason = ""
     if body.mode != DispatchMode.BUILD and body.engine == "claude-code-ollama":
         effective_engine_name = "claude-code"
+        _engine_swap_reason = "plan/manage mode does not support ollama"
+    elif body.mode != DispatchMode.BUILD and is_talos_engine(body.engine):
+        effective_engine_name = "claude-code"
+        _engine_swap_reason = "plan/manage mode does not support talos"
     engine_swapped = body.engine != effective_engine_name
     try:
         engine = get_engine(effective_engine_name)
@@ -1231,6 +1570,32 @@ async def dispatch_item(
         branch_name = dispatch.branch_name_for_item(body.item_id, item["title"])
         item_id_for_run = body.item_id
 
+    # Talos-only pre-clone rejections. Runs post-swap: after the plan/manage
+    # engine swap above, effective_engine_name is only in TALOS_ENGINES for
+    # BUILD-mode dispatches — so these two guards do NOT fire against a
+    # non-BUILD dispatch that started life as a talos-* request. Both must
+    # happen BEFORE db.insert_run so a rejected dispatch never leaves a run
+    # row behind.
+    if is_talos_engine(effective_engine_name):
+        # (1) Workspace-mode incompatibility (0.3.5 talos is monorepo-only).
+        if (project.get("repo_mode") or "") == "workspace":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"talos engines are monorepo-only in 0.3.5; project "
+                    f"{project['name']!r} is workspace-mode"
+                ),
+            )
+        # (2) Non-empty project.gate_command is a talos-only requirement — the
+        # TaskSpec's gate_command is the definition of Done, and talos self-checks
+        # it before returning exit 0. Non-talos engines are unaffected.
+        _gate = project.get("gate_command")
+        if _gate is None or not str(_gate).strip():
+            raise HTTPException(
+                status_code=400,
+                detail="talos engines require a non-empty project gate_command",
+            )
+
     max_turns = body.max_turns
     if body.timeout_minutes:
         timeout_seconds = body.timeout_minutes * 60
@@ -1254,10 +1619,11 @@ async def dispatch_item(
 
     if engine_swapped:
         logger.warning(
-            "engine_swap run_id=%s requested=%s effective=%s reason=plan/manage-mode-ollama-unsupported",
+            "engine_swap run_id=%s requested=%s effective=%s reason=%s",
             run.id,
             body.engine,
             effective_engine_name,
+            _engine_swap_reason,
         )
 
     # Create event queue so the cancel/SSE endpoints can enqueue events for
@@ -1283,7 +1649,7 @@ async def dispatch_item(
             engine_swap=EngineSwap(
                 from_engine=body.engine,
                 to_engine=effective_engine_name,
-                reason="plan/manage mode does not support ollama",
+                reason=_engine_swap_reason,
             )
             if engine_swapped
             else None,
@@ -1302,7 +1668,7 @@ async def dispatch_item(
         engine_swap=EngineSwap(
             from_engine=body.engine,
             to_engine=effective_engine_name,
-            reason="plan/manage mode does not support ollama",
+            reason=_engine_swap_reason,
         )
         if engine_swapped
         else None,

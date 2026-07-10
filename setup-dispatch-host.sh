@@ -719,6 +719,33 @@ else
 fi
 
 # ===========================================================================
+# Step 4.5b: talos binary (agent user) — MANUAL PROVISIONING NOTE
+# ===========================================================================
+# The talos-* engine family (talos-haiku/sonnet/opus/qwen/glm) invokes the
+# `talos` binary as a subprocess (see src/agent_gtd_dispatch/talos.py). The
+# binary is NOT auto-installed in 0.3.5 — build and place it manually on
+# the AGENT_USER's PATH (or point TALOS_BIN at an absolute path in
+# /home/dispatch-svc/.env). On the aarch64 Pi 5 host:
+#
+#     sudo -u "$AGENT_USER" bash <<'EOF'
+#     set -e
+#     cd "$HOME"
+#     [ -d harness-design ] || git clone <harness-design-origin> harness-design
+#     cd harness-design
+#     git pull
+#     cargo build --release -p talos
+#     ln -sf "$PWD/target/release/talos" "$HOME/.local/bin/talos"
+#     talos --version
+#     EOF
+#
+# Verify: `sudo -u dispatch talos --version` succeeds. Skip this step when
+# rolling out on hosts that will not dispatch talos-* engines; the /info
+# advertisement (is_engine_available) will simply omit them.
+echo ""
+echo "--- Step 4.5b: talos binary (agent user, MANUAL) ---"
+info "talos binary is NOT auto-installed — build via 'cargo build --release -p talos' in a harness-design clone and place it on ${AGENT_USER}'s PATH (or set TALOS_BIN in ${SERVICE_ENV}). See comment above for the recipe. Skip when dispatching only claude-code engines."
+
+# ===========================================================================
 # Step 4.6: MCP servers (agent user)
 # ===========================================================================
 echo ""

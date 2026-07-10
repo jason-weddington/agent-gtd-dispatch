@@ -270,13 +270,97 @@ CLAUDE_HAIKU = Engine(
     build_command=_build_claude_haiku_command,
 )
 
+
+def _talos_build_command_stub(
+    _system_prompt: str,
+    _title: str,
+    _max_turns: int,
+    _agent_name: str | None,
+) -> list[str]:
+    """Placeholder for talos Engine.build_command.
+
+    Talos engines never go through the shared ``run_agent`` path; they are
+    dispatched via ``agent_gtd_dispatch.talos`` from the ``main._dispatch_worker``
+    branch guarded by :func:`is_talos_engine`. ``get_engine('talos-*')`` must
+    still succeed (the /dispatch endpoint calls it before the branch), so we
+    register real Engine instances — but reaching build_command means the branch
+    is missing, which is a programming error.
+    """
+    msg = "talos engines do not use build_command"
+    raise NotImplementedError(msg)
+
+
+TALOS_HAIKU = Engine(
+    name="talos-haiku",
+    binary="talos",
+    # ANTHROPIC_API_KEY IS deliberately exposed to talos anthropic engines
+    # (see talos_env_overlay + kb-01512 comment) — talos is a raw Anthropic API
+    # client with no Max subscription, so the key is REQUIRED for auth.
+    auth_env_key="ANTHROPIC_API_KEY",
+    env_keys=frozenset(),  # env is built by talos_env_overlay, not filtered from parent
+    build_command=_talos_build_command_stub,
+)
+
+TALOS_SONNET = Engine(
+    name="talos-sonnet",
+    binary="talos",
+    auth_env_key="ANTHROPIC_API_KEY",
+    env_keys=frozenset(),
+    build_command=_talos_build_command_stub,
+)
+
+TALOS_OPUS = Engine(
+    name="talos-opus",
+    binary="talos",
+    auth_env_key="ANTHROPIC_API_KEY",
+    env_keys=frozenset(),
+    build_command=_talos_build_command_stub,
+)
+
+TALOS_QWEN = Engine(
+    name="talos-qwen",
+    binary="talos",
+    # ollama-routed: no parent-env key needed (auth flows via env overlay)
+    auth_env_key="",
+    env_keys=frozenset(),
+    build_command=_talos_build_command_stub,
+)
+
+TALOS_GLM = Engine(
+    name="talos-glm",
+    binary="talos",
+    auth_env_key="",
+    env_keys=frozenset(),
+    build_command=_talos_build_command_stub,
+)
+
 ENGINES: dict[str, Engine] = {
     "claude-code": CLAUDE,
     "kiro": KIRO,
     "claude-code-ollama": CLAUDE_OLLAMA,
     "claude-code-sonnet": CLAUDE_SONNET,
     "claude-code-haiku": CLAUDE_HAIKU,
+    "talos-haiku": TALOS_HAIKU,
+    "talos-sonnet": TALOS_SONNET,
+    "talos-opus": TALOS_OPUS,
+    "talos-qwen": TALOS_QWEN,
+    "talos-glm": TALOS_GLM,
 }
+
+# Talos-family engine names. is_talos_engine is the canonical branch discriminator
+# used in main._dispatch_worker to route talos runs down the talos.py subprocess
+# path instead of the shared run_agent + verify_pushes path used by the claude
+# family. get_engine() must still succeed for all five so the /dispatch endpoint's
+# up-front get_engine(effective_engine_name) call resolves before the branch.
+TALOS_ENGINES: frozenset[str] = frozenset(
+    {"talos-haiku", "talos-sonnet", "talos-opus", "talos-qwen", "talos-glm"}
+)
+
+
+def is_talos_engine(name: str) -> bool:
+    """Return True if *name* refers to a talos-family engine."""
+    return name in TALOS_ENGINES
+
 
 # Engine names that run the `claude` binary (auth resolved by the binary itself)
 _CLAUDE_CODE_ENGINES: frozenset[str] = frozenset(
@@ -306,6 +390,24 @@ def is_engine_available(engine: Engine) -> bool:
         from . import config
 
         return bool(config.OLLAMA_BASE_URL)
+    # Talos family: gate on the credentials the per-engine env overlay consumes
+    # (see talos.talos_env_overlay). Anthropic-backed talos engines need
+    # ANTHROPIC_API_KEY; talos-qwen needs a reachable Ollama server (mirrors the
+    # claude-code-ollama gate above); talos-glm needs the distinct cloud key.
+    # This is load-bearing — /info surfaces get_available_engine_names() and
+    # agent_gtd's dispatch_router refuses to route to an unadvertised engine.
+    if name in ("talos-haiku", "talos-sonnet", "talos-opus"):
+        from . import config
+
+        return bool(config.ANTHROPIC_API_KEY)
+    if name == "talos-qwen":
+        from . import config
+
+        return bool(config.OLLAMA_BASE_URL)
+    if name == "talos-glm":
+        from . import config
+
+        return bool(config.OLLAMA_CLOUD_API_KEY)
     return False
 
 
