@@ -1622,6 +1622,19 @@ def _env(tmp_path, monkeypatch):
         "ANTHROPIC_API_KEY": "sk-ant-test",
         "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
     }
+    # patch.dict only ADDS keys — ambient config vars from the developer's
+    # shell (e.g. a real OLLAMA_API_KEY) would otherwise leak into
+    # config.load() and break the defaults assertions on any machine that
+    # sets them.
+    for ambient in (
+        "OLLAMA_BASE_URL",
+        "OLLAMA_API_KEY",
+        "OLLAMA_CLOUD_API_KEY",
+        "OLLAMA_DEFAULT_MODEL",
+        "OLLAMA_TIMEOUT_MULTIPLIER",
+        "TALOS_BIN",
+    ):
+        monkeypatch.delenv(ambient, raising=False)
     with patch.dict(os.environ, env):
         config.load()
         yield
