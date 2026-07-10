@@ -14,8 +14,22 @@
 # KB_DATABASE_URL          — Knowledge base database URL (agent KB access)
 # OLLAMA_BASE_URL          — Ollama API base URL (local LLM access)
 # AGENT_GTD_AGENT_NAME     — Agent identity name (for GTD comment attribution)
+# ANTHROPIC_MODEL          — talos-sonnet/opus model pin; without it talos falls
+#                            back to its default (haiku) — silent downgrade.
+# TALOS_BACKEND            — talos backend selector (anthropic|ollama); without
+#                            it talos defaults to anthropic, breaking talos-glm/qwen.
+# OLLAMA_MODEL             — talos-glm/qwen model pin (glm-5.2:cloud, qwen3.6:35b).
+# OLLAMA_API_KEY           — Ollama cloud/local key for talos ollama backends.
+# OLLAMA_THINK             — talos-qwen thinking-mode toggle.
+# OLLAMA_NUM_CTX           — talos-qwen context-window pin (32768).
 # PATH                     — Required so uvx/MCP binaries in ~/.local/bin survive env_reset
-Defaults:{{SERVICE_USER}} env_keep += "CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY AGENT_GTD_URL AGENT_GTD_API_KEY DISPATCH_API_KEY KB_DATABASE_URL OLLAMA_BASE_URL AGENT_GTD_AGENT_NAME PATH"
+#
+# NOTE: talos per-engine env is built by talos_env_overlay and passed on the
+# subprocess env, but the dispatch-svc→AGENT_USER sudo hop applies env_reset —
+# so every var the talos subprocess needs MUST be listed here or it is stripped.
+# The ollama vars carry no default fallback, so their omission fails the run
+# outright; ANTHROPIC_MODEL's omission fails silently (downgrades to haiku).
+Defaults:{{SERVICE_USER}} env_keep += "CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_MODEL AGENT_GTD_URL AGENT_GTD_API_KEY DISPATCH_API_KEY KB_DATABASE_URL OLLAMA_BASE_URL OLLAMA_MODEL OLLAMA_API_KEY OLLAMA_THINK OLLAMA_NUM_CTX TALOS_BACKEND AGENT_GTD_AGENT_NAME PATH"
 
 # Override secure_path to include ~/.cargo/bin and ~/.local/bin for the agent user, so
 # cargo/cargo-nextest (gate command for talos ChecksRunner) and uvx/MCP binaries installed
