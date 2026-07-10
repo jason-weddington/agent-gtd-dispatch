@@ -17,13 +17,17 @@
 # PATH                     — Required so uvx/MCP binaries in ~/.local/bin survive env_reset
 Defaults:{{SERVICE_USER}} env_keep += "CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY AGENT_GTD_URL AGENT_GTD_API_KEY DISPATCH_API_KEY KB_DATABASE_URL OLLAMA_BASE_URL AGENT_GTD_AGENT_NAME PATH"
 
-# Override secure_path to include ~/.local/bin for the agent user, so uvx/MCP
-# binaries and other executables installed to the agent user's ~/.local/bin are
-# discoverable and executable even after sudo's env_reset applies secure_path.
-Defaults:{{SERVICE_USER}} secure_path="/home/{{AGENT_USER}}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Override secure_path to include ~/.cargo/bin and ~/.local/bin for the agent user, so
+# cargo/cargo-nextest (gate command for talos ChecksRunner) and uvx/MCP binaries installed
+# to the agent user's ~/.local/bin are discoverable and executable even after sudo's
+# env_reset applies secure_path. .cargo/bin is prepended so it is searched first.
+Defaults:{{SERVICE_USER}} secure_path="/home/{{AGENT_USER}}/.cargo/bin:/home/{{AGENT_USER}}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # claude lives at /usr/local/bin/claude on disk but resolves to the symlink
 # target /home/{{AGENT_USER}}/.local/bin/claude when secure_path is searched —
 # sudo matches the resolved path, not the symlink. Both paths must be
 # authorised so NOPASSWD survives whichever order secure_path resolves first.
-{{SERVICE_USER}} ALL=({{AGENT_USER}}) NOPASSWD: /usr/bin/git, /home/{{AGENT_USER}}/.local/bin/uv, /home/{{AGENT_USER}}/.local/bin/claude, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash, /usr/bin/mkdir
+# talos is installed to /home/{{AGENT_USER}}/.local/bin/talos (copy, not symlink) by
+# setup-dispatch-host.sh --with-talos; it must be authorised here so the
+# dispatch-svc→dispatch sudo-wrapped invocation (talos.py _sudo_wrap) is not DENIED.
+{{SERVICE_USER}} ALL=({{AGENT_USER}}) NOPASSWD: /usr/bin/git, /home/{{AGENT_USER}}/.local/bin/uv, /home/{{AGENT_USER}}/.local/bin/claude, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash, /usr/bin/mkdir, /home/{{AGENT_USER}}/.local/bin/talos

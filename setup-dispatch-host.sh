@@ -16,6 +16,7 @@ set -euo pipefail
 #   --env-file PATH        Path to a pre-filled .env file to install
 #   --dry-run              Print 'Would: <action>' for every step; no mutations
 #   --smoke                After install, verify the API is reachable (GET /health and GET /info return HTTP 200)
+#   --with-talos           Build and install the talos engine binary for AGENT_USER (opt-in; default off)
 #   -h, --help             Show this help text
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +27,7 @@ REPO_NAME="agent-gtd-dispatch"
 # that carries it.
 GIT_REMOTE_URL="${DISPATCH_REPO_URL:-https://github.com/jason-weddington/${REPO_NAME}}"
 AGENT_GTD_REMOTE_URL="${AGENT_GTD_REPO_URL:-https://github.com/jason-weddington/agent-gtd}"
+HARNESS_DESIGN_REPO_URL="${HARNESS_DESIGN_REPO_URL:-git@ubuntu-vm01:repos/harness-design}"
 
 # Derive the git host(s) to seed into known_hosts from the configured remotes,
 # so this works against any git server (homelab, GitHub, enterprise) — not just
@@ -50,6 +52,7 @@ SERVICE_USER="dispatch-svc"
 ENV_FILE_SRC=""
 DRY_RUN=false
 SMOKE=false
+WITH_TALOS=false
 
 # --- Colors ---
 if [ -t 1 ]; then
@@ -81,11 +84,14 @@ Options:
   --env-file PATH        Pre-filled .env file to install
   --dry-run              Print 'Would: <action>' for every step; make no changes
   --smoke                After install, verify the API is reachable (GET /health and GET /info return HTTP 200)
+  --with-talos           Build and install the talos engine binary for AGENT_USER (opt-in; default off)
   -h, --help             Show this help text
 
 Environment variables:
-  DISPATCH_REPO_URL      Git remote for agent-gtd-dispatch repo
-  AGENT_GTD_REPO_URL     Git remote for agent_gtd repo
+  DISPATCH_REPO_URL        Git remote for agent-gtd-dispatch repo
+  AGENT_GTD_REPO_URL       Git remote for agent_gtd repo
+  HARNESS_DESIGN_REPO_URL  Git remote for harness-design repo (used with --with-talos;
+                           default: git@ubuntu-vm01:repos/harness-design)
   DISPATCH_SINGLE_USER   Set to '1' for single-user mode (no sudoers, no user split;
                          see docs/install.md ## Single-user mode for details)
 
@@ -217,10 +223,20 @@ while [[ $# -gt 0 ]]; do
         --env-file)     ENV_FILE_SRC="$2";  shift 2 ;;
         --dry-run)      DRY_RUN=true;       shift   ;;
         --smoke)        SMOKE=true;         shift   ;;
+        --with-talos)   WITH_TALOS=true;    shift   ;;
         -h|--help)      usage ;;
         *) die "Unknown option: $1  (run with --help for usage)" ;;
     esac
 done
+
+# Extend GIT_HOSTS to include the harness-design origin when --with-talos is set,
+# so the harness host is keyscanned into known_hosts on a fresh host.
+if $WITH_TALOS; then
+    _harness_host="$(git_host_from_url "$HARNESS_DESIGN_REPO_URL")"
+    if [[ -n "$_harness_host" ]]; then
+        GIT_HOSTS="$(printf '%s\n%s\n' "$GIT_HOSTS" "$_harness_host" | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+    fi
+fi
 
 [[ $EUID -ne 0 ]] && die "This script must be run as root (use sudo)."
 
@@ -386,8 +402,15 @@ else
         chown "${AGENT_USER}:${AGENT_GROUP}" "$AGENT_WORKSPACE"
         chmod 2775 "$AGENT_WORKSPACE"
     else
-        chown -R "${AGENT_USER}:${AGENT_GROUP}" "$AGENT_HOME"
-        chmod 2775 "$AGENT_HOME" "$AGENT_WORKSPACE"
+        # Skip recursive chown when all files already have the correct owner/group
+        if find "$AGENT_HOME" \( ! -user "$AGENT_USER" -o ! -group "$AGENT_GROUP" \) -print -quit 2>/dev/null | grep -q .; then
+            chown -R "${AGENT_USER}:${AGENT_GROUP}" "$AGENT_HOME"
+            chmod 2775 "$AGENT_HOME" "$AGENT_WORKSPACE"
+            info "Set ownership on ${AGENT_HOME}"
+        else
+            chmod 2775 "$AGENT_HOME" "$AGENT_WORKSPACE"
+            skip "Ownership already correct for ${AGENT_HOME} — already configured"
+        fi
     fi
     info "Agent workspace ready: ${AGENT_WORKSPACE}"
 fi
@@ -408,9 +431,13 @@ else
     chmod 700 "${AGENT_HOME}/.ssh"
     chown "${AGENT_USER}:${AGENT_GROUP}" "${AGENT_HOME}/.ssh"
     for gh in $GIT_HOSTS; do
-        ssh-keyscan "$gh" >> "${AGENT_HOME}/.ssh/known_hosts" 2>/dev/null \
-            && info "Populated ${AGENT_HOME}/.ssh/known_hosts via ssh-keyscan ${gh}" \
-            || warn "ssh-keyscan ${gh} failed — known_hosts may be incomplete"
+        if ssh-keygen -F "$gh" -f "${AGENT_HOME}/.ssh/known_hosts" >/dev/null 2>&1; then
+            skip "Host key for ${gh} already in ${AGENT_HOME}/.ssh/known_hosts — already configured"
+        else
+            ssh-keyscan "$gh" >> "${AGENT_HOME}/.ssh/known_hosts" 2>/dev/null \
+                && info "Populated ${AGENT_HOME}/.ssh/known_hosts via ssh-keyscan ${gh}" \
+                || warn "ssh-keyscan ${gh} failed — known_hosts may be incomplete"
+        fi
     done
     if ! ls "${AGENT_HOME}/.ssh"/id_* &>/dev/null; then
         runuser -u "$AGENT_USER" -- ssh-keygen -t ed25519 -N "" \
@@ -453,21 +480,39 @@ else
     mkdir -p "${SERVICE_HOME}/.ssh"
     chmod 700 "${SERVICE_HOME}/.ssh"
     for gh in $GIT_HOSTS; do
-        ssh-keyscan "$gh" >> "${SERVICE_HOME}/.ssh/known_hosts" 2>/dev/null \
-            && info "Populated ${SERVICE_HOME}/.ssh/known_hosts via ssh-keyscan ${gh}" \
-            || warn "ssh-keyscan ${gh} failed — known_hosts may be incomplete"
+        if ssh-keygen -F "$gh" -f "${SERVICE_HOME}/.ssh/known_hosts" >/dev/null 2>&1; then
+            skip "Host key for ${gh} already in ${SERVICE_HOME}/.ssh/known_hosts — already configured"
+        else
+            ssh-keyscan "$gh" >> "${SERVICE_HOME}/.ssh/known_hosts" 2>/dev/null \
+                && info "Populated ${SERVICE_HOME}/.ssh/known_hosts via ssh-keyscan ${gh}" \
+                || warn "ssh-keyscan ${gh} failed — known_hosts may be incomplete"
+        fi
     done
     # Copy SSH key files from agent user if present (enables git auth for SERVICE_USER)
-    key_copied=false
+    # Skip a key's cp/chmod when the destination is byte-identical (idempotent on re-run)
+    key_found=false
+    any_key_copied=false
     for key in "${AGENT_HOME}/.ssh"/id_*; do
         [[ -f "$key" ]] || continue
-        cp "$key" "${SERVICE_HOME}/.ssh/"
-        chmod 600 "${SERVICE_HOME}/.ssh/$(basename "$key")"
-        key_copied=true
+        key_found=true
+        dest_key="${SERVICE_HOME}/.ssh/$(basename "$key")"
+        if cmp -s "$key" "$dest_key" 2>/dev/null; then
+            skip "SSH key already present at ${dest_key} — already configured"
+        else
+            cp "$key" "$dest_key"
+            chmod 600 "$dest_key"
+            any_key_copied=true
+        fi
     done
-    $key_copied && info "Copied SSH key(s) from ${AGENT_HOME}/.ssh/ to ${SERVICE_HOME}/.ssh/" \
-        || warn "No id_* keys found in ${AGENT_HOME}/.ssh/ — git clone may fail without auth"
-    chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${SERVICE_HOME}/.ssh"
+    if $any_key_copied; then
+        info "Copied SSH key(s) from ${AGENT_HOME}/.ssh/ to ${SERVICE_HOME}/.ssh/"
+    elif ! $key_found; then
+        warn "No id_* keys found in ${AGENT_HOME}/.ssh/ — git clone may fail without auth"
+    fi
+    # Only chown .ssh when at least one key was freshly copied (avoids unnecessary chown on re-run)
+    if $any_key_copied; then
+        chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${SERVICE_HOME}/.ssh"
+    fi
     info "SSH directory seeded for ${SERVICE_USER}"
 fi
 
@@ -492,6 +537,8 @@ DB_PATH="${AGENT_WORKSPACE}/dispatch.db"
 if [[ -f "$DB_PATH" ]]; then
     if $DRY_RUN; then
         would "chmod g+rw ${DB_PATH} (for ${SERVICE_USER} read/write access via group)"
+    elif [[ "$(stat -c '%a' "$DB_PATH")" =~ ^.[2367] ]]; then
+        skip "dispatch.db group write bit already set — already configured"
     else
         chmod g+rw "$DB_PATH"
         info "Fixed dispatch.db group permissions: ${DB_PATH}"
@@ -719,31 +766,180 @@ else
 fi
 
 # ===========================================================================
-# Step 4.5b: talos binary (agent user) — MANUAL PROVISIONING NOTE
+# Step 4.5b: talos engine provisioning (--with-talos only)
 # ===========================================================================
 # The talos-* engine family (talos-haiku/sonnet/opus/qwen/glm) invokes the
-# `talos` binary as a subprocess (see src/agent_gtd_dispatch/talos.py). The
-# binary is NOT auto-installed in 0.3.5 — build and place it manually on
-# the AGENT_USER's PATH (or point TALOS_BIN at an absolute path in
-# /home/dispatch-svc/.env). On the aarch64 Pi 5 host:
-#
-#     sudo -u "$AGENT_USER" bash <<'EOF'
-#     set -e
-#     cd "$HOME"
-#     [ -d harness-design ] || git clone <harness-design-origin> harness-design
-#     cd harness-design
-#     git pull
-#     cargo build --release -p talos
-#     ln -sf "$PWD/target/release/talos" "$HOME/.local/bin/talos"
-#     talos --version
-#     EOF
-#
-# Verify: `sudo -u dispatch talos --version` succeeds. Skip this step when
-# rolling out on hosts that will not dispatch talos-* engines; the /info
-# advertisement (is_engine_available) will simply omit them.
+# `talos` binary as a subprocess. Pass --with-talos to build and install it.
+# When absent, this step prints a single [SKIP] line and mutates nothing.
+# ===========================================================================
 echo ""
-echo "--- Step 4.5b: talos binary (agent user, MANUAL) ---"
-info "talos binary is NOT auto-installed — build via 'cargo build --release -p talos' in a harness-design clone and place it on ${AGENT_USER}'s PATH (or set TALOS_BIN in ${SERVICE_ENV}). See comment above for the recipe. Skip when dispatching only claude-code engines."
+echo "--- Step 4.5b: talos engine (agent user) ---"
+
+if ! $WITH_TALOS; then
+    skip "talos provisioning skipped — pass --with-talos to build+install the talos engine on this host"
+else
+    # Ensure AGENT_HOME/.local/bin exists (should already exist; defensive)
+    _talos_local_bin="${AGENT_HOME}/.local/bin"
+    _talos_dest="${AGENT_HOME}/.local/bin/talos"
+    _talos_cargo="${AGENT_HOME}/.cargo/bin/cargo"
+    _harness_dest="${AGENT_HOME}/harness-design"
+
+    # Sub-step A: build-essential
+    echo ""
+    echo "  [4.5b-A] build-essential"
+    if dpkg-query -W -f='${Status}' build-essential 2>/dev/null | grep -q 'install ok installed'; then
+        skip "build-essential already installed — already configured"
+    elif $DRY_RUN; then
+        would "apt-get update && apt-get install -y build-essential"
+    else
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential
+        info "Installed build-essential"
+    fi
+
+    # Sub-step B: rustup for AGENT_USER
+    echo ""
+    echo "  [4.5b-B] rustup (${AGENT_USER})"
+    if [[ -x "${AGENT_HOME}/.cargo/bin/rustup" ]]; then
+        skip "rustup already installed for ${AGENT_USER} — already configured"
+    elif $DRY_RUN; then
+        would "install rustup for ${AGENT_USER} via official installer (login shell)"
+    else
+        runuser -l "${AGENT_USER}" -c \
+            "curl --proto '=https' --tlsv1.2 -fsSf https://sh.rustup.rs | sh -s -- -y"
+        if [[ -x "${AGENT_HOME}/.cargo/bin/rustup" ]]; then
+            info "Installed rustup for ${AGENT_USER}"
+        else
+            die "rustup installer ran but ${AGENT_HOME}/.cargo/bin/rustup not found"
+        fi
+    fi
+
+    # Sub-step C: cargo-binstall + cargo-nextest
+    echo ""
+    echo "  [4.5b-C] cargo-nextest (${AGENT_USER})"
+    if [[ -x "${AGENT_HOME}/.cargo/bin/cargo-nextest" ]]; then
+        skip "cargo-nextest already installed for ${AGENT_USER} — already configured"
+    elif $DRY_RUN; then
+        would "install cargo-binstall for ${AGENT_USER} if absent, then cargo binstall -y cargo-nextest"
+    else
+        # Ensure cargo-binstall is present first
+        if [[ -x "${AGENT_HOME}/.cargo/bin/cargo-binstall" ]]; then
+            skip "cargo-binstall already installed for ${AGENT_USER} — already configured"
+        else
+            runuser -l "${AGENT_USER}" -c \
+                "curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash"
+            info "Installed cargo-binstall for ${AGENT_USER}"
+        fi
+        # Install cargo-nextest via cargo-binstall (absolute cargo path)
+        runuser -l "${AGENT_USER}" -c \
+            "${_talos_cargo} binstall -y cargo-nextest"
+        if [[ -x "${AGENT_HOME}/.cargo/bin/cargo-nextest" ]]; then
+            info "Installed cargo-nextest for ${AGENT_USER}"
+        else
+            die "cargo-nextest install ran but ${AGENT_HOME}/.cargo/bin/cargo-nextest not found"
+        fi
+    fi
+
+    # Sub-step D: clone/pull harness-design as AGENT_USER
+    echo ""
+    echo "  [4.5b-D] harness-design clone/pull (${AGENT_USER})"
+    # Creds pre-check: fail fast if the agent user can't reach the harness origin
+    if $DRY_RUN; then
+        would "git ls-remote ${HARNESS_DESIGN_REPO_URL} HEAD (as ${AGENT_USER}) — fail-fast creds check"
+        would "clone ${HARNESS_DESIGN_REPO_URL} → ${_harness_dest} (or git pull if already present)"
+    else
+        if ! runuser -l "${AGENT_USER}" -c \
+                "git ls-remote '${HARNESS_DESIGN_REPO_URL}' HEAD" >/dev/null 2>&1; then
+            die "Cannot reach harness-design origin as ${AGENT_USER}. Authorize /home/${AGENT_USER}/.ssh/id_ed25519.pub on the git host (${HARNESS_DESIGN_REPO_URL}) and re-run with --with-talos."
+        fi
+        if [[ -d "${_harness_dest}/.git" ]]; then
+            runuser -l "${AGENT_USER}" -c \
+                "git -C '${_harness_dest}' pull --ff-only"
+            info "Updated harness-design at ${_harness_dest}"
+        else
+            runuser -l "${AGENT_USER}" -c \
+                "git clone '${HARNESS_DESIGN_REPO_URL}' '${_harness_dest}'"
+            info "Cloned harness-design → ${_harness_dest}"
+        fi
+    fi
+
+    # Sub-step E: cargo build --release -p talos (always runs; incremental makes re-run near-instant)
+    echo ""
+    echo "  [4.5b-E] cargo build --release -p talos"
+    if $DRY_RUN; then
+        would "runuser -l ${AGENT_USER} -- ${_talos_cargo} build --release -p talos (in ${_harness_dest})"
+    else
+        runuser -l "${AGENT_USER}" -c \
+            "cd '${_harness_dest}' && '${_talos_cargo}' build --release -p talos"
+        [[ -f "${_harness_dest}/target/release/talos" ]] \
+            || die "cargo build completed but ${_harness_dest}/target/release/talos not found"
+        info "Built talos binary at ${_harness_dest}/target/release/talos"
+    fi
+
+    # Sub-step F: install binary (cmp-guarded copy, not symlink)
+    echo ""
+    echo "  [4.5b-F] install talos binary → ${_talos_dest}"
+    if $DRY_RUN; then
+        would "install -m 0755 -o ${AGENT_USER} -g ${AGENT_GROUP} ${_harness_dest}/target/release/talos ${_talos_dest}"
+    elif cmp -s "${_harness_dest}/target/release/talos" "${_talos_dest}" 2>/dev/null; then
+        skip "talos binary already installed and byte-identical — already configured"
+    else
+        mkdir -p "${_talos_local_bin}"
+        install -m 0755 -o "${AGENT_USER}" -g "${AGENT_GROUP}" \
+            "${_harness_dest}/target/release/talos" "${_talos_dest}"
+        info "Installed talos binary: ${_talos_dest}"
+    fi
+
+    # Sub-step G: write TALOS_BIN into SERVICE_ENV (Step-3.5-style python line-rewrite)
+    echo ""
+    echo "  [4.5b-G] TALOS_BIN in ${SERVICE_ENV}"
+    _talos_bin_value="/home/${AGENT_USER}/.local/bin/talos"
+    if [[ ! -f "$SERVICE_ENV" ]]; then
+        if $DRY_RUN; then
+            would "append TALOS_BIN=${_talos_bin_value} to ${SERVICE_ENV}"
+        else
+            die "TALOS_BIN write: ${SERVICE_ENV} does not exist — Step 3 should have created it"
+        fi
+    else
+        _talos_existing="$(_read_env_var TALOS_BIN)"
+        if [[ "$_talos_existing" == "$_talos_bin_value" ]]; then
+            skip "TALOS_BIN already set to ${_talos_bin_value} in ${SERVICE_ENV} — already configured"
+        elif $DRY_RUN; then
+            would "set TALOS_BIN=${_talos_bin_value} in ${SERVICE_ENV} (line-rewrite, preserving all other keys)"
+        else
+            _talos_tmpfile="$(mktemp /tmp/dispatch-env.XXXXXX)"
+            _TALOS_ENV_FILE="$SERVICE_ENV" _TALOS_BIN_VALUE="$_talos_bin_value" \
+            python3 - <<'TALOS_PYEOF' > "$_talos_tmpfile"
+import re, os, sys
+env_file  = os.environ['_TALOS_ENV_FILE']
+new_value = os.environ['_TALOS_BIN_VALUE']
+with open(env_file, 'r') as f:
+    content = f.read()
+lines = content.splitlines(keepends=True)
+replaced = False
+out = []
+for line in lines:
+    if re.match(r'^TALOS_BIN=', line):
+        if line.rstrip('\r\n') == 'TALOS_BIN=' + new_value:
+            out.append(line)
+        else:
+            out.append('TALOS_BIN=' + new_value + '\n')
+        replaced = True
+    else:
+        out.append(line)
+if not replaced:
+    if out and not out[-1].endswith('\n'):
+        out[-1] += '\n'
+    out.append('TALOS_BIN=' + new_value + '\n')
+sys.stdout.write(''.join(out))
+TALOS_PYEOF
+            install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
+                "$_talos_tmpfile" "$SERVICE_ENV"
+            rm -f "$_talos_tmpfile"
+            info "Set TALOS_BIN=${_talos_bin_value} in ${SERVICE_ENV}"
+        fi
+    fi
+fi  # end: if ! $WITH_TALOS
 
 # ===========================================================================
 # Step 4.6: MCP servers (agent user)

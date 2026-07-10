@@ -455,6 +455,79 @@ first-party model id (`claude-sonnet-4-6`) on the Bedrock client — it will err
 
 ---
 
+## Talos engine provisioning (--with-talos)
+
+Step 4.5b of the installer optionally builds and installs the `talos` binary for the agent user. This binary powers the `talos-*` engine family (`talos-haiku`, `talos-sonnet`, `talos-opus`, `talos-qwen`, `talos-glm`). The step is **opt-in** — pass `--with-talos` to enable it. Without the flag the step prints a single `[SKIP]` line and mutates nothing.
+
+### When to use it
+
+Add `--with-talos` when you want to dispatch `talos-*` engines on this host. Skip it on hosts that dispatch only `claude-code-*` engines — the `/info` advertisement (`is_engine_available`) will simply omit the talos engines.
+
+### Prerequisites
+
+- The agent user's SSH key must be authorised on the git host that serves `HARNESS_DESIGN_REPO_URL` (default: `git@ubuntu-vm01:repos/harness-design`). If the key is not yet authorised the installer fails with a clear `[ERROR]` and instructions before touching anything.
+- Internet access for `rustup` and `cargo-binstall` installers (or pre-install Rust for the agent user manually before running).
+
+### What the step does
+
+Seven sub-steps, all idempotent:
+
+| Sub-step | Action | Skip condition |
+|---|---|---|
+| **A** build-essential | `apt-get install -y build-essential` | `dpkg-query` reports already installed |
+| **B** rustup | Installs Rust toolchain for `AGENT_USER` via `sh.rustup.rs` | `~/.cargo/bin/rustup` exists |
+| **C** cargo-nextest | Installs `cargo-binstall` then `cargo-nextest` for `AGENT_USER` | `~/.cargo/bin/cargo-nextest` exists |
+| **D** harness-design clone/pull | Clones or fast-forward pulls `HARNESS_DESIGN_REPO_URL` → `~/harness-design` as `AGENT_USER` | Always runs (pull is idempotent) |
+| **E** cargo build | `cargo build --release -p talos` inside `~/harness-design` as `AGENT_USER` | Always runs (Cargo incremental makes re-run near-instant) |
+| **F** install binary | Copies built binary to `~/.local/bin/talos` with `install -m 0755` | Skipped when destination is byte-identical to the built binary |
+| **G** TALOS_BIN in .env | Writes `TALOS_BIN=/home/dispatch/.local/bin/talos` into `SERVICE_ENV` | Skipped when value already matches |
+
+### Environment variable override
+
+`HARNESS_DESIGN_REPO_URL` controls the git remote for the harness-design clone. Default: `git@ubuntu-vm01:repos/harness-design`. Override on the installer command line:
+
+```bash
+sudo HARNESS_DESIGN_REPO_URL=git@your-git-host:path/harness-design \
+     ./setup-dispatch-host.sh --with-talos
+```
+
+### Install path and sudoers
+
+The binary is installed as a **copy** (not a symlink) to `/home/dispatch/.local/bin/talos`. The sudoers fragment (`/etc/sudoers.d/dispatch-svc`) always includes this path in its `NOPASSWD` allowlist, regardless of whether `--with-talos` was passed — this avoids a sudoers update on first talos install. The fragment also includes `/home/dispatch/.cargo/bin` in `secure_path` so `cargo` and `cargo-nextest` are reachable across the sudo boundary.
+
+### TALOS_BIN in the env file
+
+Sub-step G writes `TALOS_BIN=/home/dispatch/.local/bin/talos` to the service env file. The dispatch service reads this at startup and uses it as the absolute path to the `talos` binary. If you place the binary at a non-standard location, override `TALOS_BIN` in the env file directly instead of relying on the installer.
+
+### Verifying talos install
+
+```bash
+# Binary accessible as the agent user:
+sudo -u dispatch -H bash -lc 'talos --version'
+# → talos X.Y.Z  (RC 0)
+
+# TALOS_BIN set in the service env:
+sudo grep '^TALOS_BIN=' /home/dispatch-svc/.env
+# → TALOS_BIN=/home/dispatch/.local/bin/talos
+
+# talos engines appear in /info:
+curl -sf http://localhost:8100/info | python3 -m json.tool | grep talos
+# → "talos-sonnet", "talos-haiku", etc. listed under available_engines
+```
+
+### Rollback (Step 4.5b)
+
+```bash
+sudo -u dispatch rm -f /home/dispatch/.local/bin/talos
+# Optionally remove the harness-design clone:
+sudo -u dispatch rm -rf /home/dispatch/harness-design
+# Remove TALOS_BIN from the env file:
+sudo sed -i '/^TALOS_BIN=/d' /home/dispatch-svc/.env
+sudo systemctl restart dispatch-api
+```
+
+---
+
 ## MCP servers for the agent user
 
 Step 4.6 of the installer registers up to four MCP servers for the `dispatch` (agent)
