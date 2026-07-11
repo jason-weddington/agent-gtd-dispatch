@@ -35,13 +35,18 @@ HARNESS_DESIGN_REPO_URL="${HARNESS_DESIGN_REPO_URL:-git@ubuntu-vm01:repos/harnes
 # so this works against any git server (homelab, GitHub, enterprise) — not just
 # the homelab default. Handles scp-style (git@host:path) and ssh:// URLs.
 git_host_from_url() {
-    local url="${1#ssh://}"   # drop ssh:// scheme if present
-    url="${url#*@}"           # drop user@ if present
+    local url="$1"
+    # http(s):// URLs authenticate via TLS — no SSH host key needed; return empty
+    case "$url" in
+        http://*|https://*) return 0 ;;
+    esac
+    url="${url#ssh://}"   # drop ssh:// scheme if present
+    url="${url#*@}"       # drop user@ if present
     printf '%s' "${url%%[:/]*}"  # take up to the first ':' or '/'
 }
 GIT_HOSTS="$(printf '%s\n%s\n' \
     "$(git_host_from_url "$GIT_REMOTE_URL")" \
-    "$(git_host_from_url "$AGENT_GTD_REMOTE_URL")" | sort -u | tr '\n' ' ')"
+    "$(git_host_from_url "$AGENT_GTD_REMOTE_URL")" | sort -u | sed '/^[[:space:]]*$/d' | tr '\n' ' ')"
 SERVICE_NAME="dispatch-api"
 API_PORT=8100
 SUDOERS_FILE="/etc/sudoers.d/dispatch-svc"
@@ -444,6 +449,7 @@ else
     chmod 700 "${AGENT_HOME}/.ssh"
     chown "${AGENT_USER}:${AGENT_GROUP}" "${AGENT_HOME}/.ssh"
     for gh in $GIT_HOSTS; do
+        [[ -z "$gh" ]] && continue
         if ssh-keygen -F "$gh" -f "${AGENT_HOME}/.ssh/known_hosts" >/dev/null 2>&1; then
             skip "Host key for ${gh} already in ${AGENT_HOME}/.ssh/known_hosts — already configured"
         else
@@ -493,6 +499,7 @@ else
     mkdir -p "${SERVICE_HOME}/.ssh"
     chmod 700 "${SERVICE_HOME}/.ssh"
     for gh in $GIT_HOSTS; do
+        [[ -z "$gh" ]] && continue
         if ssh-keygen -F "$gh" -f "${SERVICE_HOME}/.ssh/known_hosts" >/dev/null 2>&1; then
             skip "Host key for ${gh} already in ${SERVICE_HOME}/.ssh/known_hosts — already configured"
         else
