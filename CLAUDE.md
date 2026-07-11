@@ -102,3 +102,42 @@ runs as **`dispatch-svc`**; it launches the Claude Code agent as **`dispatch`** 
 Full references: **`kb-01598`** (env-file + provisioning model — which var goes where),
 `kb-01583` (how env crosses the sudo boundary at runtime), `kb-01512` (OAuth vs API
 billing), `kb-01537` (install procedure).
+
+### `--with-postgres`: local Postgres + pgvector for headless test gating
+
+Pass `--with-postgres` to `setup-dispatch-host.sh` to provision a local PostgreSQL server
+with the pgvector extension on a dispatch host. This step is **opt-in and idempotent** —
+re-running on an already-provisioned host is a no-op. Without this flag, no Postgres work
+is performed and the existing host state is unchanged.
+
+What it does:
+1. Installs `postgresql` + `postgresql-contrib` via the OS package manager (apt or dnf/yum).
+2. Installs pgvector — tries the distro package (`postgresql-XX-pgvector` on apt;
+   `pgvector_XX` on dnf) and falls back to building from source if unavailable.
+3. Enables and starts the `postgresql` systemd service.
+4. Creates a PG role named **`AGENT_USER`** (default: `dispatch`) with `LOGIN CREATEDB`.
+   The role name intentionally matches the OS agent user so **peer authentication works
+   on the Unix socket with no password and no `pg_hba.conf` changes**.
+5. Creates a `dispatch_test` database owned by that role.
+6. Runs `CREATE EXTENSION IF NOT EXISTS vector` in `dispatch_test`.
+7. Writes **`KB_TEST_DATABASE_URL=postgresql:///dispatch_test`** into
+   `/home/dispatch-svc/.env` (the canonical service env file) using the same
+   Python line-rewrite pattern as `TALOS_BIN` — preserving all other keys.
+8. When `--smoke` is also passed: runs a post-install sanity check that queries
+   `pg_extension` to confirm the `vector` extension is loaded in `dispatch_test`.
+
+**`KB_TEST_DATABASE_URL`** is the DSN headless build agents must receive for the
+`@pytest.mark.postgres` test suite (e.g. kb-core) to run instead of skip.
+Connection format: Unix socket, OS user = PG role → no password needed.
+The var is written to the service env file; a follow-up item wires it into
+`engines.py` `COMMON_ENV_KEYS` and the sudoers `env_keep` so it reaches the
+agent subprocess during dispatch runs.
+
+**To provision on a dispatch host:**
+```bash
+# On pironman01 or r7-research (re-run with existing args + --with-postgres):
+sudo ./setup-dispatch-host.sh --with-postgres --smoke
+
+# Dry-run preview (no mutations):
+sudo ./setup-dispatch-host.sh --with-postgres --dry-run
+```

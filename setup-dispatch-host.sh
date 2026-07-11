@@ -17,6 +17,8 @@ set -euo pipefail
 #   --dry-run              Print 'Would: <action>' for every step; no mutations
 #   --smoke                After install, verify the API is reachable (GET /health and GET /info return HTTP 200)
 #   --with-talos           Build and install the talos engine binary for AGENT_USER (opt-in; default off)
+#   --with-postgres        Install local Postgres + pgvector, create dispatch_test role/db, write
+#                          KB_TEST_DATABASE_URL to the service env (opt-in; default off)
 #   -h, --help             Show this help text
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,6 +55,7 @@ ENV_FILE_SRC=""
 DRY_RUN=false
 SMOKE=false
 WITH_TALOS=false
+WITH_POSTGRES=false
 
 # --- Colors ---
 if [ -t 1 ]; then
@@ -85,6 +88,9 @@ Options:
   --dry-run              Print 'Would: <action>' for every step; make no changes
   --smoke                After install, verify the API is reachable (GET /health and GET /info return HTTP 200)
   --with-talos           Build and install the talos engine binary for AGENT_USER (opt-in; default off)
+  --with-postgres        Install local Postgres + pgvector, create a '${AGENT_USER}' role with CREATEDB
+                         and a 'dispatch_test' database, enable the vector extension, and write
+                         KB_TEST_DATABASE_URL to the service env file (opt-in; default off)
   -h, --help             Show this help text
 
 Environment variables:
@@ -107,6 +113,12 @@ Examples:
 
   # Full install + smoke test:
   sudo ./setup-dispatch-host.sh --env-file /tmp/dispatch.env --smoke
+
+  # Install Postgres + pgvector (dispatch host only; dry-run preview):
+  sudo ./setup-dispatch-host.sh --with-postgres --dry-run
+
+  # Install Postgres + pgvector and smoke-test the vector extension:
+  sudo ./setup-dispatch-host.sh --with-postgres --smoke
 EOF
     exit 0
 }
@@ -221,10 +233,11 @@ while [[ $# -gt 0 ]]; do
         --agent-user)   AGENT_USER="$2";    shift 2 ;;
         --service-user) SERVICE_USER="$2";  shift 2 ;;
         --env-file)     ENV_FILE_SRC="$2";  shift 2 ;;
-        --dry-run)      DRY_RUN=true;       shift   ;;
-        --smoke)        SMOKE=true;         shift   ;;
-        --with-talos)   WITH_TALOS=true;    shift   ;;
-        -h|--help)      usage ;;
+        --dry-run)        DRY_RUN=true;        shift   ;;
+        --smoke)          SMOKE=true;          shift   ;;
+        --with-talos)     WITH_TALOS=true;     shift   ;;
+        --with-postgres)  WITH_POSTGRES=true;  shift   ;;
+        -h|--help)        usage ;;
         *) die "Unknown option: $1  (run with --help for usage)" ;;
     esac
 done
@@ -940,6 +953,259 @@ TALOS_PYEOF
         fi
     fi
 fi  # end: if ! $WITH_TALOS
+
+# ===========================================================================
+# Step 4.5c: Postgres + pgvector (--with-postgres only)
+# ===========================================================================
+# Install a local PostgreSQL server with the pgvector extension so headless
+# test runs can exercise the PG code paths without reaching out to a desktop.
+# Creates a dedicated role (name = AGENT_USER) + 'dispatch_test' database;
+# the OS-user/PG-role name match enables peer auth on the Unix socket with no
+# password and no pg_hba.conf changes.  Re-running on a host that already has
+# Postgres+pgvector is a no-op (every sub-step is idempotent).
+# ===========================================================================
+echo ""
+echo "--- Step 4.5c: Postgres + pgvector ---"
+
+if ! $WITH_POSTGRES; then
+    skip "Postgres provisioning skipped — pass --with-postgres to install Postgres+pgvector on this host"
+else
+
+    # Detect package manager (mirrors the distro-detection approach used elsewhere in the script)
+    if command -v apt-get &>/dev/null; then
+        _PG_PKG_MGR="apt"
+    elif command -v dnf &>/dev/null; then
+        _PG_PKG_MGR="dnf"
+    elif command -v yum &>/dev/null; then
+        _PG_PKG_MGR="yum"
+    else
+        die "--with-postgres: no supported package manager found (expected apt-get, dnf, or yum)"
+    fi
+
+    _PG_ROLE="${AGENT_USER}"          # role name = OS agent user → peer auth via Unix socket
+    _PG_DBNAME="dispatch_test"        # dedicated test database
+    _PG_DSN="postgresql:///${_PG_DBNAME}"  # no host/user = Unix socket + OS user as role
+
+    # Helper: build pgvector from source (fallback when no distro package is available)
+    _build_pgvector_from_source() {
+        local _pg_maj _src
+        _pg_maj="$(pg_config --version 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)"
+        [[ -z "$_pg_maj" ]] && die "pg_config not found — cannot determine PG version to build pgvector"
+        case "$_PG_PKG_MGR" in
+            apt)
+                DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                    git build-essential "postgresql-server-dev-${_pg_maj}"
+                ;;
+            dnf|yum)
+                "$_PG_PKG_MGR" install -y git gcc make redhat-rpm-config postgresql-devel
+                ;;
+        esac
+        _src="/tmp/pgvector-src-$$"
+        git clone --depth 1 https://github.com/pgvector/pgvector.git "$_src"
+        (cd "$_src" && make && make install) \
+            || die "pgvector build from source failed"
+        rm -rf "$_src"
+        info "Built and installed pgvector from source"
+    }
+
+    # Sub-step A: Install PostgreSQL server
+    echo ""
+    echo "  [4.5c-A] Install PostgreSQL server"
+    case "$_PG_PKG_MGR" in
+        apt)
+            if dpkg-query -W -f='${Status}' postgresql 2>/dev/null | grep -q 'install ok installed'; then
+                skip "postgresql already installed — already configured"
+            elif $DRY_RUN; then
+                would "apt-get update && apt-get install -y postgresql postgresql-contrib"
+            else
+                DEBIAN_FRONTEND=noninteractive apt-get update -qq
+                DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql postgresql-contrib
+                info "Installed postgresql"
+            fi
+            ;;
+        dnf|yum)
+            if rpm -q postgresql-server &>/dev/null; then
+                skip "postgresql-server already installed — already configured"
+            elif $DRY_RUN; then
+                would "${_PG_PKG_MGR} install -y postgresql-server postgresql-contrib"
+                would "postgresql-setup --initdb (if cluster not yet initialized)"
+            else
+                "$_PG_PKG_MGR" install -y postgresql-server postgresql-contrib
+                info "Installed postgresql-server"
+                if [[ ! -f "/var/lib/pgsql/data/PG_VERSION" ]]; then
+                    postgresql-setup --initdb
+                    info "Initialized PostgreSQL cluster"
+                else
+                    skip "PostgreSQL cluster already initialized — already configured"
+                fi
+            fi
+            ;;
+    esac
+
+    # Sub-step B: Enable + start PostgreSQL service
+    echo ""
+    echo "  [4.5c-B] Enable + start PostgreSQL service"
+    _PG_SERVICE="postgresql"
+    if $DRY_RUN; then
+        would "systemctl enable ${_PG_SERVICE} && systemctl start ${_PG_SERVICE}"
+    else
+        if systemctl is-enabled --quiet "$_PG_SERVICE" 2>/dev/null; then
+            skip "${_PG_SERVICE} already enabled — already configured"
+        else
+            systemctl enable "$_PG_SERVICE"
+            info "Enabled ${_PG_SERVICE} service"
+        fi
+        if systemctl is-active --quiet "$_PG_SERVICE" 2>/dev/null; then
+            skip "${_PG_SERVICE} already running — already configured"
+        else
+            systemctl start "$_PG_SERVICE"
+            info "Started ${_PG_SERVICE} service"
+        fi
+    fi
+
+    # Sub-step C: Install pgvector extension
+    echo ""
+    echo "  [4.5c-C] Install pgvector"
+    if $DRY_RUN; then
+        would "install pgvector via ${_PG_PKG_MGR} package (postgresql-XX-pgvector / pgvector_XX); fall back to source build if unavailable"
+    else
+        # Idempotent check: ask pg_config whether the vector.so is already present
+        _pg_libdir="$(pg_config --pkglibdir 2>/dev/null || true)"
+        if [[ -n "$_pg_libdir" ]] && [[ -f "${_pg_libdir}/vector.so" ]]; then
+            skip "pgvector already installed (${_pg_libdir}/vector.so) — already configured"
+        else
+            case "$_PG_PKG_MGR" in
+                apt)
+                    _pg_maj_c="$(pg_config --version 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)"
+                    _pgvec_pkg="postgresql-${_pg_maj_c}-pgvector"
+                    # Try versioned package first; fall back to unversioned meta-package; then source
+                    if [[ -n "$_pg_maj_c" ]] && apt-cache show "$_pgvec_pkg" &>/dev/null 2>&1; then
+                        DEBIAN_FRONTEND=noninteractive apt-get install -y "$_pgvec_pkg"
+                        info "Installed pgvector via package ${_pgvec_pkg}"
+                    elif apt-cache show postgresql-pgvector &>/dev/null 2>&1; then
+                        DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-pgvector
+                        info "Installed pgvector via package postgresql-pgvector"
+                    else
+                        warn "No pgvector apt package found — building from source"
+                        _build_pgvector_from_source
+                    fi
+                    ;;
+                dnf|yum)
+                    _pg_maj_c="$(pg_config --version 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "16")"
+                    _pgvec_pkg="pgvector_${_pg_maj_c}"
+                    if "$_PG_PKG_MGR" install -y "$_pgvec_pkg" 2>/dev/null; then
+                        info "Installed pgvector via package ${_pgvec_pkg}"
+                    else
+                        warn "Package ${_pgvec_pkg} not available — building pgvector from source"
+                        _build_pgvector_from_source
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+
+    # Sub-step D: Create role, database, and vector extension
+    echo ""
+    echo "  [4.5c-D] Create role '${_PG_ROLE}', database '${_PG_DBNAME}', extension 'vector'"
+    if $DRY_RUN; then
+        would "sudo -u postgres psql: CREATE ROLE ${_PG_ROLE} WITH LOGIN CREATEDB (role-exists guard)"
+        would "sudo -u postgres psql: CREATE DATABASE ${_PG_DBNAME} OWNER ${_PG_ROLE} (IF NOT EXISTS)"
+        would "sudo -u postgres psql -d ${_PG_DBNAME}: CREATE EXTENSION IF NOT EXISTS vector"
+    else
+        # Role — idempotent guard
+        if sudo -u postgres psql -tAc \
+                "SELECT 1 FROM pg_roles WHERE rolname='${_PG_ROLE}';" 2>/dev/null | grep -q 1; then
+            skip "PG role '${_PG_ROLE}' already exists — already configured"
+        else
+            sudo -u postgres psql -c "CREATE ROLE ${_PG_ROLE} WITH LOGIN CREATEDB;"
+            info "Created PG role '${_PG_ROLE}' (LOGIN CREATEDB)"
+        fi
+
+        # Database — idempotent guard
+        if sudo -u postgres psql -tAc \
+                "SELECT 1 FROM pg_database WHERE datname='${_PG_DBNAME}';" 2>/dev/null | grep -q 1; then
+            skip "Database '${_PG_DBNAME}' already exists — already configured"
+        else
+            sudo -u postgres psql -c "CREATE DATABASE ${_PG_DBNAME} OWNER ${_PG_ROLE};"
+            info "Created database '${_PG_DBNAME}' (owner: ${_PG_ROLE})"
+        fi
+
+        # Extension — IF NOT EXISTS makes this idempotent
+        sudo -u postgres psql -d "$_PG_DBNAME" \
+            -c "CREATE EXTENSION IF NOT EXISTS vector;" \
+            && info "Created extension 'vector' in '${_PG_DBNAME}' (IF NOT EXISTS)" \
+            || die "Failed to CREATE EXTENSION vector in '${_PG_DBNAME}' — is pgvector installed?"
+    fi
+
+    # Sub-step E: write KB_TEST_DATABASE_URL to SERVICE_ENV
+    # Pattern mirrors Step 4.5b-G (TALOS_BIN): python line-rewrite preserves all other keys.
+    # The DSN uses the Unix socket (no host/password) — peer auth works because the OS agent
+    # user ($AGENT_USER) matches the PG role name created above.
+    echo ""
+    echo "  [4.5c-E] KB_TEST_DATABASE_URL in ${SERVICE_ENV}"
+    if [[ ! -f "$SERVICE_ENV" ]]; then
+        if $DRY_RUN; then
+            would "append KB_TEST_DATABASE_URL=${_PG_DSN} to ${SERVICE_ENV}"
+        else
+            die "KB_TEST_DATABASE_URL write: ${SERVICE_ENV} does not exist — Step 3 should have created it"
+        fi
+    else
+        _pg_dsn_existing="$(_read_env_var KB_TEST_DATABASE_URL)"
+        if [[ "$_pg_dsn_existing" == "$_PG_DSN" ]]; then
+            skip "KB_TEST_DATABASE_URL already set in ${SERVICE_ENV} — already configured"
+        elif $DRY_RUN; then
+            would "set KB_TEST_DATABASE_URL=${_PG_DSN} in ${SERVICE_ENV} (line-rewrite, preserving all other keys)"
+        else
+            _pg_tmpfile="$(mktemp /tmp/dispatch-env.XXXXXX)"
+            _PG_ENV_FILE="$SERVICE_ENV" _PG_DSN_VALUE="$_PG_DSN" \
+            python3 - <<'PG_PYEOF' > "$_pg_tmpfile"
+import re, os, sys
+env_file  = os.environ['_PG_ENV_FILE']
+new_value = os.environ['_PG_DSN_VALUE']
+with open(env_file, 'r') as f:
+    content = f.read()
+lines = content.splitlines(keepends=True)
+replaced = False
+out = []
+for line in lines:
+    if re.match(r'^KB_TEST_DATABASE_URL=', line):
+        out.append('KB_TEST_DATABASE_URL=' + new_value + '\n')
+        replaced = True
+    else:
+        out.append(line)
+if not replaced:
+    if out and not out[-1].endswith('\n'):
+        out[-1] += '\n'
+    out.append('KB_TEST_DATABASE_URL=' + new_value + '\n')
+sys.stdout.write(''.join(out))
+PG_PYEOF
+            install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
+                "$_pg_tmpfile" "$SERVICE_ENV"
+            rm -f "$_pg_tmpfile"
+            info "Set KB_TEST_DATABASE_URL=${_PG_DSN} in ${SERVICE_ENV}"
+        fi
+    fi
+
+    # Sub-step F: Postgres smoke check (when --smoke + --with-postgres)
+    # Verifies Postgres is reachable and the vector extension is loaded in dispatch_test.
+    echo ""
+    echo "  [4.5c-F] Postgres smoke check"
+    if $DRY_RUN; then
+        would "sudo -u postgres psql -d ${_PG_DBNAME} -tAc \"SELECT extversion FROM pg_extension WHERE extname='vector';\" — expect a non-empty row"
+    elif $SMOKE; then
+        _vec_ver="$(sudo -u postgres psql -d "$_PG_DBNAME" -tAc \
+            "SELECT extversion FROM pg_extension WHERE extname='vector';" \
+            2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ -n "$_vec_ver" ]]; then
+            info "Postgres smoke check passed: vector extension v${_vec_ver} present in '${_PG_DBNAME}'"
+        else
+            die "Postgres smoke check FAILED: 'vector' extension not found in '${_PG_DBNAME}' — check pgvector install"
+        fi
+    else
+        skip "Postgres smoke check skipped (pass --smoke to run)"
+    fi
+
+fi  # end: if ! $WITH_POSTGRES
 
 # ===========================================================================
 # Step 4.6: MCP servers (agent user)
