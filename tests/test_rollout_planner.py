@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -358,6 +359,88 @@ class TestExtractEdges:
 
         edges = _extract_edges({}, {"a", "b"})
         assert edges == []
+
+    def test_unexpected_top_level_key_logs_warning(self, caplog) -> None:
+        from agent_gtd_dispatch.rollout_planner import _extract_edges
+
+        tool_input = {
+            "edges": [{"from_item_id": "a", "to_item_id": "b"}],
+            "extra_field": "unexpected",
+        }
+        with caplog.at_level(
+            logging.WARNING, logger="agent_gtd_dispatch.rollout_planner"
+        ):
+            edges = _extract_edges(tool_input, {"a", "b"})
+
+        assert len(edges) == 1  # edge still extracted despite extra key
+        assert any("extra_field" in msg for msg in caplog.messages)
+
+    def test_unexpected_edge_key_logs_warning(self, caplog) -> None:
+        from agent_gtd_dispatch.rollout_planner import _extract_edges
+
+        tool_input = {
+            "edges": [{"from_item_id": "a", "to_item_id": "b", "reason": "semantic"}]
+        }
+        with caplog.at_level(
+            logging.WARNING, logger="agent_gtd_dispatch.rollout_planner"
+        ):
+            edges = _extract_edges(tool_input, {"a", "b"})
+
+        assert len(edges) == 1  # edge still extracted despite extra key
+        assert any("reason" in msg for msg in caplog.messages)
+
+    def test_missing_from_item_id_logs_warning(self, caplog) -> None:
+        from agent_gtd_dispatch.rollout_planner import _extract_edges
+
+        tool_input = {"edges": [{"to_item_id": "b"}]}  # from_item_id absent
+        with caplog.at_level(
+            logging.WARNING, logger="agent_gtd_dispatch.rollout_planner"
+        ):
+            edges = _extract_edges(tool_input, {"a", "b"})
+
+        assert edges == []  # edge dropped because from_item_id not in valid_ids
+        assert any("from_item_id" in msg for msg in caplog.messages)
+
+    def test_missing_to_item_id_logs_warning(self, caplog) -> None:
+        from agent_gtd_dispatch.rollout_planner import _extract_edges
+
+        tool_input = {"edges": [{"from_item_id": "a"}]}  # to_item_id absent
+        with caplog.at_level(
+            logging.WARNING, logger="agent_gtd_dispatch.rollout_planner"
+        ):
+            edges = _extract_edges(tool_input, {"a", "b"})
+
+        assert edges == []  # edge dropped because to_item_id not in valid_ids
+        assert any("to_item_id" in msg for msg in caplog.messages)
+
+    def test_misspelled_from_item_key_logs_warning(self, caplog) -> None:
+        """Regression: 'from_item' (should be 'from_item_id') triggers warnings."""
+        from agent_gtd_dispatch.rollout_planner import _extract_edges
+
+        tool_input = {"edges": [{"from_item": "a", "to_item_id": "b"}]}
+        with caplog.at_level(
+            logging.WARNING, logger="agent_gtd_dispatch.rollout_planner"
+        ):
+            edges = _extract_edges(tool_input, {"a", "b"})
+
+        assert edges == []  # edge dropped — from_item_id key absent
+        all_messages = " ".join(caplog.messages)
+        # warns about the unexpected key present
+        assert "from_item" in all_messages
+        # warns about the expected key that is missing
+        assert "from_item_id" in all_messages
+
+    def test_no_warnings_on_clean_input(self, caplog) -> None:
+        from agent_gtd_dispatch.rollout_planner import _extract_edges
+
+        tool_input = {"edges": [{"from_item_id": "a", "to_item_id": "b"}]}
+        with caplog.at_level(
+            logging.WARNING, logger="agent_gtd_dispatch.rollout_planner"
+        ):
+            edges = _extract_edges(tool_input, {"a", "b"})
+
+        assert len(edges) == 1
+        assert caplog.records == []
 
 
 class TestPathsOverlap:

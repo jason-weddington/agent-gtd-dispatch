@@ -300,11 +300,20 @@ def _build_context(items: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+_EXPECTED_TOP_KEYS: frozenset[str] = frozenset({"edges"})
+_EXPECTED_EDGE_KEYS: frozenset[str] = frozenset({"from_item_id", "to_item_id"})
+
+
 def _extract_edges(tool_input: dict[str, Any], valid_ids: set[str]) -> list[DagEdge]:
     """Extract and validate edges from the LLM tool call response.
 
     Filters out any edge whose from_item_id or to_item_id is not in valid_ids,
     preventing the LLM from introducing unknown item references.
+
+    Emits WARNING log entries for:
+    - unexpected top-level keys in the tool output dict
+    - unexpected keys within individual edge dicts
+    - missing-but-expected ``from_item_id`` or ``to_item_id`` keys in edge dicts
 
     Args:
         tool_input: The raw dict from the LLM tool call (tool_use block input).
@@ -313,13 +322,34 @@ def _extract_edges(tool_input: dict[str, Any], valid_ids: set[str]) -> list[DagE
     Returns:
         List of DagEdge where both endpoints are in valid_ids.
     """
+    unexpected_top = set(tool_input) - _EXPECTED_TOP_KEYS
+    if unexpected_top:
+        logger.warning(
+            "produce_dag tool output has unexpected top-level keys: %s",
+            sorted(unexpected_top),
+        )
+
     raw_edges = tool_input.get("edges", [])
     if not isinstance(raw_edges, list):
         return []
     edges: list[DagEdge] = []
-    for raw in raw_edges:
+    for i, raw in enumerate(raw_edges):
         if not isinstance(raw, dict):
             continue
+        unexpected_edge = set(raw) - _EXPECTED_EDGE_KEYS
+        if unexpected_edge:
+            logger.warning(
+                "produce_dag edge[%d] has unexpected keys: %s",
+                i,
+                sorted(unexpected_edge),
+            )
+        for key in sorted(_EXPECTED_EDGE_KEYS):
+            if key not in raw:
+                logger.warning(
+                    "produce_dag edge[%d] is missing expected key %r",
+                    i,
+                    key,
+                )
         from_id = raw.get("from_item_id", "")
         to_id = raw.get("to_item_id", "")
         if from_id in valid_ids and to_id in valid_ids:
