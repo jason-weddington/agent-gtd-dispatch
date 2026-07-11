@@ -2,6 +2,56 @@
 
 <!-- version list -->
 
+## v1.17.0 (2026-07-11)
+
+### Bug Fixes
+
+- No spurious ssh-keyscan WARN for http/https git remotes
+  ([`23e92ee`](https://github.com/repos/agent-gtd-dispatch/commit/23e92eeb8dd00453e7ea012476c560bbebf0d4bf))
+
+- Reclassify pushed-but-lingered BUILD runs as succeeded, not timed_out
+  ([`a0c5ad9`](https://github.com/repos/agent-gtd-dispatch/commit/a0c5ad9febead2826cf8f6d457961bbc3f69757f))
+
+- **sudoers**: Keep talos backend/model env vars across the sudo boundary
+  ([`474a7b3`](https://github.com/repos/agent-gtd-dispatch/commit/474a7b300899c8a86aacc8e7680b641d882f15b2))
+
+- **tests**: Isolate _env fixture from ambient OLLAMA_*/TALOS_BIN env
+  ([`6ff3792`](https://github.com/repos/agent-gtd-dispatch/commit/6ff37926ec3210d3a108595703e8292dc712f554))
+
+### Chores
+
+- Finalize talos-update.sh artifact base URL to artifacts.lab
+  ([`88a4e8b`](https://github.com/repos/agent-gtd-dispatch/commit/88a4e8b7a150d92f8aa9aa909c151f47f7ab4cc4))
+
+### Features
+
+- --with-postgres provisions local Postgres + pgvector on dispatch hosts
+  ([`860cb25`](https://github.com/repos/agent-gtd-dispatch/commit/860cb252e6a4e5f1a9f6b71c26a21aed18b12c7e))
+
+- Idempotent setup-dispatch-host.sh + --with-talos engine provisioning
+  ([`474c881`](https://github.com/repos/agent-gtd-dispatch/commit/474c88124f9449f8b5bd19b843830a8b2761e3a2))
+
+- Raise talos --gate-timeout-secs to 900s (overridable) for cold Pi gate runs
+  ([`2b35fe0`](https://github.com/repos/agent-gtd-dispatch/commit/2b35fe00ff458e76709073a7bd0acf068b26cc1a))
+
+- Register the talos-* build-engine family (worker owns git + comment-back)
+  ([`ad8785a`](https://github.com/repos/agent-gtd-dispatch/commit/ad8785ad21ee2ad1e15afc61ed5b70a8cea6e543))
+
+- Talos-update.sh — pull the published talos binary from pi-04 to the fleet
+  ([`82ebc73`](https://github.com/repos/agent-gtd-dispatch/commit/82ebc73dbd5c7ceb469e8dee51e31f22466faa8a))
+
+- Warn on unexpected/missing keys in produce_dag tool output
+  ([`87d9663`](https://github.com/repos/agent-gtd-dispatch/commit/87d96633f02ed8cacd28be56ba704d24a87cc3d8))
+
+- Wire claude-code-glm engine (glm-5.2 via Ollama Cloud)
+  ([`443c999`](https://github.com/repos/agent-gtd-dispatch/commit/443c999d06968ad0ac90324438ab7006b00ee057))
+
+### Testing
+
+- Flywheel guard — talos_env_overlay keys must be a subset of sudoers env_keep
+  ([`443ced1`](https://github.com/repos/agent-gtd-dispatch/commit/443ced156ed3fa53ea5f9c3c95ab31e23477ea75))
+
+
 ## v1.16.0 (2026-07-07)
 
 ### Bug Fixes
