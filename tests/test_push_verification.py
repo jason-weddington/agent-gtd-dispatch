@@ -595,3 +595,276 @@ class TestWorkerVerification:
         mock_dispatch.verify_pushes.assert_not_called()
         # get_head_sha must NOT have been called for plan mode
         mock_dispatch.get_head_sha.assert_not_called()
+
+    # -----------------------------------------------------------------------
+    # Timeout-path reclassification (linger-success) — new tests
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_timeout_all_pushed_reclassified_as_succeeded(self, tmp_path) -> None:
+        """BUILD + TimeoutExpired + all repos pushed → run reclassified as succeeded.
+
+        Verifies: db status == 'succeeded', verify_pushes called, comment does
+        NOT contain 'may need to be broken down', _publish_run_event fired with
+        'succeeded' and never 'timed_out' for this run.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import DispatchMode, PushStatus, Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-timeout-success",
+            project_name="TestProject",
+            branch_name="feat/timeout-success",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        pushed_result = RepoPushStatus(
+            repo_name="repos-testproj",
+            branch="feat/timeout-success",
+            status=PushStatus.pushed,
+            local_sha="aabbccdd",
+            remote_sha="aabbccdd",
+            commits_ahead=3,
+            dirty=False,
+        )
+
+        events: list[tuple] = []
+
+        def _capture_event(run_id: str, status: str, ts: object) -> None:
+            events.append((run_id, status, ts))
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+            patch(
+                "agent_gtd_dispatch.main._publish_run_event",
+                side_effect=_capture_event,
+            ),
+        ):
+            mock_gtd.get_item = AsyncMock(
+                return_value={
+                    "id": "item-timeout-success",
+                    "title": "Fix bug",
+                    "project_id": "proj1",
+                }
+            )
+            mock_gtd.get_project = AsyncMock(
+                return_value={
+                    "id": "proj1",
+                    "name": "TestProject",
+                    "git_origin": "git@host:repos/testproj",
+                }
+            )
+            mock_gtd.post_comment = AsyncMock()
+            mock_gtd.list_attachments = AsyncMock(return_value=[])
+
+            fake_workspace = tmp_path / "repos-testproj-timeout"
+            fake_workspace.mkdir()
+            mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
+            mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
+            mock_dispatch.repo_name_from_origin = MagicMock(
+                return_value="repos-testproj"
+            )
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.run_agent = AsyncMock(
+                side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=600)
+            )
+            mock_dispatch.verify_pushes = MagicMock(return_value=[pushed_result])
+            mock_dispatch.cleanup_workspace = MagicMock()
+
+            from agent_gtd_dispatch.engines import CLAUDE
+            from agent_gtd_dispatch.main import _dispatch_worker
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "succeeded"
+
+        mock_dispatch.verify_pushes.assert_called_once()
+
+        # Comment must signal linger-success (not the genuine-timeout phrasing)
+        assert mock_gtd.post_comment.call_count >= 1
+        all_comment_texts = [
+            str(c.args[1]) if c.args else str(c.kwargs.get("content", ""))
+            for c in mock_gtd.post_comment.call_args_list
+        ]
+        final_comment = all_comment_texts[-1]
+        assert "may need to be broken down" not in final_comment
+        assert "marking run succeeded" in final_comment
+
+        # _publish_run_event: 'succeeded' must appear, 'timed_out' must not
+        assert (run.id, "succeeded") in [(rid, st) for rid, st, _ in events]
+        assert (run.id, "timed_out") not in [(rid, st) for rid, st, _ in events]
+
+    @pytest.mark.asyncio
+    async def test_timeout_unpushed_stays_timed_out(self, tmp_path) -> None:
+        """BUILD + TimeoutExpired + unpushed repo → run finalized as timed_out.
+
+        Verifies: db status == 'timed_out', error text, and timeout comment.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import DispatchMode, PushStatus, Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-timeout-unpushed",
+            project_name="TestProject",
+            branch_name="feat/timeout-unpushed",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        unpushed_result = RepoPushStatus(
+            repo_name="repos-testproj",
+            branch="feat/timeout-unpushed",
+            status=PushStatus.unpushed,
+            local_sha="deadbeef",
+            remote_sha=None,
+            commits_ahead=2,
+            dirty=False,
+        )
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_gtd.get_item = AsyncMock(
+                return_value={
+                    "id": "item-timeout-unpushed",
+                    "title": "Fix bug",
+                    "project_id": "proj1",
+                }
+            )
+            mock_gtd.get_project = AsyncMock(
+                return_value={
+                    "id": "proj1",
+                    "name": "TestProject",
+                    "git_origin": "git@host:repos/testproj",
+                }
+            )
+            mock_gtd.post_comment = AsyncMock()
+            mock_gtd.list_attachments = AsyncMock(return_value=[])
+
+            fake_workspace = tmp_path / "repos-testproj-timeout-unpushed"
+            fake_workspace.mkdir()
+            mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
+            mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
+            mock_dispatch.repo_name_from_origin = MagicMock(
+                return_value="repos-testproj"
+            )
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.run_agent = AsyncMock(
+                side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=600)
+            )
+            mock_dispatch.verify_pushes = MagicMock(return_value=[unpushed_result])
+            mock_dispatch.cleanup_workspace = MagicMock()
+
+            from agent_gtd_dispatch.engines import CLAUDE
+            from agent_gtd_dispatch.main import _dispatch_worker
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "timed_out"
+        assert updated.error == f"Timed out after {600}s"
+
+        # Genuine-timeout comment must be posted
+        assert mock_gtd.post_comment.call_count >= 1
+        all_comment_texts = [
+            str(c.args[1]) if c.args else str(c.kwargs.get("content", ""))
+            for c in mock_gtd.post_comment.call_args_list
+        ]
+        timeout_comments = [
+            t for t in all_comment_texts if "timed out after" in t.lower()
+        ]
+        assert timeout_comments, "expected a timed-out comment"
+
+    @pytest.mark.asyncio
+    async def test_plan_mode_timeout_skips_verify_pushes(self, tmp_path) -> None:
+        """PLAN mode + TimeoutExpired → timed_out, verify_pushes never called.
+
+        Plan runs don't push code, so push-verification must be skipped entirely.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import DispatchMode, Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-plan-timeout",
+            project_name="TestProject",
+            branch_name=None,
+            mode=DispatchMode.PLAN,
+        )
+        await db.insert_run(run)
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_gtd.get_item = AsyncMock(
+                return_value={
+                    "id": "item-plan-timeout",
+                    "title": "Plan feature",
+                    "project_id": "proj1",
+                }
+            )
+            mock_gtd.get_project = AsyncMock(
+                return_value={
+                    "id": "proj1",
+                    "name": "TestProject",
+                    "git_origin": "git@host:repos/testproj",
+                }
+            )
+            mock_gtd.post_comment = AsyncMock()
+            mock_gtd.list_attachments = AsyncMock(return_value=[])
+
+            fake_workspace = tmp_path / "repos-testproj-plan-timeout"
+            fake_workspace.mkdir()
+            mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
+            mock_dispatch.get_head_sha = MagicMock(return_value="baseshaxyz")
+            mock_dispatch.repo_name_from_origin = MagicMock(
+                return_value="repos-testproj"
+            )
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.run_agent = AsyncMock(
+                side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=600)
+            )
+            mock_dispatch.verify_pushes = MagicMock(
+                return_value=[
+                    RepoPushStatus(
+                        repo_name="repos-testproj",
+                        branch="feat/plan-test",
+                        status=PushStatus.pushed,
+                        local_sha="abc",
+                        remote_sha="abc",
+                        commits_ahead=1,
+                        dirty=False,
+                    )
+                ]
+            )
+            mock_dispatch.cleanup_workspace = MagicMock()
+
+            from agent_gtd_dispatch.engines import CLAUDE
+            from agent_gtd_dispatch.main import _dispatch_worker
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "timed_out"
+
+        # verify_pushes must NOT be called for plan mode
+        mock_dispatch.verify_pushes.assert_not_called()

@@ -1007,9 +1007,13 @@ async def _dispatch_worker(
             git_origin = project.get("git_origin", "")
             if not git_origin:
                 raise ValueError(f"Project '{project['name']}' has no git_origin")
-            if run.branch_name is None:  # pragma: no cover
-                raise ValueError("branch_name must be set for non-manage mode runs")
-            workspace = dispatch.prepare_workspace(git_origin, run.id, run.branch_name)
+            if (
+                mode == DispatchMode.BUILD and run.branch_name is None
+            ):  # pragma: no cover
+                raise ValueError("branch_name must be set for build-mode runs")
+            workspace = dispatch.prepare_workspace(
+                git_origin, run.id, run.branch_name or ""
+            )
             await db.update_run(run.id, workspace_path=str(workspace))
             # Capture base SHA for BUILD mode verification — BEFORE stage_attachments
             if mode == DispatchMode.BUILD:
@@ -1214,23 +1218,57 @@ async def _dispatch_worker(
 
     except subprocess.TimeoutExpired:
         _timed_out_at = datetime.now(UTC).isoformat()
-        await db.update_run(
-            run.id,
-            status=RunStatus.timed_out,
-            completed_at=_timed_out_at,
-            error=f"Timed out after {timeout_seconds}s",
-        )
-        _publish_run_event(run.id, "timed_out", _timed_out_at)
-        if run.item_id is not None:
-            await gtd_client.post_comment(
-                run.item_id,
-                f"Agent timed out after {timeout_seconds // 60} minutes (run `{run.id}`). "
-                "The task may need to be broken down into smaller pieces.",
-                created_by=attribution or "agent-gtd-dispatch",
-                token=run.callback_token,
+        _linger_success = False
+        if _verify_repos is not None:
+            # BUILD mode: agent process lingered past the timeout but may have
+            # already pushed its work.  verify_pushes is fail-closed — any error
+            # yields PushStatus.unpushed so it never misclassifies a real timeout.
+            push_results_list = dispatch.verify_pushes(
+                _verify_repos, run.branch_name or ""
             )
-        if mode == DispatchMode.MANAGE:
-            should_cleanup = False
+            unpushed = [r for r in push_results_list if r.status == PushStatus.unpushed]
+            if not unpushed:
+                # Every repo is pushed or has no changes — treat as succeeded.
+                _linger_success = True
+                _push_results_json = json.dumps(
+                    [r.model_dump(mode="json") for r in push_results_list]
+                )
+                await db.update_run(
+                    run.id,
+                    status=RunStatus.succeeded,
+                    completed_at=_timed_out_at,
+                    push_results=_push_results_json,
+                )
+                _publish_run_event(run.id, "succeeded", _timed_out_at)
+                if run.item_id is not None:
+                    await gtd_client.post_comment(
+                        run.item_id,
+                        f"Agent exceeded the {timeout_seconds // 60}-minute wall-clock "
+                        f"timeout, but its work was pushed to origin — marking run "
+                        f"succeeded (run `{run.id}`).",
+                        created_by=attribution or "agent-gtd-dispatch",
+                        token=run.callback_token,
+                    )
+        if not _linger_success:
+            # Genuine timeout: work was not pushed (or plan/manage mode with no
+            # push verification).  Preserve the original timed_out behaviour.
+            await db.update_run(
+                run.id,
+                status=RunStatus.timed_out,
+                completed_at=_timed_out_at,
+                error=f"Timed out after {timeout_seconds}s",
+            )
+            _publish_run_event(run.id, "timed_out", _timed_out_at)
+            if run.item_id is not None:
+                await gtd_client.post_comment(
+                    run.item_id,
+                    f"Agent timed out after {timeout_seconds // 60} minutes (run `{run.id}`). "
+                    "The task may need to be broken down into smaller pieces.",
+                    created_by=attribution or "agent-gtd-dispatch",
+                    token=run.callback_token,
+                )
+            if mode == DispatchMode.MANAGE:
+                should_cleanup = False
     except asyncio.CancelledError:
         _human_cancelled = True
         _cancelled_at = datetime.now(UTC).isoformat()
