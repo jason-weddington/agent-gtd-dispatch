@@ -14,7 +14,7 @@ set -euo pipefail
 #   DISPATCH_HOSTS        Space-separated SSH targets (default: "pironman01 r7-research")
 #   DISPATCH_HOST         Single SSH target — if set, overrides DISPATCH_HOSTS (back-compat)
 #   TALOS_ARTIFACT_BASE   Base URL of the talos artifact tree served by pi-04's Caddy.
-#                         PROVISIONAL default: https://pypi.lab.jasonweddington.com/talos
+#                         PROVISIONAL default: https://artifacts.lab.jasonweddington.com
 #                         The exact URL is being finalised (pypi.lab vs talos.lab subdomain);
 #                         override via this env var until the canonical URL is pinned.
 #   AGENT_USER            OS user that owns the talos binary (default: dispatch)
@@ -26,8 +26,8 @@ set -euo pipefail
 # Defaults
 # ---------------------------------------------------------------------------
 
-# PROVISIONAL: override TALOS_ARTIFACT_BASE once the pi-04 Caddy URL is finalised.
-TALOS_ARTIFACT_BASE="${TALOS_ARTIFACT_BASE:-https://pypi.lab.jasonweddington.com/talos}"
+# pi-04 Caddy serves /srv/talos at the root of this subdomain (artifacts.lab).
+TALOS_ARTIFACT_BASE="${TALOS_ARTIFACT_BASE:-https://artifacts.lab.jasonweddington.com}"
 
 AGENT_USER="${AGENT_USER:-dispatch}"
 AGENT_GROUP="${AGENT_GROUP:-${AGENT_USER}}"
