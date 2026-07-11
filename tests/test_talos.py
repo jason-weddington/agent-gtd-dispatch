@@ -233,6 +233,48 @@ class TestTalosEnvOverlay:
         assert talos_env_overlay("talos-glm")["OLLAMA_API_KEY"] == "cloud-secret"
         assert talos_env_overlay("talos-qwen")["OLLAMA_API_KEY"] == "local-secret"
 
+    def test_env_overlay_keys_are_subset_of_sudoers_env_keep(self) -> None:
+        """Flywheel guard: every key talos_env_overlay() sets must survive the
+        sudo boundary — i.e. be listed in the sudoers env_keep directive.
+
+        Both sets are derived from source-of-truth code/templates, never
+        hardcoded, so a future engine addition or template edit that breaks
+        the invariant fails loudly here rather than silently at runtime.
+        """
+        from agent_gtd_dispatch.engines import TALOS_ENGINES
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        # Build the overlay key-set by unioning across every registered talos engine.
+        overlay_keys: set[str] = set()
+        for name in TALOS_ENGINES:
+            overlay_keys |= talos_env_overlay(name).keys()
+
+        # Parse env_keep from the sudoers template (single source of truth).
+        tmpl = Path(__file__).parent.parent / "templates" / "sudoers-dispatch-svc.tmpl"
+        env_keep_line = next(
+            line for line in tmpl.read_text().splitlines() if "env_keep +=" in line
+        )
+        quoted = env_keep_line[env_keep_line.index('"') + 1 : env_keep_line.rindex('"')]
+        env_keep_keys: set[str] = set(quoted.split())
+
+        # Guard against a vacuous pass from parse or overlay failure.
+        assert env_keep_keys, "env_keep_keys is empty — sudoers template parse failed"
+        assert overlay_keys, (
+            "overlay_keys is empty — talos_env_overlay returned nothing"
+        )
+        # Single-key anchor: every talos engine sets TALOS_BACKEND, so its absence
+        # means the overlay parse resolved nothing real.
+        assert "TALOS_BACKEND" in overlay_keys, (
+            "TALOS_BACKEND not in overlay_keys — talos_env_overlay returned unexpected keys"
+        )
+
+        # The real invariant: every key the overlay sets must be in env_keep.
+        missing = overlay_keys - env_keep_keys
+        assert overlay_keys <= env_keep_keys, (
+            "talos_env_overlay sets keys not preserved across the sudo boundary — "
+            f"add to env_keep in sudoers-dispatch-svc.tmpl: {sorted(missing)}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # CLOUD-KEY CONFIG KNOB — no fallback
