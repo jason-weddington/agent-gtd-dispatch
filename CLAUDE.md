@@ -141,3 +141,70 @@ sudo ./setup-dispatch-host.sh --with-postgres --smoke
 # Dry-run preview (no mutations):
 sudo ./setup-dispatch-host.sh --with-postgres --dry-run
 ```
+
+## talos-update.sh — fast binary bump for the dispatch fleet
+
+`talos-update.sh` is the **operator-run fast bump channel** for the `talos` engine binary.
+It pulls a versioned, pre-built binary from pi-04's artifact store and installs it on every
+dispatch host, per-arch and version-checked.  No cargo build, no Rust toolchain required.
+
+### What it does
+
+1. Resolves the target version from `<TALOS_ARTIFACT_BASE>/latest` (or `--version <TOKEN>`).
+2. SSHes into each dispatch host in `DISPATCH_HOSTS`.
+3. On each host: maps `uname -m` → arch, reads the installed `talos --version` token.
+4. **Skips** the host if already at the target version (fully idempotent).
+5. Downloads `<BASE>/<TOKEN>/<arch>/talos` via `curl -fsSL` to a tempfile.
+6. Installs the binary via `sudo install -m 0755 -o <AGENT_USER> -g <AGENT_GROUP>`.
+7. Verifies the freshly-installed binary reports the expected version token.
+8. **Does NOT restart dispatch-api** — talos is a fresh subprocess per dispatch run,
+   so the new binary is picked up automatically on the next run.
+
+### Pi-04 artifact contract
+
+```
+<BASE>/latest                       → one-line file: current version token (e.g. 0.1.0-ga1b2c3d)
+<BASE>/<TOKEN>/<arch>/talos         → pre-built binary  (arch ∈ {x86_64, aarch64})
+```
+
+`talos --version` output format: `talos <TOKEN>` — extract with `awk '{print $2}'`.
+
+### Environment variables
+
+| Variable              | Default                                        | Notes |
+|-----------------------|------------------------------------------------|-------|
+| `DISPATCH_HOSTS`      | `pironman01 r7-research`                       | Space-separated SSH targets |
+| `DISPATCH_HOST`       | *(unset)*                                      | Single-host override (back-compat) |
+| `TALOS_ARTIFACT_BASE` | `https://pypi.lab.jasonweddington.com/talos`   | **PROVISIONAL** — update once the pi-04 Caddy URL is finalised (pypi.lab vs talos.lab) |
+| `AGENT_USER`          | `dispatch`                                     | OS user that owns the binary |
+| `AGENT_GROUP`         | *(same as AGENT_USER)*                         | OS group for the binary |
+
+### Usage
+
+```bash
+./talos-update.sh                          # bump all hosts to latest
+./talos-update.sh --version 0.1.0-ga1b2c3d  # pin a specific version
+DISPATCH_HOST=pironman01 ./talos-update.sh   # single host
+TALOS_ARTIFACT_BASE=https://talos.lab.jasonweddington.com ./talos-update.sh
+```
+
+### Relationship to setup-dispatch-host.sh --with-talos
+
+`setup-dispatch-host.sh --with-talos` is the **from-scratch bootstrap/fallback**: it clones
+`harness-design`, runs `cargo build --release -p talos`, and installs the locally-built
+binary (works on a fresh host with no artifacts pre-published).
+
+`talos-update.sh` is the **fast bump channel**: operator runs it after a new talos version
+is published to pi-04 (by the harness-design CI).  No Rust toolchain, no source clone,
+no cargo build — just a curl + install.  Use `setup-dispatch-host.sh --with-talos` for
+initial provisioning or as a fallback if the artifact server is unreachable.
+
+### Verification caveat
+
+End-to-end testing requires a binary to be published on pi-04 (harness-design item
+953fd927).  Until artifacts exist, verify the script locally with:
+```bash
+bash -n talos-update.sh          # syntax check
+shellcheck talos-update.sh       # static analysis
+./talos-update.sh --help         # usage output
+```
