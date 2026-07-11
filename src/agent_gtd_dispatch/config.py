@@ -70,6 +70,9 @@ OLLAMA_CLOUD_API_KEY: str = ""
 # (mirrors how the 'claude' binary is resolved for claude-code engines). Override via
 # TALOS_BIN env var when the binary lives at a non-default path on the host.
 TALOS_BIN: str = "talos"
+# Talos gate-command timeout. Talos' own default is 300 s; 900 s is chosen to
+# survive a COLD fmt+clippy+nextest gate run on the Pi (pironman01).
+TALOS_GATE_TIMEOUT_SECS: int = 900
 
 
 def load() -> None:
@@ -79,7 +82,7 @@ def load() -> None:
     global ANTHROPIC_API_KEY, PLANNER_MODEL, MAX_CONCURRENT_RUNS
     global OLLAMA_BASE_URL, OLLAMA_API_KEY, OLLAMA_DEFAULT_MODEL
     global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS
-    global OLLAMA_CLOUD_API_KEY, TALOS_BIN
+    global OLLAMA_CLOUD_API_KEY, TALOS_BIN, TALOS_GATE_TIMEOUT_SECS
     global AGENT_SUBPROCESS_USER
     global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
     global PLANNER_PROVIDER, PLANNER_BEDROCK_MODEL, AWS_REGION
@@ -136,6 +139,7 @@ def load() -> None:
     # credentials and mixing them ships the local key to the cloud.
     OLLAMA_CLOUD_API_KEY = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
     TALOS_BIN = os.environ.get("TALOS_BIN", "talos")
+    TALOS_GATE_TIMEOUT_SECS = int(os.environ.get("TALOS_GATE_TIMEOUT_SECS", "900"))
     OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "qwen3.6:35b")
     OLLAMA_TIMEOUT_MULTIPLIER = float(
         os.environ.get("OLLAMA_TIMEOUT_MULTIPLIER", "2.0")

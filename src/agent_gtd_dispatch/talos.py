@@ -169,8 +169,10 @@ def build_talos_argv(workspace_dir: Path, task_id: str, attempt: int) -> list[st
     - Uses ``config.TALOS_BIN`` (default ``'talos'``, PATH-resolved).
     - Passes ``--workspace``, ``--task-id``, ``--attempt``. The TaskSpec JSON is
       piped on STDIN by the caller — NOT via ``--file``.
-    - Does NOT pass ``--max-iterations`` or ``--gate-timeout-secs`` (relies on
-      talos defaults 12 / 300 — see the scope-out note in the item).
+    - Passes ``--gate-timeout-secs`` from ``config.TALOS_GATE_TIMEOUT_SECS``
+      (default 900, overridable via the ``TALOS_GATE_TIMEOUT_SECS`` env var) to
+      survive a cold gate run on the Pi. Does NOT pass ``--max-iterations``
+      (relies on the talos default).
     - Does NOT pass ``--run-store`` / ``--offload-dir`` — talos writes artifacts
       to its XDG default (``${XDG_STATE_HOME:-~/.local/state}/talos/<task-id>``),
       OUTSIDE the clone, so the worker's ``git add`` never touches them.
@@ -186,6 +188,8 @@ def build_talos_argv(workspace_dir: Path, task_id: str, attempt: int) -> list[st
         task_id,
         "--attempt",
         str(attempt),
+        "--gate-timeout-secs",
+        str(config.TALOS_GATE_TIMEOUT_SECS),
     ]
     return _sudo_wrap(argv)
 

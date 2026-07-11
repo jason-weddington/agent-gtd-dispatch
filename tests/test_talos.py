@@ -343,6 +343,35 @@ class TestOllamaCloudApiKeyConfig:
             config.load()
             assert config.TALOS_BIN == "/opt/talos/bin/talos"
 
+    def test_talos_gate_timeout_secs_default_is_900(self, tmp_path) -> None:
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://x",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "a",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+        }
+        with patch.dict(os.environ, env, clear=True):
+            from agent_gtd_dispatch import config
+
+            config.load()
+            assert config.TALOS_GATE_TIMEOUT_SECS == 900
+
+    def test_talos_gate_timeout_secs_override(self, tmp_path) -> None:
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://x",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "a",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+            "TALOS_GATE_TIMEOUT_SECS": "600",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            from agent_gtd_dispatch import config
+
+            config.load()
+            assert config.TALOS_GATE_TIMEOUT_SECS == 600
+
 
 # ---------------------------------------------------------------------------
 # CAPABILITIES ADVERTISEMENT + is_engine_available GATING
@@ -517,6 +546,8 @@ class TestBuildTalosArgv:
             "task-123",
             "--attempt",
             "1",
+            "--gate-timeout-secs",
+            "900",
         ]
 
     def test_argv_sudo_wrapped_when_user_set(self, monkeypatch) -> None:
@@ -529,14 +560,14 @@ class TestBuildTalosArgv:
         assert "talos" in argv
         assert "--attempt" in argv and "2" in argv
 
-    def test_argv_no_max_iterations_or_gate_timeout(self, monkeypatch) -> None:
+    def test_argv_no_max_iterations_but_has_gate_timeout(self, monkeypatch) -> None:
         from agent_gtd_dispatch import config
         from agent_gtd_dispatch.talos import build_talos_argv
 
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
         argv = build_talos_argv(Path("/workspace/work"), "task-1", attempt=1)
         assert "--max-iterations" not in argv
-        assert "--gate-timeout-secs" not in argv
+        assert "--gate-timeout-secs" in argv
         assert "--file" not in argv  # spec is on stdin, never a --file path
         assert "--run-store" not in argv
         assert "--offload-dir" not in argv
@@ -549,6 +580,16 @@ class TestBuildTalosArgv:
         monkeypatch.setattr(config, "TALOS_BIN", "/opt/talos/bin/talos")
         argv = build_talos_argv(Path("/w"), "t", attempt=1)
         assert argv[0] == "/opt/talos/bin/talos"
+
+    def test_argv_gate_timeout_secs_override(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import build_talos_argv
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(config, "TALOS_GATE_TIMEOUT_SECS", 600)
+        argv = build_talos_argv(Path("/workspace/work"), "task-1", attempt=1)
+        i = argv.index("--gate-timeout-secs")
+        assert argv[i + 1] == "600"
 
 
 # ---------------------------------------------------------------------------
