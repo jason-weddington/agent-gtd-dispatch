@@ -1377,14 +1377,19 @@ async def dispatch_item(
 ) -> RunResponse:
     """Start a new dispatch run for a GTD item."""
     # Plan-mode and manage-mode always use Anthropic, regardless of requested engine.
-    # Both claude-code-ollama and the talos-* family are BUILD-only; plan/manage
-    # dispatches swap to claude-code so the existing planner/manager code path
-    # runs untouched (talos itself does not implement plan/manage modes).
+    # The Ollama-routed Claude engines (claude-code-ollama local, claude-code-glm
+    # cloud) and the talos-* family are all BUILD-only; plan/manage dispatches swap
+    # to claude-code so the existing planner/manager code path runs untouched (small
+    # local/cloud models are unreliable at multi-wave management; talos itself does
+    # not implement plan/manage modes).
     effective_engine_name = body.engine
     _engine_swap_reason = ""
     if body.mode != DispatchMode.BUILD and body.engine == "claude-code-ollama":
         effective_engine_name = "claude-code"
         _engine_swap_reason = "plan/manage mode does not support ollama"
+    elif body.mode != DispatchMode.BUILD and body.engine == "claude-code-glm":
+        effective_engine_name = "claude-code"
+        _engine_swap_reason = "plan/manage mode does not support ollama-cloud glm"
     elif body.mode != DispatchMode.BUILD and is_talos_engine(body.engine):
         effective_engine_name = "claude-code"
         _engine_swap_reason = "plan/manage mode does not support talos"

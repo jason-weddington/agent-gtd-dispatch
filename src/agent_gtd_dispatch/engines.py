@@ -173,6 +173,51 @@ def _claude_ollama_extra_env() -> dict[str, str]:
     }
 
 
+def _build_claude_glm_command(
+    system_prompt: str,
+    title: str,
+    max_turns: int,
+    agent_name: str | None,
+) -> list[str]:
+    """Build command for claude-code-glm: same as CLAUDE but injects the GLM model.
+
+    Claude Code (the mature harness) driving glm-5.2 on Ollama Cloud — the HARNESS
+    twin of talos-glm (same model + cloud key, different loop). Auth + base URL are
+    injected via ``_claude_glm_extra_env``; here we only pin ``--model``.
+    """
+    from . import config  # local import so module is readable before config.load()
+
+    cmd = [
+        "claude",
+        "--model",
+        config.OLLAMA_CLOUD_MODEL,
+        "--dangerously-skip-permissions",
+        "--max-turns",
+        str(max_turns),
+        "--system-prompt",
+        system_prompt,
+        "--print",
+    ]
+    if agent_name:
+        cmd.extend(["--agent", agent_name])
+    cmd.append(title)
+    return cmd
+
+
+def _claude_glm_extra_env() -> dict[str, str]:
+    """Extra env vars injected into the claude-code-glm subprocess.
+
+    Points Claude Code at Ollama Cloud's Anthropic-compatible /v1/messages endpoint
+    using the DISTINCT cloud key (never the local OLLAMA_API_KEY — see config.py).
+    """
+    from . import config  # local import so module is readable before config.load()
+
+    return {
+        "ANTHROPIC_BASE_URL": config.OLLAMA_CLOUD_BASE_URL,
+        "ANTHROPIC_AUTH_TOKEN": config.OLLAMA_CLOUD_API_KEY,
+    }
+
+
 def _build_claude_sonnet_command(
     system_prompt: str,
     title: str,
@@ -250,6 +295,15 @@ CLAUDE_OLLAMA = Engine(
     env_keys=frozenset(),  # no keys inherited from parent env; all via extra_env_fn
     build_command=_build_claude_ollama_command,
     extra_env_fn=_claude_ollama_extra_env,
+)
+
+CLAUDE_GLM = Engine(
+    name="claude-code-glm",
+    binary="claude",
+    auth_env_key="",  # auth is injected via extra_env_fn (cloud key), not parent env
+    env_keys=frozenset(),  # no keys inherited from parent env; all via extra_env_fn
+    build_command=_build_claude_glm_command,
+    extra_env_fn=_claude_glm_extra_env,
 )
 
 CLAUDE_SONNET = Engine(
@@ -338,6 +392,7 @@ ENGINES: dict[str, Engine] = {
     "claude-code": CLAUDE,
     "kiro": KIRO,
     "claude-code-ollama": CLAUDE_OLLAMA,
+    "claude-code-glm": CLAUDE_GLM,
     "claude-code-sonnet": CLAUDE_SONNET,
     "claude-code-haiku": CLAUDE_HAIKU,
     "talos-haiku": TALOS_HAIKU,
@@ -390,6 +445,12 @@ def is_engine_available(engine: Engine) -> bool:
         from . import config
 
         return bool(config.OLLAMA_BASE_URL)
+    if name == "claude-code-glm":
+        # Ollama-Cloud-routed Claude Code: gate on the distinct cloud key (same
+        # credential talos-glm consumes). No local Ollama server involved.
+        from . import config
+
+        return bool(config.OLLAMA_CLOUD_API_KEY)
     # Talos family: gate on the credentials the per-engine env overlay consumes
     # (see talos.talos_env_overlay). Anthropic-backed talos engines need
     # ANTHROPIC_API_KEY; talos-qwen needs a reachable Ollama server (mirrors the

@@ -63,6 +63,16 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # OLLAMA_API_KEY=ollama
 # OLLAMA_DEFAULT_MODEL=qwen3.6:35b
 
+# Ollama CLOUD (https://ollama.com) — a single key powers TWO cloud engines:
+#   talos-glm        (talos loop → Ollama native /api/chat)
+#   claude-code-glm  (Claude Code loop → Ollama's Anthropic-compatible /v1/messages)
+# Get a non-expiring key at https://ollama.com/settings/keys. Distinct from the
+# LOCAL OLLAMA_API_KEY above — never a fallback between them. Overriding the base
+# URL / model is rarely needed (defaults: https://ollama.com, glm-5.2:cloud).
+# OLLAMA_CLOUD_API_KEY=
+# OLLAMA_CLOUD_BASE_URL=https://ollama.com
+# OLLAMA_CLOUD_MODEL=glm-5.2:cloud
+
 # Talos engine binary path — managed by setup-dispatch-host.sh --with-talos.
 # Set automatically when --with-talos is passed to the installer; override here
 # only if you place the binary at a non-standard path.

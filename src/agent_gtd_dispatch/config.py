@@ -61,10 +61,20 @@ OLLAMA_TIMEOUT_MULTIPLIER: float = 2.0
 
 # Ollama Cloud API key (https://ollama.com) — distinct from the LOCAL OLLAMA_API_KEY
 # above, which points at the operator's own Ollama server (dummy 'ollama' on
-# unauthenticated setups). Consumed ONLY by the talos-glm engine, which routes to
-# ollama.com. There is intentionally NO fallback to OLLAMA_API_KEY: mixing the two
-# would silently ship the operator's local-server key to the cloud.
+# unauthenticated setups). Consumed by the talos-glm engine (native /api/chat wire)
+# AND the claude-code-glm engine (Claude Code driving the Anthropic-compatible
+# /v1/messages endpoint ollama.com also exposes). There is intentionally NO fallback
+# to OLLAMA_API_KEY: mixing the two would silently ship the operator's local-server
+# key to the cloud.
 OLLAMA_CLOUD_API_KEY: str = ""
+
+# Ollama Cloud endpoint + model for the claude-code-glm engine. Claude Code reaches
+# glm-5.2 via the Anthropic-compatible /v1/messages route ollama.com serves (verified
+# 2026-07-11: POST /v1/messages → 401 routed, vs 404 for bogus paths). This is the
+# HARNESS twin of talos-glm — same cloud model + key, but the mature Claude Code loop
+# instead of the talos loop. The model string mirrors talos-glm's proven ':cloud' tag.
+OLLAMA_CLOUD_BASE_URL: str = "https://ollama.com"
+OLLAMA_CLOUD_MODEL: str = "glm-5.2:cloud"
 
 # talos binary discovery: default 'talos', PATH-resolved by the subprocess machinery
 # (mirrors how the 'claude' binary is resolved for claude-code engines). Override via
@@ -82,7 +92,8 @@ def load() -> None:
     global ANTHROPIC_API_KEY, PLANNER_MODEL, MAX_CONCURRENT_RUNS
     global OLLAMA_BASE_URL, OLLAMA_API_KEY, OLLAMA_DEFAULT_MODEL
     global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS
-    global OLLAMA_CLOUD_API_KEY, TALOS_BIN, TALOS_GATE_TIMEOUT_SECS
+    global OLLAMA_CLOUD_API_KEY, OLLAMA_CLOUD_BASE_URL, OLLAMA_CLOUD_MODEL
+    global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS
     global AGENT_SUBPROCESS_USER
     global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
     global PLANNER_PROVIDER, PLANNER_BEDROCK_MODEL, AWS_REGION
@@ -138,6 +149,10 @@ def load() -> None:
     # NO fallback to OLLAMA_API_KEY — cloud vs. local Ollama servers use distinct
     # credentials and mixing them ships the local key to the cloud.
     OLLAMA_CLOUD_API_KEY = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
+    OLLAMA_CLOUD_BASE_URL = os.environ.get(
+        "OLLAMA_CLOUD_BASE_URL", "https://ollama.com"
+    )
+    OLLAMA_CLOUD_MODEL = os.environ.get("OLLAMA_CLOUD_MODEL", "glm-5.2:cloud")
     TALOS_BIN = os.environ.get("TALOS_BIN", "talos")
     TALOS_GATE_TIMEOUT_SECS = int(os.environ.get("TALOS_GATE_TIMEOUT_SECS", "900"))
     OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "qwen3.6:35b")

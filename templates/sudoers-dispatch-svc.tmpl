@@ -8,6 +8,13 @@
 # Environment variables that must survive the sudo boundary.
 # CLAUDE_CODE_OAUTH_TOKEN  — Claude Code OAuth credential (auth to Anthropic)
 # ANTHROPIC_API_KEY        — Anthropic API key (auth to Anthropic API)
+# ANTHROPIC_BASE_URL       — Claude Code endpoint override for the Ollama-routed
+#                            claude-code-ollama (local) + claude-code-glm (cloud)
+#                            engines; without it Claude Code hits the default
+#                            Anthropic API and the Ollama routing silently no-ops.
+# ANTHROPIC_AUTH_TOKEN     — Bearer token for the ANTHROPIC_BASE_URL endpoint above
+#                            (claude-code-glm ships the Ollama-cloud key here). Same
+#                            silent-no-op failure mode if stripped.
 # AGENT_GTD_URL            — Agent GTD API base URL (task management)
 # AGENT_GTD_API_KEY        — Agent GTD API key (auth to task management)
 # DISPATCH_API_KEY         — Dispatch service bearer token (internal auth)
@@ -29,7 +36,7 @@
 # so every var the talos subprocess needs MUST be listed here or it is stripped.
 # The ollama vars carry no default fallback, so their omission fails the run
 # outright; ANTHROPIC_MODEL's omission fails silently (downgrades to haiku).
-Defaults:{{SERVICE_USER}} env_keep += "CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_MODEL AGENT_GTD_URL AGENT_GTD_API_KEY DISPATCH_API_KEY KB_DATABASE_URL OLLAMA_BASE_URL OLLAMA_MODEL OLLAMA_API_KEY OLLAMA_THINK OLLAMA_NUM_CTX TALOS_BACKEND AGENT_GTD_AGENT_NAME PATH"
+Defaults:{{SERVICE_USER}} env_keep += "CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL AGENT_GTD_URL AGENT_GTD_API_KEY DISPATCH_API_KEY KB_DATABASE_URL OLLAMA_BASE_URL OLLAMA_MODEL OLLAMA_API_KEY OLLAMA_THINK OLLAMA_NUM_CTX TALOS_BACKEND AGENT_GTD_AGENT_NAME PATH"
 
 # Override secure_path to include ~/.cargo/bin and ~/.local/bin for the agent user, so
 # cargo/cargo-nextest (gate command for talos ChecksRunner) and uvx/MCP binaries installed

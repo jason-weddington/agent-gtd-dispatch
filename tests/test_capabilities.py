@@ -89,7 +89,8 @@ class TestInfoEndpoint:
         # AND the three talos-anthropic engines available (they gate on
         # ANTHROPIC_API_KEY, not on CLAUDE_CODE_OAUTH_TOKEN).  KIRO_API_KEY,
         # OLLAMA_BASE_URL, and OLLAMA_CLOUD_API_KEY are not set → kiro,
-        # claude-code-ollama, talos-qwen, and talos-glm are excluded.
+        # claude-code-ollama, claude-code-glm, talos-qwen, and talos-glm are
+        # excluded.
         resp = client.get("/info")
         engines = resp.json()["engines"]
         assert isinstance(engines, list)
@@ -169,6 +170,19 @@ class TestEngineAvailability:
         monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://ollama.local:11434")
         assert is_engine_available(CLAUDE_OLLAMA) is True
 
+    def test_glm_requires_cloud_api_key(self, monkeypatch) -> None:
+        # claude-code-glm gates on the DISTINCT cloud key, NOT the local
+        # OLLAMA_BASE_URL (unlike claude-code-ollama) — the two must not leak
+        # into each other's availability signal.
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.engines import CLAUDE_GLM, is_engine_available
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "")
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://ollama.local:11434")
+        assert is_engine_available(CLAUDE_GLM) is False
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud-key")
+        assert is_engine_available(CLAUDE_GLM) is True
+
     def test_get_available_engine_names_filters(self, monkeypatch) -> None:
         from agent_gtd_dispatch import config
         from agent_gtd_dispatch.engines import get_available_engine_names
@@ -181,8 +195,8 @@ class TestEngineAvailability:
         monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "")
         names = get_available_engine_names()
         # ANTHROPIC_API_KEY set → claude-code family AND talos-anthropic family
-        # available.  Ollama disabled → claude-code-ollama, talos-qwen, talos-glm
-        # excluded.  KIRO_API_KEY unset → kiro excluded.
+        # available.  Ollama disabled → claude-code-ollama, claude-code-glm,
+        # talos-qwen, talos-glm excluded.  KIRO_API_KEY unset → kiro excluded.
         assert set(names) == {
             "claude-code",
             "claude-code-sonnet",
