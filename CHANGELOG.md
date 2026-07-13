@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.18.1 (2026-07-13)
+
+### Bug Fixes
+
+- Talos worker push --no-verify to skip dev pre-push hooks
+  ([`46ac186`](https://github.com/repos/agent-gtd-dispatch/commit/46ac18654141e7a81da7c87bf6c7a6d4aef2e281))
+
+
 ## v1.18.0 (2026-07-13)
 
 ### Features
