@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import httpx
+import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -198,6 +199,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
 
 app = FastAPI(title="Agent GTD Dispatch", lifespan=lifespan)
+
+
+def start() -> None:  # pragma: no cover
+    """Entry point for the `agent-gtd-dispatch` console script.
+
+    Runs uvicorn against the module-level FastAPI app. Bound to 0.0.0.0
+    because the systemd unit expects the service to accept LAN traffic.
+    """
+    uvicorn.run(app, host="0.0.0.0", port=8100)
 
 
 # --- Background dispatch worker ---

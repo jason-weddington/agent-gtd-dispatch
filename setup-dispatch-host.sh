@@ -161,7 +161,7 @@ _render_unit() {
         -e "s|{{SERVICE_USER}}|${SERVICE_USER}|g" \
         -e "s|{{SERVICE_GROUP}}|${SERVICE_GROUP}|g" \
         -e "s|{{AGENT_USER}}|${AGENT_USER}|g" \
-        -e "s|{{WORKING_DIR}}|${SERVICE_REPO}|g" \
+        -e "s|{{WORKING_DIR}}|${SERVICE_HOME}|g" \
         -e "s|{{ENV_FILE}}|${SERVICE_ENV}|g" \
         -e "s|{{SERVICE_HOME}}|${SERVICE_HOME}|g" \
         -e "s|{{UV_BIN}}|${UV_BIN}|g" \
@@ -329,7 +329,7 @@ printf "${GREEN}========================================${RESET}\n"
 echo ""
 echo "  Agent user:   ${AGENT_USER}  (${AGENT_HOME})"
 echo "  Service user: ${SERVICE_USER}  (${SERVICE_HOME})"
-echo "  Repo:         ${SERVICE_REPO}"
+echo "  Wheel index:  ${DISPATCH_WHEEL_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
 echo "  Service unit: ${SYSTEMD_UNIT}"
 $DRY_RUN && echo "  Mode:         DRY RUN — no mutations"
 if $SINGLE_USER; then
@@ -566,10 +566,15 @@ if [[ -f "$DB_PATH" ]]; then
 fi
 
 # ===========================================================================
-# Step 2: Clone repos
+# Step 2: Agent target repo
 # ===========================================================================
 echo ""
-echo "--- Step 2: Repos ---"
+echo "--- Step 2: Agent target repo ---"
+
+# The dispatch service itself is installed from the homelab wheel index in
+# Step 4 (uv tool install), after uv is provisioned. No dispatch source tree
+# lives on the host.  What remains here is the agent's target repo (agent_gtd)
+# — the workspace the spawned agent operates on, not the dispatch service tree.
 
 _clone_repo() {
     local remote="$1" dest="$2" owner="$3"
@@ -583,7 +588,6 @@ _clone_repo() {
     fi
 }
 
-_clone_repo "$GIT_REMOTE_URL"       "$SERVICE_REPO"                   "$SERVICE_USER"
 _clone_repo "$AGENT_GTD_REMOTE_URL" "${SERVICE_HOME}/agent_gtd"       "$SERVICE_USER"
 
 # ===========================================================================
@@ -725,10 +729,13 @@ fi
 fi  # end: if [[ ! -f "$SERVICE_ENV" ]]; else
 
 # ===========================================================================
-# Step 4: Install dependencies (uv sync)
+# Step 4: Install dependencies (uv + agent-gtd-dispatch wheel)
 # ===========================================================================
 echo ""
 echo "--- Step 4: Dependencies ---"
+
+# Homelab wheel index the service is installed from (pi-04 pypi.lab).
+DISPATCH_WHEEL_INDEX="${DISPATCH_WHEEL_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
 
 _ensure_uv() {
     local user="$1" user_home="$2"
@@ -757,13 +764,17 @@ if [[ -z "$UV_BIN" ]]; then
     UV_BIN="${SERVICE_HOME}/.local/bin/uv"
 fi
 
-# uv sync the service repo
+# Install the agent-gtd-dispatch wheel as a uv-managed tool for SERVICE_USER.
+# The install is idempotent (repeated runs bring the tool to the current index
+# version) and puts the entry point at $SERVICE_HOME/.local/bin/agent-gtd-dispatch,
+# which the systemd unit's ExecStart references.
 SERVICE_UV="${UV_BIN}"
 if $DRY_RUN; then
-    would "run 'uv sync' in ${SERVICE_REPO} as ${SERVICE_USER}"
+    would "run 'uv tool install agent-gtd-dispatch --index ${DISPATCH_WHEEL_INDEX}' as ${SERVICE_USER}"
 else
-    runuser -u "$SERVICE_USER" -- bash -c "cd '${SERVICE_REPO}' && '${SERVICE_UV}' sync"
-    info "uv sync complete in ${SERVICE_REPO}"
+    runuser -u "$SERVICE_USER" -- bash -c \
+        "'${SERVICE_UV}' tool install agent-gtd-dispatch --index '${DISPATCH_WHEEL_INDEX}'"
+    info "Installed agent-gtd-dispatch wheel for ${SERVICE_USER} from ${DISPATCH_WHEEL_INDEX}"
 fi
 
 # ===========================================================================
@@ -1445,7 +1456,7 @@ printf "${GREEN}========================================${RESET}\n"
 echo ""
 echo "  Agent user:   ${AGENT_USER}  (${AGENT_HOME})"
 echo "  Service user: ${SERVICE_USER}  (${SERVICE_HOME})"
-echo "  Repo:         ${SERVICE_REPO}"
+echo "  Wheel index:  ${DISPATCH_WHEEL_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
 echo "  Env file:     ${SERVICE_ENV}"
 echo "  Service:      ${SERVICE_NAME}  (port ${API_PORT})"
 echo ""

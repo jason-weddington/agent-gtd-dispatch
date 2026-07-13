@@ -8,7 +8,7 @@ User={{SERVICE_USER}}
 Group={{SERVICE_GROUP}}
 WorkingDirectory={{WORKING_DIR}}
 EnvironmentFile={{ENV_FILE}}
-ExecStart={{UV_BIN}} run uvicorn agent_gtd_dispatch.main:app --host 0.0.0.0 --port 8100
+ExecStart=/home/{{SERVICE_USER}}/.local/bin/agent-gtd-dispatch
 Restart=on-failure
 RestartSec=5
 

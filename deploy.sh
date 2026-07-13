@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# deploy.sh — Deploy the latest agent-gtd-dispatch to one or more hosts.
+# deploy.sh — Deploy the latest agent-gtd-dispatch wheel to one or more hosts.
 #
-# Pulls main, syncs deps, and restarts the service on each host in sequence.
-# Called by release.sh after cutting a version tag.
+# Runs `uv tool install --force agent-gtd-dispatch --index <homelab>` as the
+# service user on each host, then restarts the systemd unit and probes /health.
+# Hosts consume the wheel published to the homelab index (pi-04 pypi.lab) by
+# release.sh; no working copy on the host, no source-tree state.
+#
+# The homelab index is passed via `--index` (NOT `--index-url`) so it is
+# ADDED to the default PyPI list; uv resolves fastapi/uvicorn/anthropic/etc.
+# from public PyPI while pulling agent-gtd-dispatch and agent-gtd-dispatch-protocol
+# from the homelab. Both wheels must already be on the index; release.sh publishes
+# them before this script runs.
 #
 # Environment variables:
 #   DISPATCH_HOSTS  Space-separated SSH targets (default: "pironman01 r7-research")
 #   DISPATCH_HOST   Single SSH target — if set, overrides DISPATCH_HOSTS (back-compat)
-#   SERVICE_USER    Service account owning the working copy (default: dispatch-svc)
+#   SERVICE_USER    Service account owning the tool install (default: dispatch-svc)
 #   SERVICE_NAME    Systemd service unit name (default: dispatch-api)
-#   REPO_DIR        Working copy path on the host (default: /home/dispatch-svc/agent-gtd-dispatch)
+#   DISPATCH_INDEX  Homelab wheel index URL (default: https://pypi.lab.jasonweddington.com/simple/)
 #
 # Exit code: 0 if every host succeeded. Non-zero on first failure (other hosts skipped).
 
@@ -22,7 +30,7 @@ else
 fi
 SERVICE_USER="${SERVICE_USER:-dispatch-svc}"
 SERVICE_NAME="${SERVICE_NAME:-dispatch-api}"
-REPO_DIR="${REPO_DIR:-/home/${SERVICE_USER}/agent-gtd-dispatch}"
+DISPATCH_INDEX="${DISPATCH_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
 
 deploy_one() {
     local host="$1"
@@ -32,13 +40,19 @@ deploy_one() {
     ssh "${host}" bash -s <<EOF
 set -euo pipefail
 
-# Pull latest main
-sudo -u ${SERVICE_USER} git -C ${REPO_DIR} pull origin main
+# Install/refresh the wheel from the homelab index.
+# -H sets HOME=/home/${SERVICE_USER} so uv installs the tool under the service
+# user's ~/.local (not root's HOME); without it the entry point lands in the
+# wrong place and the systemd ExecStart path is missing.
+sudo -u ${SERVICE_USER} -H /home/${SERVICE_USER}/.local/bin/uv tool install --force agent-gtd-dispatch --index ${DISPATCH_INDEX}
 
-# Sync dependencies
-sudo -u ${SERVICE_USER} bash -c "cd ${REPO_DIR} && /home/${SERVICE_USER}/.local/bin/uv sync"
+# Gate: uv tool list must show agent-gtd-dispatch after the install.
+if ! sudo -u ${SERVICE_USER} -H /home/${SERVICE_USER}/.local/bin/uv tool list | grep -q '^agent-gtd-dispatch'; then
+    echo "[ERR]  uv tool list does not show agent-gtd-dispatch after install" >&2
+    exit 1
+fi
 
-# Restart the service
+# Restart the service so systemd runs the freshly-installed entry point.
 sudo systemctl restart ${SERVICE_NAME}
 
 # Quick health probe — retry loop (up to 30s for slower hosts)
