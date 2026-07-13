@@ -563,6 +563,7 @@ async def _run_talos(
     *,
     attribution: str | None,
     register_cb: Callable[[subprocess.Popen[bytes]], None],
+    workspace_repo_dirs: list[str] | None = None,
 ) -> None:
     """Talos execution branch: subprocess launch, commit/push, comment-back, status set.
 
@@ -582,6 +583,14 @@ async def _run_talos(
       failed — mirrors the ollama-fallback comment-post's tolerance).
     - Exit 10/20/1 (or unpushed after exit 0): no commit, no push, no status set.
     - Every terminal exit posts a comment describing the outcome.
+    - When ``workspace_repo_dirs`` is a non-empty list (workspace/multi-repo mode),
+      the exit-0 git path loops per-repo subdir under ``workspace`` doing
+      ``git add -A`` → ``git diff --cached --quiet`` staged-change detection →
+      commit + push only for changed repos. No-change repos are skipped; if NO
+      repo changed the run demotes to ``failed``. Verification is inline via each
+      ``push_rc.returncode`` — the workspace path does NOT route through
+      :func:`dispatch.verify_pushes`, and every terminal path returns before the
+      tail ``build_comment_body`` block so exactly one comment fires.
     """
     item_id = run.item_id
     branch_name = run.branch_name
@@ -726,6 +735,221 @@ async def _run_talos(
             "-c",
             f"user.email={engine_ident}@agent-gtd-dispatch",
         ]
+
+        if workspace_repo_dirs:
+            # Workspace (multi-repo) path: per-repo add/detect/commit/push.
+            # talos writes files across N side-by-side repos under `workspace`;
+            # the worker owns git for each. Every terminal path below RETURNS
+            # before the tail `build_comment_body` block so exactly one comment
+            # fires. Verification is inline via each `push_rc.returncode` — the
+            # workspace talos path does NOT route through `dispatch.verify_pushes`.
+            committed: list[str] = []
+            skipped: list[str] = []
+
+            for repo_dir in workspace_repo_dirs:
+                repo_path = workspace / repo_dir
+
+                # (a) Stage every change in this repo subdir.
+                add_rc = subprocess.run(
+                    dispatch._sudo_wrap(["git", "add", "-A"]),
+                    cwd=str(repo_path),
+                    check=False,
+                    capture_output=True,
+                )
+                if add_rc.returncode != 0:
+                    _err = add_rc.stderr.decode("utf-8", errors="replace")[-300:]
+                    await db.update_run(
+                        run.id,
+                        status=RunStatus.failed,
+                        completed_at=now,
+                        exit_code=exit_code,
+                        error=f"git add failed in {repo_dir}: {_err}",
+                    )
+                    _publish_run_event(run.id, "failed", now)
+                    try:
+                        await gtd_client.post_comment(
+                            item_id,
+                            f"talos completed but `git add` failed in repo "
+                            f"`{repo_dir}`: {_err}",
+                            created_by=attribution or "agent-gtd-dispatch",
+                            token=run.callback_token,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to post git-add failure comment for %s", run.id
+                        )
+                    return
+
+                # (b) Staged-change detection: rc 0 → no staged changes (skip),
+                # rc 1 → staged changes present (commit+push), rc>1 → error.
+                diff_rc = subprocess.run(
+                    dispatch._sudo_wrap(["git", "diff", "--cached", "--quiet"]),
+                    cwd=str(repo_path),
+                    check=False,
+                    capture_output=True,
+                )
+                if diff_rc.returncode not in (0, 1):
+                    _err = diff_rc.stderr.decode("utf-8", errors="replace")[-300:]
+                    await db.update_run(
+                        run.id,
+                        status=RunStatus.failed,
+                        completed_at=now,
+                        exit_code=exit_code,
+                        error=f"git diff failed in {repo_dir}: {_err}",
+                    )
+                    _publish_run_event(run.id, "failed", now)
+                    try:
+                        await gtd_client.post_comment(
+                            item_id,
+                            f"talos completed but `git diff --cached` failed in "
+                            f"repo `{repo_dir}`: {_err}",
+                            created_by=attribution or "agent-gtd-dispatch",
+                            token=run.callback_token,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to post git-diff failure comment for %s", run.id
+                        )
+                    return
+
+                if diff_rc.returncode == 0:
+                    # No staged changes for this repo — skip commit/push.
+                    skipped.append(repo_dir)
+                    continue
+
+                # (c) Staged changes present — commit + push this repo.
+                commit_rc = subprocess.run(
+                    dispatch._sudo_wrap(
+                        ["git", *git_ident_flags, "commit", "-m", commit_msg]
+                    ),
+                    cwd=str(repo_path),
+                    check=False,
+                    capture_output=True,
+                )
+                if commit_rc.returncode != 0:
+                    _err = commit_rc.stderr.decode("utf-8", errors="replace")[-300:]
+                    await db.update_run(
+                        run.id,
+                        status=RunStatus.failed,
+                        completed_at=now,
+                        exit_code=exit_code,
+                        error=f"git commit failed in {repo_dir}: {_err}",
+                    )
+                    _publish_run_event(run.id, "failed", now)
+                    try:
+                        await gtd_client.post_comment(
+                            item_id,
+                            f"talos completed but `git commit` failed in repo "
+                            f"`{repo_dir}`: {_err}",
+                            created_by=attribution or "agent-gtd-dispatch",
+                            token=run.callback_token,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to post git-commit failure comment for %s",
+                            run.id,
+                        )
+                    return
+
+                push_rc = subprocess.run(
+                    dispatch._sudo_wrap(["git", "push", "-u", "origin", branch_name]),
+                    cwd=str(repo_path),
+                    check=False,
+                    capture_output=True,
+                )
+                if push_rc.returncode != 0:
+                    _err = push_rc.stderr.decode("utf-8", errors="replace")[-300:]
+                    await db.update_run(
+                        run.id,
+                        status=RunStatus.failed,
+                        completed_at=now,
+                        exit_code=exit_code,
+                        error=f"git push failed in {repo_dir}: {_err}",
+                    )
+                    _publish_run_event(run.id, "failed", now)
+                    try:
+                        await gtd_client.post_comment(
+                            item_id,
+                            f"talos completed but `git push` failed in repo "
+                            f"`{repo_dir}`: {_err}",
+                            created_by=attribution or "agent-gtd-dispatch",
+                            token=run.callback_token,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to post git-push failure comment for %s", run.id
+                        )
+                    return
+
+                committed.append(repo_dir)
+
+            # Per-repo loop complete — decide terminal state.
+            if not committed:
+                # No repo had staged changes — talos returned Done but produced
+                # no committed work across any workspace repo. Demote to failed.
+                await db.update_run(
+                    run.id,
+                    status=RunStatus.failed,
+                    completed_at=now,
+                    exit_code=exit_code,
+                    error="talos Done but no committed changes across workspace repos",
+                )
+                _publish_run_event(run.id, "failed", now)
+                try:
+                    await gtd_client.post_comment(
+                        item_id,
+                        f"talos reported Done but produced no committed changes "
+                        f"across any workspace repo (run `{run.id}`).",
+                        created_by=attribution or "agent-gtd-dispatch",
+                        token=run.callback_token,
+                    )
+                except Exception:
+                    logger.warning("Failed to post no-changes comment for %s", run.id)
+                return
+
+            # At least one repo committed+pushed — mark run succeeded, set item
+            # status best-effort, then post ONE summary comment naming committed
+            # vs skipped repos. Returns before the tail `build_comment_body` block
+            # so exactly one comment fires on the workspace success path.
+            await db.update_run(
+                run.id,
+                status=RunStatus.succeeded,
+                completed_at=now,
+                exit_code=exit_code,
+            )
+            _publish_run_event(run.id, "succeeded", now)
+
+            # Status-set is deliberately tolerant: a PATCH failure does NOT flip
+            # the run to failed (mirrors the monorepo path's try/except).
+            try:
+                await gtd_client.set_item_status(
+                    item_id, "review", token=run.callback_token
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to set item %s status=review (run %s) — run stays succeeded",
+                    item_id,
+                    run.id,
+                )
+
+            skipped_fragment = (
+                f"; skipped (no changes): {', '.join(skipped)}" if skipped else ""
+            )
+            try:
+                await gtd_client.post_comment(
+                    item_id,
+                    f"talos Done — committed+pushed repos: {', '.join(committed)}"
+                    f"{skipped_fragment} (run `{run.id}`, branch `{branch_name}`).",
+                    created_by=attribution or "agent-gtd-dispatch",
+                    token=run.callback_token,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to post talos workspace success comment for %s", run.id
+                )
+            return
+
+        # Monorepo path (workspace_repo_dirs is None): single-repo add/commit/push.
         # Stage every worktree change (talos-written files under workspace).
         add_rc = subprocess.run(
             dispatch._sudo_wrap(["git", "add", "-A"]),
@@ -1092,6 +1316,7 @@ async def _dispatch_worker(
                 timeout_seconds,
                 attribution=attribution,
                 register_cb=_register_subprocess,
+                workspace_repo_dirs=workspace_repo_dirs,
             )
             return
 
@@ -1630,16 +1855,7 @@ async def dispatch_item(
     # happen BEFORE db.insert_run so a rejected dispatch never leaves a run
     # row behind.
     if is_talos_engine(effective_engine_name):
-        # (1) Workspace-mode incompatibility (0.3.5 talos is monorepo-only).
-        if (project.get("repo_mode") or "") == "workspace":
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"talos engines are monorepo-only in 0.3.5; project "
-                    f"{project['name']!r} is workspace-mode"
-                ),
-            )
-        # (2) Non-empty project.gate_command is a talos-only requirement — the
+        # Non-empty project.gate_command is a talos-only requirement — the
         # TaskSpec's gate_command is the definition of Done, and talos self-checks
         # it before returning exit 0. Non-talos engines are unaffected.
         _gate = project.get("gate_command")

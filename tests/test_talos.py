@@ -777,9 +777,15 @@ def _mk_item(project_id: str = "22222222-2222-2222-2222-222222222222") -> dict:
 
 class TestDispatchWorkspaceRejection:
     @patch("agent_gtd_dispatch.main.gtd_client")
-    def test_workspace_mode_talos_returns_400(
+    def test_workspace_mode_talos_proceeds_to_insert_run(
         self, mock_client, client, auth_headers
     ) -> None:
+        """BUILD-mode talos dispatch against a workspace project no longer 400s.
+
+        The workspace-mode 400 guard was removed — workspace talos projects with
+        non-empty ``workspace_repos`` and a non-empty ``gate_command`` proceed
+        past the talos guard to ``db.insert_run`` and return 200.
+        """
         mock_client.get_item = AsyncMock(return_value=_mk_item())
         mock_client.get_project = AsyncMock(
             return_value=_mk_project(
@@ -791,17 +797,20 @@ class TestDispatchWorkspaceRejection:
                 gate_command="uv run pytest",
             )
         )
-        resp = client.post(
-            "/dispatch",
-            json={
-                "item_id": "11111111-1111-1111-1111-111111111111",
-                "engine": "talos-haiku",
-                "max_turns": 50,
-            },
-            headers=auth_headers,
-        )
-        assert resp.status_code == 400
-        assert "monorepo-only" in resp.json()["detail"]
+        with (
+            patch("agent_gtd_dispatch.db.insert_run", new_callable=AsyncMock),
+            patch("agent_gtd_dispatch.main.asyncio.create_task"),
+        ):
+            resp = client.post(
+                "/dispatch",
+                json={
+                    "item_id": "11111111-1111-1111-1111-111111111111",
+                    "engine": "talos-haiku",
+                    "max_turns": 50,
+                },
+                headers=auth_headers,
+            )
+        assert resp.status_code == 200
 
     @patch("agent_gtd_dispatch.main.gtd_client")
     def test_non_talos_engine_workspace_still_ok(
@@ -1277,6 +1286,326 @@ class TestRunTalosWorkerBranch:
         # Comment includes the blocked decision.
         body = post_comment_mock.await_args.args[1]
         assert "which lib?" in body
+
+    # ------------------------------------------------------------------
+    # Workspace (multi-repo) branch — workspace_repo_dirs non-empty.
+    # ------------------------------------------------------------------
+
+    async def test_workspace_exit_0_commits_only_changed_repo(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Multi-repo exit-0 commits+pushes ONLY the changed repo.
+
+        Two-repo fixture with staged changes only in `agent_gtd`. The unchanged
+        `agent-gtd-dispatch` repo is skipped (no commit/push). Run succeeds,
+        item status set to review, exactly one comment posted.
+        """
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        stdout = (
+            '{"outcome":"Finished","iterations":3,'
+            '"disposition":{"Done":{"summary":"ok",'
+            '"verification":"NoChecksConfigured"}}}'
+        )
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (stdout.encode(), b"")
+        mock_proc.returncode = 0
+
+        # Capture (cmd, cwd) so we can assert per-repo cwd routing.
+        calls: list[tuple[list[str], object]] = []
+
+        def _fake_run(cmd, **kwargs):
+            cwd = kwargs.get("cwd")
+            calls.append((cmd, cwd))
+            rc = MagicMock()
+            rc.stderr = b""
+            # git diff --cached --quiet: rc 0 = no staged changes, rc 1 = staged.
+            if "diff" in cmd and "--cached" in cmd and "--quiet" in cmd:
+                cwd_s = str(cwd)
+                if cwd_s.endswith("agent_gtd"):
+                    rc.returncode = 1  # staged changes present
+                else:
+                    rc.returncode = 0  # no staged changes
+            else:
+                rc.returncode = 0
+            return rc
+
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+                workspace_repo_dirs=["agent_gtd", "agent-gtd-dispatch"],
+            )
+
+        # Run marked succeeded; status set to review once.
+        assert any(
+            call.kwargs.get("status") == RunStatus.succeeded
+            for call in update_run_mock.await_args_list
+        )
+        set_status_mock.assert_awaited_once()
+        assert set_status_mock.await_args.args == ("item-abc", "review")
+
+        # commit/push issued with cwd ending in agent_gtd
+        agent_gtd_cmds = [c for c, cwd in calls if str(cwd).endswith("agent_gtd")]
+        agent_gtd_dispatch_cmds = [
+            c for c, cwd in calls if str(cwd).endswith("agent-gtd-dispatch")
+        ]
+        assert any("commit" in " ".join(c) for c in agent_gtd_cmds), calls
+        assert any("push" in " ".join(c) for c in agent_gtd_cmds), calls
+        # No commit/push issued against the unchanged repo
+        joined_dispatch = [" ".join(c) for c in agent_gtd_dispatch_cmds]
+        assert not any("commit" in j for j in joined_dispatch), joined_dispatch
+        assert not any("push" in j for j in joined_dispatch), joined_dispatch
+        # Exactly one comment posted (summary comment).
+        assert post_comment_mock.await_count == 1
+
+    async def test_workspace_no_changes_anywhere_demotes_failed(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Exit-0 with no staged changes in any repo → run failed, no review.
+
+        `git diff --cached --quiet` returns 0 for BOTH repos. Run demotes to
+        failed, set_item_status NOT awaited, exactly one no-changes comment
+        posted.
+        """
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        stdout = (
+            '{"outcome":"Finished","iterations":1,'
+            '"disposition":{"Done":{"summary":"ok",'
+            '"verification":"NoChecksConfigured"}}}'
+        )
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (stdout.encode(), b"")
+        mock_proc.returncode = 0
+
+        def _fake_run(cmd, **kwargs):
+            rc = MagicMock()
+            rc.stderr = b""
+            # All commands rc 0 — no staged changes anywhere.
+            rc.returncode = 0
+            return rc
+
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+                workspace_repo_dirs=["agent_gtd", "agent-gtd-dispatch"],
+            )
+
+        # Run demoted to failed; status NOT set to review.
+        assert any(
+            call.kwargs.get("status") == RunStatus.failed
+            for call in update_run_mock.await_args_list
+        )
+        set_status_mock.assert_not_awaited()
+        # Exactly one no-changes comment posted.
+        assert post_comment_mock.await_count == 1
+        body = post_comment_mock.await_args.args[1]
+        assert "no committed changes" in body.lower()
+
+    async def test_workspace_push_failure_fail_closed(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """git push non-zero for the changed repo → run failed, fail-closed.
+
+        Staged changes in agent_gtd, push returns rc!=0. The worker fails
+        closed — no commit/push attempted against a later repo. Exactly one
+        failure comment posted.
+        """
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        stdout = (
+            '{"outcome":"Finished","iterations":1,'
+            '"disposition":{"Done":{"summary":"ok",'
+            '"verification":"NoChecksConfigured"}}}'
+        )
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (stdout.encode(), b"")
+        mock_proc.returncode = 0
+
+        calls: list[tuple[list[str], object]] = []
+
+        def _fake_run(cmd, **kwargs):
+            cwd = kwargs.get("cwd")
+            calls.append((cmd, cwd))
+            rc = MagicMock()
+            rc.stderr = b"push error"
+            if "diff" in cmd and "--cached" in cmd and "--quiet" in cmd:
+                # agent_gtd has staged changes; agent-gtd-dispatch would not be
+                # reached (loop order: agent_gtd first).
+                rc.returncode = 1 if str(cwd).endswith("agent_gtd") else 0
+            elif "push" in cmd:
+                rc.returncode = 1  # push fails for the changed repo
+            else:
+                rc.returncode = 0
+            return rc
+
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+                workspace_repo_dirs=["agent_gtd", "agent-gtd-dispatch"],
+            )
+
+        # Run demoted to failed; status NOT set to review.
+        assert any(
+            call.kwargs.get("status") == RunStatus.failed
+            for call in update_run_mock.await_args_list
+        )
+        set_status_mock.assert_not_awaited()
+        # Fail-closed: agent-gtd-dispatch (later in loop order) was never
+        # committed/pushed — only add/diff against it could appear, but since
+        # agent_gtd is first and push fails, the loop returns before reaching
+        # agent-gtd-dispatch at all.
+        dispatch_cwds = [
+            str(cwd) for _c, cwd in calls if str(cwd).endswith("agent-gtd-dispatch")
+        ]
+        assert dispatch_cwds == [], calls
+        # Exactly one failure comment posted.
+        assert post_comment_mock.await_count == 1
+
+    async def test_monorepo_branch_unchanged_when_workspace_repo_dirs_none(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Monorepo branch (workspace_repo_dirs=None) is byte-for-byte the prior
+        behavior — exact git add -A / commit / push sequence with cwd=str(workspace)
+        and sudo-wrapping, identical to test_exit_0_commits_pushes_and_sets_review.
+        """
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        stdout = (
+            '{"outcome":"Finished","iterations":3,'
+            '"disposition":{"Done":{"summary":"ok",'
+            '"verification":"NoChecksConfigured"}}}'
+        )
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (stdout.encode(), b"")
+        mock_proc.returncode = 0
+
+        commands: list[list[str]] = []
+        cwds: list[object] = []
+
+        def _fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            cwds.append(kwargs.get("cwd"))
+            rc = MagicMock()
+            rc.returncode = 0
+            rc.stderr = b""
+            return rc
+
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+                # Default: workspace_repo_dirs=None → monorepo path.
+            )
+
+        # Marked succeeded; status set to review once.
+        assert any(
+            call.kwargs.get("status") == RunStatus.succeeded
+            for call in update_run_mock.await_args_list
+        )
+        set_status_mock.assert_awaited_once()
+        assert set_status_mock.await_args.args == ("item-abc", "review")
+
+        # Commands issued: git add -A, git -c user.name/email commit -m 'feat: <title>',
+        # git push -u origin <branch>. All wrapped with sudo prefix.
+        joined = [" ".join(c) for c in commands]
+        assert any("git add -A" in j for j in joined), joined
+        assert any(
+            "git -c user.name=talos-haiku -c user.email=talos-haiku@agent-gtd-dispatch"
+            " commit -m feat: Do the thing" in j
+            for j in joined
+        ), joined
+        assert any("git push -u origin feat/x-do-thing" in j for j in joined), joined
+        # Sudo wrapping applied
+        for cmd in commands:
+            assert cmd[0] == "sudo"
+            assert cmd[:4] == ["sudo", "-u", "dispatch", "-H"]
+        # All git commands ran with cwd=str(workspace) == str(tmp_path)
+        for cwd in cwds:
+            assert cwd == str(tmp_path), cwds
 
 
 import httpx  # noqa: E402 — imported here for HTTPError in the status-set test
