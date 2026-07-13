@@ -2,6 +2,17 @@
 
 <!-- version list -->
 
+## v1.18.0 (2026-07-13)
+
+### Features
+
+- Enable workspace (multi-repo) dispatch to talos engines
+  ([`06894ad`](https://github.com/repos/agent-gtd-dispatch/commit/06894ade4c2d0b68a9f2e0a97a61377883ade02e))
+
+- Wheel-based deploys — install from pi-04 pypi.lab, no working copy on hosts
+  ([`f9a3335`](https://github.com/repos/agent-gtd-dispatch/commit/f9a333507b69ea69159ea643001a0e3d1bb6253d))
+
+
 ## v1.17.0 (2026-07-11)
 
 ### Bug Fixes
