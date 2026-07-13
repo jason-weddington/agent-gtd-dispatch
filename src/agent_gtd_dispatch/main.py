@@ -852,7 +852,9 @@ async def _run_talos(
                     return
 
                 push_rc = subprocess.run(
-                    dispatch._sudo_wrap(["git", "push", "-u", "origin", branch_name]),
+                    dispatch._sudo_wrap(
+                        ["git", "push", "--no-verify", "-u", "origin", branch_name]
+                    ),
                     cwd=str(repo_path),
                     check=False,
                     capture_output=True,
@@ -1008,7 +1010,9 @@ async def _run_talos(
             return
 
         push_rc = subprocess.run(
-            dispatch._sudo_wrap(["git", "push", "-u", "origin", branch_name]),
+            dispatch._sudo_wrap(
+                ["git", "push", "--no-verify", "-u", "origin", branch_name]
+            ),
             cwd=str(workspace),
             check=False,
             capture_output=True,

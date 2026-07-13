@@ -1173,7 +1173,9 @@ class TestRunTalosWorkerBranch:
             " commit -m feat: Do the thing" in j
             for j in joined
         ), joined
-        assert any("git push -u origin feat/x-do-thing" in j for j in joined), joined
+        assert any(
+            "git push --no-verify -u origin feat/x-do-thing" in j for j in joined
+        ), joined
         # Sudo wrapping applied
         for cmd in commands:
             assert cmd[0] == "sudo"
@@ -1371,7 +1373,11 @@ class TestRunTalosWorkerBranch:
             c for c, cwd in calls if str(cwd).endswith("agent-gtd-dispatch")
         ]
         assert any("commit" in " ".join(c) for c in agent_gtd_cmds), calls
-        assert any("push" in " ".join(c) for c in agent_gtd_cmds), calls
+        # Worker push must skip the repo's dev pre-push hooks (--no-verify) —
+        # talos already self-verified via the gate_command.
+        assert any(
+            "push --no-verify -u origin" in " ".join(c) for c in agent_gtd_cmds
+        ), calls
         # No commit/push issued against the unchanged repo
         joined_dispatch = [" ".join(c) for c in agent_gtd_dispatch_cmds]
         assert not any("commit" in j for j in joined_dispatch), joined_dispatch
@@ -1598,7 +1604,9 @@ class TestRunTalosWorkerBranch:
             " commit -m feat: Do the thing" in j
             for j in joined
         ), joined
-        assert any("git push -u origin feat/x-do-thing" in j for j in joined), joined
+        assert any(
+            "git push --no-verify -u origin feat/x-do-thing" in j for j in joined
+        ), joined
         # Sudo wrapping applied
         for cmd in commands:
             assert cmd[0] == "sudo"
