@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.19.0 (2026-07-14)
+
+### Features
+
+- Worker surfaces talos disposition guidance (re-decompose vs re-dispatch)
+  ([`03afa74`](https://github.com/repos/agent-gtd-dispatch/commit/03afa745640f86bc4d6e66860832623b17196d8b))
+
+
 ## v1.18.2 (2026-07-14)
 
 ### Bug Fixes
