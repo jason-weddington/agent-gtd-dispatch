@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.18.2 (2026-07-14)
+
+### Bug Fixes
+
+- Worker re-stages + retries git commit after a fixer pre-commit hook
+  ([`0f31826`](https://github.com/repos/agent-gtd-dispatch/commit/0f31826db78336d1b5355f398aeb4ed80ab56adb))
+
+
 ## v1.18.1 (2026-07-13)
 
 ### Bug Fixes
