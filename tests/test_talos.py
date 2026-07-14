@@ -168,19 +168,21 @@ class TestTalosEnvOverlay:
             "TALOS_BACKEND": "ollama",
             "OLLAMA_MODEL": "qwen3.6:35b",
             "OLLAMA_THINK": "on",
-            "OLLAMA_NUM_CTX": "32768",
+            "OLLAMA_NUM_CTX": "262144",
             "OLLAMA_BASE_URL": config.OLLAMA_BASE_URL,
             "OLLAMA_API_KEY": config.OLLAMA_API_KEY,
         }
 
     def test_qwen_num_ctx_pinned_not_config_derived(self) -> None:
-        """OLLAMA_NUM_CTX=32768 is a hardcoded literal — pinning it because
-        talos only self-defaults num_ctx for localhost URLs (main.rs:295-299).
+        """OLLAMA_NUM_CTX is a hardcoded literal pinned to qwen3.6:35b's FULL
+        256k window — talos only self-defaults num_ctx for localhost URLs
+        (main.rs:328-329), so a remote Ollama with num_ctx unset silently
+        shrinks the window.
         """
         from agent_gtd_dispatch.talos import talos_env_overlay
 
         overlay = talos_env_overlay("talos-qwen")
-        assert overlay["OLLAMA_NUM_CTX"] == "32768"
+        assert overlay["OLLAMA_NUM_CTX"] == "262144"
         assert overlay["OLLAMA_THINK"] == "on"
 
     def test_glm_overlay_literal_with_cloud_url_and_key(self) -> None:
@@ -192,6 +194,9 @@ class TestTalosEnvOverlay:
             "TALOS_BACKEND": "ollama",
             "OLLAMA_MODEL": "glm-5.2:cloud",
             "OLLAMA_BASE_URL": "https://ollama.com",
+            # glm-5.2:cloud's full 1M window; unset on a cloud URL silently
+            # shrinks context (main.rs:328-329 self-defaults localhost only).
+            "OLLAMA_NUM_CTX": "1048576",
             "OLLAMA_API_KEY": config.OLLAMA_CLOUD_API_KEY,
         }
         # No fallback to OLLAMA_API_KEY

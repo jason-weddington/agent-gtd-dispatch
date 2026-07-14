@@ -106,9 +106,15 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
     Fixed literals (must not be made configurable):
 
     - ``OLLAMA_THINK='on'`` for talos-qwen — the qwen model expects thinking.
-    - ``OLLAMA_NUM_CTX='32768'`` for talos-qwen — talos only self-defaults
-      num_ctx for localhost URLs (main.rs:295-299); the Pi's Ollama runs on a
-      remote host so omitting the pin silently shrinks context.
+    - ``OLLAMA_NUM_CTX`` is pinned to each model's FULL context window for both
+      Ollama engines, because talos only self-defaults num_ctx for localhost
+      URLs (main.rs:328-329) — a remote/cloud Ollama with num_ctx unset silently
+      shrinks the window (ollama/ollama#11885 drops the oldest messages with no
+      signal), which stalls multi-file tasks a few turns in. Pinning num_ctx
+      also ARMS talos's pre-flight context guard, so an overflow becomes a loud
+      ``ContextLengthExceeded`` instead of silent truncation. Values:
+      ``262144`` (256k) for talos-qwen (qwen3.6:35b's full window) and
+      ``1048576`` (1M) for talos-glm (glm-5.2:cloud is a 1M-context model).
     - ``OLLAMA_BASE_URL='https://ollama.com'`` for talos-glm — glm-5.2:cloud
       lives only on Ollama Cloud; no operator override.
     """
@@ -140,7 +146,9 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
             "OLLAMA_MODEL": "qwen3.6:35b",
             # Hardcoded literals — see docstring for the num_ctx reasoning.
             "OLLAMA_THINK": "on",
-            "OLLAMA_NUM_CTX": "32768",
+            # qwen3.6:35b's FULL 256k window (was 32768 = 1/8 the real window,
+            # which silently truncated large tasks).
+            "OLLAMA_NUM_CTX": "262144",
             "OLLAMA_BASE_URL": config.OLLAMA_BASE_URL,
             "OLLAMA_API_KEY": config.OLLAMA_API_KEY,
         }
@@ -150,6 +158,12 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
             "OLLAMA_MODEL": "glm-5.2:cloud",
             # The only hardcoded base URL — glm-5.2:cloud lives on Ollama Cloud.
             "OLLAMA_BASE_URL": "https://ollama.com",
+            # glm-5.2:cloud's FULL 1M window. Was UNSET — and unset on a cloud
+            # (non-localhost) URL means talos sends no num_ctx, so ollama.com
+            # applies a small default and silently drops old messages, which
+            # stalled a large multi-file dispatch ~20 turns in. Pinning 1M also
+            # arms talos's pre-flight guard (overflow → loud error, not silent).
+            "OLLAMA_NUM_CTX": "1048576",
             # Distinct cloud key — no fallback to config.OLLAMA_API_KEY (see
             # config.py comment on OLLAMA_CLOUD_API_KEY).
             "OLLAMA_API_KEY": config.OLLAMA_CLOUD_API_KEY,
