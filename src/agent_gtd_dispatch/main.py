@@ -553,6 +553,66 @@ def _try_start_pending() -> None:
         _active_processes[pending.run.id] = task
 
 
+def _commit_with_retry(
+    repo_dir: str,
+    git_ident_flags: list[str],
+    commit_msg: str,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run ``git commit`` with bounded re-stage retries.
+
+    A fixer-style pre-commit hook (end-of-file-fixer, trailing-whitespace,
+    ruff --fix, black, prettier, …) may modify the staged files and exit
+    non-zero on the first attempt — by design. The correct response is to
+    re-stage the hook's output (``git add -A``) and retry the commit, NOT to
+    skip hooks (``--no-verify``). Without this, a fully-completed item is lost
+    the first time a fixer hook fires.
+
+    Behaviour:
+    - Run ``git commit`` (no ``--no-verify`` — hooks must be allowed to fix).
+    - On rc 0, return immediately.
+    - On non-zero rc, check ``git status --porcelain``: if the tree is CLEAN
+      (nothing for the hook to have re-dirtied), give up and return the
+      failing result immediately — there is nothing to re-stage.
+    - If the tree is dirty, ``git add -A`` and retry the commit. Bound to at
+      most 2 retries (3 commit invocations total). Return the last result on
+      exhaustion.
+    """
+    max_retries = 2
+    result = subprocess.run(
+        dispatch._sudo_wrap(["git", *git_ident_flags, "commit", "-m", commit_msg]),
+        cwd=repo_dir,
+        check=False,
+        capture_output=True,
+    )
+    for _ in range(max_retries):
+        if result.returncode == 0:
+            return result
+        # Detect a dirty tree — the fixer-hook-modified case. A clean tree
+        # means the hook did not (or could not) re-dirty anything, so there
+        # is nothing to re-stage; give up on this failing commit.
+        porcelain_rc = subprocess.run(
+            dispatch._sudo_wrap(["git", "status", "--porcelain"]),
+            cwd=repo_dir,
+            check=False,
+            capture_output=True,
+        )
+        if not porcelain_rc.stdout.decode("utf-8", errors="replace").strip():
+            return result
+        subprocess.run(
+            dispatch._sudo_wrap(["git", "add", "-A"]),
+            cwd=repo_dir,
+            check=False,
+            capture_output=True,
+        )
+        result = subprocess.run(
+            dispatch._sudo_wrap(["git", *git_ident_flags, "commit", "-m", commit_msg]),
+            cwd=repo_dir,
+            check=False,
+            capture_output=True,
+        )
+    return result
+
+
 async def _run_talos(
     run: Run,
     engine: Engine,
@@ -818,13 +878,8 @@ async def _run_talos(
                     continue
 
                 # (c) Staged changes present — commit + push this repo.
-                commit_rc = subprocess.run(
-                    dispatch._sudo_wrap(
-                        ["git", *git_ident_flags, "commit", "-m", commit_msg]
-                    ),
-                    cwd=str(repo_path),
-                    check=False,
-                    capture_output=True,
+                commit_rc = _commit_with_retry(
+                    str(repo_path), git_ident_flags, commit_msg
                 )
                 if commit_rc.returncode != 0:
                     _err = commit_rc.stderr.decode("utf-8", errors="replace")[-300:]
@@ -980,12 +1035,7 @@ async def _run_talos(
                 logger.warning("Failed to post git-add failure comment for %s", run.id)
             return
 
-        commit_rc = subprocess.run(
-            dispatch._sudo_wrap(["git", *git_ident_flags, "commit", "-m", commit_msg]),
-            cwd=str(workspace),
-            check=False,
-            capture_output=True,
-        )
+        commit_rc = _commit_with_retry(str(workspace), git_ident_flags, commit_msg)
         if commit_rc.returncode != 0:
             _err = commit_rc.stderr.decode("utf-8", errors="replace")[-300:]
             await db.update_run(

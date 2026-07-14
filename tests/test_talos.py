@@ -1181,6 +1181,244 @@ class TestRunTalosWorkerBranch:
             assert cmd[0] == "sudo"
             assert cmd[:4] == ["sudo", "-u", "dispatch", "-H"]
 
+    async def test_exit_0_commit_retry_succeeds_after_fixer_hook(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Fixer-style pre-commit hook fails the 1st commit, fixes files, 2nd commit succeeds.
+
+        A fixer hook (end-of-file-fixer, ruff --fix, …) modifies the staged
+        file and exits non-zero on the first attempt. The worker must re-stage
+        (`git add -A`) and retry the commit — the completed item must NOT be
+        lost. `git commit` appears twice with an intervening `git add -A`.
+        """
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        stdout = (
+            '{"outcome":"Finished","iterations":3,'
+            '"disposition":{"Done":{"summary":"ok",'
+            '"verification":"NoChecksConfigured"}}}'
+        )
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (stdout.encode(), b"")
+        mock_proc.returncode = 0
+
+        commands: list[list[str]] = []
+        commit_attempts = {"n": 0}
+
+        def _fake_run(cmd, **_kwargs):
+            commands.append(cmd)
+            rc = MagicMock()
+            rc.stderr = b""
+            if "commit" in cmd and "-m" in cmd:
+                commit_attempts["n"] += 1
+                if commit_attempts["n"] == 1:
+                    rc.returncode = 1  # fixer hook modified file, exits non-zero
+                    rc.stderr = b"files were modified by this hook"
+                else:
+                    rc.returncode = 0  # re-staged fixed files, commit succeeds
+            elif "status" in cmd and "--porcelain" in cmd:
+                rc.returncode = 0
+                rc.stdout = b" M x.py\n"  # dirty tree — hook re-dirtied a file
+            else:
+                rc.returncode = 0
+                rc.stdout = b""
+            return rc
+
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        # Run succeeded and item status set to review exactly once.
+        assert any(
+            call.kwargs.get("status") == RunStatus.succeeded
+            for call in update_run_mock.await_args_list
+        )
+        set_status_mock.assert_awaited_once()
+        assert set_status_mock.await_args.args == ("item-abc", "review")
+
+        # git commit invoked exactly twice...
+        commit_idxs = [i for i, c in enumerate(commands) if "commit" in c and "-m" in c]
+        assert len(commit_idxs) == 2, commands
+        # ...with an intervening `git add -A` (re-stage of the fixer's output).
+        add_idxs = [i for i, c in enumerate(commands) if "add" in c and "-A" in c]
+        between = [i for i in add_idxs if commit_idxs[0] < i < commit_idxs[1]]
+        assert between, f"no git add -A between commits: {commands}"
+
+    async def test_exit_0_commit_retry_exhaustion_fails_closed(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Commit keeps failing with a persistently dirty tree → run failed.
+
+        `git commit` returns rc 1 every time and `git status --porcelain` is
+        always dirty. After the initial attempt + 2 retries (3 commits total)
+        the helper gives up; the caller's failure branch fires and a
+        `git commit failed` comment is posted.
+        """
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        stdout = (
+            '{"outcome":"Finished","iterations":3,'
+            '"disposition":{"Done":{"summary":"ok",'
+            '"verification":"NoChecksConfigured"}}}'
+        )
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (stdout.encode(), b"")
+        mock_proc.returncode = 0
+
+        def _fake_run(cmd, **_kwargs):
+            rc = MagicMock()
+            rc.stderr = b"hook keeps failing"
+            if "commit" in cmd and "-m" in cmd:
+                rc.returncode = 1  # never succeeds
+            elif "status" in cmd and "--porcelain" in cmd:
+                rc.returncode = 0
+                rc.stdout = b" M x.py\n"  # always dirty
+            else:
+                rc.returncode = 0
+                rc.stdout = b""
+            return rc
+
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        # Run marked failed; status NOT set to review.
+        assert any(
+            call.kwargs.get("status") == RunStatus.failed
+            for call in update_run_mock.await_args_list
+        )
+        set_status_mock.assert_not_awaited()
+        # A `git commit failed` comment was posted.
+        comments = [c.args[1] for c in post_comment_mock.await_args_list]
+        assert any("git commit" in c and "failed" in c for c in comments), comments
+
+    async def test_exit_0_commit_clean_tree_no_retry_fails_closed(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Failed commit + clean tree → no retry, run failed, commit exactly once.
+
+        `git commit` returns rc 1 but `git status --porcelain` is EMPTY — the
+        hook did not re-dirty anything, so there is nothing to re-stage. The
+        helper must NOT retry: `git commit` appears EXACTLY ONCE with NO retry
+        `git add -A` after it. The caller's failure branch fires.
+        """
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        stdout = (
+            '{"outcome":"Finished","iterations":3,'
+            '"disposition":{"Done":{"summary":"ok",'
+            '"verification":"NoChecksConfigured"}}}'
+        )
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (stdout.encode(), b"")
+        mock_proc.returncode = 0
+
+        commands: list[list[str]] = []
+
+        def _fake_run(cmd, **_kwargs):
+            commands.append(cmd)
+            rc = MagicMock()
+            rc.stderr = b"commit rejected"
+            if "commit" in cmd and "-m" in cmd:
+                rc.returncode = 1
+            elif "status" in cmd and "--porcelain" in cmd:
+                rc.returncode = 0
+                rc.stdout = b""  # clean tree — nothing to re-stage
+            else:
+                rc.returncode = 0
+                rc.stdout = b""
+            return rc
+
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        # Run marked failed; status NOT set to review.
+        assert any(
+            call.kwargs.get("status") == RunStatus.failed
+            for call in update_run_mock.await_args_list
+        )
+        set_status_mock.assert_not_awaited()
+        comments = [c.args[1] for c in post_comment_mock.await_args_list]
+        assert any("git commit" in c and "failed" in c for c in comments), comments
+
+        # git commit appears EXACTLY once...
+        commit_idxs = [i for i, c in enumerate(commands) if "commit" in c and "-m" in c]
+        assert len(commit_idxs) == 1, commands
+        # ...with NO `git add -A` after it (no retry on a clean tree).
+        add_after = [
+            i
+            for i, c in enumerate(commands)
+            if i > commit_idxs[0] and "add" in c and "-A" in c
+        ]
+        assert not add_after, f"unexpected retry add -A after commit: {commands}"
+
     async def test_exit_0_status_set_failure_still_leaves_run_succeeded(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -1384,6 +1622,115 @@ class TestRunTalosWorkerBranch:
         assert not any("push" in j for j in joined_dispatch), joined_dispatch
         # Exactly one comment posted (summary comment).
         assert post_comment_mock.await_count == 1
+
+    async def test_workspace_exit_0_commit_retry_succeeds_for_changed_repo(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Workspace: fixer hook fails the 1st commit in `agent_gtd`, 2nd succeeds.
+
+        Extends the cwd-routing fake from
+        `test_workspace_exit_0_commits_only_changed_repo` with a per-repo
+        commit-attempt counter: the 1st `git commit` against `agent_gtd`
+        returns rc 1 (fixer hook), the 2nd returns rc 0. `git status
+        --porcelain` is dirty for `agent_gtd` so the helper re-stages and
+        retries. The unchanged repo is still skipped. Run succeeds, item
+        status set to review once, and `agent_gtd` receives two commit
+        invocations with an intervening `git add -A`.
+        """
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        stdout = (
+            '{"outcome":"Finished","iterations":3,'
+            '"disposition":{"Done":{"summary":"ok",'
+            '"verification":"NoChecksConfigured"}}}'
+        )
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (stdout.encode(), b"")
+        mock_proc.returncode = 0
+
+        calls: list[tuple[list[str], object]] = []
+        commit_attempts: dict[str, int] = {}
+
+        def _fake_run(cmd, **kwargs):
+            cwd = kwargs.get("cwd")
+            calls.append((cmd, cwd))
+            cwd_s = str(cwd)
+            rc = MagicMock()
+            rc.stderr = b""
+            if "diff" in cmd and "--cached" in cmd and "--quiet" in cmd:
+                # staged-change gate: agent_gtd staged, agent-gtd-dispatch not.
+                if cwd_s.endswith("agent_gtd"):
+                    rc.returncode = 1
+                else:
+                    rc.returncode = 0
+            elif "commit" in cmd and "-m" in cmd:
+                # Per-repo stateful commit counter.
+                key = cwd_s
+                commit_attempts[key] = commit_attempts.get(key, 0) + 1
+                if cwd_s.endswith("agent_gtd"):
+                    if commit_attempts[key] == 1:
+                        rc.returncode = 1  # fixer hook modified file
+                        rc.stderr = b"files were modified by this hook"
+                    else:
+                        rc.returncode = 0  # re-staged fixed files
+                else:
+                    rc.returncode = 0
+            elif "status" in cmd and "--porcelain" in cmd:
+                rc.returncode = 0
+                if cwd_s.endswith("agent_gtd"):
+                    rc.stdout = b" M x.py\n"  # dirty — hook re-dirtied a file
+                else:
+                    rc.stdout = b""
+            else:
+                rc.returncode = 0
+                rc.stdout = b""
+            return rc
+
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+                workspace_repo_dirs=["agent_gtd", "agent-gtd-dispatch"],
+            )
+
+        # Run succeeded; status set to review exactly once.
+        assert any(
+            call.kwargs.get("status") == RunStatus.succeeded
+            for call in update_run_mock.await_args_list
+        )
+        set_status_mock.assert_awaited_once()
+        assert set_status_mock.await_args.args == ("item-abc", "review")
+
+        # The `agent_gtd` repo received two commit invocations with an
+        # intervening `git add -A` (re-stage of the fixer's output).
+        agent_gtd_calls = [
+            (i, c) for i, (c, cwd) in enumerate(calls) if str(cwd).endswith("agent_gtd")
+        ]
+        commit_idxs = [i for i, c in agent_gtd_calls if "commit" in c and "-m" in c]
+        assert len(commit_idxs) == 2, calls
+        add_idxs = [i for i, c in agent_gtd_calls if "add" in c and "-A" in c]
+        between = [i for i in add_idxs if commit_idxs[0] < i < commit_idxs[1]]
+        assert between, f"no git add -A between commits: {calls}"
 
     async def test_workspace_no_changes_anywhere_demotes_failed(
         self, tmp_path, monkeypatch
