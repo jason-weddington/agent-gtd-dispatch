@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.19.1 (2026-07-14)
+
+### Bug Fixes
+
+- **talos**: Pin OLLAMA_NUM_CTX to each model's full window (glm 1M, qwen 256k)
+  ([`3556b7d`](https://github.com/repos/agent-gtd-dispatch/commit/3556b7d120c6563c6e0699921ae7245b1826fd21))
+
+
 ## v1.19.0 (2026-07-14)
 
 ### Features
