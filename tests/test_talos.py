@@ -600,6 +600,7 @@ class TestBuildTalosArgv:
 _SAMPLE_RUN_SUMMARY = '{"outcome":"Finished","disposition":{"Done":{"summary":"ok","verification":"NoChecksConfigured"}},"iterations":3}'
 _BLOCKED_SUMMARY = '{"outcome":"Finished","disposition":{"Blocked":{"decision_needed":"which lib?"}},"iterations":2}'
 _FAILED_SUMMARY = '{"outcome":"Finished","disposition":{"Failed":{"mode":"Loop","summary":"gate never green"}},"iterations":5}'
+_STOPPED_WITHOUT_FINISH_SUMMARY = '{"outcome":"StoppedWithoutFinish","disposition":{"Failed":{"mode":"StoppedWithoutFinish","summary":"never called finish"}},"iterations":18}'
 _BACKEND_ERROR_SUMMARY = '{"outcome":"BackendError","disposition":{"Failed":{"mode":"TransientInfra","summary":"llm 500"}},"iterations":1}'
 _PRE_RUN_ERROR = '{"error":"cannot open workspace"}'
 
@@ -728,6 +729,37 @@ class TestParseDispositionSummary:
         out = parse_disposition_summary(disposition)
         assert "Loop" in out
         assert "gate never went green" in out
+
+
+class TestFailureModeGuidance:
+    """`failure_mode_guidance` — pure RE-DECOMPOSE / RE-DISPATCH / unknown map."""
+
+    def test_redecompose_bucket_modes(self) -> None:
+        from agent_gtd_dispatch.talos import failure_mode_guidance
+
+        for mode in ("StoppedWithoutFinish", "BudgetExhausted"):
+            out = failure_mode_guidance(mode)
+            assert "stalled / no convergence" in out, mode
+            assert "re-decomposing" in out, mode
+
+    def test_redispatch_bucket_modes(self) -> None:
+        from agent_gtd_dispatch.talos import failure_mode_guidance
+
+        for mode in (
+            "Loop",
+            "FinishDiscipline",
+            "TransientInfra",
+            "PersistentToolError",
+        ):
+            out = failure_mode_guidance(mode)
+            assert "re-dispatch" in out, mode
+
+    def test_unrecognized_mode_echoed(self) -> None:
+        from agent_gtd_dispatch.talos import failure_mode_guidance
+
+        out = failure_mode_guidance("Nonsense")
+        assert "unrecognized failure mode" in out
+        assert "Nonsense" in out
 
 
 # ---------------------------------------------------------------------------
@@ -1527,6 +1559,149 @@ class TestRunTalosWorkerBranch:
         body = post_comment_mock.await_args.args[1]
         assert "which lib?" in body
 
+    async def test_exit_20_loop_enriches_run_error_with_redispatch(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (_FAILED_SUMMARY.encode(), b"")
+        mock_proc.returncode = 20
+
+        run_mock = MagicMock()
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", run_mock),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        # Failed branch update_run carries the enriched error (visible via
+        # `agent-gtd run-status`), with the base header still present.
+        failed_calls = [
+            call
+            for call in update_run_mock.await_args_list
+            if call.kwargs.get("status") == RunStatus.failed
+        ]
+        assert failed_calls, update_run_mock.await_args_list
+        error = failed_calls[-1].kwargs["error"]
+        assert "talos task failed" in error
+        assert "re-dispatch" in error
+
+    async def test_exit_20_stopped_without_finish_enriches_run_error(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (
+            _STOPPED_WITHOUT_FINISH_SUMMARY.encode(),
+            b"",
+        )
+        mock_proc.returncode = 20
+
+        run_mock = MagicMock()
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", run_mock),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        failed_calls = [
+            call
+            for call in update_run_mock.await_args_list
+            if call.kwargs.get("status") == RunStatus.failed
+        ]
+        assert failed_calls, update_run_mock.await_args_list
+        error = failed_calls[-1].kwargs["error"]
+        assert "talos task failed" in error
+        assert "stalled / no convergence" in error
+
+    async def test_exit_20_unparseable_stdout_falls_back_to_plain_header(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (b"this is not json", b"")
+        mock_proc.returncode = 20
+
+        run_mock = MagicMock()
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", run_mock),
+        ):
+            # Defensive parse must NOT raise — plain header fallback.
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        failed_calls = [
+            call
+            for call in update_run_mock.await_args_list
+            if call.kwargs.get("status") == RunStatus.failed
+        ]
+        assert failed_calls, update_run_mock.await_args_list
+        # Plain header — no guidance enrichment, no raise.
+        assert failed_calls[-1].kwargs["error"] == "talos task failed"
+
     # ------------------------------------------------------------------
     # Workspace (multi-repo) branch — workspace_repo_dirs non-empty.
     # ------------------------------------------------------------------
@@ -2008,3 +2183,31 @@ class TestBuildCommentBody:
         body = build_comment_body(1, "", '{"error":"cannot reach ollama"}', None)
         assert "engine error" in body.lower()
         assert "cannot reach ollama" in body
+
+    def test_exit_20_loop_failed_includes_redispatch_guidance(self) -> None:
+        from agent_gtd_dispatch.talos import build_comment_body
+
+        body = build_comment_body(20, _FAILED_SUMMARY, "", "feat/x")
+        # Existing parse_disposition_summary line still present.
+        assert "Failed (Loop):" in body
+        # ...and the RE-DISPATCH guidance line is appended additionally.
+        assert "re-dispatch" in body
+
+    def test_exit_20_stopped_without_finish_includes_redecompose_guidance(self) -> None:
+        from agent_gtd_dispatch.talos import build_comment_body
+
+        body = build_comment_body(20, _STOPPED_WITHOUT_FINISH_SUMMARY, "", "feat/x")
+        # Existing parse_disposition_summary line still present.
+        assert "Failed (StoppedWithoutFinish):" in body
+        # ...and the RE-DECOMPOSE guidance line routes through the real path.
+        assert "stalled / no convergence" in body
+
+    def test_exit_1_backend_error_has_no_guidance_line(self) -> None:
+        from agent_gtd_dispatch.talos import build_comment_body
+
+        body = build_comment_body(1, _BACKEND_ERROR_SUMMARY, "", None)
+        # Exit-1 gate: no guidance substring emitted even though the
+        # disposition is `Failed` (engine-broke, not task-failed).
+        assert "re-dispatch" not in body
+        assert "stalled / no convergence" not in body
+        assert "unrecognized failure mode" not in body

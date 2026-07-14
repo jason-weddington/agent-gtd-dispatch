@@ -1112,12 +1112,26 @@ async def _run_talos(
             )
     else:
         # Every non-success terminal exit: mark failed with exit_code + error.
+        # For exit 20 (task failed) with a parseable `{"Failed": {"mode": ...}}`
+        # disposition, enrich the `error` so `agent-gtd run-status` surfaces the
+        # actionable RE-DECOMPOSE-vs-RE-DISPATCH hint too (not only the GTD
+        # comment). Parsing is defensive: any JSON/shape failure leaves `error`
+        # as the plain header and never raises from this path.
+        error = comment_header
+        if exit_code == 20 and stdout_line:
+            try:
+                _summary = json.loads(stdout_line)
+                _mode = _summary["disposition"]["Failed"]["mode"]
+                if isinstance(_mode, str):
+                    error = f"{comment_header}\n{talos.failure_mode_guidance(_mode)}"
+            except (json.JSONDecodeError, KeyError, TypeError):
+                error = comment_header
         await db.update_run(
             run.id,
             status=status,
             completed_at=now,
             exit_code=exit_code,
-            error=comment_header,
+            error=error,
         )
         _publish_run_event(run.id, status.value, now)
 

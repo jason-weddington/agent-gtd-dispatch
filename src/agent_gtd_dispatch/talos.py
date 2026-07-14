@@ -312,7 +312,10 @@ def parse_disposition_summary(disposition: dict[str, Any]) -> str:
     - Blocked → ``{"Blocked": {"decision_needed": str}}``
     - Failed → ``{"Failed": {"mode": FailureMode, "summary": str}}`` where
       FailureMode ∈ {Loop, BudgetExhausted, PersistentToolError,
-      TransientInfra, StoppedWithoutFinish, MaxIterations}
+      TransientInfra, StoppedWithoutFinish, FinishDiscipline}. Note: a
+      ``MaxIterations`` LoopOutcome surfaces as disposition mode
+      ``BudgetExhausted`` (it collapses in ``into_disposition``), so
+      ``MaxIterations`` is NOT a disposition mode.
 
     Returns a compact human-readable string for the comment body; on Done it
     additionally appends the mechanical verification evidence.
@@ -339,6 +342,36 @@ def parse_disposition_summary(disposition: dict[str, Any]) -> str:
         summary = failed.get("summary", "")
         return f"Failed ({mode}): {summary}"
     return f"Unknown disposition: {disposition!r}"
+
+
+def failure_mode_guidance(mode: str) -> str:
+    """Map a talos FailureMode string to an actionable caller hint.
+
+    Pure and total — takes the mode string only, never raises, does no JSON
+    parsing. Buckets are pinned to the harness's
+    ``crates/harness/src/run_record.rs`` FailureMode doc-comments and
+    ``crates/harness/src/engine.rs::into_disposition``:
+
+    - RE-DECOMPOSE (the item was too big to hold, not too hard):
+      ``StoppedWithoutFinish`` and ``BudgetExhausted`` (the latter is also
+      what a ``MaxIterations`` LoopOutcome collapses to) → caller should
+      re-decompose into smaller single-subsystem items.
+    - RE-DISPATCH (the spec looks sound; re-run or fix the environment):
+      ``Loop``, ``FinishDiscipline``, ``TransientInfra``, and
+      ``PersistentToolError``.
+    - any unrecognized mode → a defensible fallback that echoes the mode and
+      asks the caller to inspect the run record.
+    """
+    if mode in ("StoppedWithoutFinish", "BudgetExhausted"):
+        return (
+            "stalled / no convergence — consider re-decomposing into smaller "
+            "single-subsystem items"
+        )
+    if mode in ("Loop", "FinishDiscipline", "TransientInfra", "PersistentToolError"):
+        return (
+            "run failed (spec looks sound) — re-dispatch, or fix the environment first"
+        )
+    return f"unrecognized failure mode '{mode}' — inspect the run record"
 
 
 def build_comment_body(
@@ -379,6 +412,17 @@ def build_comment_body(
             disposition = summary.get("disposition")
             if isinstance(disposition, dict):
                 parts.append(parse_disposition_summary(disposition))
+                # Surface the actionable caller hint (RE-DECOMPOSE vs
+                # RE-DISPATCH) — but ONLY for exit 20 (task failed). Exit 1
+                # BackendError also carries a `Failed` disposition but is
+                # engine-broke, not task-failed; gating on exit 20 keeps the
+                # two surfaces from being conflated.
+                if (
+                    exit_code == 20
+                    and isinstance(disposition.get("Failed"), dict)
+                    and isinstance(disposition["Failed"].get("mode"), str)
+                ):
+                    parts.append(failure_mode_guidance(disposition["Failed"]["mode"]))
     elif stderr_line and status == RunStatus.failed:
         # Engine-broke pre-run infra error: quote the stderr line the operator
         # needs. map_talos_result already embedded it in the header for exit 1;
@@ -390,6 +434,7 @@ def build_comment_body(
 __all__ = [
     "build_comment_body",
     "build_talos_argv",
+    "failure_mode_guidance",
     "map_talos_result",
     "parse_disposition_summary",
     "serialize_task_spec",
