@@ -1162,7 +1162,8 @@ async def _dispatch_worker(
     manage_retry_count: int = 0,
 ) -> None:
     """Background task that executes a dispatch run."""
-    now = datetime.now(UTC).isoformat()
+    _run_start_dt: datetime = datetime.now(UTC)
+    now = _run_start_dt.isoformat()
     await db.update_run(run.id, status=RunStatus.running, started_at=now)
     _publish_run_event(run.id, "running", None)
 
@@ -1478,6 +1479,79 @@ async def _dispatch_worker(
                             token=run.callback_token,
                         )
                     return  # exit early — do not mark succeeded
+
+                # Zero-commits guard: all repos idle → may be a silent no-op.
+                # Distinguish intentional no-op (agent posted an explanatory
+                # comment) from a silent failure (agent exited without doing
+                # anything) by counting comments posted since this run started.
+                # Rule: ≥2 comments since run start = dispatch comment + ≥1
+                # agent comment → intentional no-op → pass.  <2 = silent
+                # failure → fail.
+                _all_no_changes = (
+                    isinstance(push_results_list, list)
+                    and bool(push_results_list)
+                    and all(
+                        r.status == PushStatus.no_changes for r in push_results_list
+                    )
+                )
+                if _all_no_changes:
+                    _is_intentional_noop = False
+                    if run.item_id is not None:
+                        try:
+                            _comments = await gtd_client.list_comments(
+                                run.item_id, token=run.callback_token
+                            )
+                            _post_start = [
+                                c
+                                for c in _comments
+                                if datetime.fromisoformat(
+                                    c.get("created_at", "1970-01-01T00:00:00+00:00")
+                                )
+                                >= _run_start_dt
+                            ]
+                            _is_intentional_noop = len(_post_start) >= 2
+                        except Exception:
+                            logger.warning(
+                                "Zero-commits guard: list_comments failed for run %s"
+                                " — treating as silent failure",
+                                run.id,
+                            )
+                    if not _is_intentional_noop:
+                        _push_results_json = json.dumps(
+                            [r.model_dump(mode="json") for r in push_results_list]
+                        )
+                        error_str = (
+                            "build run produced zero commits across all repos"
+                            " and pushed no branch"
+                        )
+                        await db.update_run(
+                            run.id,
+                            status=RunStatus.failed,
+                            completed_at=completed,
+                            exit_code=result.returncode,
+                            error=error_str,
+                            push_results=_push_results_json,
+                        )
+                        _publish_run_event(run.id, "failed", completed)
+                        if run.item_id is not None:
+                            try:
+                                await gtd_client.post_comment(
+                                    run.item_id,
+                                    (
+                                        f"Build run produced no commits"
+                                        f" (run `{run.id}`). The agent exited"
+                                        " cleanly but made no changes — possible"
+                                        " silent failure. Check the transcript."
+                                    ),
+                                    created_by=attribution or "agent-gtd-dispatch",
+                                    token=run.callback_token,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "Failed to post zero-commits comment for run %s",
+                                    run.id,
+                                )
+                        return  # exit early — do not mark succeeded
 
             # All pushed (or no BUILD verification needed) — mark succeeded
             if push_results_list is not None:

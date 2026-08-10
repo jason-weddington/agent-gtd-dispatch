@@ -324,6 +324,20 @@ def verify_pushes(
     return results
 
 
+def is_zero_commits_run(push_results: list[RepoPushStatus]) -> bool:
+    """Return True when all repos have no_changes status (zero commits across the run).
+
+    A zero-commits run may be a silent failure (the agent exited without doing
+    anything) or an intentional no-op (the agent determined work was already done
+    and posted an explanatory comment).  The caller is responsible for
+    distinguishing the two cases — for example by checking whether the agent
+    successfully posted a comment to the item after the dispatch comment was posted.
+    """
+    return bool(push_results) and all(
+        r.status == PushStatus.no_changes for r in push_results
+    )
+
+
 def _detect_default_branch(repo_path: Path) -> str:
     """Detect the default branch for a cloned repo (detection only, no checkout).
 

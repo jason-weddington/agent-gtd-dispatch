@@ -35,7 +35,7 @@ from agent_gtd_dispatch.engines import (
     build_env,
     get_engine,
 )
-from agent_gtd_dispatch.models import DispatchRequest, Run
+from agent_gtd_dispatch.models import DispatchRequest, PushStatus, RepoPushStatus, Run
 
 
 def _dispatch_sudo_available() -> bool:
@@ -3203,3 +3203,447 @@ class TestWorkspaceManagePrompt:
         )
         assert "**Git Origin:**" in prompt
         assert "workspace root" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# is_zero_commits_run helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsZeroCommitsRun:
+    """Unit tests for dispatch.is_zero_commits_run()."""
+
+    def _no_changes(self, name: str = "repo") -> RepoPushStatus:
+        return RepoPushStatus(
+            repo_name=name,
+            branch="feat/x",
+            status=PushStatus.no_changes,
+            local_sha="abc",
+            remote_sha=None,
+            commits_ahead=0,
+            dirty=False,
+        )
+
+    def _pushed(self, name: str = "repo") -> RepoPushStatus:
+        return RepoPushStatus(
+            repo_name=name,
+            branch="feat/x",
+            status=PushStatus.pushed,
+            local_sha="abc",
+            remote_sha="abc",
+            commits_ahead=2,
+            dirty=False,
+        )
+
+    def _unpushed(self, name: str = "repo") -> RepoPushStatus:
+        return RepoPushStatus(
+            repo_name=name,
+            branch="feat/x",
+            status=PushStatus.unpushed,
+            local_sha="abc",
+            remote_sha=None,
+            commits_ahead=3,
+            dirty=False,
+        )
+
+    def test_all_no_changes_returns_true(self) -> None:
+        from agent_gtd_dispatch.dispatch import is_zero_commits_run
+
+        assert (
+            is_zero_commits_run([self._no_changes("a"), self._no_changes("b")]) is True
+        )
+
+    def test_empty_list_returns_false(self) -> None:
+        from agent_gtd_dispatch.dispatch import is_zero_commits_run
+
+        assert is_zero_commits_run([]) is False
+
+    def test_mixed_pushed_returns_false(self) -> None:
+        from agent_gtd_dispatch.dispatch import is_zero_commits_run
+
+        assert is_zero_commits_run([self._no_changes(), self._pushed()]) is False
+
+    def test_any_unpushed_returns_false(self) -> None:
+        from agent_gtd_dispatch.dispatch import is_zero_commits_run
+
+        assert is_zero_commits_run([self._no_changes(), self._unpushed()]) is False
+
+    def test_single_pushed_returns_false(self) -> None:
+        from agent_gtd_dispatch.dispatch import is_zero_commits_run
+
+        assert is_zero_commits_run([self._pushed()]) is False
+
+    def test_single_no_changes_returns_true(self) -> None:
+        from agent_gtd_dispatch.dispatch import is_zero_commits_run
+
+        assert is_zero_commits_run([self._no_changes()]) is True
+
+
+# ---------------------------------------------------------------------------
+# Zero-commits no-op guard integration tests (AC unit tests)
+# ---------------------------------------------------------------------------
+
+
+class TestZeroCommitsGuard:
+    """Integration tests for the zero-commits guard in _dispatch_worker.
+
+    Covers the four cases from the acceptance criteria:
+    1. zero-commits + no agent comment → failure
+    2. zero-commits + agent comment (intentional no-op) → success
+    3. normal commit+push → success (regression, happy path)
+    4. unpushed commits → failure (regression, existing verify_pushes behaviour)
+    """
+
+    def _no_changes_result(
+        self, repo: str = "repos-testproj", branch: str = "feat/abc-fix"
+    ) -> RepoPushStatus:
+        return RepoPushStatus(
+            repo_name=repo,
+            branch=branch,
+            status=PushStatus.no_changes,
+            local_sha="deadbeef",
+            remote_sha=None,
+            commits_ahead=0,
+            dirty=False,
+        )
+
+    def _pushed_result(
+        self, repo: str = "repos-testproj", branch: str = "feat/abc-fix"
+    ) -> RepoPushStatus:
+        return RepoPushStatus(
+            repo_name=repo,
+            branch=branch,
+            status=PushStatus.pushed,
+            local_sha="aabbccdd",
+            remote_sha="aabbccdd",
+            commits_ahead=2,
+            dirty=False,
+        )
+
+    def _unpushed_result(
+        self, repo: str = "repos-testproj", branch: str = "feat/abc-fix"
+    ) -> RepoPushStatus:
+        return RepoPushStatus(
+            repo_name=repo,
+            branch=branch,
+            status=PushStatus.unpushed,
+            local_sha="deadbeef",
+            remote_sha=None,
+            commits_ahead=3,
+            dirty=False,
+        )
+
+    @pytest.fixture(autouse=True)
+    def _init_db(self, tmp_path, monkeypatch):
+        """Ensure a fresh in-memory-style DB for each test."""
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+
+    async def test_zero_commits_no_agent_comment_fails_run(self, tmp_path) -> None:
+        """All repos no_changes + only 1 comment (dispatch) → run failed.
+
+        The agent posted no explanatory comment, so this is a silent failure.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import DispatchMode, Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-zero-silent",
+            project_name="TestProject",
+            branch_name="feat/abc-fix",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        completed_result = MagicMock()
+        completed_result.returncode = 0
+
+        # Only the dispatch comment — agent posted nothing after it
+        dispatch_comment = {
+            "id": "c1",
+            "created_at": "2099-01-01T00:00:01Z",
+            "content_markdown": "Agent dispatched (run `abc`, engine: claude-code).",
+        }
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_gtd.get_item = AsyncMock(
+                return_value={
+                    "id": "item-zero-silent",
+                    "title": "Fix bug",
+                    "project_id": "proj1",
+                }
+            )
+            mock_gtd.get_project = AsyncMock(
+                return_value={
+                    "id": "proj1",
+                    "name": "TestProject",
+                    "git_origin": "git@host:repos/testproj",
+                }
+            )
+            mock_gtd.post_comment = AsyncMock()
+            mock_gtd.list_comments = AsyncMock(return_value=[dispatch_comment])
+            mock_gtd.list_attachments = AsyncMock(return_value=[])
+
+            fake_workspace = tmp_path / "repos-zero-silent"
+            fake_workspace.mkdir()
+            mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
+            mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
+            mock_dispatch.repo_name_from_origin = MagicMock(
+                return_value="repos-testproj"
+            )
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
+            mock_dispatch.verify_pushes = MagicMock(
+                return_value=[self._no_changes_result()]
+            )
+            mock_dispatch.cleanup_workspace = MagicMock()
+
+            from agent_gtd_dispatch.engines import CLAUDE
+            from agent_gtd_dispatch.main import _dispatch_worker
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "failed"
+        assert updated.error is not None
+        assert "zero commits" in updated.error
+        assert "pushed no branch" in updated.error
+
+        # list_comments must have been called to check for agent comment
+        mock_gtd.list_comments.assert_called_once()
+
+    async def test_zero_commits_with_agent_comment_succeeds_intentional_noop(
+        self, tmp_path
+    ) -> None:
+        """All repos no_changes + 2 comments (dispatch + agent no-op comment) → succeeded.
+
+        The agent posted an explanatory comment declaring the criteria already
+        satisfied — this is the intentional no-op path and must NOT fail.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import DispatchMode, Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-zero-noop",
+            project_name="TestProject",
+            branch_name="feat/abc-fix",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        completed_result = MagicMock()
+        completed_result.returncode = 0
+
+        # Two comments: dispatch comment + agent explanatory comment
+        dispatch_comment = {
+            "id": "c1",
+            "created_at": "2099-01-01T00:00:01Z",
+            "content_markdown": "Agent dispatched (run `abc`, engine: claude-code).",
+        }
+        agent_noop_comment = {
+            "id": "c2",
+            "created_at": "2099-01-01T00:10:00Z",
+            "content_markdown": "No changes needed — acceptance criteria already satisfied.",
+        }
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_gtd.get_item = AsyncMock(
+                return_value={
+                    "id": "item-zero-noop",
+                    "title": "Fix bug",
+                    "project_id": "proj1",
+                }
+            )
+            mock_gtd.get_project = AsyncMock(
+                return_value={
+                    "id": "proj1",
+                    "name": "TestProject",
+                    "git_origin": "git@host:repos/testproj",
+                }
+            )
+            mock_gtd.post_comment = AsyncMock()
+            mock_gtd.list_comments = AsyncMock(
+                return_value=[dispatch_comment, agent_noop_comment]
+            )
+            mock_gtd.list_attachments = AsyncMock(return_value=[])
+
+            fake_workspace = tmp_path / "repos-zero-noop"
+            fake_workspace.mkdir()
+            mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
+            mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
+            mock_dispatch.repo_name_from_origin = MagicMock(
+                return_value="repos-testproj"
+            )
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
+            mock_dispatch.verify_pushes = MagicMock(
+                return_value=[self._no_changes_result()]
+            )
+            mock_dispatch.cleanup_workspace = MagicMock()
+
+            from agent_gtd_dispatch.engines import CLAUDE
+            from agent_gtd_dispatch.main import _dispatch_worker
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "succeeded"
+
+    async def test_normal_commit_push_succeeds_regression(self, tmp_path) -> None:
+        """Happy path: commit + push → succeeded.  Zero-commits guard must not trigger.
+
+        Regression guard: normal build runs that commit and push must continue
+        to be recorded as succeeded after the zero-commits guard is added.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import DispatchMode, Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-normal-push",
+            project_name="TestProject",
+            branch_name="feat/abc-fix",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        completed_result = MagicMock()
+        completed_result.returncode = 0
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_gtd.get_item = AsyncMock(
+                return_value={
+                    "id": "item-normal-push",
+                    "title": "Add feature",
+                    "project_id": "proj1",
+                }
+            )
+            mock_gtd.get_project = AsyncMock(
+                return_value={
+                    "id": "proj1",
+                    "name": "TestProject",
+                    "git_origin": "git@host:repos/testproj",
+                }
+            )
+            mock_gtd.post_comment = AsyncMock()
+            mock_gtd.list_attachments = AsyncMock(return_value=[])
+
+            fake_workspace = tmp_path / "repos-normal-push"
+            fake_workspace.mkdir()
+            mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
+            mock_dispatch.get_head_sha = MagicMock(return_value="baseshaxyz")
+            mock_dispatch.repo_name_from_origin = MagicMock(
+                return_value="repos-testproj"
+            )
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
+            mock_dispatch.verify_pushes = MagicMock(
+                return_value=[self._pushed_result()]
+            )
+            mock_dispatch.cleanup_workspace = MagicMock()
+
+            from agent_gtd_dispatch.engines import CLAUDE
+            from agent_gtd_dispatch.main import _dispatch_worker
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "succeeded"
+
+        # list_comments must NOT have been called — guard only fires on no_changes
+        assert (
+            not hasattr(mock_gtd, "list_comments") or not mock_gtd.list_comments.called
+        )
+
+    async def test_unpushed_commits_fails_existing_behavior(self, tmp_path) -> None:
+        """Unpushed commits → run failed with existing push-verification error.
+
+        Regression guard: the zero-commits guard must not interfere with the
+        existing unpushed-commits failure path.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import DispatchMode, Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-unpushed",
+            project_name="TestProject",
+            branch_name="feat/abc-fix",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        completed_result = MagicMock()
+        completed_result.returncode = 0
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_gtd.get_item = AsyncMock(
+                return_value={
+                    "id": "item-unpushed",
+                    "title": "Fix bug",
+                    "project_id": "proj1",
+                }
+            )
+            mock_gtd.get_project = AsyncMock(
+                return_value={
+                    "id": "proj1",
+                    "name": "TestProject",
+                    "git_origin": "git@host:repos/testproj",
+                }
+            )
+            mock_gtd.post_comment = AsyncMock()
+            mock_gtd.list_attachments = AsyncMock(return_value=[])
+
+            fake_workspace = tmp_path / "repos-unpushed"
+            fake_workspace.mkdir()
+            mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
+            mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
+            mock_dispatch.repo_name_from_origin = MagicMock(
+                return_value="repos-testproj"
+            )
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
+            mock_dispatch.verify_pushes = MagicMock(
+                return_value=[self._unpushed_result()]
+            )
+            mock_dispatch.cleanup_workspace = MagicMock()
+
+            from agent_gtd_dispatch.engines import CLAUDE
+            from agent_gtd_dispatch.main import _dispatch_worker
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "failed"
+        assert updated.error is not None
+        assert "push verification failed" in updated.error
+        assert "3 unpushed commit(s)" in updated.error
