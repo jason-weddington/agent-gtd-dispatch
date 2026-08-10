@@ -1826,8 +1826,14 @@ async def run_agent(
     mode: DispatchMode = DispatchMode.BUILD,
     attribution: str | None = None,
     popen_callback: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    callback_token: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a headless agent CLI as a subprocess."""
+    """Run a headless agent CLI as a subprocess.
+
+    ``callback_token`` is the run's per-run GTD JWT (scoped to the dispatching
+    user). It is threaded into ``build_env`` so the agent's own agent-gtd MCP
+    identity authenticates as that user; when None, the static host key is used.
+    """
     if timeout_seconds is None:
         timeout_seconds = (
             config.MANAGE_TIMEOUT_SECONDS
@@ -1846,7 +1852,7 @@ async def run_agent(
         # must be the last flag before the prompt.
         print_idx = cmd.index("--print")
         cmd[print_idx:print_idx] = ["--allowedTools", ",".join(allowed_tools)]
-    env = build_env(engine, mode=mode)
+    env = build_env(engine, mode=mode, callback_token=callback_token)
     if attribution:
         env["AGENT_GTD_AGENT_NAME"] = attribution
     # Tag the subprocess env with the engine identifier so KB-side telemetry can

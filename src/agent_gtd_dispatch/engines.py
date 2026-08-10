@@ -49,9 +49,27 @@ _MANAGE_EXECUTOR_ENV_KEYS: tuple[str, ...] = ("DISPATCH_LOCAL_URL", "DISPATCH_AP
 
 
 def build_env(
-    engine: Engine, mode: DispatchMode = DispatchMode.BUILD
+    engine: Engine,
+    mode: DispatchMode = DispatchMode.BUILD,
+    callback_token: str | None = None,
 ) -> dict[str, str]:
-    """Build a filtered env dict for the engine's subprocess."""
+    """Build a filtered env dict for the engine's subprocess.
+
+    ``callback_token`` is the run's per-run 72h JWT, minted by the dispatch
+    worker and scoped to the DISPATCHING USER. When present it is set as
+    ``AGENT_GTD_API_KEY`` in the subprocess env so the agent's OWN agent-gtd
+    MCP server (``get_item`` / ``add_comment`` / ``update_item``) authenticates
+    as that user rather than the host's static admin key. When absent — admin
+    dispatch, legacy senders, and the watchdog/recovery/plan paths — the static
+    ``AGENT_GTD_API_KEY`` copied from ``os.environ`` below remains in force.
+
+    NOTE: reusing the ``AGENT_GTD_API_KEY`` name (rather than a new var) means
+    the token already survives the ``sudo -u dispatch`` boundary via the
+    existing ``env_keep`` entry in ``sudoers-dispatch-svc.tmpl``. The agent-gtd
+    MCP server picks it up from the subprocess env only once the literal value
+    is no longer baked into its ``.claude.json`` registration — see
+    ``templates/mcp-servers.sh`` (host reprovisioning is an operator step).
+    """
     import pwd
 
     from . import config  # local import so module is readable before config.load()
@@ -62,6 +80,12 @@ def build_env(
         allowed = allowed | frozenset(_MANAGE_EXECUTOR_ENV_KEYS)
     env = {k: v for k, v in os.environ.items() if k in allowed}
     env["HOME"] = str(Path.home())
+
+    # Per-run callback token overrides the static host key so the agent
+    # authenticates to GTD as the dispatching user. Fallback to the static key
+    # (already copied above) is mandatory and preserved when the token is None.
+    if callback_token:
+        env["AGENT_GTD_API_KEY"] = callback_token
     if engine.extra_env_fn is not None:
         env.update(engine.extra_env_fn())
 

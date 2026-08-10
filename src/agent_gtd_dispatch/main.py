@@ -1399,6 +1399,7 @@ async def _dispatch_worker(
             mode=mode,
             attribution=attribution,
             popen_callback=_register_subprocess,
+            callback_token=run.callback_token,
         )
         _exit_code = result.returncode
 

@@ -313,6 +313,53 @@ class TestBuildEnv:
         assert env["GIT_AUTHOR_NAME"] == "claude-code-haiku"
         assert env["GIT_COMMITTER_NAME"] == "claude-code-haiku"
 
+    def test_callback_token_overrides_static_gtd_key(self, monkeypatch) -> None:
+        """Phase 3: a per-run callback_token authenticates the agent's agent-gtd
+        MCP identity as the DISPATCHING USER, overriding the static host key."""
+        monkeypatch.setenv("AGENT_GTD_API_KEY", "static-host-admin-key")
+        env = build_env(CLAUDE, callback_token="per-run-user-jwt")
+        assert env["AGENT_GTD_API_KEY"] == "per-run-user-jwt"
+
+    def test_callback_token_absent_falls_back_to_static_key(self, monkeypatch) -> None:
+        """Phase 3 mandatory fallback: with no callback_token (admin dispatch,
+        legacy senders, watchdog/recovery/plan paths) the static host key is
+        used exactly as before."""
+        monkeypatch.setenv("AGENT_GTD_API_KEY", "static-host-admin-key")
+        env = build_env(CLAUDE)
+        assert env["AGENT_GTD_API_KEY"] == "static-host-admin-key"
+
+    def test_callback_token_empty_string_falls_back_to_static_key(
+        self, monkeypatch
+    ) -> None:
+        """An empty-string token must not clobber the static key (falsy guard)."""
+        monkeypatch.setenv("AGENT_GTD_API_KEY", "static-host-admin-key")
+        env = build_env(CLAUDE, callback_token="")
+        assert env["AGENT_GTD_API_KEY"] == "static-host-admin-key"
+
+    def test_gtd_key_is_in_sudoers_env_keep(self) -> None:
+        """Flywheel guard: the AGENT_GTD_API_KEY that build_env sets to the per-run
+        token must survive the sudo boundary — i.e. be listed in sudoers env_keep.
+
+        Reusing the existing AGENT_GTD_API_KEY name (rather than introducing a new
+        var) means no sudoers change is needed; this asserts that invariant holds."""
+        tmpl = Path(__file__).parent.parent / "templates" / "sudoers-dispatch-svc.tmpl"
+        env_keep_line = next(
+            line for line in tmpl.read_text().splitlines() if "env_keep +=" in line
+        )
+        quoted = env_keep_line[env_keep_line.index('"') + 1 : env_keep_line.rindex('"')]
+        env_keep_keys = set(quoted.split())
+        assert "AGENT_GTD_API_KEY" in env_keep_keys
+
+    def test_callback_token_not_baked_into_mcp_registration(self) -> None:
+        """No-leak guard: mcp-servers.sh must NOT bake a literal AGENT_GTD_API_KEY
+        into the agent-gtd MCP block (that would pin every agent to the static key
+        and defeat per-run auth). The key is inherited from the subprocess env."""
+        tmpl = Path(__file__).parent.parent / "templates" / "mcp-servers.sh"
+        text = tmpl.read_text()
+        assert "-e AGENT_GTD_API_KEY=" not in text
+        # AGENT_GTD_URL is still injected as a literal flag.
+        assert "-e AGENT_GTD_URL=" in text
+
 
 class TestBuildSystemPrompt:
     _item: ClassVar[dict] = {
@@ -741,6 +788,42 @@ class TestRunAgent:
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
             _, kwargs = mock_popen.call_args
             assert "AGENT_GTD_AGENT_NAME" not in kwargs["env"]
+
+    async def test_callback_token_reaches_subprocess_gtd_key(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Phase 3: run_agent forwards the per-run token to build_env so the
+        agent subprocess (and its agent-gtd MCP server) authenticates as the
+        dispatching user via AGENT_GTD_API_KEY."""
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        monkeypatch.setenv("AGENT_GTD_API_KEY", "static-host-admin-key")
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(
+                CLAUDE,
+                tmp_path,
+                "sys",
+                "Title",
+                20,
+                callback_token="per-run-user-jwt",
+            )
+            _, kwargs = mock_popen.call_args
+            assert kwargs["env"]["AGENT_GTD_API_KEY"] == "per-run-user-jwt"
+
+    async def test_no_callback_token_uses_static_gtd_key(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Phase 3 fallback: without a callback_token, the subprocess keeps the
+        static host AGENT_GTD_API_KEY (admin dispatch / watchdog / plan paths)."""
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        monkeypatch.setenv("AGENT_GTD_API_KEY", "static-host-admin-key")
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            _, kwargs = mock_popen.call_args
+            assert kwargs["env"]["AGENT_GTD_API_KEY"] == "static-host-admin-key"
 
     async def test_manage_mode_uses_manage_timeout_when_none(
         self, tmp_path, monkeypatch

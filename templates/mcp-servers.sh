@@ -52,15 +52,21 @@
 # for private/local mirrors: e.g. git+ssh://git@<host>/path/to/agent_gtd
 _agent_gtd_mcp_src="${AGENT_GTD_MCP_SRC:-git+https://github.com/jason-weddington/agent-gtd}"
 
-# --- agent-gtd env flags (AGENT_GTD_URL + AGENT_GTD_API_KEY) ---
+# --- agent-gtd env flags (AGENT_GTD_URL only) ---
 # Read from the service .env by setup-dispatch-host.sh and exported before sourcing
 # this file. Injected into the MCP server's subprocess env (NOT Claude Code's env).
+#
+# AGENT_GTD_API_KEY is deliberately NOT baked in here. A literal value in the MCP
+# server's `env` block takes precedence over the subprocess environment, which would
+# pin every agent to the host's static (admin@local) key and make per-run, per-user
+# auth impossible. Instead the key is INHERITED from the agent subprocess env, where
+# the dispatch worker sets it per-run to the run's callback_token — a 72h JWT scoped
+# to the dispatching user — falling back to the static host AGENT_GTD_API_KEY when no
+# token is present (admin dispatch, legacy senders, watchdog/recovery/plan paths).
+# See engines.py build_env() and sudoers-dispatch-svc.tmpl env_keep (Phase 3, kb-03189).
 _agent_gtd_flags=""
 if [[ -n "${AGENT_GTD_URL:-}" ]]; then
     _agent_gtd_flags+="-e AGENT_GTD_URL=${AGENT_GTD_URL} "
-fi
-if [[ -n "${AGENT_GTD_API_KEY:-}" ]]; then
-    _agent_gtd_flags+="-e AGENT_GTD_API_KEY=${AGENT_GTD_API_KEY} "
 fi
 
 # --- KB Anthropic key flag ---
