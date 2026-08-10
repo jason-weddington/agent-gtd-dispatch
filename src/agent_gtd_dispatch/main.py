@@ -1227,7 +1227,74 @@ async def _dispatch_worker(
         # manage-mode runs have item_id=None — derive project from the rollout instead.
         item: dict[str, Any] = {}
         if run.item_id is not None:
-            item = await gtd_client.get_item(run.item_id, token=run.callback_token)
+            # Preflight: verify the item is accessible with the run's own credential
+            # BEFORE cloning the workspace or spawning the agent subprocess.
+            # This is the fail-fast guard for the "agent can't see its own GTD item"
+            # failure mode (see kb-03189). A transient 5xx error re-raises so that
+            # existing generic error handling proceeds unchanged — no new failure class.
+            try:
+                item = await gtd_client.get_item(run.item_id, token=run.callback_token)
+            except httpx.HTTPStatusError as _preflight_exc:
+                if not gtd_client.is_authoritative_item_error(_preflight_exc):
+                    raise  # transient (5xx etc.) — existing outer handler takes over
+                # Authoritative failure (401/403/404): abort before clone/spawn.
+                _credential_desc = (
+                    "per-run callback_token"
+                    if run.callback_token
+                    else "static service key"
+                )
+                _preflight_error = (
+                    f"preflight failed: item {run.item_id!r} is not visible "
+                    f"to the run's credential ({_credential_desc}); "
+                    f"upstream HTTP {_preflight_exc.response.status_code}. "
+                    "Check that the dispatching user has access to this item."
+                )
+                _preflight_now = datetime.now(UTC).isoformat()
+                await db.update_run(
+                    run.id,
+                    status=RunStatus.failed,
+                    completed_at=_preflight_now,
+                    error=_preflight_error,
+                )
+                _publish_run_event(run.id, "failed", _preflight_now)
+                # Report through the service's own credential — try the run's
+                # callback_token first (it may have POST access even if GET
+                # failed), then fall back to the static service key (token=None
+                # → _request uses config.AGENT_GTD_API_KEY). This keeps the
+                # reporting channel independent of the broken read credential.
+                _preflight_comment = (
+                    f"Run `{run.id}` aborted (preflight failed): "
+                    f"item `{run.item_id}` is not visible to the run's credential "
+                    f"({_credential_desc}, "
+                    f"HTTP {_preflight_exc.response.status_code}). "
+                    "The dispatching user may not have access to this item."
+                )
+                _preflight_reported = False
+                for _try_token in (run.callback_token, None):
+                    try:
+                        await gtd_client.post_comment(
+                            run.item_id,
+                            _preflight_comment,
+                            created_by=attribution or "agent-gtd-dispatch",
+                            token=_try_token,
+                        )
+                        _preflight_reported = True
+                        break
+                    except Exception as _comment_exc:
+                        logger.debug(
+                            "Preflight comment attempt failed (token=%s): %s",
+                            "callback_token" if _try_token else "static",
+                            _comment_exc,
+                        )
+                        continue
+                if not _preflight_reported:
+                    logger.warning(
+                        "Preflight abort: failed to post error comment "
+                        "run_id=%s item_id=%s",
+                        run.id,
+                        run.item_id,
+                    )
+                return  # Abort — do not clone workspace or spawn agent
             project_id = item.get("project_id")
             if not project_id:
                 raise ValueError("Item has no project assigned")

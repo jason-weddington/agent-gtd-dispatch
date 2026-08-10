@@ -1684,3 +1684,207 @@ class TestWorkspaceDispatch:
 
         # AC-6: verify_pushes must not be called for manage runs
         mock_dispatch.verify_pushes.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Preflight item-fetch guard tests
+# ---------------------------------------------------------------------------
+
+
+class TestPreflightItemFetch:
+    """Preflight guard: abort before clone/spawn when item is not visible.
+
+    Tests the three preflight outcomes required by the acceptance criteria:
+    - success → run proceeds normally
+    - 404/403 (authoritative) → run aborted before clone/spawn, error surfaced
+    - 5xx (transient) → run is NOT aborted via the preflight path
+    """
+
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_preflight_success_run_proceeds(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    ) -> None:
+        """Preflight success (200) → _dispatch_worker is invoked normally."""
+        mock_client.get_item = AsyncMock(
+            return_value={"id": "item-pf-ok", "title": "OK item", "project_id": "proj1"}
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@ubuntu-vm01:repos/test",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/item-pf-ok"
+
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "item-pf-ok", "max_turns": 50},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        mock_worker.assert_called_once()
+
+    async def test_preflight_404_aborts_before_clone_and_spawn(self) -> None:
+        """Preflight 404 → run marked failed before workspace clone or agent spawn.
+
+        Verifies:
+        - run.status == failed
+        - run.error contains 'preflight'
+        - post_comment called with the preflight error (service-credential reporting)
+        - prepare_workspace* NOT called (abort happened before clone)
+        - run_agent NOT called (abort happened before spawn)
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.engines import get_engine
+        from agent_gtd_dispatch.main import _dispatch_worker
+        from agent_gtd_dispatch.models import Run, RunStatus
+
+        await db.init_db()
+        run = Run(
+            item_id="item-pf-404",
+            project_name="TestProject",
+            branch_name="feat/item-pf-404",
+            engine="claude-code",
+            callback_token="eyJ-run-token",
+        )
+        await db.insert_run(run)
+
+        post_comment_mock = AsyncMock()
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_client,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_client.get_item = AsyncMock(side_effect=_make_http_status_error(404))
+            mock_client.is_authoritative_item_error = (
+                lambda exc: exc.response.status_code in (401, 403, 404)
+            )
+            mock_client.post_comment = post_comment_mock
+
+            engine = get_engine("claude-code")
+            await _dispatch_worker(run, 50, engine, 1800)
+
+        # Run must be marked failed
+        final_run = await db.get_run(run.id)
+        assert final_run is not None
+        assert final_run.status == RunStatus.failed
+        # Error must name the preflight as the cause
+        assert "preflight" in (final_run.error or "").lower()
+
+        # Comment must have been posted (service-credential reporting)
+        assert post_comment_mock.call_count >= 1
+        comment_text = post_comment_mock.call_args_list[0][0][1]
+        assert "preflight" in comment_text.lower()
+
+        # Workspace clone must NOT have happened
+        mock_dispatch.prepare_workspace.assert_not_called()
+        mock_dispatch.prepare_workspace_multi.assert_not_called()
+
+        # Agent spawn must NOT have happened
+        mock_dispatch.run_agent.assert_not_called()
+
+    async def test_preflight_403_aborts_with_actionable_error(self) -> None:
+        """Preflight 403 (not authorised) → same abort behaviour as 404."""
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.engines import get_engine
+        from agent_gtd_dispatch.main import _dispatch_worker
+        from agent_gtd_dispatch.models import Run, RunStatus
+
+        await db.init_db()
+        run = Run(
+            item_id="item-pf-403",
+            project_name="TestProject",
+            branch_name="feat/item-pf-403",
+            engine="claude-code",
+            callback_token="eyJ-run-token",
+        )
+        await db.insert_run(run)
+
+        post_comment_mock = AsyncMock()
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_client,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_client.get_item = AsyncMock(side_effect=_make_http_status_error(403))
+            mock_client.is_authoritative_item_error = (
+                lambda exc: exc.response.status_code in (401, 403, 404)
+            )
+            mock_client.post_comment = post_comment_mock
+
+            engine = get_engine("claude-code")
+            await _dispatch_worker(run, 50, engine, 1800)
+
+        final_run = await db.get_run(run.id)
+        assert final_run is not None
+        assert final_run.status == RunStatus.failed
+        assert "preflight" in (final_run.error or "").lower()
+        assert post_comment_mock.call_count >= 1
+        mock_dispatch.prepare_workspace.assert_not_called()
+        mock_dispatch.run_agent.assert_not_called()
+
+    async def test_preflight_5xx_does_not_abort_via_preflight_path(self) -> None:
+        """Preflight 5xx (transient) → run is NOT aborted by the preflight guard.
+
+        A transient upstream error must not manufacture a new class of dispatch
+        failures. The 5xx re-raises from the preflight check and is caught by
+        the existing outer exception handler — the run may still fail, but NOT
+        because of the preflight abort path.
+
+        Verified by:
+        - No 'preflight' comment posted (the preflight abort path posts a comment;
+          the outer except handler for non-manage mode does not).
+        - run.error does NOT contain 'preflight'.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.engines import get_engine
+        from agent_gtd_dispatch.main import _dispatch_worker
+        from agent_gtd_dispatch.models import Run, RunStatus
+
+        await db.init_db()
+        run = Run(
+            item_id="item-pf-500",
+            project_name="TestProject",
+            branch_name="feat/item-pf-500",
+            engine="claude-code",
+            callback_token="eyJ-run-token",
+        )
+        await db.insert_run(run)
+
+        post_comment_mock = AsyncMock()
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_client,
+            patch("agent_gtd_dispatch.main.dispatch"),
+        ):
+            mock_client.get_item = AsyncMock(side_effect=_make_http_status_error(500))
+            mock_client.is_authoritative_item_error = (
+                lambda exc: exc.response.status_code in (401, 403, 404)
+            )
+            mock_client.post_comment = post_comment_mock
+
+            engine = get_engine("claude-code")
+            await _dispatch_worker(run, 50, engine, 1800)
+
+        # Run ends up failed — but from the outer except, not the preflight path
+        final_run = await db.get_run(run.id)
+        assert final_run is not None
+        assert final_run.status == RunStatus.failed
+        # The error must NOT say 'preflight' — this failure was NOT due to the guard
+        assert "preflight" not in (final_run.error or "").lower()
+        # No preflight comment was posted (outer except for non-manage mode is silent)
+        preflight_comments = [
+            call
+            for call in post_comment_mock.call_args_list
+            if "preflight" in str(call).lower()
+        ]
+        assert len(preflight_comments) == 0

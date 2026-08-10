@@ -42,6 +42,20 @@ async def _request_raw(
         return resp.content
 
 
+def is_authoritative_item_error(exc: httpx.HTTPStatusError) -> bool:
+    """Return True when an HTTP error is an authoritative item-access denial.
+
+    Authoritative means the server gave a definitive response indicating the
+    item is not found or the credential is not authorised (HTTP 401, 403, 404).
+    Callers that receive True should abort the run immediately.
+
+    Returns False for 5xx and any other status codes — those are transient.
+    Callers should not abort on transient failures; existing error handling
+    will deal with them the same way it did before the preflight guard existed.
+    """
+    return exc.response.status_code in (401, 403, 404)
+
+
 async def get_item(item_id: str, *, token: str | None = None) -> dict[str, Any]:
     """Fetch a GTD item by ID."""
     result: dict[str, Any] = await _request("GET", f"/items/{item_id}", token=token)
