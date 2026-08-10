@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v1.20.0 (2026-08-10)
+
+### Features
+
+- **447b0147**: A build run that produces zero commits and pushes no branch must not be recorded as
+  success
+  ([`4acba60`](https://github.com/repos/agent-gtd-dispatch/commit/4acba60594c97e9c3df2b8ec5d9fd6aa27bbe359))
+
+- **92c3aab8**: Preflight the item fetch on the run's own credential before spawning the agent
+  ([`655ff25`](https://github.com/repos/agent-gtd-dispatch/commit/655ff256bc5a96c5eb6780972795c99dee171521))
+
+- **ef4e1849**: Phase 3 of 3: forward the per-run callback token to the agent's own GTD MCP identity
+  ([`f889d85`](https://github.com/repos/agent-gtd-dispatch/commit/f889d859b0439d740d08c6cbd90125e416f51478))
+
+
 ## v1.19.1 (2026-07-14)
 
 ### Bug Fixes
