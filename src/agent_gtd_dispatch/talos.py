@@ -114,9 +114,17 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
       also ARMS talos's pre-flight context guard, so an overflow becomes a loud
       ``ContextLengthExceeded`` instead of silent truncation. Values:
       ``262144`` (256k) for talos-qwen (qwen3.6:35b's full window) and
-      ``1048576`` (1M) for talos-glm (glm-5.2:cloud is a 1M-context model).
-    - ``OLLAMA_BASE_URL='https://ollama.com'`` for talos-glm — glm-5.2:cloud
-      lives only on Ollama Cloud; no operator override.
+      ``1048576`` (1M) for talos-glm / talos-glm-flash (glm-5.3:cloud /
+      glm-5.3-flash:cloud are 1M-context models).
+    - ``OLLAMA_BASE_URL='https://ollama.com'`` for talos-glm and talos-glm-flash
+      — glm-5.3:cloud and glm-5.3-flash:cloud live only on Ollama Cloud; no
+      operator override.
+    - ``OLLAMA_THINK='high'`` for talos-glm (model=glm-5.3:cloud) and
+      talos-glm-flash (model=glm-5.3-flash:cloud) — PINNED at 'high' for both.
+      glm-5.3 defaults to max when unset (2.3x tokens, 3-6x wall vs. @high on
+      hard fixtures, one MaxIterations miss); flash@low produced a false-done
+      where flash@high had none. Never leave OLLAMA_THINK unset for either GLM
+      engine.
     """
     if engine_name == "talos-haiku":
         return {
@@ -129,7 +137,7 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
     if engine_name == "talos-sonnet":
         return {
             "TALOS_BACKEND": "anthropic",
-            "ANTHROPIC_MODEL": "claude-sonnet-4-6",
+            "ANTHROPIC_MODEL": "claude-sonnet-5",
             # ANTHROPIC_API_KEY reversal vs. claude-code — see kb-01512.
             "ANTHROPIC_API_KEY": config.ANTHROPIC_API_KEY,
         }
@@ -155,17 +163,34 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
     if engine_name == "talos-glm":
         return {
             "TALOS_BACKEND": "ollama",
-            "OLLAMA_MODEL": "glm-5.2:cloud",
-            # The only hardcoded base URL — glm-5.2:cloud lives on Ollama Cloud.
+            # Fixed literal, NOT config.OLLAMA_CLOUD_MODEL: that env override
+            # steers claude-code-glm, and letting it retarget talos-glm would
+            # swap the model under a pinned OLLAMA_THINK with no signal (the
+            # engine-label != identity failure, kb-02979).
+            "OLLAMA_MODEL": "glm-5.3:cloud",
+            # The only hardcoded base URL — glm-5.3:cloud lives on Ollama Cloud.
             "OLLAMA_BASE_URL": "https://ollama.com",
-            # glm-5.2:cloud's FULL 1M window. Was UNSET — and unset on a cloud
-            # (non-localhost) URL means talos sends no num_ctx, so ollama.com
-            # applies a small default and silently drops old messages, which
-            # stalled a large multi-file dispatch ~20 turns in. Pinning 1M also
-            # arms talos's pre-flight guard (overflow → loud error, not silent).
+            # glm-5.3:cloud's FULL 1M window — same reasoning as before, same pin.
             "OLLAMA_NUM_CTX": "1048576",
+            # Pinned at 'high' — see docstring for rationale (never leave unset).
+            "OLLAMA_THINK": "high",
             # Distinct cloud key — no fallback to config.OLLAMA_API_KEY (see
             # config.py comment on OLLAMA_CLOUD_API_KEY).
+            "OLLAMA_API_KEY": config.OLLAMA_CLOUD_API_KEY,
+        }
+    if engine_name == "talos-glm-flash":
+        return {
+            "TALOS_BACKEND": "ollama",
+            # Fixed literal: glm-5.3-flash:cloud is the flash tier; never read from
+            # config (see the talos-glm branch).
+            "OLLAMA_MODEL": "glm-5.3-flash:cloud",
+            # The only hardcoded base URL — glm-5.3-flash:cloud lives on Ollama Cloud.
+            "OLLAMA_BASE_URL": "https://ollama.com",
+            # Same 1M-window pin and same reasoning as talos-glm.
+            "OLLAMA_NUM_CTX": "1048576",
+            # Pinned at 'high' — flash@low produced a false-done; see docstring.
+            "OLLAMA_THINK": "high",
+            # No fallback to config.OLLAMA_API_KEY — see config.py comment.
             "OLLAMA_API_KEY": config.OLLAMA_CLOUD_API_KEY,
         }
     msg = f"Not a talos engine: {engine_name!r}"

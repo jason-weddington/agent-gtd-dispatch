@@ -457,7 +457,7 @@ first-party model id (`claude-sonnet-4-6`) on the Bedrock client — it will err
 
 ## Talos engine provisioning (--with-talos)
 
-Step 4.5b of the installer optionally builds and installs the `talos` binary for the agent user. This binary powers the `talos-*` engine family (`talos-haiku`, `talos-sonnet`, `talos-opus`, `talos-qwen`, `talos-glm`). The step is **opt-in** — pass `--with-talos` to enable it. Without the flag the step prints a single `[SKIP]` line and mutates nothing.
+Step 4.5b of the installer optionally builds and installs the `talos` binary for the agent user. This binary powers the `talos-*` engine family (`talos-haiku`, `talos-sonnet`, `talos-opus`, `talos-qwen`, `talos-glm`, `talos-glm-flash`). The step is **opt-in** — pass `--with-talos` to enable it. Without the flag the step prints a single `[SKIP]` line and mutates nothing.
 
 ### When to use it
 

@@ -97,8 +97,8 @@ class TestInfoEndpoint:
         # AND the three talos-anthropic engines available (they gate on
         # ANTHROPIC_API_KEY, not on CLAUDE_CODE_OAUTH_TOKEN).  KIRO_API_KEY,
         # OLLAMA_BASE_URL, and OLLAMA_CLOUD_API_KEY are not set → kiro,
-        # claude-code-ollama, claude-code-glm, talos-qwen, and talos-glm are
-        # excluded.
+        # claude-code-ollama, claude-code-glm, talos-qwen, talos-glm, and
+        # talos-glm-flash are excluded.
         resp = client.get("/info")
         engines = resp.json()["engines"]
         assert isinstance(engines, list)
@@ -216,7 +216,8 @@ class TestEngineAvailability:
         names = get_available_engine_names()
         # ANTHROPIC_API_KEY set → claude-code family AND talos-anthropic family
         # available.  Ollama disabled → claude-code-ollama, claude-code-glm,
-        # talos-qwen, talos-glm excluded.  KIRO_API_KEY unset → kiro excluded.
+        # talos-qwen, talos-glm, talos-glm-flash excluded.  KIRO_API_KEY unset
+        # → kiro excluded.
         assert set(names) == {
             "claude-code",
             "claude-code-sonnet",
@@ -669,25 +670,28 @@ class TestOllamaCloudEngineGating:
         monkeypatch.setattr(urllib.request, "urlopen", _should_not_call)
 
         assert engines.is_engine_available(engines.TALOS_GLM) is False
+        assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is False
         assert cloud_auth._probe_result is None
 
     def test_valid_probe_makes_engine_available(self, monkeypatch) -> None:
-        """Key present + probe='valid' → engine available."""
+        """Key present + probe='valid' → engine available (both GLM engines)."""
         from agent_gtd_dispatch import cloud_auth, config, engines
 
         monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "valid-key")
         monkeypatch.setattr(cloud_auth, "probe_ollama_cloud_key", lambda _k: "valid")
 
         assert engines.is_engine_available(engines.TALOS_GLM) is True
+        assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is True
 
     def test_invalid_probe_makes_engine_unavailable(self, monkeypatch) -> None:
-        """Key present + probe='invalid' → engine unavailable."""
+        """Key present + probe='invalid' → engine unavailable (both GLM engines)."""
         from agent_gtd_dispatch import cloud_auth, config, engines
 
         monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "bad-key")
         monkeypatch.setattr(cloud_auth, "probe_ollama_cloud_key", lambda _k: "invalid")
 
         assert engines.is_engine_available(engines.TALOS_GLM) is False
+        assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is False
 
     def test_unknown_probe_keeps_engine_available(self, monkeypatch) -> None:
         """Key present + probe='unknown' → engine remains available (network blip)."""
@@ -697,6 +701,7 @@ class TestOllamaCloudEngineGating:
         monkeypatch.setattr(cloud_auth, "probe_ollama_cloud_key", lambda _k: "unknown")
 
         assert engines.is_engine_available(engines.TALOS_GLM) is True
+        assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is True
 
     def test_invalid_probe_logs_error_once_with_key_length(
         self, monkeypatch, caplog

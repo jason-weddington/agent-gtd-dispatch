@@ -70,7 +70,7 @@ def project_fixture() -> dict:
 
 
 class TestTalosEngineRoster:
-    def test_all_five_talos_engines_registered(self) -> None:
+    def test_all_six_talos_engines_registered(self) -> None:
         from agent_gtd_dispatch.engines import (
             TALOS_ENGINES,
             get_engine,
@@ -82,6 +82,7 @@ class TestTalosEngineRoster:
             "talos-opus",
             "talos-qwen",
             "talos-glm",
+            "talos-glm-flash",
         }
         assert frozenset(expected) == TALOS_ENGINES
         for name in expected:
@@ -98,7 +99,7 @@ class TestTalosEngineRoster:
     def test_talos_ollama_engines_have_empty_auth_env(self) -> None:
         from agent_gtd_dispatch.engines import get_engine
 
-        for name in ("talos-qwen", "talos-glm"):
+        for name in ("talos-qwen", "talos-glm", "talos-glm-flash"):
             assert get_engine(name).auth_env_key == ""
 
     def test_talos_build_command_raises_not_implemented(self) -> None:
@@ -119,6 +120,7 @@ class TestTalosEngineRoster:
 
         assert is_talos_engine("talos-haiku")
         assert is_talos_engine("talos-glm")
+        assert is_talos_engine("talos-glm-flash")
         assert not is_talos_engine("claude-code")
         assert not is_talos_engine("claude-code-ollama")
         assert not is_talos_engine("")
@@ -146,7 +148,7 @@ class TestTalosEnvOverlay:
 
         assert talos_env_overlay("talos-sonnet") == {
             "TALOS_BACKEND": "anthropic",
-            "ANTHROPIC_MODEL": "claude-sonnet-4-6",
+            "ANTHROPIC_MODEL": "claude-sonnet-5",
             "ANTHROPIC_API_KEY": config.ANTHROPIC_API_KEY,
         }
 
@@ -185,6 +187,15 @@ class TestTalosEnvOverlay:
         assert overlay["OLLAMA_NUM_CTX"] == "262144"
         assert overlay["OLLAMA_THINK"] == "on"
 
+    def test_glm_model_ignores_cloud_model_override(self, monkeypatch) -> None:
+        # OLLAMA_CLOUD_MODEL steers claude-code-glm only; talos-glm's model is a
+        # literal so an operator override can't swap it under the think pin.
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_MODEL", "glm-5.2:cloud")
+        assert talos_env_overlay("talos-glm")["OLLAMA_MODEL"] == "glm-5.3:cloud"
+
     def test_glm_overlay_literal_with_cloud_url_and_key(self) -> None:
         from agent_gtd_dispatch import config
         from agent_gtd_dispatch.talos import talos_env_overlay
@@ -192,15 +203,54 @@ class TestTalosEnvOverlay:
         overlay = talos_env_overlay("talos-glm")
         assert overlay == {
             "TALOS_BACKEND": "ollama",
-            "OLLAMA_MODEL": "glm-5.2:cloud",
+            "OLLAMA_MODEL": "glm-5.3:cloud",
             "OLLAMA_BASE_URL": "https://ollama.com",
-            # glm-5.2:cloud's full 1M window; unset on a cloud URL silently
-            # shrinks context (main.rs:328-329 self-defaults localhost only).
             "OLLAMA_NUM_CTX": "1048576",
+            "OLLAMA_THINK": "high",
             "OLLAMA_API_KEY": config.OLLAMA_CLOUD_API_KEY,
         }
         # No fallback to OLLAMA_API_KEY
         assert overlay["OLLAMA_API_KEY"] != config.OLLAMA_API_KEY
+
+    def test_glm_flash_overlay_literal_exact_dict(self) -> None:
+        """talos-glm-flash overlay is an exact-dict with glm-5.3-flash:cloud + think=high."""
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        overlay = talos_env_overlay("talos-glm-flash")
+        assert overlay == {
+            "TALOS_BACKEND": "ollama",
+            "OLLAMA_MODEL": "glm-5.3-flash:cloud",
+            "OLLAMA_BASE_URL": "https://ollama.com",
+            "OLLAMA_NUM_CTX": "1048576",
+            "OLLAMA_THINK": "high",
+            "OLLAMA_API_KEY": config.OLLAMA_CLOUD_API_KEY,
+        }
+        # No fallback to OLLAMA_API_KEY
+        assert overlay["OLLAMA_API_KEY"] != config.OLLAMA_API_KEY
+        # Flash uses a different model from the full-size glm engine.
+        glm_overlay = talos_env_overlay("talos-glm")
+        assert overlay["OLLAMA_MODEL"] != glm_overlay["OLLAMA_MODEL"]
+
+    def test_glm_think_pinned_high(self) -> None:
+        """OLLAMA_THINK='high' is pinned for BOTH glm engines — never unset."""
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        for name in ("talos-glm", "talos-glm-flash"):
+            overlay = talos_env_overlay(name)
+            assert overlay["OLLAMA_THINK"] == "high", (
+                f"{name} OLLAMA_THINK must be pinned to 'high'"
+            )
+
+    def test_glm_num_ctx_pinned_1m(self) -> None:
+        """OLLAMA_NUM_CTX='1048576' is pinned for BOTH glm engines."""
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        for name in ("talos-glm", "talos-glm-flash"):
+            overlay = talos_env_overlay(name)
+            assert overlay["OLLAMA_NUM_CTX"] == "1048576", (
+                f"{name} OLLAMA_NUM_CTX must be pinned to '1048576'"
+            )
 
     def test_anthropic_engines_expose_api_key(self) -> None:
         """ANTHROPIC_API_KEY IS deliberately exposed to talos anthropic engines —
@@ -222,6 +272,7 @@ class TestTalosEnvOverlay:
             "talos-opus",
             "talos-qwen",
             "talos-glm",
+            "talos-glm-flash",
         ):
             overlay = talos_env_overlay(name)
             for key in overlay:
@@ -411,6 +462,7 @@ class TestTalosAvailabilityGating:
             "talos-opus",
             "talos-qwen",
             "talos-glm",
+            "talos-glm-flash",
         ):
             assert talos in names
 
@@ -429,6 +481,13 @@ class TestTalosAvailabilityGating:
 
         monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "")
         assert "talos-glm" not in get_available_engine_names()
+
+    def test_talos_glm_flash_absent_without_cloud_key(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.engines import get_available_engine_names
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "")
+        assert "talos-glm-flash" not in get_available_engine_names()
 
     def test_talos_qwen_absent_without_base_url(self, monkeypatch) -> None:
         from agent_gtd_dispatch import config

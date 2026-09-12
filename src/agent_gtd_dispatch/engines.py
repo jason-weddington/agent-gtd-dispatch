@@ -415,6 +415,15 @@ TALOS_GLM = Engine(
     build_command=_talos_build_command_stub,
 )
 
+TALOS_GLM_FLASH = Engine(
+    name="talos-glm-flash",
+    binary="talos",
+    # ollama-cloud-routed: auth flows via env overlay (OLLAMA_API_KEY=cloud key)
+    auth_env_key="",
+    env_keys=frozenset(),
+    build_command=_talos_build_command_stub,
+)
+
 ENGINES: dict[str, Engine] = {
     "claude-code": CLAUDE,
     "kiro": KIRO,
@@ -427,15 +436,23 @@ ENGINES: dict[str, Engine] = {
     "talos-opus": TALOS_OPUS,
     "talos-qwen": TALOS_QWEN,
     "talos-glm": TALOS_GLM,
+    "talos-glm-flash": TALOS_GLM_FLASH,
 }
 
 # Talos-family engine names. is_talos_engine is the canonical branch discriminator
 # used in main._dispatch_worker to route talos runs down the talos.py subprocess
 # path instead of the shared run_agent + verify_pushes path used by the claude
-# family. get_engine() must still succeed for all five so the /dispatch endpoint's
+# family. get_engine() must still succeed for all six so the /dispatch endpoint's
 # up-front get_engine(effective_engine_name) call resolves before the branch.
 TALOS_ENGINES: frozenset[str] = frozenset(
-    {"talos-haiku", "talos-sonnet", "talos-opus", "talos-qwen", "talos-glm"}
+    {
+        "talos-haiku",
+        "talos-sonnet",
+        "talos-opus",
+        "talos-qwen",
+        "talos-glm",
+        "talos-glm-flash",
+    }
 )
 
 

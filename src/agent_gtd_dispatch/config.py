@@ -68,13 +68,13 @@ OLLAMA_TIMEOUT_MULTIPLIER: float = 2.0
 # key to the cloud.
 OLLAMA_CLOUD_API_KEY: str = ""
 
-# Ollama Cloud endpoint + model for the claude-code-glm engine. Claude Code reaches
-# glm-5.2 via the Anthropic-compatible /v1/messages route ollama.com serves (verified
-# 2026-07-11: POST /v1/messages → 401 routed, vs 404 for bogus paths). This is the
-# HARNESS twin of talos-glm — same cloud model + key, but the mature Claude Code loop
-# instead of the talos loop. The model string mirrors talos-glm's proven ':cloud' tag.
+# Ollama Cloud model for the claude-code-glm engine. Claude Code reaches it via the
+# Anthropic-compatible /v1/messages route ollama.com serves. claude-code-glm is the
+# HARNESS twin of talos-glm (same cloud model + key, the Claude Code loop instead of
+# talos), so this default must match talos-glm's pinned literal in talos.py. The env
+# override steers claude-code-glm ONLY — talos-glm never reads it.
 OLLAMA_CLOUD_BASE_URL: str = "https://ollama.com"
-OLLAMA_CLOUD_MODEL: str = "glm-5.2:cloud"
+OLLAMA_CLOUD_MODEL: str = "glm-5.3:cloud"
 
 # talos binary discovery: default 'talos', PATH-resolved by the subprocess machinery
 # (mirrors how the 'claude' binary is resolved for claude-code engines). Override via
@@ -152,7 +152,7 @@ def load() -> None:
     OLLAMA_CLOUD_BASE_URL = os.environ.get(
         "OLLAMA_CLOUD_BASE_URL", "https://ollama.com"
     )
-    OLLAMA_CLOUD_MODEL = os.environ.get("OLLAMA_CLOUD_MODEL", "glm-5.2:cloud")
+    OLLAMA_CLOUD_MODEL = os.environ.get("OLLAMA_CLOUD_MODEL", "glm-5.3:cloud")
     TALOS_BIN = os.environ.get("TALOS_BIN", "talos")
     TALOS_GATE_TIMEOUT_SECS = int(os.environ.get("TALOS_GATE_TIMEOUT_SECS", "900"))
     OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "qwen3.6:35b")

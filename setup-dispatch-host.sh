@@ -847,7 +847,7 @@ fi
 # ===========================================================================
 # Step 4.5b: talos engine provisioning (--with-talos only)
 # ===========================================================================
-# The talos-* engine family (talos-haiku/sonnet/opus/qwen/glm) invokes the
+# The talos-* engine family (talos-haiku/sonnet/opus/qwen/glm/glm-flash) invokes the
 # `talos` binary as a subprocess. Pass --with-talos to build and install it.
 # When absent, this step prints a single [SKIP] line and mutates nothing.
 # ===========================================================================
