@@ -729,6 +729,54 @@ fi
 fi  # end: if [[ ! -f "$SERVICE_ENV" ]]; else
 
 # ===========================================================================
+# Step 3.6: OLLAMA_CLOUD_API_KEY probe (presence ≠ validity)
+# ===========================================================================
+# Verifies that the key is actually accepted by ollama.com, not merely present.
+# This caught a real incident where a truncated key (len 51 vs expected 57)
+# silently caused every GLM-family run to 401 at agent runtime (kb-03080).
+# Does NOT exit non-zero on failure — setup continues so the rest of the
+# service is installed; operator must fix the key and restart.
+# ===========================================================================
+echo ""
+echo "--- Step 3.6: OLLAMA_CLOUD_API_KEY probe ---"
+
+if [[ ! -f "$SERVICE_ENV" ]]; then
+    skip "OLLAMA_CLOUD_API_KEY probe skipped (env file does not exist)"
+else
+    _ollama_cloud_key="$(_read_env_var OLLAMA_CLOUD_API_KEY)"
+    if [[ -z "$_ollama_cloud_key" ]]; then
+        skip "OLLAMA_CLOUD_API_KEY not set in ${SERVICE_ENV} — skipping probe (GLM engines will be disabled)"
+    elif $DRY_RUN; then
+        would "probe OLLAMA_CLOUD_API_KEY (len ${#_ollama_cloud_key}) via POST https://ollama.com/api/me (5s timeout) — warn on 401/403, do not exit non-zero"
+    else
+        _probe_code="$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 5 \
+            -X POST \
+            -H "Authorization: Bearer ${_ollama_cloud_key}" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            "https://ollama.com/api/me" 2>/dev/null)" || _probe_code="000"
+        if [[ "$_probe_code" == "200" ]]; then
+            info "OLLAMA_CLOUD_API_KEY probe passed (HTTP 200) — key is valid"
+        elif [[ "$_probe_code" == "401" || "$_probe_code" == "403" ]]; then
+            echo ""
+            printf "${YELLOW}========================================${RESET}\n"
+            printf "${YELLOW}  WARNING: OLLAMA_CLOUD_API_KEY INVALID ${RESET}\n"
+            printf "${YELLOW}========================================${RESET}\n"
+            echo ""
+            warn "OLLAMA_CLOUD_API_KEY in ${SERVICE_ENV} was REJECTED by ollama.com (HTTP ${_probe_code})."
+            warn "Key length: ${#_ollama_cloud_key} chars (a valid key is typically 57 chars)."
+            warn "The GLM-family engines (talos-glm, claude-code-glm, talos-glm-flash) will be"
+            warn "UNAVAILABLE until this is fixed. Update OLLAMA_CLOUD_API_KEY in ${SERVICE_ENV}"
+            warn "with a valid key from https://ollama.com, then: systemctl restart ${SERVICE_NAME}"
+            echo ""
+        else
+            warn "OLLAMA_CLOUD_API_KEY probe returned HTTP ${_probe_code} (network error or unexpected status) — key validity unknown; GLM engines will attempt to connect at runtime"
+        fi
+    fi
+fi
+
+# ===========================================================================
 # Step 4: Install dependencies (uv + agent-gtd-dispatch wheel)
 # ===========================================================================
 echo ""

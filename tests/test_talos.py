@@ -384,6 +384,19 @@ class TestOllamaCloudApiKeyConfig:
 
 
 class TestTalosAvailabilityGating:
+    @pytest.fixture(autouse=True)
+    def _reset_cloud_probe(self, monkeypatch):
+        """Reset probe cache + sentinels; mock probe to 'valid' so tests that
+        call get_available_engine_names() don't trigger real network calls."""
+        from agent_gtd_dispatch import cloud_auth, engines
+
+        monkeypatch.setattr(cloud_auth, "_probe_result", None)
+        monkeypatch.setattr(engines, "_ollama_cloud_warning_logged", False)
+        monkeypatch.setattr(engines, "_ollama_cloud_error_logged", False)
+        # Default: probe returns 'valid' (tests that want 'unavailable' use
+        # an empty key, which short-circuits before the probe is called).
+        monkeypatch.setattr(cloud_auth, "probe_ollama_cloud_key", lambda _k: "valid")
+
     def test_all_available_with_all_prereqs_set(self, monkeypatch) -> None:
         from agent_gtd_dispatch import config
         from agent_gtd_dispatch.engines import get_available_engine_names

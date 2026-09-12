@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,8 @@ from agent_gtd_dispatch_protocol.models import DispatchMode
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+logger = logging.getLogger(__name__)
 
 # Env vars shared by all engines — safe to pass to any subprocess
 COMMON_ENV_KEYS: frozenset[str] = frozenset(
@@ -446,6 +449,62 @@ _CLAUDE_CODE_ENGINES: frozenset[str] = frozenset(
     {"claude-code", "claude-code-sonnet", "claude-code-haiku"}
 )
 
+# All engine names gated on OLLAMA_CLOUD_API_KEY.  Listed here rather than
+# inline so the error message can enumerate the withheld engines dynamically.
+_OLLAMA_CLOUD_ENGINE_NAMES: frozenset[str] = frozenset(
+    {"claude-code-glm", "talos-glm", "talos-glm-flash"}
+)
+
+# "Logged once" sentinels for the cloud-key availability gate so that
+# repeated calls to is_engine_available don't flood the log.
+_ollama_cloud_warning_logged: bool = False
+_ollama_cloud_error_logged: bool = False
+
+
+def _is_ollama_cloud_engine_available() -> bool:
+    """Gate shared by every engine in ``_OLLAMA_CLOUD_ENGINE_NAMES``.
+
+    Returns ``True`` iff ``OLLAMA_CLOUD_API_KEY`` is truthy **and** the
+    process-lifetime probe result is not ``'invalid'``.
+
+    * ``'valid'``   → available.
+    * ``'unknown'`` → available (a network blip must not unadvertise an
+      engine), but logs one WARNING.
+    * ``'invalid'`` → unavailable; logs one ERROR naming the key length (never
+      the key value itself) and the engines being withheld.
+    * Empty / missing key → unavailable with no network call.
+    """
+    global _ollama_cloud_warning_logged, _ollama_cloud_error_logged
+
+    from . import cloud_auth, config  # local import: safe before config.load()
+
+    key = config.OLLAMA_CLOUD_API_KEY
+    if not key:
+        return False
+
+    result = cloud_auth.probe_ollama_cloud_key(key)
+
+    if result == "invalid":
+        if not _ollama_cloud_error_logged:
+            _ollama_cloud_error_logged = True
+            withheld = sorted(n for n in _OLLAMA_CLOUD_ENGINE_NAMES if n in ENGINES)
+            logger.error(
+                "OLLAMA_CLOUD_API_KEY rejected by Ollama cloud (key length: %d)."
+                " Withholding engines: %s",
+                len(key),
+                withheld,
+            )
+        return False
+
+    if result == "unknown" and not _ollama_cloud_warning_logged:
+        _ollama_cloud_warning_logged = True
+        logger.warning(
+            "OLLAMA_CLOUD_API_KEY probe returned unknown (network error or"
+            " timeout); Ollama-cloud engines remain available."
+        )
+
+    return True
+
 
 def is_engine_available(engine: Engine) -> bool:
     """Return True if this engine can be attempted on the host.
@@ -469,16 +528,15 @@ def is_engine_available(engine: Engine) -> bool:
         from . import config
 
         return bool(config.OLLAMA_BASE_URL)
-    if name == "claude-code-glm":
-        # Ollama-Cloud-routed Claude Code: gate on the distinct cloud key (same
-        # credential talos-glm consumes). No local Ollama server involved.
-        from . import config
-
-        return bool(config.OLLAMA_CLOUD_API_KEY)
+    # Ollama-cloud engines: all validated through one probe-backed gate.
+    # This consolidates claude-code-glm, talos-glm, and talos-glm-flash (if
+    # present) — see _is_ollama_cloud_engine_available for the full policy.
+    if name in _OLLAMA_CLOUD_ENGINE_NAMES:
+        return _is_ollama_cloud_engine_available()
     # Talos family: gate on the credentials the per-engine env overlay consumes
     # (see talos.talos_env_overlay). Anthropic-backed talos engines need
     # ANTHROPIC_API_KEY; talos-qwen needs a reachable Ollama server (mirrors the
-    # claude-code-ollama gate above); talos-glm needs the distinct cloud key.
+    # claude-code-ollama gate above).
     # This is load-bearing — /info surfaces get_available_engine_names() and
     # agent_gtd's dispatch_router refuses to route to an unadvertised engine.
     if name in ("talos-haiku", "talos-sonnet", "talos-opus"):
@@ -489,10 +547,6 @@ def is_engine_available(engine: Engine) -> bool:
         from . import config
 
         return bool(config.OLLAMA_BASE_URL)
-    if name == "talos-glm":
-        from . import config
-
-        return bool(config.OLLAMA_CLOUD_API_KEY)
     return False
 
 

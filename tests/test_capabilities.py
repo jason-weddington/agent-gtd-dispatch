@@ -23,6 +23,14 @@ def _env(tmp_path):
         "AGENT_GTD_API_KEY": "test-gtd-key",
         "ANTHROPIC_API_KEY": "sk-ant-test",
         "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+        # Blank the optional engine credentials so a dev box's exported keys
+        # can't leak in: availability would drift from the assertions below,
+        # and a real OLLAMA_CLOUD_API_KEY would make the cloud-key probe hit
+        # ollama.com for real.
+        "KIRO_API_KEY": "",
+        "OLLAMA_BASE_URL": "",
+        "OLLAMA_API_KEY": "",
+        "OLLAMA_CLOUD_API_KEY": "",
     }
     with patch.dict(os.environ, env):
         from agent_gtd_dispatch import config
@@ -129,6 +137,18 @@ class TestInfoEndpoint:
 
 
 class TestEngineAvailability:
+    @pytest.fixture(autouse=True)
+    def _reset_cloud_probe(self, monkeypatch):
+        """Reset probe cache and sentinels; mock probe to 'valid' so cloud-key
+        tests don't make real network calls.  Empty-key tests are unaffected
+        because the short-circuit fires before the probe is ever called."""
+        from agent_gtd_dispatch import cloud_auth, engines
+
+        monkeypatch.setattr(cloud_auth, "_probe_result", None)
+        monkeypatch.setattr(engines, "_ollama_cloud_warning_logged", False)
+        monkeypatch.setattr(engines, "_ollama_cloud_error_logged", False)
+        monkeypatch.setattr(cloud_auth, "probe_ollama_cloud_key", lambda _k: "valid")
+
     def test_claude_code_available_with_oauth_token(self, monkeypatch) -> None:
         from agent_gtd_dispatch.engines import CLAUDE, is_engine_available
 
@@ -454,3 +474,267 @@ class TestAgentsEndpoint:
         resp = client.get("/agents", headers=auth_headers)
         assert resp.status_code == 200
         assert resp.json() == {"agents": []}
+
+
+# ---------------------------------------------------------------------------
+# cloud_auth.probe_ollama_cloud_key
+# ---------------------------------------------------------------------------
+
+
+class TestProbeOllamaCloudKey:
+    """Tests for probe_ollama_cloud_key — no real network calls permitted."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self, monkeypatch):
+        """Reset the process-lifetime probe cache before each test."""
+        from agent_gtd_dispatch import cloud_auth
+
+        monkeypatch.setattr(cloud_auth, "_probe_result", None)
+
+    def _mock_urlopen_200(self, monkeypatch):
+        import urllib.request
+
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+        monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _Response())
+
+    def _mock_urlopen_http_error(self, monkeypatch, code):
+        import urllib.error
+        import urllib.request
+
+        def _raise(req, timeout):
+            raise urllib.error.HTTPError(
+                url="https://ollama.com/api/me",
+                code=code,
+                msg="Error",
+                hdrs=None,  # type: ignore[arg-type]
+                fp=None,
+            )
+
+        monkeypatch.setattr(urllib.request, "urlopen", _raise)
+
+    def test_empty_key_returns_invalid_without_network(self, monkeypatch) -> None:
+        """Empty key → 'invalid' immediately; cache must NOT be set."""
+        import urllib.request
+
+        from agent_gtd_dispatch import cloud_auth
+
+        def _should_not_call(req, timeout):
+            raise AssertionError("urlopen must not be called for an empty key")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _should_not_call)
+
+        result = cloud_auth.probe_ollama_cloud_key("")
+        assert result == "invalid"
+        # Cache is NOT updated for empty-key short-circuit
+        assert cloud_auth._probe_result is None
+
+    def test_valid_key_returns_valid(self, monkeypatch) -> None:
+        """HTTP 200 → 'valid'; result is cached."""
+        from agent_gtd_dispatch import cloud_auth
+
+        self._mock_urlopen_200(monkeypatch)
+
+        result = cloud_auth.probe_ollama_cloud_key("good-key")
+        assert result == "valid"
+        assert cloud_auth._probe_result == "valid"
+
+    def test_401_returns_invalid(self, monkeypatch) -> None:
+        """HTTP 401 → 'invalid'; result is cached."""
+        from agent_gtd_dispatch import cloud_auth
+
+        self._mock_urlopen_http_error(monkeypatch, 401)
+
+        result = cloud_auth.probe_ollama_cloud_key("bad-key")
+        assert result == "invalid"
+        assert cloud_auth._probe_result == "invalid"
+
+    def test_403_returns_invalid(self, monkeypatch) -> None:
+        """HTTP 403 → 'invalid'; result is cached."""
+        from agent_gtd_dispatch import cloud_auth
+
+        self._mock_urlopen_http_error(monkeypatch, 403)
+
+        result = cloud_auth.probe_ollama_cloud_key("bad-key")
+        assert result == "invalid"
+        assert cloud_auth._probe_result == "invalid"
+
+    def test_other_http_status_returns_unknown(self, monkeypatch) -> None:
+        """Non-200, non-401/403 HTTP status → 'unknown'."""
+        from agent_gtd_dispatch import cloud_auth
+
+        self._mock_urlopen_http_error(monkeypatch, 500)
+
+        result = cloud_auth.probe_ollama_cloud_key("some-key")
+        assert result == "unknown"
+        assert cloud_auth._probe_result == "unknown"
+
+    def test_timeout_returns_unknown(self, monkeypatch) -> None:
+        """Timeout → 'unknown'."""
+        import urllib.request
+
+        from agent_gtd_dispatch import cloud_auth
+
+        def _timeout(req, timeout):
+            raise TimeoutError("timed out")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _timeout)
+
+        result = cloud_auth.probe_ollama_cloud_key("some-key")
+        assert result == "unknown"
+        assert cloud_auth._probe_result == "unknown"
+
+    def test_network_error_returns_unknown(self, monkeypatch) -> None:
+        """Generic network/OS error → 'unknown'."""
+        import urllib.error
+        import urllib.request
+
+        from agent_gtd_dispatch import cloud_auth
+
+        def _fail(req, timeout):
+            raise urllib.error.URLError("name or service not known")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _fail)
+
+        result = cloud_auth.probe_ollama_cloud_key("some-key")
+        assert result == "unknown"
+
+    def test_probe_runs_at_most_once(self, monkeypatch) -> None:
+        """Second call with a non-empty key returns cached result (no re-probe)."""
+        import urllib.request
+
+        from agent_gtd_dispatch import cloud_auth
+
+        call_count = 0
+
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+        def _counting_urlopen(req, timeout):
+            nonlocal call_count
+            call_count += 1
+            return _Response()
+
+        monkeypatch.setattr(urllib.request, "urlopen", _counting_urlopen)
+
+        r1 = cloud_auth.probe_ollama_cloud_key("key")
+        r2 = cloud_auth.probe_ollama_cloud_key("key")
+
+        assert r1 == "valid"
+        assert r2 == "valid"
+        assert call_count == 1  # exactly one HTTP call despite two invocations
+
+
+# ---------------------------------------------------------------------------
+# Ollama-cloud engine availability gating
+# ---------------------------------------------------------------------------
+
+
+class TestOllamaCloudEngineGating:
+    """Tests for is_engine_available with mocked probe results."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_state(self, monkeypatch):
+        """Reset probe cache and per-process logging sentinels."""
+        from agent_gtd_dispatch import cloud_auth, engines
+
+        monkeypatch.setattr(cloud_auth, "_probe_result", None)
+        monkeypatch.setattr(engines, "_ollama_cloud_warning_logged", False)
+        monkeypatch.setattr(engines, "_ollama_cloud_error_logged", False)
+
+    def test_empty_key_unavailable_no_probe(self, monkeypatch) -> None:
+        """Empty OLLAMA_CLOUD_API_KEY → engine unavailable, probe never called."""
+        import urllib.request
+
+        from agent_gtd_dispatch import cloud_auth, config, engines
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "")
+
+        def _should_not_call(req, timeout):
+            raise AssertionError("probe must not run for empty key")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _should_not_call)
+
+        assert engines.is_engine_available(engines.TALOS_GLM) is False
+        assert cloud_auth._probe_result is None
+
+    def test_valid_probe_makes_engine_available(self, monkeypatch) -> None:
+        """Key present + probe='valid' → engine available."""
+        from agent_gtd_dispatch import cloud_auth, config, engines
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "valid-key")
+        monkeypatch.setattr(cloud_auth, "probe_ollama_cloud_key", lambda _k: "valid")
+
+        assert engines.is_engine_available(engines.TALOS_GLM) is True
+
+    def test_invalid_probe_makes_engine_unavailable(self, monkeypatch) -> None:
+        """Key present + probe='invalid' → engine unavailable."""
+        from agent_gtd_dispatch import cloud_auth, config, engines
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "bad-key")
+        monkeypatch.setattr(cloud_auth, "probe_ollama_cloud_key", lambda _k: "invalid")
+
+        assert engines.is_engine_available(engines.TALOS_GLM) is False
+
+    def test_unknown_probe_keeps_engine_available(self, monkeypatch) -> None:
+        """Key present + probe='unknown' → engine remains available (network blip)."""
+        from agent_gtd_dispatch import cloud_auth, config, engines
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "some-key")
+        monkeypatch.setattr(cloud_auth, "probe_ollama_cloud_key", lambda _k: "unknown")
+
+        assert engines.is_engine_available(engines.TALOS_GLM) is True
+
+    def test_invalid_probe_logs_error_once_with_key_length(
+        self, monkeypatch, caplog
+    ) -> None:
+        """'invalid' logs exactly one ERROR naming key length, never the key."""
+        import logging
+
+        from agent_gtd_dispatch import cloud_auth, config, engines
+
+        key = "x" * 51  # real incident: truncated to 51 chars
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", key)
+        monkeypatch.setattr(cloud_auth, "probe_ollama_cloud_key", lambda _k: "invalid")
+
+        with caplog.at_level(logging.ERROR, logger="agent_gtd_dispatch.engines"):
+            engines.is_engine_available(engines.TALOS_GLM)
+            engines.is_engine_available(engines.TALOS_GLM)  # second call
+
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1, "ERROR must be logged exactly once"
+        assert "51" in errors[0].message  # key length present
+        assert key not in errors[0].message  # key value absent
+
+    def test_unknown_probe_logs_warning_once(self, monkeypatch, caplog) -> None:
+        """'unknown' logs exactly one WARNING; no re-log on subsequent calls."""
+        import logging
+
+        from agent_gtd_dispatch import cloud_auth, config, engines
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "some-key")
+        monkeypatch.setattr(cloud_auth, "probe_ollama_cloud_key", lambda _k: "unknown")
+
+        with caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.engines"):
+            engines.is_engine_available(engines.TALOS_GLM)
+            engines.is_engine_available(engines.TALOS_GLM)  # second call
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "agent_gtd_dispatch.engines" in r.name
+        ]
+        assert len(warnings) == 1, "WARNING must be logged exactly once"
