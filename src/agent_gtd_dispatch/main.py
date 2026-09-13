@@ -1438,6 +1438,47 @@ async def _dispatch_worker(
         def _register_subprocess(proc: subprocess.Popen[bytes]) -> None:
             _active_subprocesses[run.id] = proc
 
+        # Defense in depth: talos is build-mode only (no GTD/MCP access, and
+        # the worker below commits + pushes its own output — a plan/manage
+        # run handed a talos engine would try to build and commit code
+        # instead of writing a spec / managing a rollout). The run-creation
+        # endpoint already rejects this combination with HTTP 422 when the
+        # engine is known at request time; this guard catches any path where
+        # the resolved engine only becomes talos afterward (e.g. a relaunch/
+        # retry) so such a run can never reach `_run_talos`.
+        if is_talos_engine(engine_used.name) and mode != DispatchMode.BUILD:
+            _talos_mode_str = mode.value if hasattr(mode, "value") else str(mode)
+            _talos_reject_msg = (
+                f"Engine '{engine_used.name}' is a talos engine; talos is "
+                f"build mode only, refusing to run in {_talos_mode_str} mode."
+            )
+            logger.error(
+                "run %s: rejecting talos engine in non-build mode: %s",
+                run.id,
+                _talos_reject_msg,
+            )
+            _talos_reject_now = datetime.now(UTC).isoformat()
+            await db.update_run(
+                run.id,
+                status=RunStatus.failed,
+                completed_at=_talos_reject_now,
+                error=_talos_reject_msg,
+            )
+            _publish_run_event(run.id, "failed", _talos_reject_now)
+            if run.item_id is not None:
+                try:
+                    await gtd_client.post_comment(
+                        run.item_id,
+                        _talos_reject_msg,
+                        created_by=attribution or "agent-gtd-dispatch",
+                        token=run.callback_token,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to post talos-reject comment for run %s", run.id
+                    )
+            return
+
         # Talos branch: separate execution path that owns git + comment-back
         # inline. Enters INSTEAD of run_agent + verify_pushes because talos has
         # no GTD access (by design) and never runs `git commit` itself — the
@@ -1821,12 +1862,31 @@ async def dispatch_item(
     _: str = Depends(_verify_api_key),
 ) -> RunResponse:
     """Start a new dispatch run for a GTD item."""
+    # talos-* is BUILD-only: talos has no GTD/MCP access and the worker
+    # commits + pushes its own output, so a plan/manage dispatch handed a
+    # talos engine would try to build and commit code instead of writing a
+    # spec / managing a rollout. Reject up front (422) rather than silently
+    # swapping engines, since the engine is known at request time here — the
+    # caller should fix the request (e.g. by dropping the item's build_engine
+    # override for plan mode) rather than have it silently run as a different
+    # engine. See the `_dispatch_worker` guard immediately before the
+    # `is_talos_engine(engine_used.name)` branch for the defense-in-depth
+    # backstop covering paths where the engine only becomes talos afterward.
+    if body.mode != DispatchMode.BUILD and is_talos_engine(body.engine):
+        _mode_str = body.mode.value if hasattr(body.mode, "value") else str(body.mode)
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Engine '{body.engine}' is a talos engine; talos is build "
+                f"mode only, refusing to dispatch in {_mode_str} mode."
+            ),
+        )
+
     # Plan-mode and manage-mode always use Anthropic, regardless of requested engine.
     # The Ollama-routed Claude engines (claude-code-ollama local, claude-code-glm
-    # cloud) and the talos-* family are all BUILD-only; plan/manage dispatches swap
-    # to claude-code so the existing planner/manager code path runs untouched (small
-    # local/cloud models are unreliable at multi-wave management; talos itself does
-    # not implement plan/manage modes).
+    # cloud) are BUILD-only; plan/manage dispatches swap to claude-code so the
+    # existing planner/manager code path runs untouched (small local/cloud
+    # models are unreliable at multi-wave management).
     effective_engine_name = body.engine
     _engine_swap_reason = ""
     if body.mode != DispatchMode.BUILD and body.engine == "claude-code-ollama":
@@ -1835,9 +1895,6 @@ async def dispatch_item(
     elif body.mode != DispatchMode.BUILD and body.engine == "claude-code-glm":
         effective_engine_name = "claude-code"
         _engine_swap_reason = "plan/manage mode does not support ollama-cloud glm"
-    elif body.mode != DispatchMode.BUILD and is_talos_engine(body.engine):
-        effective_engine_name = "claude-code"
-        _engine_swap_reason = "plan/manage mode does not support talos"
     engine_swapped = body.engine != effective_engine_name
     try:
         engine = get_engine(effective_engine_name)
@@ -2058,12 +2115,11 @@ async def dispatch_item(
         branch_name = dispatch.branch_name_for_item(body.item_id, item["title"])
         item_id_for_run = body.item_id
 
-    # Talos-only pre-clone rejections. Runs post-swap: after the plan/manage
-    # engine swap above, effective_engine_name is only in TALOS_ENGINES for
-    # BUILD-mode dispatches — so these two guards do NOT fire against a
-    # non-BUILD dispatch that started life as a talos-* request. Both must
-    # happen BEFORE db.insert_run so a rejected dispatch never leaves a run
-    # row behind.
+    # Talos-only pre-clone rejections. The non-BUILD + talos combination is
+    # already rejected with HTTP 422 above, before any of this — so by this
+    # point effective_engine_name is only in TALOS_ENGINES for BUILD-mode
+    # dispatches. Must happen BEFORE db.insert_run so a rejected dispatch
+    # never leaves a run row behind.
     if is_talos_engine(effective_engine_name):
         # Non-empty project.gate_command is a talos-only requirement — the
         # TaskSpec's gate_command is the definition of Done, and talos self-checks

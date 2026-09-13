@@ -1014,35 +1014,46 @@ class TestDispatchGateCommandRequired:
         assert resp.status_code == 200
 
 
-class TestPlanModeTalosSwap:
+class TestPlanModeTalosRejected:
+    """talos-* is build-mode only: a plan/manage request carrying a talos
+    engine must be rejected at the run-creation endpoint (422) rather than
+    silently swapped to claude-code, and must never reach `_run_talos`.
+    """
+
+    @patch("agent_gtd_dispatch.main._run_talos", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.gtd_client")
-    def test_plan_mode_talos_swaps_to_claude_code(
-        self, mock_client, client, auth_headers
+    def test_plan_mode_talos_rejected_with_422(
+        self, mock_client, mock_run_talos, client, auth_headers
     ) -> None:
         mock_client.get_item = AsyncMock(return_value=_mk_item())
         mock_client.get_project = AsyncMock(
             return_value=_mk_project(gate_command="uv run pytest")
         )
         with (
-            patch("agent_gtd_dispatch.db.insert_run", new_callable=AsyncMock),
-            patch("agent_gtd_dispatch.main.asyncio.create_task"),
+            patch(
+                "agent_gtd_dispatch.db.insert_run", new_callable=AsyncMock
+            ) as mock_insert,
+            patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
         ):
             resp = client.post(
                 "/dispatch",
                 json={
                     "item_id": "11111111-1111-1111-1111-111111111111",
-                    "engine": "talos-haiku",
+                    "engine": "talos-glm",
                     "mode": "plan",
                     "max_turns": 50,
                 },
                 headers=auth_headers,
             )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["engine"] == "talos-haiku"
-        assert data["engine_actual"] == "claude-code"
-        assert data["engine_swap"] is not None
-        assert "talos" in data["engine_swap"]["reason"]
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert "talos" in detail
+        assert "build mode only" in detail
+        # Rejected before a run row was ever created or a worker task spawned —
+        # proves the plan+talos-glm request never gets anywhere near _run_talos.
+        mock_insert.assert_not_called()
+        mock_create_task.assert_not_called()
+        mock_run_talos.assert_not_called()
 
     @patch("agent_gtd_dispatch.main.gtd_client")
     def test_build_mode_talos_engine_actual_records_talos(
@@ -1067,6 +1078,76 @@ class TestPlanModeTalosSwap:
             )
         assert resp.status_code == 200
         assert resp.json()["engine_actual"] == "talos-haiku"
+
+
+class TestDispatchWorkerRejectsTalosNonBuild:
+    """Defense-in-depth: even if a talos engine reaches `_dispatch_worker` in a
+    non-build mode (bypassing the run-creation-time 422 above — e.g. a
+    relaunch/retry path that doesn't go through POST /dispatch), the worker
+    must fail fast immediately before the `is_talos_engine` branch and never
+    call `_run_talos`.
+    """
+
+    async def test_plan_mode_talos_marks_run_failed_without_run_talos(
+        self, tmp_path
+    ) -> None:
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.engines import get_engine
+        from agent_gtd_dispatch.main import _dispatch_worker
+        from agent_gtd_dispatch.models import DispatchMode, Run, RunStatus
+
+        await db.init_db()
+        run = Run(
+            item_id="item-abc",
+            project_name="agent-gtd-dev",
+            branch_name="feat/x-do-thing",
+            engine="talos-glm",
+            engine_actual="talos-glm",
+            mode=DispatchMode.PLAN,
+        )
+        await db.insert_run(run)
+        engine = get_engine("talos-glm")
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_client,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+            patch(
+                "agent_gtd_dispatch.main._run_talos", new_callable=AsyncMock
+            ) as mock_run_talos,
+        ):
+            mock_client.post_comment = AsyncMock()
+            mock_client.get_item = AsyncMock(
+                return_value={
+                    "id": "item-abc",
+                    "title": "Do the thing",
+                    "project_id": "proj1",
+                }
+            )
+            mock_client.get_project = AsyncMock(
+                return_value={
+                    "id": "proj1",
+                    "name": "agent-gtd-dev",
+                    "git_origin": "git@host:repos/agent-gtd-dev",
+                    "gate_command": "uv run pytest",
+                }
+            )
+            mock_dispatch.prepare_workspace.return_value = tmp_path
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt.return_value = "system prompt"
+            mock_dispatch.cleanup_workspace = MagicMock()
+
+            await _dispatch_worker(run, 50, engine, 1800)
+
+        mock_run_talos.assert_not_called()
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status == RunStatus.failed
+        assert "talos" in (updated.error or "")
+        assert "build mode only" in (updated.error or "")
+        assert mock_client.post_comment.await_count >= 1
+        comment = mock_client.post_comment.await_args_list[-1].args[1]
+        assert "talos" in comment
+        assert "build mode only" in comment
 
 
 # ---------------------------------------------------------------------------
