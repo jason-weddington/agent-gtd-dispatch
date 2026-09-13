@@ -11,7 +11,7 @@ set -euo pipefail
 # so the next run picks up the new binary automatically.  Do NOT restart dispatch-api here.
 #
 # Environment variables:
-#   DISPATCH_HOSTS        Space-separated SSH targets (default: "pironman01 r7-research")
+#   DISPATCH_HOSTS        Space-separated SSH targets (default: "pironman01 r7-research r7-server")
 #   DISPATCH_HOST         Single SSH target — if set, overrides DISPATCH_HOSTS (back-compat)
 #   TALOS_ARTIFACT_BASE   Base URL of the talos artifact tree served by pi-04's Caddy.
 #                         PROVISIONAL default: https://artifacts.lab.jasonweddington.com
@@ -35,7 +35,7 @@ AGENT_GROUP="${AGENT_GROUP:-${AGENT_USER}}"
 if [ -n "${DISPATCH_HOST:-}" ]; then
     HOSTS="${DISPATCH_HOST}"
 else
-    HOSTS="${DISPATCH_HOSTS:-pironman01 r7-research}"
+    HOSTS="${DISPATCH_HOSTS:-pironman01 r7-research r7-server}"
 fi
 
 TARGET_TOKEN=""  # resolved after argument parsing (below)
@@ -74,7 +74,7 @@ Options:
   -h, --help         Show this help text.
 
 Environment variables:
-  DISPATCH_HOSTS        Space-separated SSH targets       (default: "pironman01 r7-research")
+  DISPATCH_HOSTS        Space-separated SSH targets       (default: "pironman01 r7-research r7-server")
   DISPATCH_HOST         Single SSH target (overrides DISPATCH_HOSTS)
   TALOS_ARTIFACT_BASE   Artifact base URL served by pi-04 (provisional default: pypi.lab URL)
   AGENT_USER            OS user that owns the talos binary (default: dispatch)

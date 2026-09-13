@@ -63,7 +63,7 @@ tests/
 - Branch from main: `git checkout -b feat/description` (or `fix/`, `chore/`)
 - Conventional commits enforced on main (hook). Feature branches are free-form.
 - Squash merge to main: `git checkout main && git merge --squash feat/x && git commit`
-- Push to origin freely; `./deploy.sh` deploys current main to all dispatch hosts (`DISPATCH_HOSTS`, default: `pironman01 r7-research`; set `DISPATCH_HOST` to target a single host).
+- Push to origin freely; `./deploy.sh` deploys current main to all dispatch hosts (`DISPATCH_HOSTS`, default: `pironman01 r7-research r7-server`; set `DISPATCH_HOST` to target a single host).
 - `./release.sh` cuts a version (semantic-release), pushes main + tags to origin and github, then deploys.
 - Pre-push hook runs full test suite with coverage (threshold from `[tool.coverage.report]` in `pyproject.toml`).
 - All `uv run` in hooks uses `--frozen` to avoid rebuilding mid-hook.
@@ -173,7 +173,7 @@ dispatch host, per-arch and version-checked.  No cargo build, no Rust toolchain 
 
 | Variable              | Default                                        | Notes |
 |-----------------------|------------------------------------------------|-------|
-| `DISPATCH_HOSTS`      | `pironman01 r7-research`                       | Space-separated SSH targets |
+| `DISPATCH_HOSTS`      | `pironman01 r7-research r7-server`                       | Space-separated SSH targets |
 | `DISPATCH_HOST`       | *(unset)*                                      | Single-host override (back-compat) |
 | `TALOS_ARTIFACT_BASE` | `https://pypi.lab.jasonweddington.com/talos`   | **PROVISIONAL** — update once the pi-04 Caddy URL is finalised (pypi.lab vs talos.lab) |
 | `AGENT_USER`          | `dispatch`                                     | OS user that owns the binary |

@@ -184,7 +184,9 @@ _health_check() {
             info "Health check passed: ${url}"
             return 0
         fi
-        (( attempts++ ))
+        # Not `(( attempts++ ))`: post-increment from 0 evaluates to 0 (exit 1), and
+        # `set -e` then kills the installer silently on the first failed probe.
+        attempts=$((attempts + 1))
         warn "Health check attempt ${attempts}/${max} failed — retrying in ${delay}s"
         sleep "$delay"
     done

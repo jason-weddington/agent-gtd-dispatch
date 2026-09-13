@@ -15,9 +15,10 @@ set -euo pipefail
 # them before this script runs.
 #
 # Environment variables:
-#   DISPATCH_HOSTS  Space-separated SSH targets (default: "pironman01 r7-research")
+#   DISPATCH_HOSTS  Space-separated SSH targets (default: "pironman01 r7-research r7-server")
 #   DISPATCH_HOST   Single SSH target — if set, overrides DISPATCH_HOSTS (back-compat)
 #   SERVICE_USER    Service account owning the tool install (default: dispatch-svc)
+#   AGENT_USER      Agent subprocess user whose Claude Code is refreshed (default: dispatch)
 #   SERVICE_NAME    Systemd service unit name (default: dispatch-api)
 #   DISPATCH_INDEX  Homelab wheel index URL (default: https://pypi.lab.jasonweddington.com/simple/)
 #
@@ -26,9 +27,10 @@ set -euo pipefail
 if [ -n "${DISPATCH_HOST:-}" ]; then
     HOSTS="${DISPATCH_HOST}"
 else
-    HOSTS="${DISPATCH_HOSTS:-pironman01 r7-research}"
+    HOSTS="${DISPATCH_HOSTS:-pironman01 r7-research r7-server}"
 fi
 SERVICE_USER="${SERVICE_USER:-dispatch-svc}"
+AGENT_USER="${AGENT_USER:-dispatch}"
 SERVICE_NAME="${SERVICE_NAME:-dispatch-api}"
 DISPATCH_INDEX="${DISPATCH_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
 
@@ -51,6 +53,14 @@ if ! sudo -u ${SERVICE_USER} -H /home/${SERVICE_USER}/.local/bin/uv tool list | 
     echo "[ERR]  uv tool list does not show agent-gtd-dispatch after install" >&2
     exit 1
 fi
+
+# Refresh the agent user's Claude Code. Headless `claude -p` runs never
+# self-update, so without this the fleet silently drifts (hosts were found
+# ~125 releases behind). Non-fatal: a failed update keeps the old binary.
+if ! sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/claude update >/dev/null 2>&1; then
+    echo "[WARN] claude update failed for ${AGENT_USER} — agent keeps its current version" >&2
+fi
+echo "[OK]   Claude Code (${AGENT_USER}): \$(sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/claude --version)"
 
 # Restart the service so systemd runs the freshly-installed entry point.
 sudo systemctl restart ${SERVICE_NAME}
