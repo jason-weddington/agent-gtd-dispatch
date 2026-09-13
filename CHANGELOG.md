@@ -2,6 +2,17 @@
 
 <!-- version list -->
 
+## v1.21.0 (2026-09-13)
+
+### Features
+
+- **engines**: Talos-glm → glm-5.3, add talos-glm-flash, talos-sonnet → Sonnet 5 (ce002dd4)
+  ([`1df77b9`](https://github.com/repos/agent-gtd-dispatch/commit/1df77b9289e6d1e311eae5405a97c62e33b7c9cb))
+
+- **engines**: Validate OLLAMA_CLOUD_API_KEY, not just its presence (8949ccd0)
+  ([`e9acd96`](https://github.com/repos/agent-gtd-dispatch/commit/e9acd96c0569164dc0f10c3cdf1bae6fc58ebd52))
+
+
 ## v1.20.0 (2026-08-10)
 
 ### Features
