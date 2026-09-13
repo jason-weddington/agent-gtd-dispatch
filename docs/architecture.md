@@ -157,13 +157,57 @@ After a build-mode agent exits 0, `dispatch.verify_pushes()` classifies each rep
 | `pushed` | Local HEAD SHA matches `origin`'s SHA for the feature branch (`git ls-remote`) |
 | `unpushed` | Local commits exist but the remote branch is missing or behind — **or any git command failed** (fail-closed) |
 
-If **any** repo is `unpushed`:
+### Worker push backstop
+
+Before declaring failure, the worker gets one chance to finish the push itself. This
+exists because an agent can commit correct, finished work and then background its
+`git push` (e.g. to avoid blocking on a slow pre-push hook) and exit before the push
+completes — the commit is real, but nothing ever reached origin. The build-mode prompts
+now instruct agents to always push in the foreground and wait for exit 0, but the worker
+backstop covers the case anyway.
+
+For each repo classified `unpushed` with a non-`None` `local_sha` (i.e. `verify_pushes`
+itself didn't fail-closed on a git error — those are left to the normal failure path),
+the worker:
+
+1. Computes `remaining = timeout_seconds - (now - run_start_time)`. If
+   `remaining <= config.PUSH_BACKSTOP_MIN_SECONDS` (env `DISPATCH_PUSH_BACKSTOP_MIN_SECONDS`,
+   default 10s), the backstop is skipped entirely — not enough budget left to plausibly
+   succeed.
+2. Otherwise, for each eligible repo in turn (recomputing `remaining` immediately before
+   each attempt), calls `dispatch.push_unpushed_repo(repo_path, branch_name, remaining)`
+   **exactly once** via `loop.run_in_executor(_executor, ...)` — never inline on the event
+   loop, since a pre-push hook can block for minutes. Hooks stay **enabled**; the helper
+   never passes `--no-verify`. Any exception/timeout from the attempt is caught and logged,
+   not propagated.
+3. Re-runs `dispatch.verify_pushes()` to get the post-backstop classification.
+
+If **any** repo is (still) `unpushed` after the backstop attempt (or after it was skipped):
 
 - The run is flipped to `RunStatus.failed` with error `"push verification failed: ..."`.
 - The per-repo results are serialized as JSON into the `push_results` column on the run row.
 - The workspace is **preserved** (the commits exist only in the clone).
 - A per-repo status comment is posted to the GTD item (including a `[dirty working tree]`
   marker when tracked files were left modified).
+- This failure output is **identical** whether or not a backstop attempt was made — the
+  backstop is invisible on the failure path.
+
+If no repo is unpushed after the backstop, the run proceeds down the normal success path.
+When at least one backstop attempt actually ran and rescued a repo, the worker additionally
+posts one comment to the item:
+
+```
+Push verification found unpushed work after the agent exited (run `{run.id}`). The dispatch worker completed the push before the run would have failed:
+- {repo_name}: pushed by worker ({commits_ahead} commit(s), {local_sha[:8]})
+```
+
+with one bullet per rescued repo, using that repo's pre-backstop `commits_ahead`/`local_sha`.
+
+The backstop only fires on the exit-code-0 success branch (the reported incident was an
+agent that exited cleanly with an incomplete push) — the `TimeoutExpired` "linger success"
+path, and plan/manage modes (`_verify_repos is None`), are unchanged. Talos-engine build
+runs return before `run_agent`/`verify_pushes` are ever reached (talos mints its own
+commit + push, with `--no-verify`, by design), so the backstop cannot apply to them.
 
 Plan and manage modes are exempt — `_verify_repos` is `None` for those, so verification is
 skipped entirely. See `tests/test_push_verification.py` for the full behavior matrix.

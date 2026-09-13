@@ -338,6 +338,27 @@ def is_zero_commits_run(push_results: list[RepoPushStatus]) -> bool:
     )
 
 
+def push_unpushed_repo(
+    repo_path: Path, branch_name: str, timeout_seconds: float
+) -> subprocess.CompletedProcess[bytes]:
+    """Backstop push: complete a push the agent started but never finished.
+
+    Runs synchronously and may block for the full pre-push hook duration (e.g. a
+    coverage-gated test suite) — callers MUST invoke this via
+    ``loop.run_in_executor(_executor, ...)``, never inline on the event loop.
+
+    Hooks stay ENABLED (never ``--no-verify``) — this is the same push the agent
+    would have run, just completed by the worker after the agent exited.
+    """
+    return subprocess.run(
+        _sudo_wrap(["git", "push", "-u", "origin", branch_name]),
+        cwd=repo_path,
+        timeout=timeout_seconds,
+        capture_output=True,
+        check=False,
+    )
+
+
 def _detect_default_branch(repo_path: Path) -> str:
     """Detect the default branch for a cloned repo (detection only, no checkout).
 
@@ -610,7 +631,12 @@ def _build_workspace_layout_section_build(
 
         - **Commit** your changes in whichever repos you modify.
         - **Push `{branch_name}` to origin ONLY in repos where you made commits.**
-        - After each push, verify the remote ref advanced. Run in that repo's directory:
+        - Run `git push` **in the foreground** in each such repo. NEVER invoke `git push`
+          with `run_in_background` or any other async/background execution mechanism.
+          Pre-push hooks may run the full test suite and take several minutes — that is
+          expected; wait for the command to exit. Do not end your turn or session while a
+          `git push` you started is still running.
+        - After each push exits 0, verify the remote ref advanced. Run in that repo's directory:
           ```bash
           git ls-remote origin refs/heads/{branch_name}
           ```
@@ -1777,8 +1803,13 @@ def _build_build_prompt(
         2. **Branch.** You are already on branch `{branch_name}`. Stay on it. Never commit to main.
         3. **Test.** Run the project's test suite before committing. Fix failures.
         4. **Commit.** Use conventional commit messages. Small, focused commits.
-        5. **Push.** When done, push `{branch_name}` to origin. After pushing, verify the remote
-           ref advanced — run:
+        5. **Push.** When done, run `git push` to push `{branch_name}` to origin, **in the
+           foreground**. NEVER invoke `git push` with `run_in_background` or any other
+           async/background execution mechanism. Pre-push hooks may run the full test
+           suite and take several minutes — that is expected; wait for the command to
+           exit. Do not end your turn or session while a `git push` you started is
+           still running. Only after `git push` exits 0 do you proceed to verify the
+           remote ref advanced — run:
            ```bash
            git ls-remote origin refs/heads/{branch_name}
            ```

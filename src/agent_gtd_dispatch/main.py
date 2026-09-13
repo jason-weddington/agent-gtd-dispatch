@@ -1518,6 +1518,7 @@ async def _dispatch_worker(
             # Plan and manage modes are exempt (_verify_repos is None for those).
             push_results_list: list[RepoPushStatus] | None = None
             _push_results_json: str | None = None
+            _rescued_repos: list[RepoPushStatus] = []
             if _verify_repos is not None:
                 push_results_list = dispatch.verify_pushes(
                     _verify_repos, run.branch_name or ""
@@ -1525,6 +1526,66 @@ async def _dispatch_worker(
                 unpushed = [
                     r for r in push_results_list if r.status == PushStatus.unpushed
                 ]
+
+                # Push backstop: the agent exited 0 but left committed work
+                # unpushed (e.g. it backgrounded `git push` and its session ended
+                # before a slow pre-push hook finished). Attempt one bounded,
+                # hooks-enabled push per eligible repo before declaring failure.
+                eligible = [r for r in unpushed if r.local_sha is not None]
+                if eligible:
+                    _repo_paths = {
+                        _name: _path for _name, _path, _base in _verify_repos
+                    }
+                    _attempted_names: set[str] = set()
+                    _elapsed = (datetime.now(UTC) - _run_start_dt).total_seconds()
+                    _remaining = timeout_seconds - _elapsed
+                    if _remaining > config.PUSH_BACKSTOP_MIN_SECONDS:
+                        _loop = asyncio.get_event_loop()
+                        for _r in eligible:
+                            _elapsed = (
+                                datetime.now(UTC) - _run_start_dt
+                            ).total_seconds()
+                            _remaining = timeout_seconds - _elapsed
+                            if _remaining <= config.PUSH_BACKSTOP_MIN_SECONDS:
+                                break
+                            _repo_path = _repo_paths.get(_r.repo_name)
+                            if _repo_path is None:
+                                continue
+                            _attempted_names.add(_r.repo_name)
+                            try:
+                                await _loop.run_in_executor(
+                                    dispatch._executor,
+                                    dispatch.push_unpushed_repo,
+                                    _repo_path,
+                                    run.branch_name or "",
+                                    _remaining,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "push backstop: attempt failed for repo %s"
+                                    " (run %s)",
+                                    _r.repo_name,
+                                    run.id,
+                                )
+                        # Re-classify after the backstop attempt(s).
+                        push_results_list = dispatch.verify_pushes(
+                            _verify_repos, run.branch_name or ""
+                        )
+                        _status_by_name = {r.repo_name: r for r in push_results_list}
+                        _rescued_repos = [
+                            _old
+                            for _old in eligible
+                            if _old.repo_name in _attempted_names
+                            and _status_by_name.get(_old.repo_name) is not None
+                            and _status_by_name[_old.repo_name].status
+                            != PushStatus.unpushed
+                        ]
+                        unpushed = [
+                            r
+                            for r in push_results_list
+                            if r.status == PushStatus.unpushed
+                        ]
+
                 if unpushed:
                     # Build error string: prefix once, one fragment per unpushed repo
                     fragments = []
@@ -1674,6 +1735,29 @@ async def _dispatch_worker(
                 push_results=_push_results_json,
             )
             _publish_run_event(run.id, "succeeded", completed)
+            if _rescued_repos and run.item_id is not None:
+                _rescue_header = (
+                    f"Push verification found unpushed work after the agent"
+                    f" exited (run `{run.id}`). The dispatch worker completed"
+                    " the push before the run would have failed:"
+                )
+                _rescue_bullets = "\n".join(
+                    f"- {r.repo_name}: pushed by worker"
+                    f" ({r.commits_ahead} commit(s), {(r.local_sha or '')[:8]})"
+                    for r in _rescued_repos
+                )
+                try:
+                    await gtd_client.post_comment(
+                        run.item_id,
+                        _rescue_header + "\n" + _rescue_bullets,
+                        created_by=attribution or "agent-gtd-dispatch",
+                        token=run.callback_token,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to post push-backstop rescue comment for run %s",
+                        run.id,
+                    )
         else:
             # Derive error snippet from transcript (stdout/stderr are always "" with Popen streaming)
             error_msg = None

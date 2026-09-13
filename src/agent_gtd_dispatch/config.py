@@ -35,6 +35,11 @@ MAX_MANAGE_RETRIES: int = 2  # max auto-recovery relaunches for manage mode
 MAX_CONCURRENT_RUNS: int = 32  # thread-pool ceiling for run_in_executor
 CANCEL_GRACE_SECONDS: int = 5  # seconds between SIGTERM and SIGKILL on cancel
 
+# Floor on remaining run budget below which the push backstop (worker completes an
+# agent's unfinished `git push` after a successful build-mode exit) is not attempted
+# at all — not enough time left to plausibly succeed (e.g. a slow pre-push hook).
+PUSH_BACKSTOP_MIN_SECONDS: int = 10
+
 # Watchdog (manage-agent staleness detection)
 # Set above the longest build a manager may wait on: a manager has no polling
 # heartbeat, so its state timestamp only advances on real progress. Too low and
@@ -91,7 +96,7 @@ def load() -> None:
     global WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS, MANAGE_TIMEOUT_SECONDS
     global ANTHROPIC_API_KEY, PLANNER_MODEL, MAX_CONCURRENT_RUNS
     global OLLAMA_BASE_URL, OLLAMA_API_KEY, OLLAMA_DEFAULT_MODEL
-    global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS
+    global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS, PUSH_BACKSTOP_MIN_SECONDS
     global OLLAMA_CLOUD_API_KEY, OLLAMA_CLOUD_BASE_URL, OLLAMA_CLOUD_MODEL
     global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS
     global AGENT_SUBPROCESS_USER
@@ -160,6 +165,9 @@ def load() -> None:
         os.environ.get("OLLAMA_TIMEOUT_MULTIPLIER", "2.0")
     )
     CANCEL_GRACE_SECONDS = int(os.environ.get("DISPATCH_CANCEL_GRACE_SECONDS", "5"))
+    PUSH_BACKSTOP_MIN_SECONDS = int(
+        os.environ.get("DISPATCH_PUSH_BACKSTOP_MIN_SECONDS", "10")
+    )
     MANAGE_STALE_THRESHOLD_SECONDS = int(
         os.environ.get("DISPATCH_MANAGE_STALE_THRESHOLD_SECONDS", "2100")
     )

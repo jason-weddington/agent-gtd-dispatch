@@ -432,6 +432,22 @@ class TestBuildSystemPrompt:
             ]
         )
 
+    def test_push_must_run_in_foreground(self) -> None:
+        prompt = self._prompt()
+        assert "foreground" in prompt
+
+    def test_push_forbids_run_in_background(self) -> None:
+        prompt = self._prompt()
+        assert "run_in_background" in prompt
+
+    def test_push_hooks_may_take_minutes(self) -> None:
+        prompt = self._prompt()
+        assert "minutes" in prompt
+
+    def test_push_must_not_end_session_while_running(self) -> None:
+        prompt = self._prompt()
+        assert "still running" in prompt
+
 
 class TestBuildPlanPrompt:
     _item: ClassVar[dict] = {
@@ -2623,6 +2639,36 @@ class TestWorkspacePrompts:
             workspace_repo_dirs=self._repo_dirs,
         )
         assert "ls-remote" in prompt
+
+    def test_build_workspace_section_push_in_foreground(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            self._branch,
+            self._max_turns,
+            workspace_repo_dirs=self._repo_dirs,
+        )
+        assert "foreground" in prompt
+
+    def test_build_workspace_section_forbids_run_in_background(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            self._branch,
+            self._max_turns,
+            workspace_repo_dirs=self._repo_dirs,
+        )
+        assert "run_in_background" in prompt
+
+    def test_build_workspace_section_hooks_may_take_minutes(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            self._branch,
+            self._max_turns,
+            workspace_repo_dirs=self._repo_dirs,
+        )
+        assert "minutes" in prompt
 
     # --- plan prompt with workspace_repo_dirs ---
 

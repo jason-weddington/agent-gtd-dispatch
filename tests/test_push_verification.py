@@ -868,3 +868,441 @@ class TestWorkerVerification:
 
         # verify_pushes must NOT be called for plan mode
         mock_dispatch.verify_pushes.assert_not_called()
+
+
+class TestPushUnpushedRepo:
+    """Tests for dispatch.push_unpushed_repo() — the worker's backstop push primitive."""
+
+    def test_calls_sudo_wrap_with_git_push_dash_u_origin_branch(self, tmp_path) -> None:
+        from agent_gtd_dispatch.dispatch import push_unpushed_repo
+
+        with (
+            patch(
+                "agent_gtd_dispatch.dispatch._sudo_wrap", side_effect=lambda c: c
+            ) as mock_wrap,
+            patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = _make_completed(0)
+            push_unpushed_repo(tmp_path, "feat/x", 120.0)
+
+        mock_wrap.assert_called_once_with(["git", "push", "-u", "origin", "feat/x"])
+
+    def test_never_passes_no_verify(self, tmp_path) -> None:
+        from agent_gtd_dispatch.dispatch import push_unpushed_repo
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = _make_completed(0)
+            push_unpushed_repo(tmp_path, "feat/x", 120.0)
+
+        cmd_arg = mock_run.call_args[0][0]
+        assert "--no-verify" not in cmd_arg
+
+    def test_passes_timeout_through_to_subprocess_run(self, tmp_path) -> None:
+        from agent_gtd_dispatch.dispatch import push_unpushed_repo
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = _make_completed(0)
+            push_unpushed_repo(tmp_path, "feat/x", 45.5)
+
+        assert mock_run.call_args.kwargs["timeout"] == 45.5
+
+    def test_timeout_expired_propagates(self, tmp_path) -> None:
+        from agent_gtd_dispatch.dispatch import push_unpushed_repo
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(
+                cmd=["git", "push"], timeout=10
+            )
+            with pytest.raises(subprocess.TimeoutExpired):
+                push_unpushed_repo(tmp_path, "feat/x", 10.0)
+
+
+class TestPushBackstop:
+    """Worker-level integration tests for the push backstop (AC-6/7/8)."""
+
+    @pytest.mark.asyncio
+    async def test_backstop_succeeds_marks_run_succeeded_and_posts_rescue_comment(
+        self, tmp_path
+    ) -> None:
+        """Eligible unpushed repo, backstop pushes it, re-verify finds it pushed →
+        run succeeds and a rescue comment is posted with the pinned wording."""
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import DispatchMode, PushStatus, Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-backstop-ok",
+            project_name="TestProject",
+            branch_name="feat/backstop-ok",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        unpushed_result = RepoPushStatus(
+            repo_name="repos-testproj",
+            branch="feat/backstop-ok",
+            status=PushStatus.unpushed,
+            local_sha="deadbeef",
+            remote_sha=None,
+            commits_ahead=2,
+            dirty=False,
+        )
+        pushed_after_backstop = RepoPushStatus(
+            repo_name="repos-testproj",
+            branch="feat/backstop-ok",
+            status=PushStatus.pushed,
+            local_sha="deadbeef",
+            remote_sha="deadbeef",
+            commits_ahead=2,
+            dirty=False,
+        )
+
+        completed_result = MagicMock()
+        completed_result.returncode = 0
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_gtd.get_item = AsyncMock(
+                return_value={
+                    "id": "item-backstop-ok",
+                    "title": "Fix bug",
+                    "project_id": "proj1",
+                }
+            )
+            mock_gtd.get_project = AsyncMock(
+                return_value={
+                    "id": "proj1",
+                    "name": "TestProject",
+                    "git_origin": "git@host:repos/testproj",
+                }
+            )
+            mock_gtd.post_comment = AsyncMock()
+            mock_gtd.list_attachments = AsyncMock(return_value=[])
+
+            fake_workspace = tmp_path / "repos-testproj-backstop-ok"
+            fake_workspace.mkdir()
+            mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
+            mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
+            mock_dispatch.repo_name_from_origin = MagicMock(
+                return_value="repos-testproj"
+            )
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
+            mock_dispatch.verify_pushes = MagicMock(
+                side_effect=[[unpushed_result], [pushed_after_backstop]]
+            )
+            mock_dispatch.push_unpushed_repo = MagicMock(
+                return_value=_make_completed(0)
+            )
+            mock_dispatch._executor = None
+            mock_dispatch.cleanup_workspace = MagicMock()
+
+            from agent_gtd_dispatch.engines import CLAUDE
+            from agent_gtd_dispatch.main import _dispatch_worker
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "succeeded"
+
+        # Backstop attempted exactly once for the eligible repo
+        mock_dispatch.push_unpushed_repo.assert_called_once()
+        call_args = mock_dispatch.push_unpushed_repo.call_args[0]
+        assert call_args[0] == fake_workspace
+        assert call_args[1] == "feat/backstop-ok"
+
+        # Re-verified after the backstop attempt
+        assert mock_dispatch.verify_pushes.call_count == 2
+
+        # Rescue comment posted with the pinned wording
+        comment_texts = [
+            str(c.args[1]) if c.args else str(c.kwargs.get("content", ""))
+            for c in mock_gtd.post_comment.call_args_list
+        ]
+        rescue_comments = [t for t in comment_texts if "completed the push before" in t]
+        assert len(rescue_comments) == 1
+        assert f"run `{run.id}`" in rescue_comments[0]
+        assert (
+            "- repos-testproj: pushed by worker (2 commit(s), deadbeef)"
+            in rescue_comments[0]
+        )
+
+        # Workspace cleaned up as normal on success
+        mock_dispatch.cleanup_workspace.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_backstop_fails_falls_through_to_unchanged_failure_path(
+        self, tmp_path
+    ) -> None:
+        """Backstop attempted but repo still unpushed after re-verify → failure
+        path/output is identical to the no-backstop failing case."""
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import DispatchMode, PushStatus, Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-backstop-fail",
+            project_name="TestProject",
+            branch_name="feat/backstop-fail",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        unpushed_result = RepoPushStatus(
+            repo_name="repos-testproj",
+            branch="feat/backstop-fail",
+            status=PushStatus.unpushed,
+            local_sha="deadbeef",
+            remote_sha=None,
+            commits_ahead=2,
+            dirty=False,
+        )
+
+        completed_result = MagicMock()
+        completed_result.returncode = 0
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_gtd.get_item = AsyncMock(
+                return_value={
+                    "id": "item-backstop-fail",
+                    "title": "Fix bug",
+                    "project_id": "proj1",
+                }
+            )
+            mock_gtd.get_project = AsyncMock(
+                return_value={
+                    "id": "proj1",
+                    "name": "TestProject",
+                    "git_origin": "git@host:repos/testproj",
+                }
+            )
+            mock_gtd.post_comment = AsyncMock()
+            mock_gtd.list_attachments = AsyncMock(return_value=[])
+
+            fake_workspace = tmp_path / "repos-testproj-backstop-fail"
+            fake_workspace.mkdir()
+            mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
+            mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
+            mock_dispatch.repo_name_from_origin = MagicMock(
+                return_value="repos-testproj"
+            )
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
+            # Still unpushed both before AND after the backstop attempt.
+            mock_dispatch.verify_pushes = MagicMock(
+                side_effect=[[unpushed_result], [unpushed_result]]
+            )
+            mock_dispatch.push_unpushed_repo = MagicMock(
+                return_value=_make_completed(1, stderr="rejected")
+            )
+            mock_dispatch._executor = None
+            mock_dispatch.cleanup_workspace = MagicMock()
+
+            from agent_gtd_dispatch.engines import CLAUDE
+            from agent_gtd_dispatch.main import _dispatch_worker
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "failed"
+        assert updated.error is not None
+        assert "push verification failed" in updated.error
+        assert "repos-testproj: 2 unpushed commit(s) on feat/backstop-fail" in (
+            updated.error
+        )
+
+        # The backstop attempt ran but is invisible in the failure output.
+        mock_dispatch.push_unpushed_repo.assert_called_once()
+        comment_texts = [
+            str(c.args[1]) if c.args else str(c.kwargs.get("content", ""))
+            for c in mock_gtd.post_comment.call_args_list
+        ]
+        verification_comment = next(
+            (c for c in comment_texts if "Push verification failed" in c), None
+        )
+        assert verification_comment is not None
+        assert "worker" not in verification_comment
+
+        # cleanup_workspace must NOT have been called (workspace preserved)
+        mock_dispatch.cleanup_workspace.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_remaining_budget_below_floor_skips_backstop(self, tmp_path) -> None:
+        """remaining <= config.PUSH_BACKSTOP_MIN_SECONDS → push_unpushed_repo is
+        never called; existing (no-backstop) failure path is taken."""
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import DispatchMode, PushStatus, Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-backstop-nobudget",
+            project_name="TestProject",
+            branch_name="feat/backstop-nobudget",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        unpushed_result = RepoPushStatus(
+            repo_name="repos-testproj",
+            branch="feat/backstop-nobudget",
+            status=PushStatus.unpushed,
+            local_sha="deadbeef",
+            remote_sha=None,
+            commits_ahead=2,
+            dirty=False,
+        )
+
+        completed_result = MagicMock()
+        completed_result.returncode = 0
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_gtd.get_item = AsyncMock(
+                return_value={
+                    "id": "item-backstop-nobudget",
+                    "title": "Fix bug",
+                    "project_id": "proj1",
+                }
+            )
+            mock_gtd.get_project = AsyncMock(
+                return_value={
+                    "id": "proj1",
+                    "name": "TestProject",
+                    "git_origin": "git@host:repos/testproj",
+                }
+            )
+            mock_gtd.post_comment = AsyncMock()
+            mock_gtd.list_attachments = AsyncMock(return_value=[])
+
+            fake_workspace = tmp_path / "repos-testproj-backstop-nobudget"
+            fake_workspace.mkdir()
+            mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
+            mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
+            mock_dispatch.repo_name_from_origin = MagicMock(
+                return_value="repos-testproj"
+            )
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
+            mock_dispatch.verify_pushes = MagicMock(return_value=[unpushed_result])
+            mock_dispatch.push_unpushed_repo = MagicMock(
+                return_value=_make_completed(0)
+            )
+            mock_dispatch._executor = None
+            mock_dispatch.cleanup_workspace = MagicMock()
+
+            from agent_gtd_dispatch.engines import CLAUDE
+            from agent_gtd_dispatch.main import _dispatch_worker
+
+            # timeout_seconds (5) is below config.PUSH_BACKSTOP_MIN_SECONDS (10
+            # by default) — no plausible budget remains for a backstop attempt.
+            assert config.PUSH_BACKSTOP_MIN_SECONDS == 10
+            await _dispatch_worker(run, 50, CLAUDE, 5)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "failed"
+
+        mock_dispatch.push_unpushed_repo.assert_not_called()
+        # verify_pushes only called once — no re-verification without an attempt
+        mock_dispatch.verify_pushes.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_verification_error_repo_never_passed_to_backstop(
+        self, tmp_path
+    ) -> None:
+        """A repo classified unpushed with local_sha=None (verify_pushes' own
+        fail-closed error case) is never eligible for the backstop."""
+        from unittest.mock import AsyncMock, patch
+
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import DispatchMode, PushStatus, Run
+
+        await db.init_db()
+        run = Run(
+            item_id="item-backstop-verifyerr",
+            project_name="TestProject",
+            branch_name="feat/backstop-verifyerr",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        verify_error_result = RepoPushStatus(
+            repo_name="repos-testproj",
+            branch="feat/backstop-verifyerr",
+            status=PushStatus.unpushed,
+            local_sha=None,
+            remote_sha=None,
+            commits_ahead=0,
+            dirty=False,
+        )
+
+        completed_result = MagicMock()
+        completed_result.returncode = 0
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            mock_gtd.get_item = AsyncMock(
+                return_value={
+                    "id": "item-backstop-verifyerr",
+                    "title": "Fix bug",
+                    "project_id": "proj1",
+                }
+            )
+            mock_gtd.get_project = AsyncMock(
+                return_value={
+                    "id": "proj1",
+                    "name": "TestProject",
+                    "git_origin": "git@host:repos/testproj",
+                }
+            )
+            mock_gtd.post_comment = AsyncMock()
+            mock_gtd.list_attachments = AsyncMock(return_value=[])
+
+            fake_workspace = tmp_path / "repos-testproj-backstop-verifyerr"
+            fake_workspace.mkdir()
+            mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
+            mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
+            mock_dispatch.repo_name_from_origin = MagicMock(
+                return_value="repos-testproj"
+            )
+            mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+            mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
+            mock_dispatch.verify_pushes = MagicMock(return_value=[verify_error_result])
+            mock_dispatch.push_unpushed_repo = MagicMock(
+                return_value=_make_completed(0)
+            )
+            mock_dispatch._executor = None
+            mock_dispatch.cleanup_workspace = MagicMock()
+
+            from agent_gtd_dispatch.engines import CLAUDE
+            from agent_gtd_dispatch.main import _dispatch_worker
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "failed"
+
+        mock_dispatch.push_unpushed_repo.assert_not_called()
+        mock_dispatch.verify_pushes.assert_called_once()
