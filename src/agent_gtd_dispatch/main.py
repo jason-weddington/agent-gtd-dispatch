@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
 
-from . import config, db, dispatch, gtd_client, rollout_planner, talos
+from . import config, db, dispatch, gates, gtd_client, rollout_planner, talos
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
 from .engines import (
     COMMON_ENV_KEYS,
@@ -1402,6 +1403,124 @@ async def _dispatch_worker(
                 workspace, run.id, run.item_id, token=run.callback_token
             )
 
+        # --- Pre-launch gate install -----------------------------------
+        # Deterministic per-repo hook-manager install + verification, run
+        # after clone and BEFORE the agent launches. Talos self-gates via
+        # gate_command and commits its own output once (installed hooks,
+        # especially fixers, would mutate or block that commit — kb-03099),
+        # so talos runs skip this entirely. Plan runs never clone a
+        # mutable workspace the agent will commit into, so they're exempt
+        # too.
+        gate_steps: list[gates.GateStep] = []
+        _mode_str = mode.value if hasattr(mode, "value") else str(mode)
+        if mode not in (DispatchMode.BUILD, DispatchMode.MANAGE):
+            logger.info(
+                "gate: run_id=%s mode=%s engine=%s decision=skipped reason=%s",
+                run.id,
+                _mode_str,
+                engine_used.name,
+                "plan",
+            )
+        elif is_talos_engine(engine_used.name):
+            logger.info(
+                "gate: run_id=%s mode=%s engine=%s decision=skipped reason=%s",
+                run.id,
+                _mode_str,
+                engine_used.name,
+                "talos",
+            )
+        elif workspace is None:
+            logger.info(
+                "gate: run_id=%s mode=%s engine=%s decision=skipped reason=%s",
+                run.id,
+                _mode_str,
+                engine_used.name,
+                "no-workspace",
+            )
+        else:
+            if workspace_repo_dirs:
+                gate_repos = [(d, workspace / d) for d in workspace_repo_dirs]
+            else:
+                gate_repos = [
+                    (
+                        dispatch.repo_name_from_origin(project.get("git_origin", "")),
+                        workspace,
+                    )
+                ]
+            gate_steps = gates.detect_gate_steps(gate_repos, run_id=run.id)
+            if gate_steps:
+                gate_failure = await asyncio.get_event_loop().run_in_executor(
+                    dispatch._executor,
+                    functools.partial(
+                        gates.run_gate_steps,
+                        gate_steps,
+                        config.GATE_INSTALL_TIMEOUT_SECONDS,
+                        run_id=run.id,
+                    ),
+                )
+                if gate_failure is not None:
+                    logger.warning(
+                        "gate: run_id=%s repo=%s step=%r decision=failed "
+                        "reason=%r duration_ms=%d",
+                        run.id,
+                        gate_failure.repo_label,
+                        gate_failure.step,
+                        gate_failure.reason,
+                        gate_failure.duration_ms,
+                    )
+                    _gate_fail_now = datetime.now(UTC).isoformat()
+                    await db.update_run(
+                        run.id,
+                        status=RunStatus.failed,
+                        completed_at=_gate_fail_now,
+                        error=(
+                            f"gate install failed: {gate_failure.repo_label}: "
+                            f"{gate_failure.step}: {gate_failure.reason}"
+                        )[:500],
+                    )
+                    _publish_run_event(run.id, "failed", _gate_fail_now)
+                    if run.item_id is not None:
+                        try:
+                            await gtd_client.post_comment(
+                                run.item_id,
+                                gates.format_failure_comment(run.id, gate_failure),
+                                created_by=attribution or "agent-gtd-dispatch",
+                                token=run.callback_token,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to post gate-failure comment for run %s",
+                                run.id,
+                            )
+                    if mode == DispatchMode.MANAGE and run.rollout_id:
+                        _gate_halt_tokens = (
+                            [run.callback_token, None] if run.callback_token else [None]
+                        )
+                        for _gate_tok in _gate_halt_tokens:
+                            try:
+                                await gtd_client.halt_rollout(
+                                    run.rollout_id,
+                                    reason=(
+                                        f"gate install failed in "
+                                        f"{gate_failure.repo_label}: "
+                                        f"{gate_failure.step}: "
+                                        f"{gate_failure.reason}"
+                                    )[:500],
+                                    comment=gates.format_failure_comment(
+                                        run.id, gate_failure
+                                    ),
+                                    token=_gate_tok,
+                                )
+                                break
+                            except Exception:
+                                logger.exception(
+                                    "Failed to halt rollout %s after gate "
+                                    "failure (token=%s)",
+                                    run.rollout_id,
+                                    "callback_token" if _gate_tok else "static",
+                                )
+                    return
+
         system_prompt = dispatch.build_system_prompt(
             item,
             project,
@@ -1426,6 +1545,9 @@ async def _dispatch_worker(
                 f"Agent dispatched (run `{run.id}`, engine: {engine_used.name}). "
                 f"Working on branch `{run.branch_name}` in `{project['name']}`."
             )
+
+        if gate_steps:
+            dispatch_comment += gates.format_success_lines(gate_steps)
 
         if run.item_id is not None:
             await gtd_client.post_comment(

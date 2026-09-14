@@ -40,6 +40,10 @@ CANCEL_GRACE_SECONDS: int = 5  # seconds between SIGTERM and SIGKILL on cancel
 # at all — not enough time left to plausibly succeed (e.g. a slow pre-push hook).
 PUSH_BACKSTOP_MIN_SECONDS: int = 10
 
+# Per-subprocess timeout for the pre-launch gate install (hook-manager install,
+# hook-dir lookup, or `.agent-gtd/setup`). See gates.py.
+GATE_INSTALL_TIMEOUT_SECONDS: int = 300
+
 # Watchdog (manage-agent staleness detection)
 # Set above the longest build a manager may wait on: a manager has no polling
 # heartbeat, so its state timestamp only advances on real progress. Too low and
@@ -97,6 +101,7 @@ def load() -> None:
     global ANTHROPIC_API_KEY, PLANNER_MODEL, MAX_CONCURRENT_RUNS
     global OLLAMA_BASE_URL, OLLAMA_API_KEY, OLLAMA_DEFAULT_MODEL
     global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS, PUSH_BACKSTOP_MIN_SECONDS
+    global GATE_INSTALL_TIMEOUT_SECONDS
     global OLLAMA_CLOUD_API_KEY, OLLAMA_CLOUD_BASE_URL, OLLAMA_CLOUD_MODEL
     global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS
     global AGENT_SUBPROCESS_USER
@@ -167,6 +172,9 @@ def load() -> None:
     CANCEL_GRACE_SECONDS = int(os.environ.get("DISPATCH_CANCEL_GRACE_SECONDS", "5"))
     PUSH_BACKSTOP_MIN_SECONDS = int(
         os.environ.get("DISPATCH_PUSH_BACKSTOP_MIN_SECONDS", "10")
+    )
+    GATE_INSTALL_TIMEOUT_SECONDS = int(
+        os.environ.get("DISPATCH_GATE_INSTALL_TIMEOUT_SECONDS", "300")
     )
     MANAGE_STALE_THRESHOLD_SECONDS = int(
         os.environ.get("DISPATCH_MANAGE_STALE_THRESHOLD_SECONDS", "2100")

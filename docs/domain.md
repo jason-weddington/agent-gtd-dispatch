@@ -124,6 +124,9 @@ Every run has a `mode` that controls the system prompt and workspace lifecycle.
   `failed`, `push_results` is recorded, a per-repo comment is posted to the item, and the
   workspace is **preserved** (the commits exist only in the clone). Only when all repos
   are `pushed` or `no_changes` is the run `succeeded` and the workspace cleaned up.
+- **Gate install**: after clone and before launch, the worker installs and verifies each
+  repo's hook manager (or runs its `.agent-gtd/setup`); failure → run `failed` before the
+  agent starts
 
 ### `plan`
 
@@ -154,6 +157,9 @@ squash-merge passing branches, and complete items in the rollout.
 - On failure: workspace is **preserved** (not cleaned up) for post-mortem debugging.
 - Auto-recovery: if the manage agent exits before the rollout reaches a terminal state,
   the service relaunches it (see Manage Recovery below).
+- **Gate install**: after clone and before launch, the worker installs and verifies each
+  repo's hook manager (or runs its `.agent-gtd/setup`); failure → run `failed` before the
+  agent starts and the rollout is halted
 
 ---
 

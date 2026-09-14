@@ -51,6 +51,50 @@ class Engine:
 _MANAGE_EXECUTOR_ENV_KEYS: tuple[str, ...] = ("DISPATCH_LOCAL_URL", "DISPATCH_API_KEY")
 
 
+def agent_local_bin_dirs() -> list[Path]:
+    """Return the agent user's ``.local/bin`` and ``.cargo/bin`` directories.
+
+    Shared by :func:`build_env` and ``gates.agent_shell_env`` so both PATH
+    computations stay in lockstep. Resolves the agent user's home directory
+    the same way in both cases: via ``pwd.getpwnam(config.AGENT_SUBPROCESS_USER)``
+    when that config var is set (falling back to ``Path.home()`` on ``KeyError``),
+    else ``Path.home()``.
+
+    ``.local/bin`` comes first (uvx/MCP binaries), then ``.cargo/bin`` (rustup
+    toolchain binaries — cargo, cog, typos, cargo-sort, etc.), so both are
+    discoverable after sudo's ``env_reset`` strips PATH.
+    """
+    import pwd
+
+    from . import config  # local import so module is readable before config.load()
+
+    if config.AGENT_SUBPROCESS_USER:
+        try:
+            pw = pwd.getpwnam(config.AGENT_SUBPROCESS_USER)
+            home = Path(pw.pw_dir)
+        except KeyError:
+            home = Path.home()
+    else:
+        home = Path.home()
+
+    return [home / ".local" / "bin", home / ".cargo" / "bin"]
+
+
+def prepend_agent_bin_dirs(current_path: str) -> str:
+    """Prepend the agent's `.local/bin` and `.cargo/bin` dirs onto *current_path*.
+
+    Each directory is added at most once (never duplicated) and only if not
+    already present as a `:`-split entry of *current_path*.
+    """
+    existing = current_path.split(":") if current_path else []
+    prefixes = [str(d) for d in agent_local_bin_dirs() if str(d) not in existing]
+    if not prefixes:
+        return current_path
+    if current_path:
+        return ":".join([*prefixes, current_path])
+    return ":".join(prefixes)
+
+
 def build_env(
     engine: Engine,
     mode: DispatchMode = DispatchMode.BUILD,
@@ -73,10 +117,6 @@ def build_env(
     is no longer baked into its ``.claude.json`` registration — see
     ``templates/mcp-servers.sh`` (host reprovisioning is an operator step).
     """
-    import pwd
-
-    from . import config  # local import so module is readable before config.load()
-
     allowed = COMMON_ENV_KEYS | engine.env_keys
     # Manage-mode env exposure: add dispatch URL + key for claude manage-mode executors
     if engine.name == "claude-code" and mode == DispatchMode.MANAGE:
@@ -100,23 +140,11 @@ def build_env(
     env["GIT_AUTHOR_EMAIL"] = f"{engine.name}@agent-gtd-dispatch"
     env["GIT_COMMITTER_EMAIL"] = f"{engine.name}@agent-gtd-dispatch"
 
-    # Prepend ~/.local/bin for the agent user so uvx/MCP binaries (personal-kb,
-    # agent-gtd) are discoverable after sudo's env_reset strips PATH.
-    if config.AGENT_SUBPROCESS_USER:
-        try:
-            pw = pwd.getpwnam(config.AGENT_SUBPROCESS_USER)
-            local_bin = Path(pw.pw_dir) / ".local" / "bin"
-        except KeyError:
-            local_bin = Path.home() / ".local" / "bin"
-    else:
-        local_bin = Path.home() / ".local" / "bin"
-
-    local_bin_str = str(local_bin)
-    current_path = env.get("PATH", "")
-    if local_bin_str not in current_path.split(":"):
-        env["PATH"] = (
-            f"{local_bin_str}:{current_path}" if current_path else local_bin_str
-        )
+    # Prepend ~/.local/bin and ~/.cargo/bin for the agent user so uvx/MCP
+    # binaries (personal-kb, agent-gtd) and rustup toolchain binaries (cargo,
+    # cog, typos, cargo-sort, ...) are discoverable after sudo's env_reset
+    # strips PATH.
+    env["PATH"] = prepend_agent_bin_dirs(env.get("PATH", ""))
 
     return env
 

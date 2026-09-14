@@ -357,7 +357,8 @@ So the actual flow is:
    - `update_rollout_state(phase="warm_up", current_step="Verifying main is green")`.
    - Install Python deps (`[ -f pyproject.toml ] && uv sync`).
    - Install JS deps (`[ -f package.json ] && npm install`).
-   - Install pre-commit hooks if `.pre-commit-config.yaml` exists.
+   - Git hooks are installed and verified by the dispatch worker before the manager
+     launches (see architecture.md § Gate Install) — the manager does not install them.
    - Read `CLAUDE.md` and `README.md` to learn the project's test/lint
      commands and coverage threshold — this becomes the **merge bar** the
      manager applies to every child build.

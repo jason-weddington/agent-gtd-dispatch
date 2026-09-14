@@ -31,6 +31,7 @@ src/agent_gtd_dispatch/
   dispatch.py            # Core logic: workspace prep (incl. multi-repo), prompt
                          #   building, agent invocation, push verification
   engines.py             # Per-engine CLI command builders + env filtering (claude, kiro, ...)
+  gates.py               # Pre-launch per-repo gate install: hook-manager detection, .agent-gtd/setup override, live-hook verification
   gtd_client.py          # HTTP client for the Agent GTD API (items, projects, comments)
   config.py              # Env-var config with load() — shared service config only
   agent_discovery.py     # /agents endpoint backing — runs list_agents.sh

@@ -161,14 +161,27 @@ async def relaunch_manage_rollout(
 
 
 async def halt_rollout(
-    rollout_id: str, reason: str, *, token: str | None = None
+    rollout_id: str,
+    reason: str,
+    *,
+    token: str | None = None,
+    comment: str | None = None,
 ) -> None:
-    """POST /api/rollouts/{rollout_id}/halt."""
+    """POST /api/rollouts/{rollout_id}/halt.
+
+    ``comment`` is included in the JSON body only when provided — used by the
+    gate-install failure path to attach the full failure detail (including the
+    output tail) to the halt, without changing the existing ``reason``-only
+    callers.
+    """
+    body: dict[str, str] = {"reason": reason}
+    if comment is not None:
+        body["comment"] = comment
     await _request(
         "POST",
         f"/rollouts/{rollout_id}/halt",
         token=token,
-        json={"reason": reason},
+        json=body,
     )
 
 

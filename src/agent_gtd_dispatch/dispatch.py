@@ -936,7 +936,7 @@ def _build_manage_workspace_main_prompt(
         are reset to None. If you want to preserve `current_item_id` across a
         phase change, pass it in every subsequent call.
 
-        For EACH repo in Workspace Repos (run all five steps in that repo's directory):
+        For EACH repo in Workspace Repos (run all four steps in that repo's directory):
 
         **1. Record the default branch** — run BEFORE any other checkout in this repo:
         ```bash
@@ -951,14 +951,11 @@ def _build_manage_workspace_main_prompt(
         [ -f package.json ] && npm install
         ```
 
-        **3. Install pre-commit hooks** (if `.pre-commit-config.yaml` exists):
-        ```bash
-        [ -f .pre-commit-config.yaml ] && pre-commit install \\
-          --hook-type pre-commit --hook-type commit-msg \\
-          --hook-type post-commit --hook-type pre-push
-        ```
+        If this repo uses lefthook, pre-commit, husky, or a committed `.agent-gtd/setup`
+        override, the dispatch worker already installed and verified its git hooks before
+        you launched — do not reinstall or change them.
 
-        **4. Record the merge bar** — read `CLAUDE.md` and/or `README.md` for this repo:
+        **3. Record the merge bar** — read `CLAUDE.md` and/or `README.md` for this repo:
         - Test command (e.g. `uv run pytest`, `npm test`)
         - Lint command (e.g. `uv run ruff check src/ tests/`, `npm run lint`)
         - Coverage threshold (if any)
@@ -967,7 +964,7 @@ def _build_manage_workspace_main_prompt(
         If a repo has no discoverable test or lint command, record `none` for that repo
         and continue — do NOT halt.
 
-        **5. Verify that repo's default branch is green** — run the test + lint commands
+        **4. Verify that repo's default branch is green** — run the test + lint commands
         you recorded. If they fail, call:
         ```
         mcp__agent-gtd__halt_rollout(
@@ -1420,21 +1417,18 @@ def _build_manage_prompt(
         [ -f package.json ] && npm install
         ```
 
-        **2. Install pre-commit hooks** (if `.pre-commit-config.yaml` exists):
-        ```bash
-        [ -f .pre-commit-config.yaml ] && pre-commit install \\
-          --hook-type pre-commit --hook-type commit-msg \\
-          --hook-type post-commit --hook-type pre-push
-        ```
+        If this repo uses lefthook, pre-commit, husky, or a committed `.agent-gtd/setup`
+        override, the dispatch worker already installed and verified its git hooks before
+        you launched — do not reinstall or change them.
 
-        **3. Record the merge bar** — read `CLAUDE.md` and/or `README.md` and store in
+        **2. Record the merge bar** — read `CLAUDE.md` and/or `README.md` and store in
         your working memory:
         - Test command (e.g. `uv run pytest`, `npm test`)
         - Lint command (e.g. `uv run ruff check src/ tests/`, `npm run lint`)
         - Coverage threshold (if any)
         - Any project-specific merge conventions
 
-        **4. Verify `main` is green** — run the test + lint commands you just recorded.
+        **3. Verify `main` is green** — run the test + lint commands you just recorded.
         If they fail, call:
         ```
         mcp__agent-gtd__halt_rollout(

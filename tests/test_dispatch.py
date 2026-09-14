@@ -293,6 +293,32 @@ class TestBuildEnv:
         parts = env["PATH"].split(":")
         assert parts.count(local_bin) == 1
 
+    def test_path_starts_with_local_bin_then_cargo_bin(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        mock_pw = MagicMock()
+        mock_pw.pw_dir = "/home/dispatch"
+        with patch("pwd.getpwnam", return_value=mock_pw):
+            env = build_env(CLAUDE)
+        assert env["PATH"].startswith(
+            "/home/dispatch/.local/bin:/home/dispatch/.cargo/bin:"
+        )
+
+    def test_path_cargo_bin_not_duplicated_when_already_present(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        cargo_bin = "/home/dispatch/.cargo/bin"
+        local_bin = "/home/dispatch/.local/bin"
+        monkeypatch.setenv("PATH", f"{cargo_bin}:{local_bin}:/usr/bin:/bin")
+        mock_pw = MagicMock()
+        mock_pw.pw_dir = "/home/dispatch"
+        with patch("pwd.getpwnam", return_value=mock_pw):
+            env = build_env(CLAUDE)
+        parts = env["PATH"].split(":")
+        assert parts.count(cargo_bin) == 1
+        assert parts.count(local_bin) == 1
+
     def test_git_identity_reflects_engine_name_claude(self, monkeypatch) -> None:
         """Git identity env vars should reflect the engine being used (AC3)."""
         env = build_env(CLAUDE)
@@ -1095,7 +1121,8 @@ class TestBuildManagePrompt:
         prompt = self._prompt()
         assert "uv sync" in prompt
         assert "npm install" in prompt
-        assert "pre-commit install" in prompt
+        assert "pre-commit install" not in prompt
+        assert "installed and verified its git hooks" in prompt
 
     def test_sensitive_area_guidance_present(self) -> None:
         prompt = self._prompt()
@@ -3077,7 +3104,8 @@ class TestWorkspaceManagePrompt:
 
     def test_per_repo_precommit_install(self) -> None:
         prompt = self._ws_prompt()
-        assert "pre-commit install" in prompt
+        assert "pre-commit install" not in prompt
+        assert "installed and verified its git hooks" in prompt
 
     def test_no_test_command_fallback_none(self) -> None:
         prompt = self._ws_prompt()

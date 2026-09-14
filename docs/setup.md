@@ -87,6 +87,7 @@ the mode-mismatch guards.
 | `DISPATCH_CANCEL_GRACE_SECONDS` | `5` | Seconds between SIGTERM and SIGKILL on cancel |
 | `DISPATCH_MANAGE_STALE_THRESHOLD_SECONDS` | `2100` | Manage-watchdog staleness threshold (35 minutes) — a manage run with no activity for this long is considered stale. Must stay below `DISPATCH_MANAGE_TIMEOUT_SECONDS`. |
 | `DISPATCH_WATCHDOG_INTERVAL_SECONDS` | `180` | How often the manage watchdog scans for stale manage runs (3 minutes) |
+| `DISPATCH_GATE_INSTALL_TIMEOUT_SECONDS` | `300` | Per-subprocess timeout for the pre-launch gate install (hook-manager install, hook-dir lookup, or `.agent-gtd/setup`) |
 
 ### Optional — Concurrency
 

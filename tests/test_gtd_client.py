@@ -380,6 +380,26 @@ class TestRolloutMethods:
         )
 
     @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_halt_rollout_includes_comment_only_when_passed(
+        self, mock_cls
+    ) -> None:
+        from agent_gtd_dispatch.gtd_client import halt_rollout
+
+        mock_client, _ = _make_client_mock(content=b"")
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await halt_rollout(
+            "wr-123", reason="gate install failed", comment="full detail here"
+        )
+
+        mock_client.request.assert_called_once_with(
+            "POST",
+            "http://localhost:9999/api/rollouts/wr-123/halt",
+            headers={"Authorization": "Bearer test-gtd-key"},
+            json={"reason": "gate install failed", "comment": "full detail here"},
+        )
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
     async def test_list_comments_returns_list(self, mock_cls) -> None:
         from agent_gtd_dispatch.gtd_client import list_comments
 

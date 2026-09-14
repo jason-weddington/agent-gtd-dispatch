@@ -74,6 +74,7 @@ Coverage scope is controlled by `[tool.coverage.run] source` in `pyproject.toml`
 | `test_manage_recovery.py` | Manage-mode auto-recovery: retry cap, relaunch, halt |
 | `test_manage_watchdog.py` | Stale-manager watchdog: stale detection, kill + shared recovery path |
 | `test_push_verification.py` | Build-mode per-repo push verification: `verify_pushes` classification (`pushed`/`no_changes`/`unpushed`), failure handling, workspace preservation |
+| `test_gates.py` | Gate install: detection precedence, sudo argv/env, failure shapes, per-manager hook verification, worker integration (build/manage/talos/plan) |
 | `test_capabilities.py` | `GET /info` and `GET /agents` endpoint tests |
 | `test_attachments_staging.py` | Attachment download, sanitization, and staging |
 | `test_branches.py` | Branch name generation (via protocol package) |

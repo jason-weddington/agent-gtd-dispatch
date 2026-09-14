@@ -74,6 +74,7 @@ convention = "google"
 "src/agent_gtd_dispatch/dispatch.py" = ["S603", "S607", "S608", "E501"]
 "src/agent_gtd_dispatch/main.py" = ["B008", "E501", "S104", "S603", "S607"]
 "src/agent_gtd_dispatch/agent_discovery.py" = ["S603", "S607"]
+"src/agent_gtd_dispatch/gates.py" = ["S603", "S607"]
 
 [tool.mypy]
 python_version = "3.13"
@@ -104,7 +105,7 @@ filterwarnings = [
 source = ["agent_gtd_dispatch", "agent_gtd_dispatch_protocol"]
 
 [tool.coverage.report]
-fail_under = 88
+fail_under = 89
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
