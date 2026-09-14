@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v1.21.1 (2026-09-14)
+
+### Bug Fixes
+
+- **dispatch**: Build runs no longer lose finished work to an unfinished git push (4e1c0ca8)
+  ([`13aa7d2`](https://github.com/repos/agent-gtd-dispatch/commit/13aa7d2e11b0728dd60bac76494f484a913c4d31))
+
+- **dispatch**: Reject talos engines for non-build dispatch modes with 422 (feb9f761)
+  ([`ea5610f`](https://github.com/repos/agent-gtd-dispatch/commit/ea5610f71a749a6c9d8c15a043e54fef02a9ac40))
+
+- **setup**: Health-check retry no longer kills the installer under set -e; deploy refreshes agent
+  Claude Code; add r7-server
+  ([`531d246`](https://github.com/repos/agent-gtd-dispatch/commit/531d246b360af64f8a162ad5a42ad083f8caf243))
+
+
 ## v1.21.0 (2026-09-13)
 
 ### Features
