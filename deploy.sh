@@ -18,7 +18,7 @@ set -euo pipefail
 #   DISPATCH_HOSTS  Space-separated SSH targets (default: "pironman01 r7-research r7-server")
 #   DISPATCH_HOST   Single SSH target — if set, overrides DISPATCH_HOSTS (back-compat)
 #   SERVICE_USER    Service account owning the tool install (default: dispatch-svc)
-#   AGENT_USER      Agent subprocess user whose Claude Code is refreshed (default: dispatch)
+#   AGENT_USER      Agent subprocess user whose Claude Code and lefthook are refreshed (default: dispatch)
 #   SERVICE_NAME    Systemd service unit name (default: dispatch-api)
 #   DISPATCH_INDEX  Homelab wheel index URL (default: https://pypi.lab.jasonweddington.com/simple/)
 #
@@ -54,13 +54,28 @@ if ! sudo -u ${SERVICE_USER} -H /home/${SERVICE_USER}/.local/bin/uv tool list | 
     exit 1
 fi
 
-# Refresh the agent user's Claude Code. Headless `claude -p` runs never
+# Refresh the agent user's Claude Code. Headless 'claude -p' runs never
 # self-update, so without this the fleet silently drifts (hosts were found
 # ~125 releases behind). Non-fatal: a failed update keeps the old binary.
 if ! sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/claude update >/dev/null 2>&1; then
     echo "[WARN] claude update failed for ${AGENT_USER} — agent keeps its current version" >&2
 fi
 echo "[OK]   Claude Code (${AGENT_USER}): \$(sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/claude --version)"
+
+# Install/refresh lefthook for the agent user. Repos that use lefthook.yml
+# (e.g. harness-design) cannot activate their hooks without it. Non-fatal:
+# install --upgrade installs when absent and upgrades when present; a failure
+# keeps whatever lefthook (if any) the agent already has.
+if ! LH_OUT=\$(sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/uv tool install --upgrade lefthook 2>&1); then
+    echo "[WARN] lefthook install/upgrade failed for ${AGENT_USER} — agent keeps its current lefthook (if any). Last output:" >&2
+    printf '%s\n' "\$LH_OUT" | tail -n 5 | sed 's/^/[WARN]   /' >&2
+fi
+
+if LH_VER=\$(sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/lefthook version 2>/dev/null); then
+    echo "[OK]   lefthook (${AGENT_USER}): \${LH_VER}"
+else
+    echo "[WARN] lefthook not runnable for ${AGENT_USER} — lefthook repos cannot activate hooks on this host" >&2
+fi
 
 # Restart the service so systemd runs the freshly-installed entry point.
 sudo systemctl restart ${SERVICE_NAME}

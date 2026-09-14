@@ -1387,6 +1387,24 @@ else
 fi
 
 # ===========================================================================
+# Step 4.8: lefthook (agent user)
+# ===========================================================================
+echo ""
+echo "--- Step 4.8: lefthook (agent user) ---"
+
+LEFTHOOK_EXE="${AGENT_HOME}/.local/bin/lefthook"
+
+if [[ -f "$LEFTHOOK_EXE" ]] && lefthook_ver="$(runuser -l "$AGENT_USER" -c 'lefthook version' 2>/dev/null)"; then
+    skip "lefthook ${lefthook_ver} already installed for ${AGENT_USER} — already configured"
+elif $DRY_RUN; then
+    would "install lefthook as a uv tool for ${AGENT_USER} (uv tool install lefthook)"
+else
+    runuser -l "$AGENT_USER" -c 'uv tool install lefthook'
+    lefthook_ver="$(runuser -l "$AGENT_USER" -c 'lefthook version' 2>/dev/null)" || die "lefthook installed but 'lefthook version' failed for ${AGENT_USER}"
+    info "Installed lefthook ${lefthook_ver} for ${AGENT_USER}"
+fi
+
+# ===========================================================================
 # Step 5a: Claude symlink (must precede sudoers so the path exists when
 #           visudo validates the fragment)
 # ===========================================================================

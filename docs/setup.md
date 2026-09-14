@@ -42,8 +42,8 @@ The `--reload` flag enables hot-reload for development. Omit it for a production
 
 Running uvicorn by hand is fine for hacking on the code, but if you want a real
 installed service on a developer/engineer machine — systemd unit, auto-minted
-`DISPATCH_API_KEY`, MCP server registration, pre-commit template directory — without
-the production two-user split, use **single-user mode**:
+`DISPATCH_API_KEY`, MCP server registration, pre-commit template directory, lefthook —
+without the production two-user split, use **single-user mode**:
 
 ```bash
 # Canonical form: name the var explicitly so sudo's env-stripping doesn't drop it

@@ -138,8 +138,9 @@ sudo --preserve-env=DISPATCH_SINGLE_USER DISPATCH_SINGLE_USER=1 \
 
 Trade-off: no extra users are created and no sudoers fragment is installed — which also
 means **no POSIX isolation** between the service and the agent subprocesses it spawns.
-You still get the systemd unit, auto-minted `DISPATCH_API_KEY`, MCP registration, and
-pre-commit template setup. The installer guards against mixing modes on one host. Full
+You still get the systemd unit, auto-minted `DISPATCH_API_KEY`, MCP registration,
+pre-commit template setup, and lefthook for the agent user. The installer guards
+against mixing modes on one host. Full
 details: [docs/install.md — Single-user mode](docs/install.md#single-user-mode).
 
 ### MCP servers for the agent user

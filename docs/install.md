@@ -15,9 +15,9 @@ This guide covers bootstrapping a fresh Ubuntu host and migrating an existing si
 | `uv` | Installed automatically by the script if absent |
 
 > **Note**: The script auto-installs `uv`, Claude Code for the agent user (Step 4.5,
-> via the official `claude.ai/install.sh` installer), and `pre-commit` (Step 4.7, via
-> `uv tool install`). All other tooling (`python3`, `visudo`, `systemctl`) ships with
-> standard Ubuntu.
+> via the official `claude.ai/install.sh` installer), `pre-commit` (Step 4.7, via
+> `uv tool install`), and `lefthook` (Step 4.8, via `uv tool install`). All other
+> tooling (`python3`, `visudo`, `systemctl`) ships with standard Ubuntu.
 >
 > **Single-user mode** (`DISPATCH_SINGLE_USER=1`) does **not** require creating extra
 > system users or installing a sudoers fragment — it runs the service and agent under
@@ -716,6 +716,45 @@ grep -l skip-on-missing-config /home/dispatch/.git-template/hooks/*
 
 ---
 
+## lefthook (Step 4.8)
+
+Step 4.8 of the installer installs the `lefthook` binary for the `dispatch` (agent) user so that repositories which use `lefthook.yml` can activate their hooks.
+
+### Why this matters
+
+Repos using `lefthook.yml` (e.g. `harness-design`) cannot activate their hooks without the `lefthook` binary. Installing `lefthook` does not install the tools a repo's `lefthook.yml` commands call (for `harness-design`: `cog`, `typos`, `cargo-sort`, `cargo-llvm-cov`, `cargo-machete`, `cargo-deny`, `gitleaks`) — those are provisioned separately.
+
+### What the step does
+
+The step runs `uv tool install lefthook` as the agent user, creating a symlink at `/home/dispatch/.local/bin/lefthook` into `/home/dispatch/.local/share/uv/tools/lefthook/`, and is skipped if lefthook is already present and runnable. The binary is on the agent's PATH via `engines.py`'s `~/.local/bin` prepend and the sudoers `secure_path`. lefthook is deliberately not in the sudoers NOPASSWD allowlist — sudo matches the resolved uv-tool venv path — so the dispatch service reaches it through the already-allowed `/bin/bash`, not a direct `sudo -u dispatch lefthook`.
+
+### Architecture support (aarch64 + x86_64)
+
+PyPI ships `lefthook` as manylinux_2_17 wheels for both aarch64 and x86_64 (each wheel bundles a static Go binary), verified with lefthook 2.1.14 on pironman01 (aarch64) and an x86_64 host.
+
+### Deploy refresh
+
+Every `./deploy.sh` runs `uv tool install --upgrade lefthook` as the agent user on each host (it installs when absent and upgrades when present), non-fatally, and prints `[OK]   lefthook (dispatch): <version>` or a `[WARN]` line that includes the last 5 lines of uv output.
+
+### The binary does not install hooks
+
+Installing the binary does not activate any hooks. Clones keep the Step 4.7 pre-commit shims until something runs `lefthook install` in that clone, and `lefthook install` renames an existing non-lefthook hook to `<hook>.old`.
+
+### Verifying the lefthook install
+
+```bash
+sudo -u dispatch -H bash -lc 'lefthook version'
+# → X.Y.Z  (RC 0)
+
+ls -l /home/dispatch/.local/bin/lefthook
+# → ... -> /home/dispatch/.local/share/uv/tools/lefthook/bin/lefthook
+
+sudo -u dispatch -H /home/dispatch/.local/bin/uv tool list | grep '^lefthook'
+# → lefthook vX.Y.Z
+```
+
+---
+
 ## Rollback procedure
 
 To undo the installer step by step (in reverse order):
@@ -744,6 +783,12 @@ sudo rm /etc/sudoers.d/dispatch-svc
 sudo rm /usr/local/bin/claude
 ```
 
+### Step 4.8 — lefthook
+```bash
+sudo -u dispatch -H bash -lc 'uv tool uninstall lefthook'
+```
+(Same `bash -lc` requirement as Step 4.7 — `uv` is not on sudo's search path.)
+
 ### Step 4.7 — Pre-commit template
 ```bash
 sudo -u dispatch -H git config --global --unset init.templateDir
@@ -763,7 +808,7 @@ sudo rm /home/dispatch/.claude.json
 
 ### Step 4.5 — Claude Code
 No separate rollback — Step 4's removal of `/home/dispatch/.local` also deletes the
-`claude` binary (and the `pre-commit` tool from Step 4.7).
+`claude` binary (and the `pre-commit` tool from Step 4.7 and the `lefthook` tool from Step 4.8).
 
 ### Step 4 — Dependencies (uv)
 ```bash
@@ -819,6 +864,9 @@ claude mcp remove team-kb --scope user   # only if it was registered
 git config --global --unset init.templateDir
 rm -rf ~/.git-template
 uv tool uninstall pre-commit
+
+# lefthook (Step 4.8)
+uv tool uninstall lefthook   # only if the installer installed it — skip if lefthook was yours already
 
 # Env file, repos, workspace (Steps 3 / 2 / 1)
 rm -rf ~/.config/agent-gtd-dispatch
