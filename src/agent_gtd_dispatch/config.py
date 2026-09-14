@@ -40,6 +40,11 @@ CANCEL_GRACE_SECONDS: int = 5  # seconds between SIGTERM and SIGKILL on cancel
 # at all — not enough time left to plausibly succeed (e.g. a slow pre-push hook).
 PUSH_BACKSTOP_MIN_SECONDS: int = 10
 
+# Minimum seconds granted to the post-run gate even when the build used most of
+# its run timeout — a build that finishes with only seconds left on the clock
+# still gets a real shot at running the project's quality gate.
+POST_RUN_GATE_MIN_SECONDS: int = 600
+
 # Per-subprocess timeout for the pre-launch gate install (hook-manager install,
 # hook-dir lookup, or `.agent-gtd/setup`). See gates.py.
 GATE_INSTALL_TIMEOUT_SECONDS: int = 300
@@ -101,7 +106,7 @@ def load() -> None:
     global ANTHROPIC_API_KEY, PLANNER_MODEL, MAX_CONCURRENT_RUNS
     global OLLAMA_BASE_URL, OLLAMA_API_KEY, OLLAMA_DEFAULT_MODEL
     global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS, PUSH_BACKSTOP_MIN_SECONDS
-    global GATE_INSTALL_TIMEOUT_SECONDS
+    global GATE_INSTALL_TIMEOUT_SECONDS, POST_RUN_GATE_MIN_SECONDS
     global OLLAMA_CLOUD_API_KEY, OLLAMA_CLOUD_BASE_URL, OLLAMA_CLOUD_MODEL
     global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS
     global AGENT_SUBPROCESS_USER
@@ -175,6 +180,9 @@ def load() -> None:
     )
     GATE_INSTALL_TIMEOUT_SECONDS = int(
         os.environ.get("DISPATCH_GATE_INSTALL_TIMEOUT_SECONDS", "300")
+    )
+    POST_RUN_GATE_MIN_SECONDS = int(
+        os.environ.get("DISPATCH_POST_RUN_GATE_MIN_SECONDS", "600")
     )
     MANAGE_STALE_THRESHOLD_SECONDS = int(
         os.environ.get("DISPATCH_MANAGE_STALE_THRESHOLD_SECONDS", "2100")

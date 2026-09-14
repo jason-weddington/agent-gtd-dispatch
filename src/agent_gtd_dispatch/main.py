@@ -1641,6 +1641,9 @@ async def _dispatch_worker(
             push_results_list: list[RepoPushStatus] | None = None
             _push_results_json: str | None = None
             _rescued_repos: list[RepoPushStatus] = []
+            _gate_cmd: str = ""
+            _gate_result: dispatch.GateResult | None = None
+            _stashed_names: list[str] = []
             if _verify_repos is not None:
                 push_results_list = dispatch.verify_pushes(
                     _verify_repos, run.branch_name or ""
@@ -1844,6 +1847,186 @@ async def _dispatch_worker(
                                 )
                         return  # exit early — do not mark succeeded
 
+                # Post-run gate: run the project's quality gate (non-talos build
+                # runs only) after push verification has succeeded, so a hook
+                # bypass (--no-verify, a self-skipping hook) can't slip a
+                # gate-failing tree past dispatch as a reported success.
+                _raw_gate = project.get("gate_command")
+                _gate_cmd = _raw_gate.strip() if isinstance(_raw_gate, str) else ""
+                _n_pushed = sum(
+                    1 for r in push_results_list if r.status == PushStatus.pushed
+                )
+                _gate_timeout: int | None = None
+                _gate_remaining: float | None = None
+                _gate_rc: int | None = None
+                _gate_timed_out: bool | None = None
+                _gate_duration: float | None = None
+
+                if _n_pushed == 0:
+                    decision = "skipped_no_pushed_repo"
+                elif not _gate_cmd:
+                    decision = "skipped_no_gate_command"
+                else:
+                    decision = None  # gate runs below
+
+                if decision is None:
+                    assert workspace is not None  # noqa: S101
+                    _gate_remaining = (
+                        timeout_seconds
+                        - (datetime.now(UTC) - _run_start_dt).total_seconds()
+                    )
+                    _gate_timeout = max(
+                        int(_gate_remaining), config.POST_RUN_GATE_MIN_SECONDS
+                    )
+                    _stashed_names = [r.repo_name for r in push_results_list if r.dirty]
+                    _dirty_paths = [
+                        p for n, p, _b in _verify_repos if n in _stashed_names
+                    ]
+                    logger.info(
+                        "run %s: post-run gate starting (timeout %ds)",
+                        run.id,
+                        _gate_timeout,
+                    )
+                    _gate_result = await asyncio.get_event_loop().run_in_executor(
+                        dispatch._executor,
+                        dispatch.run_gate_command,
+                        workspace,
+                        _gate_cmd,
+                        _gate_timeout,
+                        engine_used,
+                        _register_subprocess,
+                        _dirty_paths or None,
+                    )
+                    assert _gate_result is not None  # noqa: S101
+                    completed = datetime.now(UTC).isoformat()
+                    _gate_rc = _gate_result.returncode
+                    _gate_timed_out = _gate_result.timed_out
+                    _gate_duration = _gate_result.duration_seconds
+                    if _gate_result.timed_out:
+                        decision = "timed_out"
+                    elif _gate_result.returncode is None:
+                        decision = "launch_error"
+                    elif _gate_result.returncode != 0:
+                        decision = "failed"
+                    else:
+                        decision = "passed"
+
+                logger.info(
+                    "post-run gate: run_id=%s decision=%s project=%s"
+                    " pushed_repos=%d timeout_s=%s floor_applied=%s"
+                    " returncode=%s timed_out=%s duration_s=%s",
+                    run.id,
+                    decision,
+                    project.get("name"),
+                    _n_pushed,
+                    _gate_timeout or None,
+                    (
+                        _gate_remaining is not None
+                        and _gate_remaining < config.POST_RUN_GATE_MIN_SECONDS
+                    )
+                    or None,
+                    _gate_rc or None,
+                    _gate_timed_out or None,
+                    (f"{_gate_duration:.1f}" if _gate_duration is not None else None),
+                )
+
+                if _gate_result is not None and not _gate_result.passed:
+                    if decision == "timed_out":
+                        error_str = f"post-run gate timed out after {_gate_timeout}s"
+                    elif (
+                        decision == "failed" and _gate_rc is not None and _gate_rc >= 0
+                    ):
+                        error_str = f"post-run gate failed: exit {_gate_rc}"
+                    elif decision == "failed":
+                        assert _gate_rc is not None  # noqa: S101
+                        error_str = (
+                            f"post-run gate failed: killed by signal {-_gate_rc}"
+                        )
+                    else:  # launch_error
+                        error_str = "post-run gate failed: launch error"
+
+                    _push_results_json = json.dumps(
+                        [r.model_dump(mode="json") for r in push_results_list]
+                    )
+                    await db.update_run(
+                        run.id,
+                        status=RunStatus.failed,
+                        completed_at=completed,
+                        exit_code=result.returncode,
+                        error=error_str,
+                        push_results=_push_results_json,
+                    )
+                    _publish_run_event(run.id, "failed", completed)
+                    logger.warning(
+                        "post-run gate: run_id=%s decision=%s output_tail=%r",
+                        run.id,
+                        decision,
+                        _gate_result.output[-1000:],
+                    )
+                    if run.item_id is not None:
+                        if decision == "timed_out":
+                            _gate_first_line = (
+                                f"Post-run gate timed out (run `{run.id}`):"
+                                f" `{_gate_cmd}` did not finish within"
+                                f" {_gate_timeout}s. Branch `{run.branch_name}`"
+                                " was pushed but was not gate-verified."
+                            )
+                        elif (
+                            decision == "failed"
+                            and _gate_rc is not None
+                            and _gate_rc >= 0
+                        ):
+                            _gate_first_line = (
+                                f"Post-run gate failed (run `{run.id}`):"
+                                f" `{_gate_cmd}` exited {_gate_rc} after"
+                                f" {int(_gate_duration or 0)}s. Branch"
+                                f" `{run.branch_name}` was pushed but does not"
+                                " pass the project gate."
+                            )
+                        elif decision == "failed":
+                            assert _gate_rc is not None  # noqa: S101
+                            _gate_first_line = (
+                                f"Post-run gate failed (run `{run.id}`):"
+                                f" `{_gate_cmd}` was killed by signal"
+                                f" {-_gate_rc} after {int(_gate_duration or 0)}s."
+                                f" Branch `{run.branch_name}` was pushed but"
+                                " does not pass the project gate."
+                            )
+                        else:  # launch_error
+                            _gate_first_line = (
+                                f"Post-run gate failed (run `{run.id}`):"
+                                f" `{_gate_cmd}` could not be launched. Branch"
+                                f" `{run.branch_name}` was pushed but was not"
+                                " gate-verified."
+                            )
+                        _gate_comment = (
+                            _gate_first_line
+                            + "\n\nGate output (tail):\n\n````\n"
+                            + (_gate_result.output or "(no output)").rstrip("\n")
+                            + "\n````"
+                        )
+                        if decision != "launch_error" and _stashed_names:
+                            _gate_comment += (
+                                "\n\nUncommitted changes in"
+                                f" {', '.join(_stashed_names)} were stashed"
+                                " before the gate ran, so the gate checked"
+                                " only the committed work."
+                            )
+                        try:
+                            await gtd_client.post_comment(
+                                run.item_id,
+                                _gate_comment,
+                                created_by=attribution or "agent-gtd-dispatch",
+                                token=run.callback_token,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to post post-run gate failure comment"
+                                " for run %s",
+                                run.id,
+                            )
+                    return  # exit early — do not mark succeeded
+
             # All pushed (or no BUILD verification needed) — mark succeeded
             if push_results_list is not None:
                 _push_results_json = json.dumps(
@@ -1878,6 +2061,33 @@ async def _dispatch_worker(
                 except Exception:
                     logger.warning(
                         "Failed to post push-backstop rescue comment for run %s",
+                        run.id,
+                    )
+            if (
+                _gate_result is not None
+                and _gate_result.passed
+                and run.item_id is not None
+            ):
+                _gate_pass_comment = (
+                    f"Post-run gate passed (run `{run.id}`): `{_gate_cmd}`"
+                    f" exited 0 in {int(_gate_result.duration_seconds)}s."
+                )
+                if _stashed_names:
+                    _gate_pass_comment += (
+                        "\n\nUncommitted changes in"
+                        f" {', '.join(_stashed_names)} were stashed before the"
+                        " gate ran, so the gate checked only the committed work."
+                    )
+                try:
+                    await gtd_client.post_comment(
+                        run.item_id,
+                        _gate_pass_comment,
+                        created_by=attribution or "agent-gtd-dispatch",
+                        token=run.callback_token,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to post post-run gate pass comment for run %s",
                         run.id,
                     )
         else:

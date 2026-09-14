@@ -358,6 +358,82 @@ commit + push, with `--no-verify`, by design), so the backstop cannot apply to t
 Plan and manage modes are exempt — `_verify_repos` is `None` for those, so verification is
 skipped entirely. See `tests/test_push_verification.py` for the full behavior matrix.
 
+### Post-run gate (non-talos build runs)
+
+Hooks can be bypassed (`--no-verify`, a hook that skips itself), so the real guarantee
+against "pushed a tree that fails the gate while reporting success" is the harness
+running the gate. Talos already runs `project.gate_command` as its own definition of
+Done (its engine binary, not the dispatch worker, runs it — see the Gate Install section
+above for how Talos and non-talos engines are gated differently before launch). The
+dispatch worker runs the same command, once, for every **non-talos BUILD run** — after
+push verification (including the push backstop and the zero-commits guard) has already
+succeeded.
+
+**Placement.** The gate step sits at the very end of the exit-0, `_verify_repos is not
+None` branch — after the backstop's `unpushed` failure path and the zero-commits guard,
+and before the run is marked `succeeded`. It therefore only ever runs on a branch that
+has genuinely landed on origin.
+
+**Eligibility.** The worker reads `project.gate_command` (the same key Talos reads) and
+strips it. The gate is skipped — logged, no item comment — when either:
+
+- no repo in the run actually reached `pushed` status (`skipped_no_pushed_repo`), or
+- `gate_command` is empty/unset (`skipped_no_gate_command`).
+
+**Timeout.** `gate_timeout = max(timeout_seconds - elapsed_since_run_start,
+config.POST_RUN_GATE_MIN_SECONDS)` — the gate always gets at least
+`POST_RUN_GATE_MIN_SECONDS` (env `DISPATCH_POST_RUN_GATE_MIN_SECONDS`, default 600s),
+even when the build agent used almost the entire run timeout.
+
+**Launch shim.** The gate does not run the project's command directly. It runs
+`/bin/bash -c 'exec timeout --kill-after="$1" "$2" /bin/sh -c "$3"' agent-gtd-gate
+<CANCEL_GRACE_SECONDS>s <gate_timeout>s <gate_command>`, wrapped in `sudo -u <agent
+user> -H` when the two-user split is active. Two things force this shape:
+
+- The sudoers `NOPASSWD` list authorizes `/bin/bash`, not `/bin/sh` — so the outer shell
+  has to be bash even though the gate command itself runs under `/bin/sh -c`.
+- GNU `timeout` sends its signal to the command's whole process group, so a
+  gate that forks background children still gets torn down. `--kill-after` escalates to
+  `SIGKILL` if the gate ignores the initial `SIGTERM`.
+
+Output (stdout+stderr combined) goes to a `tempfile.TemporaryFile()` outside the
+workspace, never a pipe — a backgrounded grandchild holding a pipe's write end open
+can't hold up `proc.wait()`. `stdin=subprocess.DEVNULL`. The subprocess env is filtered
+to `dispatch.GATE_ENV_KEYS` (`engines.COMMON_ENV_KEYS` minus `AGENT_GTD_URL` /
+`AGENT_GTD_API_KEY` / `KB_DATABASE_URL`) — an arbitrary project-authored gate command has
+no business touching GTD credentials. The gate registers itself as the run's active
+subprocess (the same `popen_callback` hook `run_agent` uses), so `cancel_run`'s SIGTERM
+reaches it.
+
+**Dirty-tree stash.** Any repo the run's push verification found `dirty` (pushed or
+no-changes) is stashed — `git stash push --message agent-gtd-post-run-gate` as the
+`agent-gtd-dispatch` git identity — before the gate launches, so the gate only ever
+checks committed work. The stash is left in place afterward (not popped); the pass/fail
+comment names which repos were stashed.
+
+**Outcomes.** The worker classifies the result into one of four failure shapes, each
+with a pinned first line on the GTD comment: gate **timed out**, gate **exited
+non-zero**, gate **killed by signal** (negative return code), or the gate **could not be
+launched** (a `Popen` `OSError`, e.g. missing binary). Every failure comment also
+includes the last 3000 chars of combined gate output in a fenced block. A pass posts a
+short confirmation comment instead. Both cases mention the stashed repos when
+applicable. Every decision — pass, each failure shape, or a skip — is recorded in a
+single structured `post-run gate: ...` INFO log line, so fleet-wide gate health is
+greppable even though outcomes aren't (yet) persisted in the runs table.
+
+**Exemptions.** Talos build runs never reach this code (they return from `_run_talos`
+before `run_agent`/verification) — Talos self-gates via its own `TaskSpec.gate_command`
+and `TALOS_GATE_TIMEOUT_SECS`. Plan and manage runs never run the post-run gate
+(`_verify_repos` is `None` for both). The `TimeoutExpired` "linger success" path
+(agent process outlives the wall clock but every repo is already pushed) is exempt too,
+mirroring the push backstop's own scope.
+
+A rollout manager gets one exception to the usual "any non-`succeeded` child run is a
+halt candidate" rule: when a child run's `error_msg` starts with `post-run gate`, the
+branch **was** pushed and only the project gate failed — the manager re-runs the gate
+itself as part of its own quality-gate step instead of halting immediately. See
+`docs/rollouts.md` for the manager-side wording.
+
 ---
 
 ## Engine Routing

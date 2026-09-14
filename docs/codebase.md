@@ -255,7 +255,7 @@ or `_pending_queue`. Inserting an `await` in that gap re-introduces the race.
 | Module | Responsibility |
 |---|---|
 | `main.py` | FastAPI app, endpoints, lifespan, `_dispatch_worker`, capacity logic |
-| `dispatch.py` | Workspace prep (single- and multi-repo: `prepare_workspace_multi`, `prepare_manage_workspace_multi`, `repo_dir_from_url`), push verification (`verify_pushes`, `get_head_sha`), prompt building, `run_agent()`, attachment staging |
+| `dispatch.py` | Workspace prep (single- and multi-repo: `prepare_workspace_multi`, `prepare_manage_workspace_multi`, `repo_dir_from_url`), push verification (`verify_pushes`, `get_head_sha`), post-run gate (`run_gate_command`), prompt building, `run_agent()`, attachment staging |
 | `engines.py` | Engine registry, command builders, env filtering, availability checks |
 | `gates.py` | Pre-launch per-repo gate install: hook-manager detection, `.agent-gtd/setup` override, install + live-hook verification, agent-user command runner |
 | `models.py` | `Run`, `RunStatus`, `RunResponse`, `EngineSwap`, `InfoResponse` |

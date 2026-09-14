@@ -442,7 +442,10 @@ When a notification arrives, the manager:
    run** — without waiting for other runs in the same wave.
 
 If a run ended `failed`, `timed_out`, or `cancelled`, that run is treated as
-a halt candidate; see the **Halt path** below.
+a halt candidate; see the **Halt path** below — except a failed run whose
+error starts with `post-run gate` (branch pushed, only the project gate
+failed): the manager re-runs the project gate command on the branch in its
+quality-gate step, inline-fixes if small, and merges only once it exits 0.
 
 #### Step 4 — AC reconciliation
 
@@ -1029,7 +1032,11 @@ A rollout can reach a terminal state through three paths.
 
 - **Who calls it:** the manage agent (via `halt_rollout`) on any of:
   - `advance_rollout` failed 3 times.
-  - A build agent ended `failed` / `timed_out` / `cancelled`.
+  - A build agent ended `failed` / `timed_out` / `cancelled` — except a
+    failed run whose error starts with `post-run gate` (branch pushed,
+    only the project gate failed): the manager re-runs the project gate
+    command on the branch in its quality-gate step, inline-fixes if small,
+    and merges only once it exits 0.
   - Quality gates failed and an inline fix didn't work.
   - Diff touched a sensitive area (auth, deploy, infra) and the change
     looked non-trivial.

@@ -68,8 +68,8 @@ of build-mode push verification (`dispatch.verify_pushes()`):
 |---|---|
 | `pending` | Run created; waiting for a capacity slot (`_pending_queue`) |
 | `running` | Agent subprocess is active |
-| `succeeded` | Subprocess exited with code 0 (and, for build runs, push verification passed) |
-| `failed` | Subprocess exited non-zero, an unhandled exception occurred, or a build run exited 0 but push verification found unpushed commits |
+| `succeeded` | Subprocess exited with code 0 (and, for build runs, push verification passed and — when the project has a non-empty `gate_command` and at least one repo was pushed — the post-run gate passed) |
+| `failed` | Subprocess exited non-zero, an unhandled exception occurred, a build run exited 0 but push verification found unpushed commits, or a build run's post-run gate failed/timed out (error starts with `post-run gate`) |
 | `timed_out` | Subprocess exceeded the timeout wall-clock limit |
 | `cancelled` | Human called `POST /runs/{run_id}/cancel` |
 
@@ -77,8 +77,10 @@ of build-mode push verification (`dispatch.verify_pushes()`):
 
 ```
 pending → running    (slot available, _dispatch_worker starts)
-running → succeeded  (exit code 0; build runs additionally require push verification to pass)
-running → failed     (exit code != 0, exception, or exit 0 + unpushed repo in build mode)
+running → succeeded  (exit code 0; build runs additionally require push verification — and,
+                       when gate_command is set and a repo was pushed, the post-run gate — to pass)
+running → failed     (exit code != 0, exception, exit 0 + unpushed repo in build mode, or
+                       exit 0 + push verified + post-run gate failed/timed out in build mode)
 running → timed_out  (subprocess.TimeoutExpired)
 running → cancelled  (asyncio.CancelledError from cancel endpoint)
 pending → cancelled  (cancel called before slot was available)
@@ -86,7 +88,11 @@ pending → cancelled  (cancel called before slot was available)
 
 **Note**: exit code 0 does **not** imply `succeeded` for build runs — push verification
 can transition an exit-0 run to `failed` (with `push_results` populated and the workspace
-preserved).
+preserved). When push verification passes, a build run whose project has a non-empty
+`gate_command` and at least one pushed repo still has to clear the post-run gate
+(`dispatch.run_gate_command()`) before it's `succeeded` — a gate failure or timeout also
+transitions the run to `failed`, with an `error` that starts with `post-run gate` and the
+branch left on origin for inspection.
 
 Orphaned `pending`/`running` runs (from a service restart) are forced to `failed` by
 `db.reconcile_orphans()` on startup.
@@ -127,6 +133,13 @@ Every run has a `mode` that controls the system prompt and workspace lifecycle.
 - **Gate install**: after clone and before launch, the worker installs and verifies each
   repo's hook manager (or runs its `.agent-gtd/setup`); failure → run `failed` before the
   agent starts
+- **Post-run gate**: after push verification succeeds, when the project has a non-empty
+  `gate_command` and at least one repo was pushed, the worker (for every non-talos engine)
+  runs that command once from the workspace root, bounded by the run's remaining timeout
+  (floored at `POST_RUN_GATE_MIN_SECONDS`). Exit 0 → the run proceeds to `succeeded` as
+  above. A non-zero exit, a timeout, or a launch error → the run is `failed` (error starts
+  with `post-run gate`) even though the branch is already on origin. Talos engines are
+  exempt — they self-gate via their own `gate_command` run before minting the commit.
 
 ### `plan`
 

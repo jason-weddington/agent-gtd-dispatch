@@ -7,7 +7,10 @@ import concurrent.futures
 import logging
 import re
 import subprocess
+import tempfile
 import textwrap
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -19,7 +22,7 @@ from agent_gtd_dispatch_protocol.branches import make_branch_name
 from agent_gtd_dispatch_protocol.models import DispatchMode
 
 from . import config, gtd_client
-from .engines import Engine, build_env
+from .engines import COMMON_ENV_KEYS, Engine, build_env
 from .models import PushStatus, RepoPushStatus
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,28 @@ logger = logging.getLogger(__name__)
 _executor: concurrent.futures.ThreadPoolExecutor | None = None
 
 _DEFAULT_BRANCH_CANDIDATES: tuple[str, ...] = ("main", "master")
+
+# Post-run gate: how many chars of combined gate output to keep for the
+# failure comment (tail only — the most recent output is the most useful).
+GATE_OUTPUT_TAIL_CHARS: int = 3000
+
+# Env vars passed to the post-run gate subprocess — COMMON_ENV_KEYS minus the
+# secrets an arbitrary project-authored gate_command has no business touching
+# (AGENT_GTD_URL / AGENT_GTD_API_KEY / KB_DATABASE_URL).
+GATE_ENV_KEYS: frozenset[str] = COMMON_ENV_KEYS - {
+    "AGENT_GTD_URL",
+    "AGENT_GTD_API_KEY",
+    "KB_DATABASE_URL",
+}
+
+# git stash message used to park uncommitted changes in a dirty repo before
+# running the post-run gate, so the gate only ever checks committed work.
+GATE_STASH_MESSAGE: str = "agent-gtd-post-run-gate"
+
+# Shim run via `/bin/bash -c` (the binary the sudoers NOPASSWD list already
+# authorizes): GNU `timeout` bounds the gate and signals its whole process
+# group, then `/bin/sh -c` runs the gate_command string itself.
+_GATE_SHIM: str = 'exec timeout --kill-after="$1" "$2" /bin/sh -c "$3"'
 
 
 def _sudo_wrap(cmd: list[str]) -> list[str]:
@@ -357,6 +382,164 @@ def push_unpushed_repo(
         capture_output=True,
         check=False,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class GateResult:
+    """Outcome of a single post-run quality-gate invocation."""
+
+    returncode: int | None
+    timed_out: bool
+    output: str
+    duration_seconds: float
+
+    @property
+    def passed(self) -> bool:
+        """True when the gate exited 0 and did not time out."""
+        return self.returncode == 0 and not self.timed_out
+
+
+def _classify_gate_timeout(
+    returncode: int, duration_seconds: float, timeout_seconds: int
+) -> bool:
+    """Classify whether *returncode* represents a gate timeout rather than a real failure.
+
+    124 is GNU ``timeout``'s own expiry status. 137 and -9 are what a gate that
+    ignores SIGTERM gets once ``--kill-after`` escalates to SIGKILL. The
+    duration check guards against a gate that legitimately produces one of
+    these exit codes well before the deadline being misclassified as a
+    timeout.
+    """
+    return returncode in (124, 137, -9) and duration_seconds >= timeout_seconds - 1
+
+
+def run_gate_command(
+    workspace: Path,
+    gate_command: str,
+    timeout_seconds: int,
+    engine: Engine,
+    popen_callback: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    dirty_repo_paths: list[Path] | None = None,
+) -> GateResult:
+    """Run the project's post-run quality gate and capture its outcome.
+
+    Runs synchronously and may block for the gate's full duration (a cold
+    fmt+lint+test+coverage run) — callers MUST invoke this via
+    ``loop.run_in_executor(_executor, ...)``, never inline on the event loop,
+    mirroring :func:`push_unpushed_repo`.
+
+    Never raises ``subprocess.TimeoutExpired`` or ``OSError`` — both are
+    caught and folded into the returned :class:`GateResult` so a gate failure
+    or a launch error can never be misclassified by the caller as an agent
+    timeout.
+    """
+    for path in dirty_repo_paths or []:
+        try:
+            stash_proc = subprocess.run(
+                _sudo_wrap(
+                    [
+                        "git",
+                        "-c",
+                        "user.name=agent-gtd-dispatch",
+                        "-c",
+                        "user.email=agent-gtd-dispatch@localhost",
+                        "stash",
+                        "push",
+                        "--message",
+                        GATE_STASH_MESSAGE,
+                    ]
+                ),
+                cwd=path,
+                capture_output=True,
+                check=False,
+            )
+        except OSError as exc:
+            return GateResult(
+                returncode=None,
+                timed_out=False,
+                output=(
+                    "gate launch failed: could not stash uncommitted changes"
+                    f" in {path.name}: {exc}"
+                ),
+                duration_seconds=0.0,
+            )
+        if stash_proc.returncode != 0:
+            stderr_tail = stash_proc.stderr.decode("utf-8", errors="replace")[-500:]
+            return GateResult(
+                returncode=None,
+                timed_out=False,
+                output=(
+                    "gate launch failed: could not stash uncommitted changes"
+                    f" in {path.name}: {stderr_tail}"
+                ),
+                duration_seconds=0.0,
+            )
+
+    argv = _sudo_wrap(
+        [
+            "/bin/bash",
+            "-c",
+            _GATE_SHIM,
+            "agent-gtd-gate",
+            f"{config.CANCEL_GRACE_SECONDS}s",
+            f"{timeout_seconds}s",
+            gate_command,
+        ]
+    )
+    env = {
+        k: v
+        for k, v in build_env(engine, mode=DispatchMode.BUILD).items()
+        if k in GATE_ENV_KEYS
+    }
+
+    with tempfile.TemporaryFile() as stdout_file:
+        start = time.monotonic()
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=workspace,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=subprocess.STDOUT,
+            )
+        except OSError as exc:
+            return GateResult(
+                returncode=None,
+                timed_out=False,
+                output=f"gate launch failed: {exc}",
+                duration_seconds=time.monotonic() - start,
+            )
+
+        if popen_callback is not None:
+            popen_callback(proc)
+
+        def _tail() -> str:
+            size = stdout_file.tell()
+            stdout_file.seek(max(0, size - 4 * GATE_OUTPUT_TAIL_CHARS))
+            data = stdout_file.read()
+            return data.decode("utf-8", errors="replace")[-GATE_OUTPUT_TAIL_CHARS:]
+
+        try:
+            proc.wait(timeout=timeout_seconds + 2 * config.CANCEL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return GateResult(
+                returncode=None,
+                timed_out=True,
+                output=_tail(),
+                duration_seconds=time.monotonic() - start,
+            )
+
+        duration = time.monotonic() - start
+        rc = proc.returncode
+        return GateResult(
+            returncode=rc,
+            timed_out=_classify_gate_timeout(rc, duration, timeout_seconds),
+            output=_tail(),
+            duration_seconds=duration,
+        )
 
 
 def _detect_default_branch(repo_path: Path) -> str:
@@ -887,6 +1070,25 @@ def _build_manage_workspace_main_prompt(
     first_repo = workspace_repo_dirs[0]
     repos_order = " → ".join(f"`{d}/`" for d in workspace_repo_dirs)
 
+    _gate = (project.get("gate_command") or "").strip()
+    _gate_ind = _gate.replace("\n", "\n        ")
+    gate_exception = ""
+    if _gate:
+        gate_exception = (
+            "\n\n        "
+            "Exception — post-run gate failure: if the run's `error_msg` (from "
+            "`get_run_status`) starts with `post-run gate`, the build agent's "
+            "branch WAS pushed and only the project gate command failed or "
+            "timed out. Do NOT halt yet. Read the item's comment starting "
+            "`Post-run gate` for the output tail, then continue with Step 4. "
+            "In Step 5b, after checking out the branch in every pushed repo, "
+            "ALSO run the project gate command from the workspace root: "
+            f"`{_gate_ind}`. Proceed to Step 6 only once it exits 0. If it "
+            "fails, apply the inline-fix rules (small fix, then re-run the "
+            "same command); otherwise halt with reason "
+            '`"post-run gate failure: run <run_id> for item <item_id>"`.'
+        )
+
     return textwrap.dedent(
         f"""\
         You are a headless rollout-manager executor dispatched by Agent GTD.
@@ -1045,7 +1247,7 @@ def _build_manage_workspace_main_prompt(
         Process each item as it completes — don't wait for all before acting on any.
         If a run ended with `failed`, `timed_out`, or `cancelled`: treat as a halt
         candidate (see Halt path) with reason
-        `"build agent <status>: run <run_id> for item <item_id>"`.
+        `"build agent <status>: run <run_id> for item <item_id>"`.{gate_exception}
 
         **Step 4 — AC reconciliation**
 
@@ -1361,6 +1563,24 @@ def _build_manage_prompt(
             rollout_id, project, max_turns, workspace_repo_dirs
         )
 
+    _gate = (project.get("gate_command") or "").strip()
+    _gate_ind = _gate.replace("\n", "\n        ")
+    gate_exception = ""
+    if _gate:
+        gate_exception = (
+            "\n\n        "
+            "Exception — post-run gate failure: if the run's `error_msg` (from "
+            "`get_run_status`) starts with `post-run gate`, the build agent's "
+            "branch WAS pushed and only the project gate command failed or "
+            "timed out. Do NOT halt yet. Read the item's comment starting "
+            "`Post-run gate` for the output tail, then continue with Step 4. "
+            "In Step 5, after checking out the branch, ALSO run the project "
+            f"gate command from the repo root: `{_gate_ind}`. Proceed to Step "
+            "6 only once it exits 0. If it fails, apply the inline-fix rules "
+            "(small fix, then re-run the same command); otherwise halt with "
+            'reason `"post-run gate failure: run <run_id> for item <item_id>"`.'
+        )
+
     main_prompt = textwrap.dedent(
         f"""\
         You are a headless rollout-manager executor dispatched by Agent GTD.
@@ -1509,7 +1729,7 @@ def _build_manage_prompt(
         Process each item as it completes — don't wait for all before acting on any.
         If a run ended with `failed`, `timed_out`, or `cancelled`: treat as a halt
         candidate (see Halt path) with reason
-        `"build agent <status>: run <run_id> for item <item_id>"`.
+        `"build agent <status>: run <run_id> for item <item_id>"`.{gate_exception}
 
         **Step 4 — AC reconciliation**
 
@@ -1743,6 +1963,19 @@ def _build_manage_prompt(
     return recovery_block + main_prompt
 
 
+def _build_gate_section_build(gate_command: str, workspace_mode: bool) -> str:
+    """'## Quality Gate' section for build-mode runs with a project gate_command."""
+    where = "the workspace root" if workspace_mode else "the repo root"
+    return (
+        "## Quality Gate\n\n"
+        "This project's quality gate command is:\n\n"
+        f"```bash\n{gate_command}\n```\n\n"
+        f"Run it from {where} and make it exit 0 before you push. After you "
+        "exit, the dispatch worker re-runs this exact command from "
+        f"{where} and marks the run failed if it exits non-zero."
+    )
+
+
 def _build_build_prompt(
     item: dict[str, Any],
     project: dict[str, Any],
@@ -1785,6 +2018,14 @@ def _build_build_prompt(
         prompt += (
             "\n"
             + _build_workspace_layout_section_build(workspace_repo_dirs, branch_name)
+            + "\n"
+        )
+
+    _gate_command = (project.get("gate_command") or "").strip()
+    if _gate_command:
+        prompt += (
+            "\n"
+            + _build_gate_section_build(_gate_command, bool(workspace_repo_dirs))
             + "\n"
         )
 
