@@ -168,7 +168,7 @@ class TestTalosEnvOverlay:
 
         assert talos_env_overlay("talos-qwen") == {
             "TALOS_BACKEND": "ollama",
-            "OLLAMA_MODEL": "qwen3.6:35b",
+            "OLLAMA_MODEL": "qwen3.8:27b",
             "OLLAMA_THINK": "on",
             "OLLAMA_NUM_CTX": "262144",
             "OLLAMA_BASE_URL": config.OLLAMA_BASE_URL,
@@ -176,7 +176,7 @@ class TestTalosEnvOverlay:
         }
 
     def test_qwen_num_ctx_pinned_not_config_derived(self) -> None:
-        """OLLAMA_NUM_CTX is a hardcoded literal pinned to qwen3.6:35b's FULL
+        """OLLAMA_NUM_CTX is a hardcoded literal pinned to qwen3.8:27b's FULL
         256k window — talos only self-defaults num_ctx for localhost URLs
         (main.rs:328-329), so a remote Ollama with num_ctx unset silently
         shrinks the window.

@@ -113,7 +113,8 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
       signal), which stalls multi-file tasks a few turns in. Pinning num_ctx
       also ARMS talos's pre-flight context guard, so an overflow becomes a loud
       ``ContextLengthExceeded`` instead of silent truncation. Values:
-      ``262144`` (256k) for talos-qwen (qwen3.6:35b's full window) and
+      ``262144`` (256k) for talos-qwen (qwen3.8:27b's full window — fits the
+      5090 host only with the Ollama server's 8-bit KV cache, see below) and
       ``1048576`` (1M) for talos-glm / talos-glm-flash (glm-5.3:cloud /
       glm-5.3-flash:cloud are 1M-context models).
     - ``OLLAMA_BASE_URL='https://ollama.com'`` for talos-glm and talos-glm-flash
@@ -151,11 +152,16 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
     if engine_name == "talos-qwen":
         return {
             "TALOS_BACKEND": "ollama",
-            "OLLAMA_MODEL": "qwen3.6:35b",
+            # qwen3.8:27b (was qwen3.6:35b until 2026-09-14): on the tier-2
+            # production-parity matrix it resolved 21/24 with 2 real false dones
+            # vs qwen3.6's 19/24 and 5 (harness-design kb-03252).
+            "OLLAMA_MODEL": "qwen3.8:27b",
             # Hardcoded literals — see docstring for the num_ctx reasoning.
             "OLLAMA_THINK": "on",
-            # qwen3.6:35b's FULL 256k window (was 32768 = 1/8 the real window,
-            # which silently truncated large tasks).
+            # qwen3.8:27b's FULL 256k window. It is a dense 27B: at 256k the
+            # fp16 KV cache spills ~45% to CPU on the 32 GB host GPU, so the
+            # Ollama server runs OLLAMA_KV_CACHE_TYPE=q8_0 +
+            # OLLAMA_FLASH_ATTENTION=1 (server-side, not settable here).
             "OLLAMA_NUM_CTX": "262144",
             "OLLAMA_BASE_URL": config.OLLAMA_BASE_URL,
             "OLLAMA_API_KEY": config.OLLAMA_API_KEY,

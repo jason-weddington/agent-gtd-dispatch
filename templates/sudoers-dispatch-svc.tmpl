@@ -25,10 +25,10 @@
 #                            back to its default (haiku) — silent downgrade.
 # TALOS_BACKEND            — talos backend selector (anthropic|ollama); without
 #                            it talos defaults to anthropic, breaking talos-glm/qwen.
-# OLLAMA_MODEL             — talos-glm/qwen model pin (glm-5.2:cloud, qwen3.6:35b).
+# OLLAMA_MODEL             — talos-glm/qwen model pin (glm-5.3:cloud, glm-5.3-flash:cloud, qwen3.8:27b).
 # OLLAMA_API_KEY           — Ollama cloud/local key for talos ollama backends.
 # OLLAMA_THINK             — talos-qwen thinking-mode toggle.
-# OLLAMA_NUM_CTX           — talos-qwen context-window pin (32768).
+# OLLAMA_NUM_CTX           — talos-qwen/glm context-window pin (262144 / 1048576).
 # PATH                     — Required so uvx/MCP binaries in ~/.local/bin survive env_reset
 #
 # NOTE: talos per-engine env is built by talos_env_overlay and passed on the
