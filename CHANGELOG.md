@@ -2,6 +2,26 @@
 
 <!-- version list -->
 
+## v1.22.0 (2026-09-16)
+
+### Features
+
+- **dispatch**: Run a per-repo gate install after clone, before the agent launches (810e67b6)
+  ([`617c8a2`](https://github.com/repos/agent-gtd-dispatch/commit/617c8a2772e8d313d03a05c7141b8d1a5a792cd2))
+
+- **dispatch**: Run the project gate_command after a successful non-talos build (850c058b)
+  ([`0e4c85b`](https://github.com/repos/agent-gtd-dispatch/commit/0e4c85b64c642e37576dba442233cae545b38f84))
+
+- **setup**: Install and refresh lefthook for the agent user on dispatch hosts (25bcf1a9)
+  ([`7da4aaa`](https://github.com/repos/agent-gtd-dispatch/commit/7da4aaa73342c71fbb60f60fa954ac3ced4baa7f))
+
+- **setup**: Provision the dev toolchain (Rust tools + gitleaks) for the agent user (75b88467)
+  ([`87e6a09`](https://github.com/repos/agent-gtd-dispatch/commit/87e6a097f124ea314877eacfa3f509806e3524ec))
+
+- **talos**: Talos-qwen runs qwen3.8:27b at 256K context (was qwen3.6:35b)
+  ([`952f2dd`](https://github.com/repos/agent-gtd-dispatch/commit/952f2dde25b2ee4b6799ad42c9e0d218363380ec))
+
+
 ## v1.21.1 (2026-09-14)
 
 ### Bug Fixes
