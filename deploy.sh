@@ -18,7 +18,8 @@ set -euo pipefail
 #   DISPATCH_HOSTS  Space-separated SSH targets (default: "pironman01 r7-research r7-server")
 #   DISPATCH_HOST   Single SSH target — if set, overrides DISPATCH_HOSTS (back-compat)
 #   SERVICE_USER    Service account owning the tool install (default: dispatch-svc)
-#   AGENT_USER      Agent subprocess user whose Claude Code and lefthook are refreshed (default: dispatch)
+#   AGENT_USER      Agent subprocess user whose Claude Code, lefthook and dev toolchain
+#                   (Rust tools + gitleaks, Step 4.9) are refreshed (default: dispatch)
 #   SERVICE_NAME    Systemd service unit name (default: dispatch-api)
 #   DISPATCH_INDEX  Homelab wheel index URL (default: https://pypi.lab.jasonweddington.com/simple/)
 #
@@ -33,6 +34,37 @@ SERVICE_USER="${SERVICE_USER:-dispatch-svc}"
 AGENT_USER="${AGENT_USER:-dispatch}"
 SERVICE_NAME="${SERVICE_NAME:-dispatch-api}"
 DISPATCH_INDEX="${DISPATCH_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
+
+# --- Dev toolchain data (single source of truth: templates/dev-toolchain.sh) ---
+# deploy.sh runs LOCALLY from a repo checkout, so the tool list is sourced here and
+# the resulting lists are interpolated into the unquoted ssh heredoc below (same
+# mechanism as ${AGENT_USER}/${SERVICE_USER}). The list is deliberately NOT copied
+# into this file — adding a tool stays a one-line change in templates/dev-toolchain.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOLCHAIN_CONF="${SCRIPT_DIR}/templates/dev-toolchain.sh"
+if [ -f "${TOOLCHAIN_CONF}" ]; then
+    # shellcheck source=templates/dev-toolchain.sh
+    . "${TOOLCHAIN_CONF}"
+    # Entries contain a '|' separator, and these lists are interpolated into the
+    # heredoc as literal SCRIPT TEXT (not as a runtime expansion), so a bare '|'
+    # would be parsed as a pipe on the remote side. Single-quote each entry.
+    DEV_TOOLCHAIN_PKG_LIST=""
+    for _e in "${DEV_TOOLCHAIN_CARGO_PKGS[@]}"; do
+        DEV_TOOLCHAIN_PKG_LIST="${DEV_TOOLCHAIN_PKG_LIST}'${_e}' "
+    done
+    GITLEAKS_ARCH_MAP_LIST=""
+    for _e in "${GITLEAKS_ARCH_MAP[@]}"; do
+        GITLEAKS_ARCH_MAP_LIST="${GITLEAKS_ARCH_MAP_LIST}'${_e}' "
+    done
+    # Substitute {version} locally; {arch} is resolved on each host from `uname -m`.
+    GITLEAKS_URL_VERSIONED="${GITLEAKS_URL_TEMPLATE//\{version\}/${GITLEAKS_VERSION}}"
+else
+    echo "[WARN] ${TOOLCHAIN_CONF} not found — dev toolchain refresh will be skipped on every host" >&2
+    DEV_TOOLCHAIN_PKG_LIST=""
+    GITLEAKS_ARCH_MAP_LIST=""
+    GITLEAKS_URL_VERSIONED=""
+    GITLEAKS_VERSION=""
+fi
 
 deploy_one() {
     local host="$1"
@@ -75,6 +107,57 @@ if LH_VER=\$(sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/lefthook ve
     echo "[OK]   lefthook (${AGENT_USER}): \${LH_VER}"
 else
     echo "[WARN] lefthook not runnable for ${AGENT_USER} — lefthook repos cannot activate hooks on this host" >&2
+fi
+
+# Refresh the agent user's dev toolchain (setup-dispatch-host.sh Step 4.9): the
+# Rust tools and gitleaks that dispatched repos' hooks and gate commands call.
+# The package list and the gitleaks pin come from templates/dev-toolchain.sh,
+# sourced locally above and interpolated here — never hand-copied.
+# Non-fatal throughout: a failed refresh leaves the agent on its current binaries
+# and must not abort the deploy (only the health check below may exit non-zero).
+_cargo="/home/${AGENT_USER}/.cargo/bin/cargo"
+if [ ! -x "\$_cargo" ]; then
+    echo "[WARN] cargo not found for ${AGENT_USER} — dev toolchain refresh skipped; run 'sudo ./setup-dispatch-host.sh' (Step 4.9) on this host" >&2
+else
+    for _entry in ${DEV_TOOLCHAIN_PKG_LIST}; do
+        _crate="\${_entry%%|*}"
+        _bin="\${_entry#*|}"
+        if _TC_OUT=\$(sudo -u ${AGENT_USER} -H "\$_cargo" binstall -y "\$_crate" 2>&1); then
+            echo "[OK]   \$_crate (\$_bin) refreshed for ${AGENT_USER}"
+        else
+            echo "[WARN] cargo binstall \$_crate failed for ${AGENT_USER} — agent keeps its current binary. Last output:" >&2
+            printf '%s\n' "\$_TC_OUT" | tail -n 5 | sed 's/^/[WARN]   /' >&2
+        fi
+    done
+fi
+
+# gitleaks: re-install only when the installed binary differs from the pinned version.
+_gl_dest="/home/${AGENT_USER}/.local/bin/gitleaks"
+_gl_machine=\$(uname -m)
+_gl_arch=""
+for _map in ${GITLEAKS_ARCH_MAP_LIST}; do
+    if [ "\${_map%%|*}" = "\$_gl_machine" ]; then
+        _gl_arch="\${_map#*|}"
+    fi
+done
+_gl_have=\$(sudo -u ${AGENT_USER} -H "\$_gl_dest" version 2>/dev/null | tr -d '[:space:]' | sed 's/^v//' || true)
+if [ -z "${GITLEAKS_VERSION}" ]; then
+    echo "[WARN] no gitleaks pin available (templates/dev-toolchain.sh missing) — skipping gitleaks refresh" >&2
+elif [ -z "\$_gl_arch" ]; then
+    echo "[WARN] unsupported architecture '\$_gl_machine' for gitleaks — agent keeps its current binary" >&2
+elif [ "\$_gl_have" = "${GITLEAKS_VERSION}" ]; then
+    echo "[OK]   gitleaks (${AGENT_USER}): \$_gl_have"
+else
+    _gl_url=\$(printf '%s' '${GITLEAKS_URL_VERSIONED}' | sed "s/{arch}/\$_gl_arch/")
+    _gl_tmp=\$(mktemp -d)
+    if curl -fsSL "\$_gl_url" -o "\$_gl_tmp/gitleaks.tar.gz" \\
+        && tar -xzf "\$_gl_tmp/gitleaks.tar.gz" -C "\$_gl_tmp" gitleaks \\
+        && sudo install -m 0755 -o ${AGENT_USER} -g "\$(id -gn ${AGENT_USER})" "\$_gl_tmp/gitleaks" "\$_gl_dest"; then
+        echo "[OK]   gitleaks (${AGENT_USER}): \$(sudo -u ${AGENT_USER} -H "\$_gl_dest" version 2>/dev/null || echo unknown)"
+    else
+        echo "[WARN] gitleaks ${GITLEAKS_VERSION} install failed (\$_gl_url) — agent keeps its current binary" >&2
+    fi
+    rm -rf "\$_gl_tmp"
 fi
 
 # Restart the service so systemd runs the freshly-installed entry point.

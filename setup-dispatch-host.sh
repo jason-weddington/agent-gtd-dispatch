@@ -847,6 +847,54 @@ else
 fi
 
 # ===========================================================================
+# Shared Rust bootstrap helpers (used by Step 4.5b-B/C AND Step 4.9)
+# ===========================================================================
+# Two steps need rustup + cargo-binstall for AGENT_USER:
+#   * Step 4.5b (talos engine, --with-talos only) — builds talos from source.
+#   * Step 4.9  (dev toolchain, ALWAYS) — installs the tools that dispatched
+#     repos' hooks and gate commands call.
+# The install commands live here ONCE so the two call sites can never drift
+# (item 75b88467 / AC-2). Each helper carries its own `[[ -x ... ]]` skip guard
+# and its own $DRY_RUN branch, so it is idempotent and safe to call from either
+# site, in either order, with or without --with-talos.
+# ===========================================================================
+
+# Install rustup (and the default toolchain) for AGENT_USER if absent.
+ensure_rustup() {
+    if [[ -x "${AGENT_HOME}/.cargo/bin/rustup" ]]; then
+        skip "rustup already installed for ${AGENT_USER} — already configured"
+    elif $DRY_RUN; then
+        would "install rustup for ${AGENT_USER} via official installer (curl https://sh.rustup.rs | sh -s -- -y, login shell)"
+    else
+        runuser -l "${AGENT_USER}" -c \
+            "curl --proto '=https' --tlsv1.2 -fsSf https://sh.rustup.rs | sh -s -- -y"
+        if [[ -x "${AGENT_HOME}/.cargo/bin/rustup" ]]; then
+            info "Installed rustup for ${AGENT_USER}"
+        else
+            die "rustup installer ran but ${AGENT_HOME}/.cargo/bin/rustup not found"
+        fi
+    fi
+}
+
+# Install cargo-binstall for AGENT_USER if absent. Callers must have run
+# ensure_rustup first (cargo-binstall lands in ~/.cargo/bin).
+ensure_cargo_binstall() {
+    if [[ -x "${AGENT_HOME}/.cargo/bin/cargo-binstall" ]]; then
+        skip "cargo-binstall already installed for ${AGENT_USER} — already configured"
+    elif $DRY_RUN; then
+        would "install cargo-binstall for ${AGENT_USER} via install-from-binstall-release.sh (login shell)"
+    else
+        runuser -l "${AGENT_USER}" -c \
+            "curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash"
+        if [[ -x "${AGENT_HOME}/.cargo/bin/cargo-binstall" ]]; then
+            info "Installed cargo-binstall for ${AGENT_USER}"
+        else
+            die "cargo-binstall installer ran but ${AGENT_HOME}/.cargo/bin/cargo-binstall not found"
+        fi
+    fi
+}
+
+# ===========================================================================
 # Step 4.5b: talos engine provisioning (--with-talos only)
 # ===========================================================================
 # The talos-* engine family (talos-haiku/sonnet/opus/qwen/glm/glm-flash) invokes the
@@ -879,38 +927,24 @@ else
     fi
 
     # Sub-step B: rustup for AGENT_USER
+    # Bootstrap logic lives in ensure_rustup() (shared with Step 4.9 — AC-2);
+    # the helper carries the skip guard and the $DRY_RUN branch.
     echo ""
     echo "  [4.5b-B] rustup (${AGENT_USER})"
-    if [[ -x "${AGENT_HOME}/.cargo/bin/rustup" ]]; then
-        skip "rustup already installed for ${AGENT_USER} — already configured"
-    elif $DRY_RUN; then
-        would "install rustup for ${AGENT_USER} via official installer (login shell)"
-    else
-        runuser -l "${AGENT_USER}" -c \
-            "curl --proto '=https' --tlsv1.2 -fsSf https://sh.rustup.rs | sh -s -- -y"
-        if [[ -x "${AGENT_HOME}/.cargo/bin/rustup" ]]; then
-            info "Installed rustup for ${AGENT_USER}"
-        else
-            die "rustup installer ran but ${AGENT_HOME}/.cargo/bin/rustup not found"
-        fi
-    fi
+    ensure_rustup
 
     # Sub-step C: cargo-binstall + cargo-nextest
+    # cargo-binstall bootstrap lives in ensure_cargo_binstall() (shared with Step 4.9).
+    # cargo-nextest itself is also in the Step 4.9 toolchain list; installing it here
+    # too keeps --with-talos self-contained and is a no-op when 4.9 already did it.
     echo ""
     echo "  [4.5b-C] cargo-nextest (${AGENT_USER})"
+    ensure_cargo_binstall
     if [[ -x "${AGENT_HOME}/.cargo/bin/cargo-nextest" ]]; then
         skip "cargo-nextest already installed for ${AGENT_USER} — already configured"
     elif $DRY_RUN; then
-        would "install cargo-binstall for ${AGENT_USER} if absent, then cargo binstall -y cargo-nextest"
+        would "runuser -l ${AGENT_USER} -- ${_talos_cargo} binstall -y cargo-nextest"
     else
-        # Ensure cargo-binstall is present first
-        if [[ -x "${AGENT_HOME}/.cargo/bin/cargo-binstall" ]]; then
-            skip "cargo-binstall already installed for ${AGENT_USER} — already configured"
-        else
-            runuser -l "${AGENT_USER}" -c \
-                "curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash"
-            info "Installed cargo-binstall for ${AGENT_USER}"
-        fi
         # Install cargo-nextest via cargo-binstall (absolute cargo path)
         runuser -l "${AGENT_USER}" -c \
             "${_talos_cargo} binstall -y cargo-nextest"
@@ -1402,6 +1436,102 @@ else
     runuser -l "$AGENT_USER" -c 'uv tool install lefthook'
     lefthook_ver="$(runuser -l "$AGENT_USER" -c 'lefthook version' 2>/dev/null)" || die "lefthook installed but 'lefthook version' failed for ${AGENT_USER}"
     info "Installed lefthook ${lefthook_ver} for ${AGENT_USER}"
+fi
+
+# ===========================================================================
+# Step 4.9: Dev toolchain (Rust tools + gitleaks, agent user)
+# ===========================================================================
+# Step 4.8 installs the lefthook *runner*; this step installs the tools a
+# dispatched repo's hooks and gate command actually shell out to (harness-design's
+# lefthook.yml calls cog, typos, cargo-sort, cargo-deny, cargo-llvm-cov,
+# cargo-machete, cargo-nextest and gitleaks). Dispatched agents run as the
+# unprivileged AGENT_USER and cannot install anything, so provisioning belongs here.
+#
+# DESIGN DECISION (item 75b88467, AC-1) — this step does NOT require --with-talos.
+# It unconditionally bootstraps rustup + cargo-binstall for AGENT_USER when absent,
+# reusing ensure_rustup() / ensure_cargo_binstall() — the same install commands
+# Step 4.5b-B/C uses, defined once (AC-2). Rationale: claude-code-* dispatches are
+# the majority of traffic and need this toolchain just as much as talos runs do.
+# Gating it behind --with-talos (a talos-engine-only opt-in) would leave most hosts
+# unprovisioned and defeat the purpose of this step.
+#
+# The tool list is data, not code: see templates/dev-toolchain.sh. Adding a tool a
+# future repo needs is a one-line change there — never edit the loop below.
+# ===========================================================================
+echo ""
+echo "--- Step 4.9: Dev toolchain (Rust tools + gitleaks, agent user) ---"
+
+TOOLCHAIN_CONF="${TMPL_DIR}/dev-toolchain.sh"
+if [[ ! -f "$TOOLCHAIN_CONF" ]]; then
+    die "Dev toolchain config not found at ${TOOLCHAIN_CONF} — cannot provision the dev toolchain"
+fi
+# shellcheck source=templates/dev-toolchain.sh
+source "$TOOLCHAIN_CONF"
+
+# Sub-action A: rustup + cargo-binstall (shared helpers; no-ops when 4.5b ran them)
+ensure_rustup
+ensure_cargo_binstall
+
+# Sub-action B: one `cargo binstall -y <crate>` per entry in the data file.
+# Skipped per-package when the binary is already on AGENT_USER's PATH, and each
+# package logs its own [OK]/[SKIP]/[DRY] line (same one-line-per-entry shape as
+# Step 4.6's MCP server loop).
+_agent_cargo="${AGENT_HOME}/.cargo/bin/cargo"
+for _tc_entry in "${DEV_TOOLCHAIN_CARGO_PKGS[@]}"; do
+    _tc_crate="${_tc_entry%%|*}"
+    _tc_bin="${_tc_entry#*|}"
+    if runuser -l "$AGENT_USER" -c "command -v '${_tc_bin}'" >/dev/null 2>&1; then
+        skip "${_tc_bin} (${_tc_crate}) already on ${AGENT_USER}'s PATH — already configured"
+    elif $DRY_RUN; then
+        would "runuser -l ${AGENT_USER} -- ${_agent_cargo} binstall -y ${_tc_crate}  (provides '${_tc_bin}')"
+    else
+        runuser -l "$AGENT_USER" -c "'${_agent_cargo}' binstall -y '${_tc_crate}'" \
+            || die "cargo binstall -y ${_tc_crate} failed for ${AGENT_USER}"
+        if runuser -l "$AGENT_USER" -c "command -v '${_tc_bin}'" >/dev/null 2>&1; then
+            info "Installed ${_tc_crate} (${_tc_bin}) for ${AGENT_USER}"
+        else
+            die "cargo binstall -y ${_tc_crate} ran but '${_tc_bin}' is not on ${AGENT_USER}'s PATH"
+        fi
+    fi
+done
+
+# Sub-action C: gitleaks — pinned GitHub release archive, not a cargo crate.
+# Installed with the same `install -m 0755 -o/-g` idiom as the talos binary (4.5b-F).
+_gl_dest="${AGENT_HOME}/.local/bin/gitleaks"
+_gl_machine="$(uname -m)"
+_gl_arch=""
+for _gl_map in "${GITLEAKS_ARCH_MAP[@]}"; do
+    if [[ "${_gl_map%%|*}" == "$_gl_machine" ]]; then
+        _gl_arch="${_gl_map#*|}"
+    fi
+done
+_gl_url="${GITLEAKS_URL_TEMPLATE//\{version\}/${GITLEAKS_VERSION}}"
+_gl_url="${_gl_url//\{arch\}/${_gl_arch}}"
+# Installed version, normalised: `gitleaks version` prints a bare version string,
+# but tolerate a leading 'v' and surrounding whitespace across releases.
+_gl_have="$(runuser -l "$AGENT_USER" -c "'${_gl_dest}' version" 2>/dev/null | tr -d '[:space:]' | sed 's/^v//' || true)"
+
+if [[ -z "$_gl_arch" ]]; then
+    warn "Unsupported architecture '${_gl_machine}' for gitleaks (supported: x86_64, aarch64) — skipping gitleaks; add a GITLEAKS_ARCH_MAP entry in ${TOOLCHAIN_CONF} if this host should be supported"
+elif [[ "$_gl_have" == "$GITLEAKS_VERSION" ]]; then
+    skip "gitleaks ${GITLEAKS_VERSION} already installed at ${_gl_dest} — already configured"
+elif $DRY_RUN; then
+    would "download ${_gl_url}, extract 'gitleaks', then install -m 0755 -o ${AGENT_USER} -g ${AGENT_GROUP} → ${_gl_dest}"
+else
+    _gl_tmp="$(mktemp -d /tmp/gitleaks.XXXXXX)"
+    curl -fsSL "$_gl_url" -o "${_gl_tmp}/gitleaks.tar.gz" \
+        || { rm -rf "$_gl_tmp"; die "Failed to download gitleaks ${GITLEAKS_VERSION} from ${_gl_url}"; }
+    tar -xzf "${_gl_tmp}/gitleaks.tar.gz" -C "$_gl_tmp" gitleaks \
+        || { rm -rf "$_gl_tmp"; die "Downloaded gitleaks archive did not contain a 'gitleaks' binary (${_gl_url})"; }
+    mkdir -p "${AGENT_HOME}/.local/bin"
+    install -m 0755 -o "${AGENT_USER}" -g "${AGENT_GROUP}" "${_gl_tmp}/gitleaks" "$_gl_dest"
+    rm -rf "$_gl_tmp"
+    _gl_now="$(runuser -l "$AGENT_USER" -c "'${_gl_dest}' version" 2>/dev/null | tr -d '[:space:]' | sed 's/^v//' || true)"
+    if [[ "$_gl_now" == "$GITLEAKS_VERSION" ]]; then
+        info "Installed gitleaks ${GITLEAKS_VERSION} (${_gl_arch}) for ${AGENT_USER}: ${_gl_dest}"
+    else
+        die "gitleaks installed at ${_gl_dest} but reports '${_gl_now}' instead of the pinned ${GITLEAKS_VERSION}"
+    fi
 fi
 
 # ===========================================================================

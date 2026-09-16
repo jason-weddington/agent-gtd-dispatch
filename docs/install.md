@@ -16,8 +16,12 @@ This guide covers bootstrapping a fresh Ubuntu host and migrating an existing si
 
 > **Note**: The script auto-installs `uv`, Claude Code for the agent user (Step 4.5,
 > via the official `claude.ai/install.sh` installer), `pre-commit` (Step 4.7, via
-> `uv tool install`), and `lefthook` (Step 4.8, via `uv tool install`). All other
-> tooling (`python3`, `visudo`, `systemctl`) ships with standard Ubuntu.
+> `uv tool install`), `lefthook` (Step 4.8, via `uv tool install`), and the
+> **dev toolchain** the agent's hooks and gate commands call (Step 4.9: `rustup` +
+> `cargo-binstall`, then `cargo-nextest`, `cargo-llvm-cov`, `cargo-deny`,
+> `cargo-machete`, `typos`, `cargo-sort`, `cargo-release`, `cog`, plus a pinned
+> `gitleaks` release binary — see [Dev toolchain (Step 4.9)](#dev-toolchain-step-49)).
+> All other tooling (`python3`, `visudo`, `systemctl`) ships with standard Ubuntu.
 >
 > **Single-user mode** (`DISPATCH_SINGLE_USER=1`) does **not** require creating extra
 > system users or installing a sudoers fragment — it runs the service and agent under
@@ -722,7 +726,7 @@ Step 4.8 of the installer installs the `lefthook` binary for the `dispatch` (age
 
 ### Why this matters
 
-Repos using `lefthook.yml` (e.g. `harness-design`) cannot activate their hooks without the `lefthook` binary. Installing `lefthook` does not install the tools a repo's `lefthook.yml` commands call (for `harness-design`: `cog`, `typos`, `cargo-sort`, `cargo-llvm-cov`, `cargo-machete`, `cargo-deny`, `gitleaks`) — those are provisioned separately.
+Repos using `lefthook.yml` (e.g. `harness-design`) cannot activate their hooks without the `lefthook` binary. Installing `lefthook` does not install the tools a repo's `lefthook.yml` commands call (for `harness-design`: `cog`, `typos`, `cargo-sort`, `cargo-llvm-cov`, `cargo-machete`, `cargo-deny`, `cargo-nextest`, `gitleaks`) — those are provisioned by [Step 4.9](#dev-toolchain-step-49).
 
 ### What the step does
 
@@ -755,6 +759,94 @@ sudo -u dispatch -H /home/dispatch/.local/bin/uv tool list | grep '^lefthook'
 
 ---
 
+## Dev toolchain (Step 4.9)
+
+Step 4.9 installs the tools a dispatched repo's **hooks and gate command actually shell out to**. Step 4.8 installs the lefthook *runner*; this step installs what that runner invokes.
+
+### Why this matters
+
+Dispatched agents run as the unprivileged `dispatch` user and **cannot install anything** — so every tool a repo's `lefthook.yml` / `.pre-commit-config.yaml` / gate command calls must already be on the host. `harness-design`'s `lefthook.yml` is the current superset: `cog`, `typos`, `cargo-sort`, `cargo-deny`, `cargo-llvm-cov`, `cargo-machete`, `cargo-nextest` and `gitleaks`. Without them the hooks fail on the first commit and the build dies with a confusing "command not found".
+
+### Design decision — this step does **not** require `--with-talos`
+
+Step 4.9 runs on **every** install and **unconditionally bootstraps `rustup` + `cargo-binstall`** for the agent user when they are absent (same installers as Step 4.5b — `sh.rustup.rs` and `install-from-binstall-release.sh`; the logic lives once in the `ensure_rustup` / `ensure_cargo_binstall` helpers that both steps call).
+
+It deliberately does **not** require or imply `--with-talos`. `--with-talos` is a talos-engine-only opt-in, while `claude-code-*` dispatches are the majority of fleet traffic and need this toolchain just as much. Gating the toolchain behind that flag would leave most hosts unprovisioned, which is exactly the failure this step exists to prevent.
+
+### What the step does
+
+1. `ensure_rustup` — installs `rustup` for the agent user if `~/.cargo/bin/rustup` is absent (no-op when Step 4.5b already did it).
+2. `ensure_cargo_binstall` — installs `cargo-binstall` if `~/.cargo/bin/cargo-binstall` is absent.
+3. For each entry in `templates/dev-toolchain.sh`'s `DEV_TOOLCHAIN_CARGO_PKGS`, runs `cargo binstall -y <crate>` as the agent user — **skipped per package** when its binary is already on the agent's `PATH` (`command -v <binary>`). Each package prints its own `[OK]`/`[SKIP]`/`[DRY]` line.
+4. Downloads the **pinned** `gitleaks` GitHub release archive for the host's architecture, extracts the `gitleaks` binary, and installs it to `/home/dispatch/.local/bin/gitleaks` via `install -m 0755 -o dispatch -g dispatch` — skipped when the installed binary already reports the pinned version.
+
+The tool list is **data, not code**: `templates/dev-toolchain.sh` is the single source of truth (same precedent as `templates/mcp-servers.sh`), consumed by both `setup-dispatch-host.sh` and `deploy.sh`. Adding a tool a future repo needs is a **one-line change** there — nothing else needs editing.
+
+Entries are `"<crate>|<binary>"` so crates whose binary name differs are handled explicitly (`typos-cli` → `typos`, `cocogitto` → `cog`).
+
+Everything is idempotent, and every mutating action is gated behind `$DRY_RUN` with a `[DRY]  Would: ...` line.
+
+### gitleaks pinned version
+
+`gitleaks` is a Go binary with no crates.io package, so it is pinned explicitly in `templates/dev-toolchain.sh` (the same "explicit, bumpable pin" convention as `talos-update.sh` — never an unrecorded "latest"):
+
+```bash
+GITLEAKS_VERSION="8.30.1"
+```
+
+**To bump it:**
+
+1. Check <https://github.com/gitleaks/gitleaks/releases> for the newest tag.
+2. Edit `GITLEAKS_VERSION` in `templates/dev-toolchain.sh` — bare version, **no leading `v`** (the `v` appears only in the tag segment of `GITLEAKS_URL_TEMPLATE`).
+3. Re-run `sudo ./setup-dispatch-host.sh` or `./deploy.sh` on every host. Both compare the pin against `gitleaks version` and re-install on drift.
+
+### Architecture support (aarch64 + x86_64)
+
+`cargo binstall` downloads a prebuilt artifact when the crate publishes one for the host triple and falls back to a source build (`cargo install`) otherwise, so every crate in the list works on both architectures.
+
+`gitleaks` names its Linux release assets `x64` / `arm64`, **not** `x86_64` / `aarch64`, so `templates/dev-toolchain.sh` carries an explicit `GITLEAKS_ARCH_MAP`:
+
+| `uname -m` | gitleaks asset token | Hosts |
+|---|---|---|
+| `x86_64` | `x64` | r7-research, r7-server |
+| `aarch64` | `arm64` | pironman01 (Raspberry Pi 5) |
+
+Any other architecture prints a `[WARN]` and skips gitleaks rather than guessing an asset name.
+
+### Deploy refresh
+
+Every `./deploy.sh` re-runs `cargo binstall -y <crate>` for each package and re-installs `gitleaks` when the installed version differs from the pin. `deploy.sh` runs from a repo checkout, so it `source`s `templates/dev-toolchain.sh` **locally** and interpolates the resulting lists into the ssh heredoc — the tool list is never duplicated in `deploy.sh`.
+
+The whole block is **non-fatal**, exactly like the Claude Code and lefthook refreshes: a failure prints `[WARN] ... — agent keeps its current binary` (with the last 5 lines of output) and the deploy continues. Only the existing health check can make `deploy.sh` exit non-zero.
+
+### Verifying the dev toolchain install
+
+Run each tool **as the dispatch user with the agent's login `PATH`** (`~/.local/bin` and `~/.cargo/bin` — the `-lc` login shell is what puts them there):
+
+```bash
+sudo -u dispatch -H bash -lc 'cog --version'
+sudo -u dispatch -H bash -lc 'typos --version'
+sudo -u dispatch -H bash -lc 'cargo-sort --version'
+sudo -u dispatch -H bash -lc 'cargo-deny --version'
+sudo -u dispatch -H bash -lc 'cargo-llvm-cov --version'
+sudo -u dispatch -H bash -lc 'cargo-machete --version'
+sudo -u dispatch -H bash -lc 'cargo-nextest --version'
+sudo -u dispatch -H bash -lc 'cargo-release --version'
+sudo -u dispatch -H bash -lc 'gitleaks version'
+# → each prints a version and exits 0 (gitleaks must print the pinned 8.30.1)
+
+# Bootstrap prerequisites:
+sudo -u dispatch -H bash -lc 'rustup --version; cargo binstall -V'
+
+# One-liner over the whole list:
+for t in cog typos cargo-sort cargo-deny cargo-llvm-cov cargo-machete cargo-nextest cargo-release; do
+    sudo -u dispatch -H bash -lc "$t --version" || echo "MISSING: $t"
+done
+sudo -u dispatch -H bash -lc 'gitleaks version' || echo "MISSING: gitleaks"
+```
+
+---
+
 ## Rollback procedure
 
 To undo the installer step by step (in reverse order):
@@ -782,6 +874,21 @@ sudo rm /etc/sudoers.d/dispatch-svc
 ```bash
 sudo rm /usr/local/bin/claude
 ```
+
+### Step 4.9 — Dev toolchain
+```bash
+# Rust tools installed via cargo binstall (cargo uninstall removes the binary):
+sudo -u dispatch -H bash -lc 'cargo uninstall cargo-nextest cargo-llvm-cov cargo-deny cargo-machete typos-cli cargo-sort cargo-release cocogitto'
+
+# gitleaks (plain binary, not a cargo crate):
+sudo rm -f /home/dispatch/.local/bin/gitleaks
+
+# Optional — remove the Rust bootstrap entirely (ONLY if --with-talos is not in use;
+# Step 4.5b builds talos with the same toolchain):
+sudo -u dispatch -H bash -lc 'rustup self uninstall -y'
+```
+(Same `bash -lc` requirement as Steps 4.7/4.8 — `cargo` lives at
+`/home/dispatch/.cargo/bin/cargo`, which is not on sudo's search path.)
 
 ### Step 4.8 — lefthook
 ```bash
