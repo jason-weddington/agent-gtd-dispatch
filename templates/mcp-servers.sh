@@ -70,7 +70,7 @@ fi
 # Same precedent as _agent_gtd_mcp_src above: override via PERSONAL_KB_MCP_SRC for a
 # pinned ref (recommended — see PERSONAL_KB_MCP_SRC note in dispatch-env.tmpl) or a
 # private/local mirror. The '[postgres]' bracket is quoted per the zsh note above.
-_personal_kb_mcp_src="${PERSONAL_KB_MCP_SRC:-git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb'[postgres]'}"
+_personal_kb_mcp_src="${PERSONAL_KB_MCP_SRC:-personal-kb[postgres]@git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb}"
 
 MCP_SERVERS=(
   # agent-gtd: LOAD-BEARING — must resolve for Step 4 verification to pass.

@@ -58,7 +58,10 @@ class TestMcpServersRender:
         assert "-e PERSONAL_KB_URL=https://kb.example" in line
         assert "-e PERSONAL_KB_API_KEY=pk-test" in line
         assert "-e KB_CONTRIBUTOR=jason" in line
-        assert "personal_kb'[postgres]'" in line
+        # PEP 508 form: the extra belongs to the PACKAGE NAME, not the URL path.
+        # `git+ssh://...personal_kb[postgres]@<ref>` makes git clone a repo
+        # literally named "personal_kb[postgres]@<ref>" and fails at launch.
+        assert "personal-kb[postgres]@git+ssh://" in line
         assert line.endswith(" personal-kb")
         assert "ANTHROPIC_API_KEY" not in line
         assert "KB_DATABASE_URL" not in line

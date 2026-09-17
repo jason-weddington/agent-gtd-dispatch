@@ -1481,7 +1481,7 @@ else
     #
     #   PERSONAL_KB_MCP_SRC   → optional override for the personal_kb package source,
     #     used by BOTH KB servers. Set it to a PINNED ref
-    #     (…/personal_kb'[postgres]'@<sha>) on production hosts: the default tracks the
+    #     (personal-kb[postgres]@git+ssh://…/personal_kb@<sha>) on production hosts: the default tracks the
     #     branch head, and an upstream rewrite is exactly what silently broke KB access
     #     for every dispatched agent (this item). Defaults to the unpinned homelab source.
     #
