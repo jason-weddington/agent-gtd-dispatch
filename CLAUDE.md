@@ -94,11 +94,13 @@ runs as **`dispatch-svc`**; it launches the Claude Code agent as **`dispatch`** 
   `dispatch-svc`. It creates both users, installs the unit + sudoers, and reads
   `/home/dispatch-svc/.env` to register MCP servers (Step 4.6, driven by
   `templates/mcp-servers.sh`).
-- **KB MCP secrets** live in `/home/dispatch-svc/.env` as `TEAM_KB_DATABASE_URL` and
-  `KB_ANTHROPIC_API_KEY` (NOT `ANTHROPIC_API_KEY` — that name would reach the agent's
-  env and flip Claude Code off Max/OAuth billing). They are injected into the per-server
-  `env` blocks of `personal-kb`/`team-kb` at provision time; `mcp-servers.sh` references
-  the env vars, never literals (gitleaks-safe).
+- **KB MCP secrets** live in `/home/dispatch-svc/.env` as `PERSONAL_KB_URL` /
+  `PERSONAL_KB_API_KEY` / `TEAM_KB_URL` / `TEAM_KB_API_KEY` (both KB MCP servers are
+  thin HTTP clients of a hosted KB web service, so no `ANTHROPIC_API_KEY` is injected
+  here — that name would reach the agent's env and flip Claude Code off Max/OAuth
+  billing). They are injected into the per-server `env` blocks of
+  `personal-kb`/`team-kb` at provision time; `mcp-servers.sh` references the env vars,
+  never literals (gitleaks-safe).
 
 Full references: **`kb-01598`** (env-file + provisioning model — which var goes where),
 `kb-01583` (how env crosses the sudo boundary at runtime), `kb-01512` (OAuth vs API

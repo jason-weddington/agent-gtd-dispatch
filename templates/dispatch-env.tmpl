@@ -113,7 +113,7 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # CLAUDE_CODE_OAUTH_TOKEN=
 
 # Knowledge base database URL — passed to agent subprocesses for KB access.
-# This points at the PERSONAL KB; personal-kb inherits it (empty MCP env block).
+# This points at the PERSONAL KB.
 # KB_DATABASE_URL=
 
 # Local test-Postgres DSN for @pytest.mark.postgres suites (e.g. kb-core) run by
@@ -123,18 +123,40 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # KB_TEST_DATABASE_URL=
 # KB_REQUIRE_POSTGRES_TESTS=
 
-# Team KB database URL — injected into the team-kb MCP server's env block by
-# setup-dispatch-host.sh (Step 4.6). Required for team-kb registration; if unset,
-# team-kb is skipped. Same personal_kb package, different database.
+# Team KB database URL — RETIRED — no longer read by installer Step 4.6. The team-kb
+# MCP server is now a thin HTTP client of the hosted team KB service; see
+# TEAM_KB_URL / TEAM_KB_API_KEY below.
 # TEAM_KB_DATABASE_URL=
 
-# Anthropic API key for the KB MCP servers' own LLM calls (query planning, graph
-# enrichment, summaries). Injected into the personal-kb AND team-kb MCP env blocks by
-# setup-dispatch-host.sh (Step 4.6). MUST NOT be named ANTHROPIC_API_KEY: that name
-# would reach Claude Code's launch env via the worker passthrough and flip billing from
-# the Max subscription to pay-per-token API (see engines.py / kb-01512). Value is the
-# same Anthropic key used elsewhere; the distinct name is the safety mechanism.
+# Anthropic API key for the KB MCP servers' own LLM calls — RETIRED — no longer read
+# by installer Step 4.6. Both KB MCP servers are now thin HTTP clients of a hosted KB
+# web service and make no LLM calls of their own.
 # KB_ANTHROPIC_API_KEY=
+
+# Hosted personal KB service URL + API key. Read by installer Step 4.6 (not the
+# service) and injected into the personal-kb MCP server's OWN env block
+# (PERSONAL_KB_URL / PERSONAL_KB_API_KEY there too — see templates/mcp-servers.sh).
+# personal-kb is skipped when either is unset. No sudoers env_keep entry is needed:
+# the values are baked into the agent user's ~/.claude.json at provision time, not
+# inherited by the agent subprocess at run time.
+# PERSONAL_KB_URL=
+# PERSONAL_KB_API_KEY=
+
+# Hosted team KB service URL + API key. Read by installer Step 4.6 and injected into
+# the team-kb MCP server's OWN env block — bound there to the PERSONAL_KB_URL /
+# PERSONAL_KB_API_KEY variable NAMES (same personal_kb package, pointed at the team
+# service instead; personal_kb's config module reads those names regardless of which
+# service it targets). team-kb is skipped when either is unset. No sudoers env_keep
+# entry is needed, for the same reason as PERSONAL_KB_URL above.
+# TEAM_KB_URL=
+# TEAM_KB_API_KEY=
+
+# Optional override for the personal_kb package source used by BOTH personal-kb and
+# team-kb (see _personal_kb_mcp_src in templates/mcp-servers.sh). Pin this to a commit
+# SHA so an upstream change to the personal_kb repo can't silently break agents again.
+# Must be a single whitespace-free token, e.g.:
+#   git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb'[postgres]'@<sha>
+# PERSONAL_KB_MCP_SRC=
 
 # Agent identity name — used for GTD comment attribution so comments appear
 # under a specific agent name (e.g. claude-build-abc12345) rather than the

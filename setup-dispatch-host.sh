@@ -54,6 +54,10 @@ API_PORT=8100
 SUDOERS_FILE="/etc/sudoers.d/dispatch-svc"
 SYSTEMD_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
 TMPL_DIR="${SCRIPT_DIR}/templates"
+# Budget per MCP server for the Step 4.6 initialize + tools/list probe. 600s is sized
+# for a cold ~/.cache/uv building personal_kb from git on the aarch64 Pi 5. Set to 0 to
+# skip the probe pass entirely.
+MCP_PROBE_TIMEOUT="${MCP_PROBE_TIMEOUT:-600}"
 
 # --- Defaults (overridden by CLI flags) ---
 AGENT_USER="dispatch"
@@ -1385,8 +1389,9 @@ echo "--- Step 4.6: MCP servers (agent user) ---"
 if ! $DRY_RUN && [[ ! -f "$CLAUDE_SRC" ]]; then
     warn "Claude Code not found at ${CLAUDE_SRC} — skipping MCP server registration (install claude as ${AGENT_USER} first)"
 elif $DRY_RUN; then
-    would "read AGENT_GTD_URL, AGENT_GTD_API_KEY, AGENT_GTD_MCP_SRC, KB_DATABASE_URL, TEAM_KB_DATABASE_URL, KB_ANTHROPIC_API_KEY from ${SERVICE_ENV}"
-    would "source ${TMPL_DIR}/mcp-servers.sh and register each MCP server for ${AGENT_USER} via claude mcp add --scope user"
+    would "read AGENT_GTD_URL, AGENT_GTD_API_KEY, AGENT_GTD_MCP_SRC, PERSONAL_KB_URL, PERSONAL_KB_API_KEY, TEAM_KB_URL, TEAM_KB_API_KEY, PERSONAL_KB_MCP_SRC from ${SERVICE_ENV}"
+    would "GET <PERSONAL_KB_URL>/api/health and <TEAM_KB_URL>/api/health (reachability warn-check)"
+    would "probe each registered MCP server as ${AGENT_USER} with an MCP initialize + tools/list handshake (timeout ${MCP_PROBE_TIMEOUT}s per server)"
 else
     MCP_CONF="${TMPL_DIR}/mcp-servers.sh"
     if [[ ! -f "$MCP_CONF" ]]; then
@@ -1405,47 +1410,191 @@ else
     #     (e.g. git+ssh://git@<host>/path/agent_gtd for a homelab/private mirror).
     #     Defaults to public GitHub when unset — no entry needed for standard installs.
     #
-    #   KB_DATABASE_URL       → personal-kb connection string (skipped if unset).
-    #   TEAM_KB_DATABASE_URL  → team-kb DB connection string (skipped if unset).
-    #   KB_ANTHROPIC_API_KEY  → ANTHROPIC_API_KEY for both KB servers' LLM calls.
-    #     Deliberately NOT named ANTHROPIC_API_KEY: that name would reach Claude Code's
-    #     launch env and flip billing off the Max subscription (engines.py / kb-01512).
+    #   PERSONAL_KB_MCP_SRC   → optional override for the personal_kb package source,
+    #     used by BOTH KB servers. Set it to a PINNED ref
+    #     (…/personal_kb'[postgres]'@<sha>) on production hosts: the default tracks the
+    #     branch head, and an upstream rewrite is exactly what silently broke KB access
+    #     for every dispatched agent (this item). Defaults to the unpinned homelab source.
+    #
+    #   PERSONAL_KB_URL / PERSONAL_KB_API_KEY → hosted personal-KB service URL + API
+    #     key, injected into the personal-kb MCP server's own env block. personal-kb is
+    #     skipped when either is unset.
+    #   TEAM_KB_URL / TEAM_KB_API_KEY → hosted team-KB service URL + API key, injected
+    #     into the team-kb MCP server's own env block (bound there to the same
+    #     PERSONAL_KB_URL / PERSONAL_KB_API_KEY variable NAMES — see
+    #     templates/mcp-servers.sh; personal_kb's config module reads those names
+    #     regardless of which service it is pointed at). team-kb is skipped when
+    #     either TEAM_KB_URL or TEAM_KB_API_KEY is unset.
     if [[ -f "$SERVICE_ENV" ]]; then
         AGENT_GTD_URL="$(_read_env_var AGENT_GTD_URL)";                 export AGENT_GTD_URL
         AGENT_GTD_API_KEY="$(_read_env_var AGENT_GTD_API_KEY)";         export AGENT_GTD_API_KEY
         AGENT_GTD_MCP_SRC="$(_read_env_var AGENT_GTD_MCP_SRC)";         export AGENT_GTD_MCP_SRC
-        KB_DATABASE_URL="$(_read_env_var KB_DATABASE_URL)";             export KB_DATABASE_URL
-        TEAM_KB_DATABASE_URL="$(_read_env_var TEAM_KB_DATABASE_URL)";   export TEAM_KB_DATABASE_URL
-        KB_ANTHROPIC_API_KEY="$(_read_env_var KB_ANTHROPIC_API_KEY)";   export KB_ANTHROPIC_API_KEY
+        PERSONAL_KB_URL="$(_read_env_var PERSONAL_KB_URL)";             export PERSONAL_KB_URL
+        PERSONAL_KB_API_KEY="$(_read_env_var PERSONAL_KB_API_KEY)";     export PERSONAL_KB_API_KEY
+        TEAM_KB_URL="$(_read_env_var TEAM_KB_URL)";                     export TEAM_KB_URL
+        TEAM_KB_API_KEY="$(_read_env_var TEAM_KB_API_KEY)";             export TEAM_KB_API_KEY
+        PERSONAL_KB_MCP_SRC="$(_read_env_var PERSONAL_KB_MCP_SRC)";     export PERSONAL_KB_MCP_SRC
     fi
     # agent-gtd warnings are elevated (LOAD-BEARING for step-4 verification)
     [[ -z "${AGENT_GTD_URL:-}" ]]     && warn "AGENT_GTD_URL not set in ${SERVICE_ENV} — agent-gtd MCP will launch without a URL; Step 4 verification will fail"
     [[ -z "${AGENT_GTD_API_KEY:-}" ]] && warn "AGENT_GTD_API_KEY not set in ${SERVICE_ENV} — agent-gtd MCP will launch without credentials; Step 4 verification will fail"
-    [[ -z "${TEAM_KB_DATABASE_URL:-}" ]] && warn "TEAM_KB_DATABASE_URL not set in ${SERVICE_ENV} — team-kb MCP server will be skipped"
-    [[ -z "${KB_DATABASE_URL:-}" ]]      && warn "KB_DATABASE_URL not set in ${SERVICE_ENV} — personal-kb MCP server will be skipped"
-    [[ -z "${KB_ANTHROPIC_API_KEY:-}" ]] && warn "KB_ANTHROPIC_API_KEY not set in ${SERVICE_ENV} — KB servers will register without an Anthropic key (LLM features degraded)"
+    [[ -z "${PERSONAL_KB_URL:-}" ]] && warn "PERSONAL_KB_URL not set in ${SERVICE_ENV} — personal-kb MCP server will be skipped"
+    [[ -n "${PERSONAL_KB_URL:-}" && -z "${PERSONAL_KB_API_KEY:-}" ]] && warn "PERSONAL_KB_API_KEY not set in ${SERVICE_ENV} — personal-kb MCP server will be skipped (a URL without a key cannot authenticate)"
+    [[ -z "${TEAM_KB_URL:-}" ]] && warn "TEAM_KB_URL not set in ${SERVICE_ENV} — team-kb MCP server will be skipped"
+    [[ -n "${TEAM_KB_URL:-}" && -z "${TEAM_KB_API_KEY:-}" ]] && warn "TEAM_KB_API_KEY not set in ${SERVICE_ENV} — team-kb MCP server will be skipped (a URL without a key cannot authenticate)"
+
+    # Reachability warn-check: both KB services are LAN-only (no public DNS/ingress),
+    # so a failure here is informational, never fatal — registration continues either way.
+    if [[ -n "${PERSONAL_KB_URL:-}" ]]; then
+        _url="${PERSONAL_KB_URL%/}"
+        rc=0; out="$(curl -sS --max-time 10 -w '\n%{http_code}' "${_url}/api/health" 2>&1)" || rc=$?
+        _http_code="$(printf '%s' "$out" | tail -n1)"
+        _body="$(printf '%s' "$out" | sed '$d')"
+        if [[ "$rc" -eq 0 && "$_http_code" == "200" ]] && printf '%s' "$_body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+            info "KB health check passed: ${_url}/api/health"
+        else
+            warn "KB health check failed: ${_url}/api/health http=${_http_code} — both KB services are LAN-only (no public DNS/ingress); registration continues"
+        fi
+    fi
+    if [[ -n "${TEAM_KB_URL:-}" ]]; then
+        _url="${TEAM_KB_URL%/}"
+        rc=0; out="$(curl -sS --max-time 10 -w '\n%{http_code}' "${_url}/api/health" 2>&1)" || rc=$?
+        _http_code="$(printf '%s' "$out" | tail -n1)"
+        _body="$(printf '%s' "$out" | sed '$d')"
+        if [[ "$rc" -eq 0 && "$_http_code" == "200" ]] && printf '%s' "$_body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+            info "KB health check passed: ${_url}/api/health"
+        else
+            warn "KB health check failed: ${_url}/api/health http=${_http_code} — both KB services are LAN-only (no public DNS/ingress); registration continues"
+        fi
+    fi
+
     # shellcheck source=templates/mcp-servers.sh
     source "$MCP_CONF"
+
+    # Unconditional de-registration pass over the fixed set of known server names —
+    # this is what makes a server that's newly skipped (e.g. a KB var removed from the
+    # .env) actually disappear, instead of surviving in its stale shape from a
+    # previous run. The per-entry remove-then-add loop below is no longer needed.
+    for _known_name in agent-gtd aws-documentation-mcp-server personal-kb team-kb; do
+        runuser -l "$AGENT_USER" -c \
+            "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp remove ${_known_name} --scope user 2>/dev/null || true"
+    done
+
     for entry in "${MCP_SERVERS[@]}"; do
         mcp_name="${entry%%|*}"
         mcp_args="${entry#*|}"
-        # Idempotent: remove first (tolerate "not registered"), then add
-        runuser -l "$AGENT_USER" -c \
-            "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp remove ${mcp_name} --scope user 2>/dev/null || true"
+        rc=0
         # word-split mcp_args intentionally — they are space-separated CLI flags
         # shellcheck disable=SC2086
-        runuser -l "$AGENT_USER" -c \
-            "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp add ${mcp_name} ${mcp_args}"
-        info "Registered MCP server '${mcp_name}' for ${AGENT_USER}"
+        out="$(runuser -l "$AGENT_USER" -c \
+            "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp add ${mcp_name} ${mcp_args}" 2>&1)" || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            warn "claude mcp add ${mcp_name} failed (rc=${rc}): ${out}"
+            continue
+        fi
+        case "$mcp_name" in
+            agent-gtd)
+                info "Registered MCP server '${mcp_name}' for ${AGENT_USER} src=${_agent_gtd_mcp_src}"
+                ;;
+            personal-kb)
+                _api_key_state="ABSENT"; [[ -n "${PERSONAL_KB_API_KEY:-}" ]] && _api_key_state="present"
+                info "Registered MCP server '${mcp_name}' for ${AGENT_USER} — mode=hosted url=${PERSONAL_KB_URL:-} api_key=${_api_key_state} src=${_personal_kb_mcp_src}"
+                ;;
+            team-kb)
+                _api_key_state="ABSENT"; [[ -n "${TEAM_KB_API_KEY:-}" ]] && _api_key_state="present"
+                info "Registered MCP server '${mcp_name}' for ${AGENT_USER} — mode=hosted url=${TEAM_KB_URL:-} api_key=${_api_key_state} src=${_personal_kb_mcp_src}"
+                ;;
+            *)
+                info "Registered MCP server '${mcp_name}' for ${AGENT_USER}"
+                ;;
+        esac
     done
-    # Smoke test: verify agent-gtd is listed (name presence only — cold uvx cache
-    # makes the "✓ Connected" health check unreliable on first invocation)
-    if runuser -l "$AGENT_USER" -c \
-            "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp list" 2>/dev/null \
-            | grep -q "^agent-gtd:"; then
-        info "Smoke test passed: 'agent-gtd' MCP server registered for ${AGENT_USER}"
+
+    # agent-gtd is LOAD-BEARING: assert the REGISTERED (not just intended) env carries
+    # a non-empty AGENT_GTD_URL, or the server silently falls back to its local SQLite
+    # backend and Step 4 verification would pass against the wrong database.
+    rc=0
+    agent_gtd_url_registered="$(runuser -l "$AGENT_USER" -c \
+        "python3 -c \"import json; d=json.load(open('${AGENT_HOME}/.claude.json')); print(d.get('mcpServers', {}).get('agent-gtd', {}).get('env', {}).get('AGENT_GTD_URL', ''))\"" \
+        2>/dev/null)" || rc=$?
+    if [[ "$rc" -ne 0 || -z "$agent_gtd_url_registered" ]]; then
+        die "agent-gtd MCP registered without AGENT_GTD_URL — the server would fall back to its local SQLite backend and Step 4 verification would silently pass against the wrong database"
+    fi
+
+    # MCP probes: a real initialize + tools/list handshake per registered server, as
+    # the agent user. This replaces the old `claude` list-servers smoke test, which
+    # reports every server as failed when run from a shell whose cwd/PATH differ from
+    # the agent's — a registration-name check, not a health check (kb-03289).
+    if [[ "${MCP_PROBE_TIMEOUT}" == "0" ]]; then
+        skip "MCP probes skipped (MCP_PROBE_TIMEOUT=0)"
     else
-        die "Smoke test failed: 'agent-gtd' not found in \`claude mcp list\` output for ${AGENT_USER} — registration may have failed"
+        _mcp_probe_tmp="$(mktemp)"
+        trap 'rm -f "${_mcp_probe_tmp}"' EXIT
+        cp "${TMPL_DIR}/mcp-probe.py" "${_mcp_probe_tmp}"
+        chmod 0755 "${_mcp_probe_tmp}"
+
+        info "MCP probes: up to ${MCP_PROBE_TIMEOUT}s per server × ${#MCP_SERVERS[@]} servers — a cold uv cache can make the first run take several minutes per server"
+
+        _mcp_probe() {  # $1=name $2=expect_tool(or "") $3=extra env prefix (or "")
+            local name="$1" expect_tool="$2" env_prefix="$3" expect_flag=""
+            [[ -n "$expect_tool" ]] && expect_flag="--expect-tool '${expect_tool}'"
+            local rc=0
+            local out
+            out="$(runuser -l "$AGENT_USER" -c \
+                "cd '${AGENT_HOME}' && ${env_prefix} python3 '${_mcp_probe_tmp}' --claude-json '${AGENT_HOME}/.claude.json' --name '${name}' --timeout ${MCP_PROBE_TIMEOUT} ${expect_flag}" \
+                2>&1)" || rc=$?
+            _MCP_PROBE_RC=$rc
+            _MCP_PROBE_OUT="$out"
+        }
+
+        for entry in "${MCP_SERVERS[@]}"; do
+            mcp_name="${entry%%|*}"
+            case "$mcp_name" in
+                agent-gtd)   expect_tool="add_item" ;;
+                personal-kb) expect_tool="kb_search" ;;
+                team-kb)     expect_tool="team_kb_search" ;;
+                *)           expect_tool="" ;;
+            esac
+
+            if [[ "$mcp_name" == "agent-gtd" ]]; then
+                # AGENT_GTD_API_KEY is deliberately NOT baked into the registration
+                # (see mcp-servers.sh), so it must be supplied as an extra env var at
+                # probe time — mirroring the run-time injection in
+                # engines.py::build_env(), where the dispatch worker sets this same
+                # var per-run. A probe against only the registered env would test a
+                # configuration that never runs in production.
+                _mcp_probe "$mcp_name" "$expect_tool" "AGENT_GTD_API_KEY='${AGENT_GTD_API_KEY:-}'"
+                if [[ "$_MCP_PROBE_RC" -ne 0 ]]; then
+                    if [[ "$_MCP_PROBE_RC" -eq 1 ]]; then
+                        die "agent-gtd MCP probe failed: ${_MCP_PROBE_OUT}"
+                    fi
+                    # rc 2 (launch/resolution) or 3 (timeout): retry once — cold uv
+                    # cache building agent-gtd-mcp from source is the common cause.
+                    _mcp_probe "$mcp_name" "$expect_tool" "AGENT_GTD_API_KEY='${AGENT_GTD_API_KEY:-}'"
+                    if [[ "$_MCP_PROBE_RC" -eq 1 ]]; then
+                        die "agent-gtd MCP probe failed: ${_MCP_PROBE_OUT}"
+                    elif [[ "$_MCP_PROBE_RC" -ne 0 ]]; then
+                        warn "agent-gtd MCP probe could not complete (${_MCP_PROBE_OUT}) — cold uv cache or git/PyPI reachability; registration is in place, re-run the installer to confirm"
+                    fi
+                fi
+            else
+                _mcp_probe "$mcp_name" "$expect_tool" ""
+                if [[ "$_MCP_PROBE_RC" -ne 0 ]]; then
+                    warn "${_MCP_PROBE_OUT}"
+                fi
+            fi
+
+            if [[ "$_MCP_PROBE_RC" -eq 0 ]]; then
+                info "${_MCP_PROBE_OUT}"
+            fi
+            _elapsed="$(printf '%s' "$_MCP_PROBE_OUT" | grep -o 'elapsed_s=[0-9]*' | head -n1 | cut -d= -f2)"
+            if [[ -n "${_elapsed:-}" && "$_elapsed" -gt 300 ]]; then
+                warn "MCP probe for ${mcp_name} took ${_elapsed}s of a ${MCP_PROBE_TIMEOUT}s budget — raise MCP_PROBE_TIMEOUT before it breaches"
+            fi
+        done
+
+        rm -f "${_mcp_probe_tmp}"
+        trap - EXIT
     fi
 fi
 

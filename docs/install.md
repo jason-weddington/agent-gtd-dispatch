@@ -426,8 +426,14 @@ All variables documented in `templates/dispatch-env.tmpl`. Key variables:
 | `DISPATCH_PLANNER_PROVIDER` | – | Planner LLM provider: `anthropic` (default) or `bedrock`. See [Bedrock planner provider](#bedrock-planner-provider-corporateport-environments) below. |
 | `DISPATCH_PLANNER_BEDROCK_MODEL` | – | Bedrock model ID (default: `global.anthropic.claude-sonnet-4-6`). Only used when `DISPATCH_PLANNER_PROVIDER=bedrock`. |
 | `AWS_REGION` | – | AWS region for Bedrock API calls (default: `us-east-1` per SDK fallback). Only used when `DISPATCH_PLANNER_PROVIDER=bedrock`. |
-| `TEAM_KB_DATABASE_URL` | – | Team KB Postgres connection string. Read by installer Step 4.6 (not the service) and injected into the `team-kb` MCP server's per-server env; if unset, `team-kb` registration is skipped |
-| `KB_ANTHROPIC_API_KEY` | – | Anthropic key for the KB MCP servers' own LLM calls. Read by installer Step 4.6 and injected per-server as `ANTHROPIC_API_KEY` — deliberately NOT named `ANTHROPIC_API_KEY` in `.env`, so it never reaches the agent's process env (which would flip Claude Code billing off the Max subscription) |
+| `PERSONAL_KB_URL` | – | Hosted personal KB service URL. Read by installer Step 4.6 (not the service) and injected into the `personal-kb` MCP server's per-server env; if unset (or `PERSONAL_KB_API_KEY` is unset), `personal-kb` registration is skipped |
+| `PERSONAL_KB_API_KEY` | – | API key for the hosted personal KB service. Read by installer Step 4.6 and injected into the `personal-kb` MCP server's per-server env |
+| `TEAM_KB_URL` | – | Hosted team KB service URL. Read by installer Step 4.6 (not the service) and injected into the `team-kb` MCP server's per-server env; if unset (or `TEAM_KB_API_KEY` is unset), `team-kb` registration is skipped |
+| `TEAM_KB_API_KEY` | – | API key for the hosted team KB service. Read by installer Step 4.6 and injected into the `team-kb` MCP server's per-server env |
+
+Both KB services are **LAN-only** (no public DNS or ingress). Mint a dispatch-specific
+API key per host from each KB service's Settings → API Keys pane *before* running the
+installer.
 
 The env file is installed at `/home/dispatch-svc/.env` with mode `0600`,
 owned by `dispatch-svc`. In single-user mode it is installed at
@@ -542,16 +548,17 @@ falling back to raw `curl` calls.
 | Server | Purpose |
 |---|---|
 | `agent-gtd` | GTD items, comments, and dispatch (prevents `created_by="human"` regression) |
-| `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) |
-| `team-kb` | Team knowledge base — **conditional**: only registered when `TEAM_KB_DATABASE_URL` is set in the service `.env` |
+| `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) — a thin HTTP client of the hosted personal KB service, **conditional**: only registered when `PERSONAL_KB_URL` and `PERSONAL_KB_API_KEY` are both set in the service `.env` |
+| `team-kb` | Team knowledge base — same package as `personal-kb`, pointed at the team KB service instead, **conditional**: only registered when `TEAM_KB_URL` and `TEAM_KB_API_KEY` are both set in the service `.env` |
 | `aws-documentation-mcp-server` | AWS docs for any AWS-related implementation work |
 
-Step 4.6 reads `TEAM_KB_DATABASE_URL` and `KB_ANTHROPIC_API_KEY` out of the installed
-service `.env` and exports them before sourcing `templates/mcp-servers.sh`, so the KB
-servers get their secrets in their **per-server** MCP env blocks (see the
-[environment file reference](#environment-file-reference)). If either is unset the
-installer prints a `[WARN]` and continues — `team-kb` is skipped entirely, and the KB
-servers register without an Anthropic key (LLM features degraded).
+Step 4.6 reads `PERSONAL_KB_URL`, `PERSONAL_KB_API_KEY`, `TEAM_KB_URL` and
+`TEAM_KB_API_KEY` out of the installed service `.env` and exports them before sourcing
+`templates/mcp-servers.sh`, so the KB servers get their secrets in their **per-server**
+MCP env blocks (see the [environment file reference](#environment-file-reference)). If
+a URL is unset the installer prints a `[WARN]` and skips that server entirely; if the
+URL is set but its API key is not, the installer warns that a URL without a key cannot
+authenticate and skips that server too.
 
 Registration is **per-host and per-user** using `--scope user`, which writes to
 `/home/dispatch/.claude.json` in the two-user split. **In single-user mode the agent
@@ -560,11 +567,12 @@ user is your own login account, so `--scope user` writes to YOUR `~/.claude.json
 > ⚠️ **Adapt this to your environment.** The entries in `templates/mcp-servers.sh`
 > hardcode homelab-specific values: `uvx` sources pointing at
 > `git+ssh://git@<your-git-host>/home/git/repos/...` and KB identities
-> (`KB_CONTRIBUTOR=jason`, `KB_TEAM=grit-mile`). On any other environment these
-> register successfully but **fail at runtime** — the Step 4.6 smoke test only greps
-> for the server name in `claude mcp list`, so it passes regardless. Edit
-> `templates/mcp-servers.sh` to point at your git host and KB identities (or trim the
-> array to just the servers you need) **before** running the installer.
+> (`KB_CONTRIBUTOR=jason`, `KB_TEAM=grit-mile`). On any other environment these need
+> your own git host and KB identities (or trim the array to just the servers you
+> need) — Step 4.6 now runs a real MCP `initialize` + `tools/list` handshake against
+> each registered server (`templates/mcp-probe.py`), so a misconfigured entry is
+> caught at install time instead of silently registering successfully. Edit
+> `templates/mcp-servers.sh` **before** running the installer.
 
 ### Config file
 
@@ -591,19 +599,44 @@ sudo -u dispatch -H bash -lc "claude mcp add <name> --scope user <args>"
 
 ### Verifying registration
 
-```bash
-# List registered servers on a host:
-ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && claude mcp list"'
-# → agent-gtd: ...
-# → aws-documentation-mcp-server: ...
-# → personal-kb: ...
-# → team-kb: ...                (only if TEAM_KB_DATABASE_URL was set at install time)
+`claude mcp list` is **not** a valid health check — it reports every server as failed
+when run from a shell whose cwd/PATH differ from the agent's, so it can't distinguish
+a healthy server from a broken one. Use the same probe the installer runs in Step 4.6:
 
-# Inspect ~/.claude.json directly:
+```bash
+ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && python3 /path/to/mcp-probe.py --claude-json ~/.claude.json --name personal-kb --expect-tool kb_search"'
+# → PASS personal-kb tools=<N> elapsed_s=<S>
+```
+
+Copy `templates/mcp-probe.py` to the host to run this manually, or inspect
+`~/.claude.json` directly for the registered shape:
+
+```bash
 ssh <HOST> 'sudo cat /home/dispatch/.claude.json' | jq '.mcpServers | keys'
 # → ["agent-gtd", "aws-documentation-mcp-server", "personal-kb"]
-# → (plus "team-kb" on hosts where TEAM_KB_DATABASE_URL was set)
+# → (plus "team-kb" on hosts where TEAM_KB_URL / TEAM_KB_API_KEY were set)
 ```
+
+### Idempotency check
+
+Two consecutive installer runs should register byte-identical MCP config:
+
+```bash
+sudo ./setup-dispatch-host.sh          # first run
+sudo jq -S '.mcpServers' /home/dispatch/.claude.json > /tmp/a
+sudo ./setup-dispatch-host.sh          # second run
+sudo jq -S '.mcpServers' /home/dispatch/.claude.json > /tmp/b
+diff /tmp/a /tmp/b                     # expect empty output
+```
+
+Also run `sudo ./setup-dispatch-host.sh --dry-run` and confirm it completes cleanly.
+The first real (cold `~/.cache/uv`) probe run on each host reports its own
+`elapsed_s=<S>` per server — note the largest value here so `MCP_PROBE_TIMEOUT`
+(default 600s) can be recalibrated from a real number instead of a guess:
+
+| Host | Server | Cold `elapsed_s` |
+|---|---|---|
+| _(fill in after first re-run)_ | | |
 
 ---
 

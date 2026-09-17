@@ -148,25 +148,25 @@ details: [docs/install.md — Single-user mode](docs/install.md#single-user-mode
 
 ### MCP servers for the agent user
 
-The installer registers three MCP servers for the `dispatch` (agent) user — plus a
-fourth, `team-kb`, when `TEAM_KB_DATABASE_URL` is set in the service `.env` — so that
+The installer registers up to four MCP servers for the `dispatch` (agent) user, so that
 dispatched Claude Code agents have tool access to GTD, the knowledge bases,
 and AWS documentation:
 
 | Server | Purpose |
 |---|---|
 | `agent-gtd` | GTD items, comments, and dispatch — lets agents post comments and update items via MCP rather than raw `curl` |
-| `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) |
-| `team-kb` | Team knowledge base (same package, team database) — registered only when `TEAM_KB_DATABASE_URL` is present in the service `.env` |
+| `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) — a thin HTTP client of the hosted personal KB service; registered only when `PERSONAL_KB_URL` and `PERSONAL_KB_API_KEY` are both present in the service `.env` |
+| `team-kb` | Team knowledge base (same package, pointed at the team KB service instead) — registered only when `TEAM_KB_URL` and `TEAM_KB_API_KEY` are both present in the service `.env` |
 | `aws-documentation-mcp-server` | AWS docs for any AWS-related implementation work |
 
 Registration is **per-host and per-user** (`--scope user`, writes to
-`/home/dispatch/.claude.json`). Step 4.6 of the installer handles this automatically.
-It also injects `KB_ANTHROPIC_API_KEY` (from the service `.env`) into both KB servers'
-per-server `env` blocks as their `ANTHROPIC_API_KEY` — the KB servers make their own
-LLM calls. Never name this variable `ANTHROPIC_API_KEY` in the service `.env` itself:
-that name would reach the agent subprocess env and flip Claude Code off OAuth/Max
-billing onto pay-as-you-go API billing.
+`/home/dispatch/.claude.json`). Step 4.6 of the installer handles this automatically,
+injecting each KB server's URL and API key into its OWN per-server `env` block (see
+`templates/mcp-servers.sh`). Neither KB server makes its own LLM calls anymore — both
+are thin HTTP clients of a hosted KB web service — so no `ANTHROPIC_API_KEY` is ever
+injected here. A literal `ANTHROPIC_API_KEY` in the service `.env` would reach the
+agent subprocess env and flip Claude Code off OAuth/Max billing onto pay-as-you-go API
+billing (kb-01512); that rule still applies elsewhere in this file.
 
 **Config file**: `templates/mcp-servers.sh`
 
@@ -187,9 +187,13 @@ sudo -u dispatch -H bash -lc "claude mcp add <name> --scope user <args>"
 ```
 
 **To verify registration on a host:**
+
+`claude mcp list` is **not** a valid health check — it reports every server as failed
+when run from a shell whose cwd/PATH differ from the agent's. Use the real MCP
+handshake probe the installer runs in Step 4.6 instead:
 ```bash
-ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && claude mcp list"'
-# → all registered servers listed (three, or four with team-kb)
+ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && python3 /path/to/mcp-probe.py --claude-json ~/.claude.json --name personal-kb --expect-tool kb_search"'
+# → PASS personal-kb tools=<N> elapsed_s=<S>
 ```
 
 ## Tests
