@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.23.0 (2026-09-17)
+
+### Features
+
+- **setup**: Local Postgres + pgvector per dispatch host for kb-core's Postgres tests (9e35b99a)
+  ([`5c01fe4`](https://github.com/repos/agent-gtd-dispatch/commit/5c01fe46ba79aa57848f99a8d6e862184ace08c9))
+
+
 ## v1.22.0 (2026-09-16)
 
 ### Features
