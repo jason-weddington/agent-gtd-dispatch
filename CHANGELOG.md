@@ -2,6 +2,25 @@
 
 <!-- version list -->
 
+## v1.24.0 (2026-09-17)
+
+### Bug Fixes
+
+- **setup**: Guarantee a usable rustup default toolchain (4be5f488)
+  ([`5a03335`](https://github.com/repos/agent-gtd-dispatch/commit/5a03335055bac5cea442ad6e704c906f04f94bbe))
+
+### Features
+
+- Pass bare --transcript on talos dispatches for full JSONL run transcripts
+  ([`28c5e6e`](https://github.com/repos/agent-gtd-dispatch/commit/28c5e6efc1252139d29e34fa33acf7630cbcfafd))
+
+- **setup**: Register the KB MCP servers in hosted thin-client mode (1b4f224f)
+  ([`3e11598`](https://github.com/repos/agent-gtd-dispatch/commit/3e11598cfc35df9125425872cac50c18be34a54a))
+
+- **setup**: Warn (and optionally restart) on a stale service environment (0542f656)
+  ([`d54e50a`](https://github.com/repos/agent-gtd-dispatch/commit/d54e50a3f836494659c3921f2f1fdd8f611526d7))
+
+
 ## v1.23.0 (2026-09-17)
 
 ### Features
