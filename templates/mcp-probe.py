@@ -25,11 +25,13 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 EXIT_PASS = 0
@@ -157,12 +159,42 @@ def probe(
             + _redact(str(exc), secrets),
         )
 
+    # Write the requests but hold stdin OPEN until both responses arrive.
+    # Closing stdin immediately (plain communicate(input=...)) makes the server
+    # see EOF and shut down; on a slower host — or in HTTP mode, which starts
+    # slower — it exits before answering tools/list, and the probe reports a
+    # bogus tools-error. Reproduced on pironman01 (aarch64): identical probe
+    # passes when stdin is held open, fails when it is closed at once.
+    stdout_chunks: list[str] = []
+    reader = threading.Thread(
+        target=lambda: stdout_chunks.extend(iter(proc.stdout.readline, "")),  # type: ignore[union-attr]
+        daemon=True,
+    )
+    reader.start()
     try:
-        stdout, stderr = proc.communicate(input=_build_requests(), timeout=timeout)
+        if proc.stdin is None:  # pragma: no cover - Popen(stdin=PIPE) always sets it
+            return EXIT_LAUNCH, f"FAIL {name} reason=launch elapsed_s={elapsed()}"
+        proc.stdin.write(_build_requests())
+        proc.stdin.flush()
+        deadline = time.monotonic() + timeout
+        # Wait for the id=2 (tools/list) response, then close stdin so the
+        # server exits cleanly.
+        while time.monotonic() < deadline:
+            if any('"id":2' in c or '"id": 2' in c for c in stdout_chunks):
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
+        proc.wait(timeout=max(1.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.communicate()
+        proc.wait()
         return EXIT_TIMEOUT, f"FAIL {name} reason=timeout elapsed_s={elapsed()}"
+    reader.join(timeout=5)
+    stdout = "".join(stdout_chunks)
+    stderr = proc.stderr.read() if proc.stderr is not None else ""
 
     stdout = stdout or ""
     stderr = stderr or ""
