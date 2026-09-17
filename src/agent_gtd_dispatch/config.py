@@ -57,6 +57,19 @@ GATE_INSTALL_TIMEOUT_SECONDS: int = 300
 MANAGE_STALE_THRESHOLD_SECONDS: int = 2100  # 35 min
 WATCHDOG_INTERVAL_SECONDS: int = 180  # scan every 3 min
 
+# Minimum agent-subprocess uptime (seconds) a manage run must have reached before
+# its exit is eligible for a "free" (uncounted) relaunch. Below this, the manager
+# is treated as crash-looping and the relaunch counts toward MAX_MANAGE_RETRIES —
+# this is the crash-loop protection that keeps the free-relaunch exemption from
+# masking a manager that dies immediately on every launch.
+MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS: int = 120
+
+# Lifetime cap (per rollout) on free (uncounted) manage relaunches granted while a
+# child build run is healthy and still in flight. Bounds the free-relaunch
+# exemption so a single stuck item cannot relaunch the manager forever without
+# ever counting toward MAX_MANAGE_RETRIES.
+MAX_MANAGE_FREE_RELAUNCHES: int = 25
+
 # Planner (wave DAG)
 ANTHROPIC_API_KEY: str = ""
 PLANNER_MODEL: str = "claude-sonnet-4-6"
@@ -112,6 +125,7 @@ def load() -> None:
     global AGENT_SUBPROCESS_USER
     global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
     global PLANNER_PROVIDER, PLANNER_BEDROCK_MODEL, AWS_REGION
+    global MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS, MAX_MANAGE_FREE_RELAUNCHES
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
@@ -189,4 +203,10 @@ def load() -> None:
     )
     WATCHDOG_INTERVAL_SECONDS = int(
         os.environ.get("DISPATCH_WATCHDOG_INTERVAL_SECONDS", "180")
+    )
+    MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS = int(
+        os.environ.get("DISPATCH_MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS", "120")
+    )
+    MAX_MANAGE_FREE_RELAUNCHES = int(
+        os.environ.get("DISPATCH_MAX_MANAGE_FREE_RELAUNCHES", "25")
     )

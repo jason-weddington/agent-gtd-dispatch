@@ -502,11 +502,9 @@ When a manage-mode `_dispatch_worker` exits (for any reason except human cancell
 
 1. Fetches the rollout status from the GTD API.
 2. If the rollout is already in a terminal state (`completed`, `halted`, `cancelled`) — does nothing.
-3. Otherwise, calls `relaunch_manage_rollout()` to atomically increment `manage_retry_count`.
-4. If `retry_count > MAX_MANAGE_RETRIES` (default 2): halts the rollout with reason
-   `"manage_relaunch_cap_exceeded"`.
-5. Otherwise: sleeps `MANAGE_RETRY_BACKOFF_SECONDS` (30 s) then spawns a new `_dispatch_worker`
-   with `manage_retry_count` set so the recovery prompt includes a warning header.
+3. Otherwise, walks an ordered decision ladder (full 8-value ladder in [docs/rollouts.md](rollouts.md)) that first checks whether this is a *free* relaunch — the manager exited while a healthy child build is still in flight — bounded by three limits: a minimum agent uptime (`MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS`, default 120 s, so a crash-looping manager still counts toward the cap), the `MANAGE_TIMEOUT_SECONDS` backstop anchored on `manager_state_updated_at` (so a genuinely-wedged build can't defer recovery forever), and a lifetime `MAX_MANAGE_FREE_RELAUNCHES` cap per rollout (default 25) that resets when the rollout makes real progress — a terminal build outcome — rather than on a manager heartbeat alone.
+4. A free relaunch (decision `free-relaunch-build-in-flight`) does NOT call `relaunch_manage_rollout()`, so it never consumes `MAX_MANAGE_RETRIES` budget and can never halt the rollout on its own — it posts a GTD comment on the in-flight item, then spawns a new `_dispatch_worker`.
+5. Every other (`counted-*`) decision calls `relaunch_manage_rollout()` to atomically increment `manage_retry_count` exactly as before this feature: if the new count exceeds `MAX_MANAGE_RETRIES` (default 2) the rollout halts with reason `"manage_relaunch_cap_exceeded"`, otherwise it sleeps `MANAGE_RETRY_BACKOFF_SECONDS` (30 s) then spawns a new `_dispatch_worker` with `manage_retry_count` set so the recovery prompt includes a warning header.
 
 ### Stale-Manager Watchdog
 

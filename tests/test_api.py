@@ -1761,8 +1761,8 @@ class TestPreflightItemFetch:
             patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
         ):
             mock_client.get_item = AsyncMock(side_effect=_make_http_status_error(404))
-            mock_client.is_authoritative_item_error = (
-                lambda exc: exc.response.status_code in (401, 403, 404)
+            mock_client.is_authoritative_item_error = lambda exc: (
+                exc.response.status_code in (401, 403, 404)
             )
             mock_client.post_comment = post_comment_mock
 
@@ -1814,8 +1814,8 @@ class TestPreflightItemFetch:
             patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
         ):
             mock_client.get_item = AsyncMock(side_effect=_make_http_status_error(403))
-            mock_client.is_authoritative_item_error = (
-                lambda exc: exc.response.status_code in (401, 403, 404)
+            mock_client.is_authoritative_item_error = lambda exc: (
+                exc.response.status_code in (401, 403, 404)
             )
             mock_client.post_comment = post_comment_mock
 
@@ -1867,8 +1867,8 @@ class TestPreflightItemFetch:
             patch("agent_gtd_dispatch.main.dispatch"),
         ):
             mock_client.get_item = AsyncMock(side_effect=_make_http_status_error(500))
-            mock_client.is_authoritative_item_error = (
-                lambda exc: exc.response.status_code in (401, 403, 404)
+            mock_client.is_authoritative_item_error = lambda exc: (
+                exc.response.status_code in (401, 403, 404)
             )
             mock_client.post_comment = post_comment_mock
 

@@ -132,6 +132,31 @@ _rollout_to_run: dict[str, Run] = {}  # rollout_id → active manage-mode Run
 _watchdog_task: asyncio.Task[None] | None = None  # handle for clean shutdown
 _watchdog_acted: dict[str, float] = {}  # rollout_id → monotonic() of last action
 
+# rollout_id -> lifetime count of UNCOUNTED (free) manage relaunches granted while
+# a child build run is healthy and still in flight. A lifetime tally: it is NEVER
+# reset by manager progress alone (see _manage_last_terminal_count below), and is
+# cleared only by (a) a counted recovery and (b) the clean-exit early return. A
+# progress-reset tally keyed on the manager heartbeat alone would be unbounded,
+# because a manager that refreshes manager_state_updated_at once per cycle and
+# then dies would reset it every cycle.
+_manage_free_relaunches: dict[str, int] = {}
+
+# rollout_id -> last-seen count of items that have reached a terminal build
+# outcome (left the rollout's in-flight-build set after having been observed
+# there). GET /api/rollouts/{id} does not carry a `done_count` field (that is
+# only computed by the project-active-rollout and list endpoints), so this is
+# the "equivalent terminal-item count" derived from the field that IS already
+# on the rollout dict `_maybe_relaunch_manage` holds: inFlightBuildRuns. Used to
+# reset `_manage_free_relaunches` on real wave progress — bounding the free-relaunch
+# budget per stuck item rather than per wave. Cleared together with
+# `_manage_free_relaunches`.
+_manage_last_terminal_count: dict[str, int] = {}
+
+# rollout_id -> set of item_ids ever observed in the rollout's in-flight-build set.
+# Bookkeeping for computing `_manage_last_terminal_count` above; cleared together
+# with it.
+_manage_seen_in_flight_item_ids: dict[str, frozenset[str]] = {}
+
 
 def _publish_run_event(run_id: str, status: str, completed_at: str | None) -> None:
     """Publish a status-change event to the run's in-memory event queue."""
@@ -153,6 +178,16 @@ MANAGE_RETRY_BACKOFF_SECONDS = 30
 
 # Frozenset of rollout statuses that indicate a clean/terminal manage exit
 _CLEAN_EXIT_STATUSES: frozenset[str] = frozenset({"completed", "halted", "cancelled"})
+
+# `_maybe_relaunch_manage` decisions logged at WARNING (crash-loop / cap / backstop
+# signals an operator should notice) rather than INFO (routine).
+_ABNORMAL_DECISIONS: frozenset[str] = frozenset(
+    {
+        "counted-free-cap-exhausted",
+        "counted-backstop-exceeded",
+        "counted-run-timed-out",
+    }
+)
 
 
 def _in_flight_build_runs(rollout: dict[str, Any]) -> list[Any]:
@@ -223,6 +258,8 @@ async def _do_manage_recovery(
     attribution: str | None,
     *,
     halt_reason: str,
+    count_toward_cap: bool = True,
+    known_retry_count: int = 0,
 ) -> None:
     """Shared manage-recovery: kill stale subprocess (if any), increment retry, relaunch or halt.
 
@@ -239,6 +276,13 @@ async def _do_manage_recovery(
         timeout_seconds: Forwarded to the new _dispatch_worker.
         attribution: Forwarded to the new _dispatch_worker.
         halt_reason: Reason string for halt_rollout when cap is exceeded.
+        count_toward_cap: When False, this is a "free" relaunch granted while a
+            healthy child build is still in flight — it does not call
+            relaunch_manage_rollout, does not evaluate the retry cap, and never
+            halts. When True (default), behaves exactly as before this feature.
+        known_retry_count: retry_count to report/forward when count_toward_cap
+            is False (relaunch_manage_rollout is not called on that path, so
+            the caller must supply the rollout's current manage_retry_count).
     """
     source = "watchdog" if halt_reason == "manage_watchdog_stale" else "exit-path"
     run_id = run.id if run is not None else "none"
@@ -257,54 +301,77 @@ async def _do_manage_recovery(
             run_killed = True
 
     logger.info(
-        "manage-recovery: entry rollout_id=%s run_id=%s source=%s run_killed=%s",
+        "manage-recovery: entry rollout_id=%s run_id=%s source=%s run_killed=%s "
+        "count_toward_cap=%s",
         rollout_id,
         run_id,
         source,
         run_killed,
+        count_toward_cap,
     )
 
-    # manage-recovery deliberately uses the static service key: it can fire from
-    # the watchdog (no owning user/run) or from the post-exit relaunch path, and
-    # we want recovery to succeed even when the original Run's callback_token
-    # has expired. Do NOT thread a per-run token here.
-    try:
-        updated = await gtd_client.relaunch_manage_rollout(rollout_id)
-    except Exception:
-        logger.exception(
-            "Failed to increment manage_retry_count for rollout %s — skipping recovery",
+    if count_toward_cap:
+        # Clear the free-relaunch tally at this shared choke point so a
+        # watchdog-triggered counted recovery also resets it, without editing
+        # _watchdog_evaluate_rollout.
+        _manage_free_relaunches.pop(rollout_id, None)
+        _manage_last_terminal_count.pop(rollout_id, None)
+        _manage_seen_in_flight_item_ids.pop(rollout_id, None)
+
+        # manage-recovery deliberately uses the static service key: it can fire
+        # from the watchdog (no owning user/run) or from the post-exit relaunch
+        # path, and we want recovery to succeed even when the original Run's
+        # callback_token has expired. Do NOT thread a per-run token here.
+        try:
+            updated = await gtd_client.relaunch_manage_rollout(rollout_id)
+        except Exception:
+            logger.exception(
+                "Failed to increment manage_retry_count for rollout %s — skipping recovery",
+                rollout_id,
+            )
+            return
+
+        retry_count = int(updated["manage_retry_count"])
+        logger.info(
+            "manage-recovery: retry_count rollout_id=%s run_id=%s retry_count=%d cap=%d",
             rollout_id,
+            run_id,
+            retry_count,
+            MAX_MANAGE_RETRIES,
         )
-        return
 
-    retry_count = int(updated["manage_retry_count"])
-    logger.info(
-        "manage-recovery: retry_count rollout_id=%s run_id=%s retry_count=%d cap=%d",
-        rollout_id,
-        run_id,
-        retry_count,
-        MAX_MANAGE_RETRIES,
-    )
+        if retry_count > MAX_MANAGE_RETRIES:
+            logger.warning(
+                "Manage retry cap exceeded for rollout %s (count=%d) — halting",
+                rollout_id,
+                retry_count,
+            )
+            try:
+                await gtd_client.halt_rollout(rollout_id, reason=halt_reason)
+            except Exception:
+                logger.exception(
+                    "Failed to halt rollout %s after cap exceeded", rollout_id
+                )
+            return
 
-    if retry_count > MAX_MANAGE_RETRIES:
-        logger.warning(
-            "Manage retry cap exceeded for rollout %s (count=%d) — halting",
+        logger.info(
+            "Relaunching manage agent for rollout %s (retry %d/%d) after %ds",
             rollout_id,
             retry_count,
+            MAX_MANAGE_RETRIES,
+            MANAGE_RETRY_BACKOFF_SECONDS,
         )
-        try:
-            await gtd_client.halt_rollout(rollout_id, reason=halt_reason)
-        except Exception:
-            logger.exception("Failed to halt rollout %s after cap exceeded", rollout_id)
-        return
+    else:
+        retry_count = known_retry_count
+        logger.info(
+            "manage-recovery: free-relaunch rollout_id=%s run_id=%s retry_count=%d "
+            "cap=%d counted=false",
+            rollout_id,
+            run_id,
+            retry_count,
+            MAX_MANAGE_RETRIES,
+        )
 
-    logger.info(
-        "Relaunching manage agent for rollout %s (retry %d/%d) after %ds",
-        rollout_id,
-        retry_count,
-        MAX_MANAGE_RETRIES,
-        MANAGE_RETRY_BACKOFF_SECONDS,
-    )
     await asyncio.sleep(MANAGE_RETRY_BACKOFF_SECONDS)
 
     new_run = Run(
@@ -317,6 +384,15 @@ async def _do_manage_recovery(
         callback_token=run.callback_token if run else None,
     )
     await db.insert_run(new_run)
+    logger.info(
+        "manage-recovery: relaunched rollout_id=%s prior_run_id=%s new_run_id=%s "
+        "counted=%s retry_count=%d",
+        rollout_id,
+        run_id,
+        new_run.id,
+        count_toward_cap,
+        retry_count,
+    )
     task = asyncio.create_task(
         _dispatch_worker(
             new_run,
@@ -325,6 +401,7 @@ async def _do_manage_recovery(
             timeout_seconds,
             attribution=attribution,
             manage_retry_count=retry_count,
+            is_recovery=True,
         )
     )
     _active_processes[new_run.id] = task
@@ -336,45 +413,175 @@ async def _maybe_relaunch_manage(
     engine: Engine,
     timeout_seconds: int,
     attribution: str | None,
+    *,
+    manager_uptime_seconds: float,
+    run_timed_out: bool,
 ) -> None:
     """Check rollout status on manage exit and relaunch or halt as appropriate.
 
     Called from _dispatch_worker's finally block (skipped when human-cancelled).
     - If rollout is in a clean terminal state: do nothing.
-    - If rollout is still running/pending (unexpected exit): delegate to
-      _do_manage_recovery which increments retry count and either relaunches
-      or halts.
+    - Otherwise, walk the ordered decision ladder below (first match wins) to
+      decide whether this exit is a "free" relaunch (a manager that exited
+      while a healthy child build is still in flight — does not consume
+      MAX_MANAGE_RETRIES budget) or must count toward the cap as before.
+
+    Args:
+        run: The Run for the manage worker that just exited.
+        max_turns: Forwarded to the (possible) new _dispatch_worker.
+        engine: Forwarded to the (possible) new _dispatch_worker.
+        timeout_seconds: Forwarded to the (possible) new _dispatch_worker.
+        attribution: Forwarded to the (possible) new _dispatch_worker.
+        manager_uptime_seconds: Wall-clock seconds between the agent subprocess
+            launch and this exit (0.0 if the agent never launched).
+        run_timed_out: True if this run ended via subprocess.TimeoutExpired.
     """
     assert run.rollout_id is not None  # noqa: S101 — caller guarantees this
+    rollout_id = run.rollout_id
     # manage-recovery probe: deliberately on the static key (callback_token may
     # have expired by the time we relaunch). See _do_manage_recovery comment.
     try:
-        rollout = await gtd_client.get_rollout(run.rollout_id)
+        rollout = await gtd_client.get_rollout(rollout_id)
     except Exception:
         logger.exception(
             "Failed to fetch rollout %s for relaunch check — skipping recovery",
-            run.rollout_id,
+            rollout_id,
         )
         return
 
     if rollout["status"] in _CLEAN_EXIT_STATUSES:
         logger.info(
             "manage-recovery: clean-exit rollout_id=%s run_id=%s rollout_status=%s",
-            run.rollout_id,
+            rollout_id,
             run.id,
             rollout["status"],
         )
+        _manage_free_relaunches.pop(rollout_id, None)
+        _manage_last_terminal_count.pop(rollout_id, None)
+        _manage_seen_in_flight_item_ids.pop(rollout_id, None)
         return  # clean exit — nothing to do
 
-    logger.info(
-        "manage-recovery: unexpected-exit rollout_id=%s run_id=%s rollout_status=%s",
-        run.rollout_id,
+    in_flight = _in_flight_build_runs(rollout)
+    in_flight_ids = frozenset(str(r.get("itemId")) for r in in_flight)
+
+    # Progress reset: an item that was in flight and has since left the
+    # in-flight set has reached a terminal build outcome (completed/failed/
+    # cancelled) — real forward progress, unlike a manager heartbeat which
+    # only proves *a* manager is alive. Reset the free-relaunch tally whenever
+    # this rollout's terminal-item count increases, so a long multi-item wave
+    # is bounded per stuck item (max MAX_MANAGE_FREE_RELAUNCHES hand-offs
+    # waiting on any single item) rather than per wave.
+    previously_in_flight = _manage_seen_in_flight_item_ids.get(rollout_id, frozenset())
+    newly_terminal = previously_in_flight - in_flight_ids
+    last_terminal_count = _manage_last_terminal_count.get(rollout_id, 0)
+    current_terminal_count = last_terminal_count + len(newly_terminal)
+    if current_terminal_count > last_terminal_count:
+        _manage_free_relaunches[rollout_id] = 0
+    _manage_last_terminal_count[rollout_id] = current_terminal_count
+    _manage_seen_in_flight_item_ids[rollout_id] = in_flight_ids
+
+    manager_phase = rollout.get("manager_phase")
+    manager_current_step = rollout.get("manager_current_step")
+    updated_at_str: str | None = rollout.get("manager_state_updated_at")
+    manager_state_age_seconds: str | int = "unknown"
+    age_seconds: float | None = None
+    if updated_at_str:
+        try:
+            updated_at = datetime.fromisoformat(updated_at_str)
+        except ValueError:
+            age_seconds = None
+        else:
+            age_seconds = (datetime.now(UTC) - updated_at).total_seconds()
+    if age_seconds is not None:
+        manager_state_age_seconds = int(age_seconds)
+
+    free_relaunches = _manage_free_relaunches.get(rollout_id, 0)
+
+    decision: str
+    if run_timed_out:
+        decision = "counted-run-timed-out"
+    elif manager_phase != "polling":
+        decision = "counted-not-polling"
+    elif not in_flight:
+        decision = "counted-no-build-in-flight"
+    elif manager_uptime_seconds < config.MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS:
+        decision = "counted-short-uptime"
+    elif age_seconds is None:
+        decision = "counted-unknown-manager-state-age"
+    elif age_seconds > config.MANAGE_TIMEOUT_SECONDS:
+        decision = "counted-backstop-exceeded"
+    elif free_relaunches >= config.MAX_MANAGE_FREE_RELAUNCHES:
+        decision = "counted-free-cap-exhausted"
+    else:
+        decision = "free-relaunch-build-in-flight"
+
+    in_flight_build_run_ids = ",".join(str(r.get("runId")) for r in in_flight) or "none"
+    log_fmt = (
+        "manage-recovery: exit-path rollout_id=%s run_id=%s rollout_status=%s "
+        "manager_phase=%s manager_current_step=%s in_flight_builds=%d "
+        "in_flight_build_run_ids=%s uptime_seconds=%.0f manager_state_age_seconds=%s "
+        "free_relaunches=%d decision=%s"
+    )
+    log_args = (
+        rollout_id,
         run.id,
         rollout["status"],
+        manager_phase,
+        manager_current_step,
+        len(in_flight),
+        in_flight_build_run_ids,
+        manager_uptime_seconds,
+        manager_state_age_seconds,
+        free_relaunches,
+        decision,
     )
-    # Unexpected exit: rollout still running or pending
+    if decision in _ABNORMAL_DECISIONS:
+        logger.warning(log_fmt, *log_args)
+    else:
+        logger.info(log_fmt, *log_args)
+
+    if decision == "free-relaunch-build-in-flight":
+        new_free_relaunches = free_relaunches + 1
+        _manage_free_relaunches[rollout_id] = new_free_relaunches
+        # Mark acted-on so a watchdog tick within MANAGE_STALE_THRESHOLD_SECONDS
+        # takes its existing skipped-idempotency branch instead of killing the
+        # warming-up replacement manager and burning a counted retry — the same
+        # mark-before-await pattern the watchdog itself uses.
+        _watchdog_acted[rollout_id] = time.monotonic()
+
+        comment_run_id = in_flight[0]["runId"]
+        comment_item_id = in_flight[0]["itemId"]
+        comment = (
+            "manage-recovery: free relaunch — the rollout manager exited while "
+            f"build run `{comment_run_id}` is still in flight. `manage_retry_count` "
+            f"is unchanged at {int(rollout.get('manage_retry_count', 0))}; "
+            f"free relaunch {new_free_relaunches}/{config.MAX_MANAGE_FREE_RELAUNCHES}; "
+            f"manager uptime {manager_uptime_seconds:.0f}s."
+        )
+        try:
+            await gtd_client.post_comment(
+                comment_item_id, comment, created_by="agent-gtd-dispatch"
+            )
+        except Exception:
+            logger.exception(
+                "Failed to post free-relaunch comment for rollout %s", rollout_id
+            )
+
+        await _do_manage_recovery(
+            rollout_id,
+            run,
+            max_turns,
+            engine,
+            timeout_seconds,
+            attribution,
+            halt_reason="manage_relaunch_cap_exceeded",
+            count_toward_cap=False,
+            known_retry_count=int(rollout.get("manage_retry_count", 0)),
+        )
+        return
+
     await _do_manage_recovery(
-        run.rollout_id,
+        rollout_id,
         run,
         max_turns,
         engine,
@@ -1161,6 +1368,7 @@ async def _dispatch_worker(
     *,
     attribution: str | None = None,
     manage_retry_count: int = 0,
+    is_recovery: bool = False,
 ) -> None:
     """Background task that executes a dispatch run."""
     _run_start_dt: datetime = datetime.now(UTC)
@@ -1222,6 +1430,8 @@ async def _dispatch_worker(
     should_cleanup = True
     _human_cancelled = False
     _exit_code: int | None = None
+    _run_timed_out = False
+    _agent_start_dt: datetime | None = None
 
     try:
         # Fetch item and project.
@@ -1532,6 +1742,7 @@ async def _dispatch_worker(
             rollout_id=run.rollout_id,
             manage_retry_count=manage_retry_count,
             workspace_repo_dirs=workspace_repo_dirs,
+            is_recovery=is_recovery,
         )
 
         item_title = item.get("title", f"rollout:{run.rollout_id}")
@@ -1619,6 +1830,7 @@ async def _dispatch_worker(
             )
             return
 
+        _agent_start_dt = datetime.now(UTC)
         result = await dispatch.run_agent(
             engine_used,
             workspace,
@@ -2119,6 +2331,9 @@ async def _dispatch_worker(
                 )
 
     except subprocess.TimeoutExpired:
+        # manage runs never take the _linger_success branch below — _verify_repos
+        # is None for non-build modes.
+        _run_timed_out = True
         _timed_out_at = datetime.now(UTC).isoformat()
         _linger_success = False
         if _verify_repos is not None:
@@ -2207,7 +2422,17 @@ async def _dispatch_worker(
             dispatch.cleanup_workspace(workspace)
         if run.mode == DispatchMode.MANAGE and run.rollout_id and not _human_cancelled:
             await _maybe_relaunch_manage(
-                run, max_turns, engine_used, timeout_seconds, attribution
+                run,
+                max_turns,
+                engine_used,
+                timeout_seconds,
+                attribution,
+                manager_uptime_seconds=(
+                    0.0
+                    if _agent_start_dt is None
+                    else (datetime.now(UTC) - _agent_start_dt).total_seconds()
+                ),
+                run_timed_out=_run_timed_out,
             )
 
 

@@ -1176,6 +1176,52 @@ class TestBuildManagePrompt:
         assert "Recovery Context" not in prompt
         assert "recovery" not in prompt.lower() or "non-recoverable" in prompt.lower()
 
+    def test_recovery_block_is_recovery_zero_retry_count(self) -> None:
+        """is_recovery=True with manage_retry_count=0 renders the free-relaunch wording."""
+        prompt = build_system_prompt(
+            item={"id": "item-1", "title": "ignored"},
+            project=self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="manage",
+            rollout_id=self._rollout_id,
+            manage_retry_count=0,
+            is_recovery=True,
+        )
+        assert "## ⚠️ Recovery Context" in prompt
+        assert "this relaunch did not consume a retry" in prompt
+        assert "retry attempt" not in prompt
+
+    def test_recovery_block_is_recovery_with_retry_count(self) -> None:
+        """is_recovery=True with manage_retry_count=1 still shows the retry-attempt clause."""
+        prompt = build_system_prompt(
+            item={"id": "item-1", "title": "ignored"},
+            project=self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="manage",
+            rollout_id=self._rollout_id,
+            manage_retry_count=1,
+            is_recovery=True,
+        )
+        assert "retry attempt 1 of 2" in prompt
+
+    def test_no_recovery_block_not_recovery_zero_retry_count(self) -> None:
+        """is_recovery=False (default) with manage_retry_count=0 renders no block."""
+        prompt = build_system_prompt(
+            item={"id": "item-1", "title": "ignored"},
+            project=self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="manage",
+            rollout_id=self._rollout_id,
+            manage_retry_count=0,
+            is_recovery=False,
+        )
+        assert "## ⚠️ Recovery Context" not in prompt
+        assert "this relaunch did not consume a retry" not in prompt
+        assert "retry attempt" not in prompt
+
     def test_recovery_block_at_count_one(self) -> None:
         """manage_retry_count=1 should prepend the recovery context block."""
         prompt = build_system_prompt(

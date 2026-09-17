@@ -855,6 +855,7 @@ def build_system_prompt(
     rollout_id: str | None = None,
     manage_retry_count: int = 0,
     workspace_repo_dirs: list[str] | None = None,
+    is_recovery: bool = False,
 ) -> str:
     """Build the headless agent system prompt."""
     if mode == DispatchMode.PLAN:
@@ -873,6 +874,7 @@ def build_system_prompt(
             max_turns,
             manage_retry_count=manage_retry_count,
             workspace_repo_dirs=workspace_repo_dirs,
+            is_recovery=is_recovery,
         )
     return _build_build_prompt(
         item,
@@ -1538,6 +1540,7 @@ def _build_manage_prompt(
     max_turns: int,
     manage_retry_count: int = 0,
     workspace_repo_dirs: list[str] | None = None,
+    is_recovery: bool = False,
 ) -> str:
     """System prompt for manage mode — run the rollout-manager executor loop."""
     project_name = project["name"]
@@ -1545,13 +1548,22 @@ def _build_manage_prompt(
     project_id = project.get("id", "")
 
     recovery_block = ""
-    if manage_retry_count > 0:
+    if is_recovery or manage_retry_count > 0:
+        if manage_retry_count > 0:
+            _retry_clause = (
+                f"(retry attempt {manage_retry_count} of {config.MAX_MANAGE_RETRIES})"
+            )
+        else:
+            _retry_clause = (
+                "(this relaunch did not consume a retry — a build run is still "
+                "in flight)"
+            )
         recovery_block = textwrap.dedent(
             f"""\
             ## ⚠️ Recovery Context
 
             You are a *recovery* manage agent — a previous manager for this rollout exited unexpectedly
-            (retry attempt {manage_retry_count} of {config.MAX_MANAGE_RETRIES}). The rollout is already in `running`
+            {_retry_clause}. The rollout is already in `running`
             state. Read its current state via `advance_rollout` and continue normally. Items already terminal
             may have unmerged work waiting; process those first before dispatching new ones.
 

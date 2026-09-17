@@ -253,16 +253,16 @@ dispatch service detects this and automatically relaunches:
 |---|---|---|
 | Max auto-relaunches | 2 | `MAX_MANAGE_RETRIES` constant in `config.py` (**not** env-configurable — `config.load()` never reads an env var for it) |
 | Backoff between relaunches | 30 seconds | `MANAGE_RETRY_BACKOFF_SECONDS` (hardcoded) |
+| Free-relaunch minimum agent uptime | 120 seconds | `MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS` (`DISPATCH_MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS` env) |
+| Free-relaunch lifetime cap per rollout | 25 | `MAX_MANAGE_FREE_RELAUNCHES` (`DISPATCH_MAX_MANAGE_FREE_RELAUNCHES` env) |
 
 **Relaunch flow** (in `_maybe_relaunch_manage()`):
 
 1. Fetch the rollout from the GTD API.
 2. If the rollout is already in `completed`, `halted`, or `cancelled`: nothing to do.
-3. Call `relaunch_manage_rollout()` to atomically increment `manage_retry_count`.
-4. If `manage_retry_count > MAX_MANAGE_RETRIES`: call `halt_rollout()` with reason
-   `"manage_relaunch_cap_exceeded"` and stop.
-5. Otherwise: sleep 30 s, create a new Run record, spawn a new `_dispatch_worker` with
-   `manage_retry_count` injected into the system prompt as a recovery warning.
+3. Otherwise walk an ordered decision ladder (see [docs/rollouts.md](rollouts.md) for the full 8-value ladder). If the manager exited while a healthy child build is still in flight (`manager_phase == "polling"` with a non-terminal `inFlightBuildRuns` entry), and the agent ran for at least `MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS`, and `manager_state_updated_at` is fresh enough to be under the `MANAGE_TIMEOUT_SECONDS` backstop, and the rollout's lifetime free-relaunch tally is below `MAX_MANAGE_FREE_RELAUNCHES`: this is a **free relaunch** — skip straight to step 5 without calling `relaunch_manage_rollout()`, so `manage_retry_count` stays unchanged; post a GTD comment on the in-flight item noting the free relaunch. The free-relaunch tally resets whenever the rollout's count of terminal (no-longer-in-flight) items increases, so a long multi-item wave is bounded per stuck item rather than per wave.
+4. Otherwise (a `counted-*` decision — including a run that timed out, a non-polling manager, no build in flight, too-short uptime, an unreadable or too-old `manager_state_updated_at`, or an exhausted free-relaunch tally): call `relaunch_manage_rollout()` to atomically increment `manage_retry_count`. If `manage_retry_count > MAX_MANAGE_RETRIES`: call `halt_rollout()` with reason `"manage_relaunch_cap_exceeded"` and stop.
+5. Otherwise: sleep 30 s, create a new Run record, spawn a new `_dispatch_worker` with `is_recovery=True` and `manage_retry_count` injected into the system prompt as a recovery warning (a free relaunch renders the warning with `manage_retry_count` still at its prior value, worded to say no retry was consumed).
 
 **Orphan reconciliation** (on startup): any run stuck in `pending` or `running` at
 startup is marked `failed`. For manage runs, this triggers the relaunch check the next time

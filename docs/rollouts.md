@@ -927,37 +927,40 @@ Manage runs are subject to:
 - Network failures during a long MCP call.
 - Human cancellation.
 
-The dispatch worker handles all of these via the
-`_maybe_relaunch_manage` flow in `main.py`. Called from `_dispatch_worker`'s
-`finally` block on **any non-cancellation exit**:
+The dispatch worker handles all of these via the `_maybe_relaunch_manage` flow in `main.py`. Called from `_dispatch_worker`'s `finally` block on **any non-cancellation exit**:
 
 ```python
 if run.mode == "manage" and run.rollout_id and not _human_cancelled:
     await _maybe_relaunch_manage(
-        run, max_turns, engine_used, timeout_seconds, attribution
+        run, max_turns, engine_used, timeout_seconds, attribution,
+        manager_uptime_seconds=manager_uptime_seconds, run_timed_out=_run_timed_out,
     )
 ```
 
+`manager_uptime_seconds` is the wall-clock time between the agent subprocess launch (stamped immediately before `dispatch.run_agent`) and this exit — `0.0` if the agent never launched — and `run_timed_out` is `True` only when the run ended via `subprocess.TimeoutExpired`.
+
 ### The recovery decision
 
-1. Fetch the current rollout state via `get_rollout(rollout_id)`.
-2. If status is in `_CLEAN_EXIT_STATUSES = {"completed", "halted", "cancelled", "crashed"}`:
-   the rollout reached a terminal state on its own. **Do nothing.**
-3. Otherwise the manage agent exited unexpectedly while the rollout was
-   still `running` or `pending`. Call
-   `gtd_client.relaunch_manage_rollout(rollout_id)` which atomically
-   increments `manage_retry_count` on the agent-gtd side and returns the
-   updated rollout.
-4. If the new `manage_retry_count > MAX_MANAGE_RETRIES` (config default: 2):
-   halt the rollout with reason `"manage_relaunch_cap_exceeded"` and stop.
-5. Otherwise sleep `MANAGE_RETRY_BACKOFF_SECONDS` (30s) and spawn a fresh
-   `_dispatch_worker` for a new manage run, passing `manage_retry_count`
-   into the new prompt.
+A manager that exits while a healthy child build is still in flight (the common case: the manager's own turn/time budget runs out shortly after it arms a poller on a long-running build) must not burn `MAX_MANAGE_RETRIES` budget waiting on work that hasn't failed. `_maybe_relaunch_manage` fetches the current rollout via `get_rollout(rollout_id)` and, unless the status is in `_CLEAN_EXIT_STATUSES = {"completed", "halted", "cancelled"}` (a terminal state reached on its own — do nothing), walks an ordered ladder, first match wins, producing exactly one of eight `decision` values:
+
+1. `run_timed_out is True` → `counted-run-timed-out`.
+2. `manager_phase != "polling"` → `counted-not-polling`.
+3. No non-terminal child build run (`inFlightBuildRuns` empty) → `counted-no-build-in-flight`.
+4. `manager_uptime_seconds < MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS` (crash-loop protection, default 120s) → `counted-short-uptime`.
+5. `manager_state_updated_at` missing or unparseable → `counted-unknown-manager-state-age`.
+6. Its age exceeds `MANAGE_TIMEOUT_SECONDS` (the absolute backstop) → `counted-backstop-exceeded`.
+7. The rollout's lifetime free-relaunch tally is already at `MAX_MANAGE_FREE_RELAUNCHES` (default 25) → `counted-free-cap-exhausted`.
+8. Otherwise → `free-relaunch-build-in-flight`.
+
+Every `counted-*` decision calls `gtd_client.relaunch_manage_rollout(rollout_id)`, which atomically increments `manage_retry_count` on the agent-gtd side; if the new count exceeds `MAX_MANAGE_RETRIES` (config default: 2), the rollout halts with reason `"manage_relaunch_cap_exceeded"`, otherwise it sleeps `MANAGE_RETRY_BACKOFF_SECONDS` (30s) and spawns a fresh `_dispatch_worker`.
+
+`free-relaunch-build-in-flight` takes a different path: it does NOT call `relaunch_manage_rollout` and can NEVER halt — it increments the in-process `_manage_free_relaunches[rollout_id]` tally, posts a GTD comment on the in-flight item explaining the free relaunch, stamps `_watchdog_acted` (so a watchdog tick within `MANAGE_STALE_THRESHOLD_SECONDS` doesn't kill the warming-up replacement and burn a counted retry), then relaunches with `known_retry_count` set to the rollout's current (unchanged) `manage_retry_count`. The free-relaunch tally is a **lifetime** counter per rollout — it is not reset by manager progress alone (a manager that touches `manager_state_updated_at` once per cycle and then dies would otherwise reset it every cycle) — except when the rollout's count of terminal (no-longer-in-flight) items increases, which bounds the budget per stuck item (at most `MAX_MANAGE_FREE_RELAUNCHES` hand-offs waiting on any single item) rather than per wave. It is cleared by a counted recovery and by the clean-exit early return.
+
+Every ladder invocation emits exactly one log line — `logger.warning` for the three abnormal decisions (`counted-free-cap-exhausted`, `counted-backstop-exceeded`, `counted-run-timed-out`), `logger.info` for the other five — carrying the rollout id, manager phase/step, in-flight build run ids, uptime, manager-state age, the free-relaunch tally, and the decision.
 
 ### Recovery prompt prelude
 
-When `manage_retry_count > 0`, `_build_manage_prompt` prepends a recovery
-block to the system prompt:
+`_build_manage_prompt` prepends a recovery block to the system prompt when `is_recovery or manage_retry_count > 0` — `is_recovery` is threaded explicitly from `_do_manage_recovery` through `_dispatch_worker` and `build_system_prompt` rather than inferred from the counter, because a free relaunch keeps `manage_retry_count` at its prior value (often `0`), which the counter-only condition would miss:
 
 ```python
 recovery_block = textwrap.dedent(
@@ -965,8 +968,7 @@ recovery_block = textwrap.dedent(
     ## ⚠️ Recovery Context
 
     You are a *recovery* manage agent — a previous manager for this rollout
-    exited unexpectedly (retry attempt {manage_retry_count} of
-    {config.MAX_MANAGE_RETRIES}). The rollout is already in `running`
+    exited unexpectedly {retry_clause}. The rollout is already in `running`
     state. Read its current state via `advance_rollout` and continue
     normally. Items already terminal may have unmerged work waiting;
     process those first before dispatching new ones.
@@ -974,18 +976,11 @@ recovery_block = textwrap.dedent(
 )
 ```
 
-The recovery agent has the same prompt body, the same allowed tools, and the
-same workspace setup as a fresh manager — but it knows to read state from
-agent-gtd rather than starting from scratch. Critically, no in-memory state
-from the previous manager is carried over: the recovery is **rebuilt
-entirely from rollout state in agent-gtd**.
+`retry_clause` is `(retry attempt {manage_retry_count} of {config.MAX_MANAGE_RETRIES})` when `manage_retry_count > 0` (a counted recovery), or the literal `(this relaunch did not consume a retry — a build run is still in flight)` when it's `0` (a free recovery). All other prompt wording is identical in both cases.
 
-This means a recovery agent might re-run a quality gate on a branch that
-the previous manager had already gated and merged. The commit-count guard
-handles this correctly: a branch that was already merged + deleted will fail
-the guard (or fail `git checkout`), and the manager will treat it as an
-inline-fix or halt candidate. The cost of an occasional duplicate gate is
-much smaller than the cost of dropped work.
+The recovery agent has the same prompt body, the same allowed tools, and the same workspace setup as a fresh manager — but it knows to read state from agent-gtd rather than starting from scratch. Critically, no in-memory state from the previous manager is carried over: the recovery is **rebuilt entirely from rollout state in agent-gtd**.
+
+This means a recovery agent might re-run a quality gate on a branch that the previous manager had already gated and merged. The commit-count guard handles this correctly: a branch that was already merged + deleted will fail the guard (or fail `git checkout`), and the manager will treat it as an inline-fix or halt candidate. The cost of an occasional duplicate gate is much smaller than the cost of dropped work.
 
 ### `manage_retry_count` cap
 
@@ -995,8 +990,7 @@ Beyond that, the rollout halts and the lead must intervene — typically by
 finishing the remaining items inline or grooming the rollout into a
 follow-up wave.
 
-The cap is configurable via the `MAX_MANAGE_RETRIES` env knob; it's
-re-exported from `main.py` for the test suite.
+`MAX_MANAGE_RETRIES` is a plain module constant in `config.py` with no env override (`config.load()` never reads one for it); it's re-exported from `main.py` for the test suite.
 
 ### Human cancellation bypasses recovery
 
@@ -1062,13 +1056,7 @@ A rollout can reach a terminal state through three paths.
 
 ### `crashed` — legacy, no longer set
 
-`crashed` appears in the dispatch-side `_CLEAN_EXIT_STATUSES` tuple but
-**no current agent-gtd code path sets `status="crashed"` on a rollout.**
-The state was originally set by a "wave reaper" background task that
-was removed in `feat/99eaab2d-remove-the-wave-reaper`. The cleanup
-migration `scripts/migrate_remove_reaper.sql` reclassifies any
-historical `crashed` rollouts to `cancelled` and deletes the
-reaper-emitted events:
+**No current agent-gtd code path sets `status="crashed"` on a rollout**, and `crashed` was REMOVED from the dispatch-side `_CLEAN_EXIT_STATUSES` frozenset (now `{"completed", "halted", "cancelled"}`) — a rollout that somehow still carries a historical `crashed` status is no longer treated as a clean exit by `_maybe_relaunch_manage`. The state was originally set by a "wave reaper" background task that was removed in `feat/99eaab2d-remove-the-wave-reaper`. The cleanup migration `scripts/migrate_remove_reaper.sql` reclassifies any historical `crashed` rollouts to `cancelled` and deletes the reaper-emitted events:
 
 ```sql
 UPDATE autonomous_wave_runs
@@ -1080,11 +1068,7 @@ DELETE FROM wave_events
 WHERE actor = 'reaper' OR kind = 'wave_crashed';
 ```
 
-The dispatch side retains `crashed` in `_CLEAN_EXIT_STATUSES` as a
-defensive belt-and-braces — if a future agent-gtd version brings back
-some flavour of automatic crash detection, the dispatch side will
-already treat it as a clean exit and won't try to relaunch. For now,
-treat `crashed` as a state you will never observe in production data.
+Run this migration on any database that predates the reaper's removal, after which `crashed` is a state you will never observe in production data — dispatch no longer special-cases it at all.
 
 ---
 
@@ -1148,7 +1132,8 @@ the lead's job in the interactive session.
 | **Quality gate** | The test + lint + manifest-drift + coverage check the manager runs on each feature branch before merging. |
 | **Sensitive area** | A file path pattern (auth, deploy, infra, secrets, CI) that triggers a halt instead of an auto-merge. |
 | **Commit-count guard** | A `git rev-list` check that fails the merge if the build agent pushed no commits. |
-| **Recovery agent** | A new manage subprocess spawned by `_maybe_relaunch_manage` after an unexpected previous exit. Sees `manage_retry_count > 0` in its prompt. |
+| **Recovery agent** | A new manage subprocess spawned by `_maybe_relaunch_manage` after an unexpected previous exit. Sees `is_recovery=True` in its prompt (the recovery block also renders on a free relaunch, where `manage_retry_count` stays at its prior value). |
+| **Free relaunch** | A recovery that does NOT consume `MAX_MANAGE_RETRIES` budget because a healthy child build was still in flight when the manager exited — decision `free-relaunch-build-in-flight` in the ladder, bounded by `MAX_MANAGE_FREE_RELAUNCHES` and reset on real wave progress. |
 | **Replan** | Re-running the planner on a live rollout to rebuild the DAG over its remaining (`pending`/`ready`) items. See "Replanning a live rollout" below for the full picture. |
 
 ---
@@ -1158,12 +1143,15 @@ the lead's job in the interactive session.
 | Thing you want to know | File and symbol |
 |---|---|
 | The full manage prompt | `src/agent_gtd_dispatch/dispatch.py::_build_manage_prompt` |
-| The recovery prelude | `src/agent_gtd_dispatch/dispatch.py::_build_manage_prompt`, conditional on `manage_retry_count > 0` |
+| The recovery prelude | `src/agent_gtd_dispatch/dispatch.py::_build_manage_prompt`, conditional on `is_recovery or manage_retry_count > 0` |
 | Allowed MCP tools for manage | `src/agent_gtd_dispatch/dispatch.py::_MANAGE_ALLOWED_TOOLS` |
 | `_dispatch_worker` lifecycle | `src/agent_gtd_dispatch/main.py::_dispatch_worker` |
-| Auto-recovery | `src/agent_gtd_dispatch/main.py::_maybe_relaunch_manage` |
+| Auto-recovery (the 8-decision ladder) | `src/agent_gtd_dispatch/main.py::_maybe_relaunch_manage` |
+| Shared relaunch/halt mechanics | `src/agent_gtd_dispatch/main.py::_do_manage_recovery` |
 | Manage timeout default | `src/agent_gtd_dispatch/config.py::MANAGE_TIMEOUT_SECONDS` (4h) |
-| Retry cap | `src/agent_gtd_dispatch/config.py::MAX_MANAGE_RETRIES` (default 2) |
+| Retry cap | `src/agent_gtd_dispatch/config.py::MAX_MANAGE_RETRIES` (default 2, no env override) |
+| Free-relaunch min uptime | `src/agent_gtd_dispatch/config.py::MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS` (default 120s) |
+| Free-relaunch lifetime cap | `src/agent_gtd_dispatch/config.py::MAX_MANAGE_FREE_RELAUNCHES` (default 25) |
 | Planner LLM call | `src/agent_gtd_dispatch/rollout_planner.py::plan_rollout` |
 | Planner prompt template | `src/agent_gtd_dispatch/rollout_planner.py::_build_context` |
 | Planner edge validation | `src/agent_gtd_dispatch/rollout_planner.py::_extract_edges` |
