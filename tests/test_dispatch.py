@@ -376,6 +376,21 @@ class TestBuildEnv:
         env_keep_keys = set(quoted.split())
         assert "AGENT_GTD_API_KEY" in env_keep_keys
 
+    def test_kb_test_postgres_keys_are_in_sudoers_env_keep(self) -> None:
+        """Flywheel guard: KB_TEST_DATABASE_URL and KB_REQUIRE_POSTGRES_TESTS
+        (set by setup-dispatch-host.sh --with-postgres, read by engines.py
+        COMMON_ENV_KEYS) must survive the dispatch-svc→dispatch sudo boundary —
+        i.e. be listed in sudoers env_keep — or the gate's pytest run never sees
+        them and @pytest.mark.postgres suites silently skip again."""
+        tmpl = Path(__file__).parent.parent / "templates" / "sudoers-dispatch-svc.tmpl"
+        env_keep_line = next(
+            line for line in tmpl.read_text().splitlines() if "env_keep +=" in line
+        )
+        quoted = env_keep_line[env_keep_line.index('"') + 1 : env_keep_line.rindex('"')]
+        env_keep_keys = set(quoted.split())
+        assert "KB_TEST_DATABASE_URL" in env_keep_keys
+        assert "KB_REQUIRE_POSTGRES_TESTS" in env_keep_keys
+
     def test_callback_token_not_baked_into_mcp_registration(self) -> None:
         """No-leak guard: mcp-servers.sh must NOT bake a literal AGENT_GTD_API_KEY
         into the agent-gtd MCP block (that would pin every agent to the static key

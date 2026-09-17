@@ -27,6 +27,8 @@ COMMON_ENV_KEYS: frozenset[str] = frozenset(
         "AGENT_GTD_URL",
         "AGENT_GTD_API_KEY",
         "KB_DATABASE_URL",
+        "KB_TEST_DATABASE_URL",
+        "KB_REQUIRE_POSTGRES_TESTS",
         "SSH_AUTH_SOCK",
         "GIT_SSH_COMMAND",
     }

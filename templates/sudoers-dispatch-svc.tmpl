@@ -19,6 +19,13 @@
 # AGENT_GTD_API_KEY        — Agent GTD API key (auth to task management)
 # DISPATCH_API_KEY         — Dispatch service bearer token (internal auth)
 # KB_DATABASE_URL          — Knowledge base database URL (agent KB access)
+# KB_TEST_DATABASE_URL     — Local test-Postgres maintenance DSN (postgresql:///postgres;
+#                            Unix socket, peer auth as {{AGENT_USER}}), written by
+#                            setup-dispatch-host.sh --with-postgres. Without this in
+#                            env_keep, @pytest.mark.postgres suites (e.g. kb-core) silently skip.
+# KB_REQUIRE_POSTGRES_TESTS — Flag (set to "1") that turns a missing KB_TEST_DATABASE_URL into a
+#                            hard test failure instead of a silent skip, in repos whose conftest
+#                            honors it.
 # OLLAMA_BASE_URL          — Ollama API base URL (local LLM access)
 # AGENT_GTD_AGENT_NAME     — Agent identity name (for GTD comment attribution)
 # ANTHROPIC_MODEL          — talos-sonnet/opus model pin; without it talos falls
@@ -36,7 +43,7 @@
 # so every var the talos subprocess needs MUST be listed here or it is stripped.
 # The ollama vars carry no default fallback, so their omission fails the run
 # outright; ANTHROPIC_MODEL's omission fails silently (downgrades to haiku).
-Defaults:{{SERVICE_USER}} env_keep += "CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL AGENT_GTD_URL AGENT_GTD_API_KEY DISPATCH_API_KEY KB_DATABASE_URL OLLAMA_BASE_URL OLLAMA_MODEL OLLAMA_API_KEY OLLAMA_THINK OLLAMA_NUM_CTX TALOS_BACKEND AGENT_GTD_AGENT_NAME PATH"
+Defaults:{{SERVICE_USER}} env_keep += "CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL AGENT_GTD_URL AGENT_GTD_API_KEY DISPATCH_API_KEY KB_DATABASE_URL KB_TEST_DATABASE_URL KB_REQUIRE_POSTGRES_TESTS OLLAMA_BASE_URL OLLAMA_MODEL OLLAMA_API_KEY OLLAMA_THINK OLLAMA_NUM_CTX TALOS_BACKEND AGENT_GTD_AGENT_NAME PATH"
 
 # Override secure_path to include ~/.cargo/bin and ~/.local/bin for the agent user, so
 # cargo/cargo-nextest (gate command for talos ChecksRunner) and uvx/MCP binaries installed

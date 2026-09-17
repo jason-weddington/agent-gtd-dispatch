@@ -137,6 +137,23 @@ class TestRunGateCommandMocked:
             assert key not in env
         assert "PATH" in env
 
+    def test_env_includes_kb_test_database_url_and_require_flag(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """KB_TEST_DATABASE_URL/KB_REQUIRE_POSTGRES_TESTS are not secrets (a local
+        peer-auth maintenance DSN and a boolean flag) — unlike KB_DATABASE_URL, they
+        must reach the gate subprocess so @pytest.mark.postgres suites (e.g. kb-core)
+        run instead of silently skipping."""
+        monkeypatch.setenv("KB_TEST_DATABASE_URL", "postgresql:///postgres")
+        monkeypatch.setenv("KB_REQUIRE_POSTGRES_TESTS", "1")
+        with patch(
+            "agent_gtd_dispatch.dispatch.subprocess.Popen", side_effect=_popen_ok()
+        ) as mock_popen:
+            dispatch.run_gate_command(tmp_path, "echo hi", 30, CLAUDE)
+        env = mock_popen.call_args.kwargs["env"]
+        assert env["KB_TEST_DATABASE_URL"] == "postgresql:///postgres"
+        assert env["KB_REQUIRE_POSTGRES_TESTS"] == "1"
+
     def test_env_path_matches_build_env_path(self, tmp_path) -> None:
         """The gate's PATH is exactly build_env()'s PATH (picks up .cargo/bin etc)."""
         from agent_gtd_dispatch.engines import build_env

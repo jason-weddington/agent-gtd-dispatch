@@ -17,8 +17,10 @@ set -euo pipefail
 #   --dry-run              Print 'Would: <action>' for every step; no mutations
 #   --smoke                After install, verify the API is reachable (GET /health and GET /info return HTTP 200)
 #   --with-talos           Build and install the talos engine binary for AGENT_USER (opt-in; default off)
-#   --with-postgres        Install local Postgres + pgvector, create dispatch_test role/db, write
-#                          KB_TEST_DATABASE_URL to the service env (opt-in; default off)
+#   --with-postgres        Install local Postgres + pgvector, create an AGENT_USER-named
+#                          CREATEDB role (peer auth over the Unix socket), install pgvector
+#                          into template1, write KB_TEST_DATABASE_URL + KB_REQUIRE_POSTGRES_TESTS
+#                          to the service env (opt-in; default off)
 #   -h, --help             Show this help text
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -94,8 +96,10 @@ Options:
   --smoke                After install, verify the API is reachable (GET /health and GET /info return HTTP 200)
   --with-talos           Build and install the talos engine binary for AGENT_USER (opt-in; default off)
   --with-postgres        Install local Postgres + pgvector, create a '${AGENT_USER}' role with CREATEDB
-                         and a 'dispatch_test' database, enable the vector extension, and write
-                         KB_TEST_DATABASE_URL to the service env file (opt-in; default off)
+                         (peer-auth over the Unix socket, no password), install the vector
+                         extension into 'template1' so every database the test suite creates
+                         inherits it, and write KB_TEST_DATABASE_URL=postgresql:///postgres +
+                         KB_REQUIRE_POSTGRES_TESTS=1 to the service env file (opt-in; default off)
   -h, --help             Show this help text
 
 Environment variables:
@@ -1060,11 +1064,32 @@ fi  # end: if ! $WITH_TALOS
 # Step 4.5c: Postgres + pgvector (--with-postgres only)
 # ===========================================================================
 # Install a local PostgreSQL server with the pgvector extension so headless
-# test runs can exercise the PG code paths without reaching out to a desktop.
-# Creates a dedicated role (name = AGENT_USER) + 'dispatch_test' database;
-# the OS-user/PG-role name match enables peer auth on the Unix socket with no
-# password and no pg_hba.conf changes.  Re-running on a host that already has
-# Postgres+pgvector is a no-op (every sub-step is idempotent).
+# test runs can exercise the PG code paths without reaching out to a desktop
+# (or, worse, a shared box holding live data — see kb-03276/kb-03277: pointing
+# test suites at a shared Postgres is an ambient-DSN footgun this deliberately
+# avoids by keeping the test Postgres local to each dispatch host).
+#
+# AUTH MODEL (pinned, do not re-derive): Postgres is reachable ONLY over the
+# local Unix socket with peer auth. The PG role is named after AGENT_USER (the
+# OS user the agent subprocess runs as) — the OS-user/PG-role name match is
+# what makes peer auth work with no password and no pg_hba.conf changes. Do
+# NOT create a separate 'kbtest' role, do NOT use trust auth, do NOT edit
+# pg_hba.conf, and do NOT change listen_addresses or open a TCP listener:
+# trust-on-loopback would let any local account on the host connect as a
+# CREATEDB role. Postgres's packaged defaults are left alone; the only
+# server-side objects created are the role and the template1 extension.
+#
+# No dedicated test database is created here: personal_kb's test suite
+# (kb-core conftest.py::pg_temp_db) connects to the maintenance 'postgres'
+# database, runs CREATE DATABASE kb_test_<uuid8> itself, and drops it WITH
+# (FORCE) on teardown — so the DSN handed to dispatched runs just points at
+# 'postgres'. The vector extension is installed into 'template1' (as
+# superuser, once, at provision time) so every database the suite creates
+# inherits it automatically — the unprivileged test role must never need to
+# run CREATE EXTENSION itself, since pgvector is not a trusted extension.
+#
+# Re-running on a host that already has Postgres+pgvector is a no-op (every
+# sub-step is idempotent).
 # ===========================================================================
 echo ""
 echo "--- Step 4.5c: Postgres + pgvector ---"
@@ -1085,8 +1110,51 @@ else
     fi
 
     _PG_ROLE="${AGENT_USER}"          # role name = OS agent user → peer auth via Unix socket
-    _PG_DBNAME="dispatch_test"        # dedicated test database
-    _PG_DSN="postgresql:///${_PG_DBNAME}"  # no host/user = Unix socket + OS user as role
+    _PG_MAINT_DB="postgres"           # maintenance DB; the test suite creates/drops its own DBs
+    _PG_DSN="postgresql:///${_PG_MAINT_DB}"  # no host/user = Unix socket + OS user as role
+
+    # Helper: idempotent write of a single KEY=VALUE line into SERVICE_ENV,
+    # preserving every other key. Mirrors the Step 4.5b-G (TALOS_BIN) pattern.
+    _set_service_env_var() {  # $1=VAR_NAME $2=VALUE
+        local _name="$1" _value="$2" _existing _tmp
+        _existing="$(_read_env_var "$_name")"
+        if [[ "$_existing" == "$_value" ]]; then
+            skip "${_name} already set in ${SERVICE_ENV} — already configured"
+            return
+        fi
+        if $DRY_RUN; then
+            would "set ${_name}=${_value} in ${SERVICE_ENV} (line-rewrite, preserving all other keys)"
+            return
+        fi
+        _tmp="$(mktemp /tmp/dispatch-env.XXXXXX)"
+        _SEV_FILE="$SERVICE_ENV" _SEV_NAME="$_name" _SEV_VALUE="$_value" \
+        python3 - <<'SEV_PYEOF' > "$_tmp"
+import re, os, sys
+env_file  = os.environ['_SEV_FILE']
+name      = os.environ['_SEV_NAME']
+new_value = os.environ['_SEV_VALUE']
+with open(env_file, 'r') as f:
+    content = f.read()
+lines = content.splitlines(keepends=True)
+pattern = re.compile('^' + re.escape(name) + '=')
+replaced = False
+out = []
+for line in lines:
+    if pattern.match(line):
+        out.append(name + '=' + new_value + '\n')
+        replaced = True
+    else:
+        out.append(line)
+if not replaced:
+    if out and not out[-1].endswith('\n'):
+        out[-1] += '\n'
+    out.append(name + '=' + new_value + '\n')
+sys.stdout.write(''.join(out))
+SEV_PYEOF
+        install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "$_tmp" "$SERVICE_ENV"
+        rm -f "$_tmp"
+        info "Set ${_name}=${_value} in ${SERVICE_ENV}"
+    }
 
     # Helper: build pgvector from source (fallback when no distro package is available)
     _build_pgvector_from_source() {
@@ -1206,102 +1274,101 @@ else
         fi
     fi
 
-    # Sub-step D: Create role, database, and vector extension
+    # Sub-step D: Create role (no superuser, no password) via peer auth. The
+    # role name matches AGENT_USER exactly — that identity match is what lets
+    # the OS user authenticate over the Unix socket with zero Postgres-side
+    # credential configuration.
     echo ""
-    echo "  [4.5c-D] Create role '${_PG_ROLE}', database '${_PG_DBNAME}', extension 'vector'"
+    echo "  [4.5c-D] Create role '${_PG_ROLE}'"
     if $DRY_RUN; then
-        would "sudo -u postgres psql: CREATE ROLE ${_PG_ROLE} WITH LOGIN CREATEDB (role-exists guard)"
-        would "sudo -u postgres psql: CREATE DATABASE ${_PG_DBNAME} OWNER ${_PG_ROLE} (IF NOT EXISTS)"
-        would "sudo -u postgres psql -d ${_PG_DBNAME}: CREATE EXTENSION IF NOT EXISTS vector"
+        would "sudo -u postgres psql: CREATE ROLE ${_PG_ROLE} WITH LOGIN CREATEDB (role-exists guard, no superuser, no password)"
     else
-        # Role — idempotent guard
         if sudo -u postgres psql -tAc \
                 "SELECT 1 FROM pg_roles WHERE rolname='${_PG_ROLE}';" 2>/dev/null | grep -q 1; then
             skip "PG role '${_PG_ROLE}' already exists — already configured"
         else
             sudo -u postgres psql -c "CREATE ROLE ${_PG_ROLE} WITH LOGIN CREATEDB;"
-            info "Created PG role '${_PG_ROLE}' (LOGIN CREATEDB)"
+            info "Created PG role '${_PG_ROLE}' (LOGIN CREATEDB, no superuser, no password)"
         fi
-
-        # Database — idempotent guard
-        if sudo -u postgres psql -tAc \
-                "SELECT 1 FROM pg_database WHERE datname='${_PG_DBNAME}';" 2>/dev/null | grep -q 1; then
-            skip "Database '${_PG_DBNAME}' already exists — already configured"
-        else
-            sudo -u postgres psql -c "CREATE DATABASE ${_PG_DBNAME} OWNER ${_PG_ROLE};"
-            info "Created database '${_PG_DBNAME}' (owner: ${_PG_ROLE})"
-        fi
-
-        # Extension — IF NOT EXISTS makes this idempotent
-        sudo -u postgres psql -d "$_PG_DBNAME" \
-            -c "CREATE EXTENSION IF NOT EXISTS vector;" \
-            && info "Created extension 'vector' in '${_PG_DBNAME}' (IF NOT EXISTS)" \
-            || die "Failed to CREATE EXTENSION vector in '${_PG_DBNAME}' — is pgvector installed?"
     fi
 
-    # Sub-step E: write KB_TEST_DATABASE_URL to SERVICE_ENV
-    # Pattern mirrors Step 4.5b-G (TALOS_BIN): python line-rewrite preserves all other keys.
-    # The DSN uses the Unix socket (no host/password) — peer auth works because the OS agent
-    # user ($AGENT_USER) matches the PG role name created above.
+    # Sub-step E: vector extension in 'template1'
+    # template1 is the template CREATE DATABASE clones by default, so every
+    # database the test suite creates — including the throwaway kb_test_<uuid8>
+    # databases pg_temp_db creates and drops itself — inherits the extension;
+    # the unprivileged role's own `CREATE EXTENSION IF NOT EXISTS vector`
+    # becomes a no-op instead of failing on missing superuser.
     echo ""
-    echo "  [4.5c-E] KB_TEST_DATABASE_URL in ${SERVICE_ENV}"
+    echo "  [4.5c-E] vector extension in 'template1'"
+    if $DRY_RUN; then
+        would "sudo -u postgres psql -d template1: CREATE EXTENSION IF NOT EXISTS vector"
+    else
+        sudo -u postgres psql -d template1 \
+            -c "CREATE EXTENSION IF NOT EXISTS vector;" \
+            && info "Ensured extension 'vector' is present in 'template1' (inherited by every new database)" \
+            || die "Failed to CREATE EXTENSION vector in 'template1' — is pgvector installed?"
+    fi
+
+    # Sub-step F: write KB_TEST_DATABASE_URL + KB_REQUIRE_POSTGRES_TESTS to SERVICE_ENV
+    # KB_REQUIRE_POSTGRES_TESTS=1 is the flag consuming repos' conftest will read to
+    # turn a missing-DSN skip into a hard failure (that conftest change is out of
+    # scope here — see the GTD item — but the flag is safe to set unconditionally
+    # now: it has no effect until a conftest honors it).
+    echo ""
+    echo "  [4.5c-F] KB_TEST_DATABASE_URL + KB_REQUIRE_POSTGRES_TESTS in ${SERVICE_ENV}"
     if [[ ! -f "$SERVICE_ENV" ]]; then
         if $DRY_RUN; then
-            would "append KB_TEST_DATABASE_URL=${_PG_DSN} to ${SERVICE_ENV}"
+            would "append KB_TEST_DATABASE_URL=${_PG_DSN} and KB_REQUIRE_POSTGRES_TESTS=1 to ${SERVICE_ENV}"
         else
             die "KB_TEST_DATABASE_URL write: ${SERVICE_ENV} does not exist — Step 3 should have created it"
         fi
     else
-        _pg_dsn_existing="$(_read_env_var KB_TEST_DATABASE_URL)"
-        if [[ "$_pg_dsn_existing" == "$_PG_DSN" ]]; then
-            skip "KB_TEST_DATABASE_URL already set in ${SERVICE_ENV} — already configured"
-        elif $DRY_RUN; then
-            would "set KB_TEST_DATABASE_URL=${_PG_DSN} in ${SERVICE_ENV} (line-rewrite, preserving all other keys)"
-        else
-            _pg_tmpfile="$(mktemp /tmp/dispatch-env.XXXXXX)"
-            _PG_ENV_FILE="$SERVICE_ENV" _PG_DSN_VALUE="$_PG_DSN" \
-            python3 - <<'PG_PYEOF' > "$_pg_tmpfile"
-import re, os, sys
-env_file  = os.environ['_PG_ENV_FILE']
-new_value = os.environ['_PG_DSN_VALUE']
-with open(env_file, 'r') as f:
-    content = f.read()
-lines = content.splitlines(keepends=True)
-replaced = False
-out = []
-for line in lines:
-    if re.match(r'^KB_TEST_DATABASE_URL=', line):
-        out.append('KB_TEST_DATABASE_URL=' + new_value + '\n')
-        replaced = True
-    else:
-        out.append(line)
-if not replaced:
-    if out and not out[-1].endswith('\n'):
-        out[-1] += '\n'
-    out.append('KB_TEST_DATABASE_URL=' + new_value + '\n')
-sys.stdout.write(''.join(out))
-PG_PYEOF
-            install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
-                "$_pg_tmpfile" "$SERVICE_ENV"
-            rm -f "$_pg_tmpfile"
-            info "Set KB_TEST_DATABASE_URL=${_PG_DSN} in ${SERVICE_ENV}"
-        fi
+        _set_service_env_var KB_TEST_DATABASE_URL "$_PG_DSN"
+        _set_service_env_var KB_REQUIRE_POSTGRES_TESTS "1"
     fi
 
-    # Sub-step F: Postgres smoke check (when --smoke + --with-postgres)
-    # Verifies Postgres is reachable and the vector extension is loaded in dispatch_test.
+    # Sub-step G: Postgres smoke check (when --smoke + --with-postgres)
+    # The real functional check, run AS the AGENT_USER OS user (peer auth
+    # requires it — root has no matching PG role): create a throwaway
+    # database, confirm vector is present WITHOUT running CREATE EXTENSION
+    # (proves template1 inheritance, not a per-database install), create a
+    # table with a vector(1024) column, round-trip one row, then drop the
+    # database.
     echo ""
-    echo "  [4.5c-F] Postgres smoke check"
+    echo "  [4.5c-G] Postgres smoke check (peer auth, template1 inheritance, vector round-trip)"
     if $DRY_RUN; then
-        would "sudo -u postgres psql -d ${_PG_DBNAME} -tAc \"SELECT extversion FROM pg_extension WHERE extname='vector';\" — expect a non-empty row"
+        would "as ${AGENT_USER} over the socket: CREATE DATABASE kb_smoke_<rand>; confirm vector present without CREATE EXTENSION; CREATE TABLE with vector(1024) col; INSERT + SELECT one row; DROP DATABASE"
     elif $SMOKE; then
-        _vec_ver="$(sudo -u postgres psql -d "$_PG_DBNAME" -tAc \
-            "SELECT extversion FROM pg_extension WHERE extname='vector';" \
-            2>/dev/null | tr -d '[:space:]' || true)"
-        if [[ -n "$_vec_ver" ]]; then
-            info "Postgres smoke check passed: vector extension v${_vec_ver} present in '${_PG_DBNAME}'"
+        _smoke_db="kb_smoke_$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c8)"
+        [[ -z "$_smoke_db" || "$_smoke_db" == "kb_smoke_" ]] && _smoke_db="kb_smoke_$$"
+        _smoke_db_dsn="postgresql:///${_smoke_db}"
+        _smoke_vec_vals="$(printf '0.1,%.0s' $(seq 1 1024))"
+        _smoke_vec_literal="[${_smoke_vec_vals%,}]"
+
+        runuser -u "${AGENT_USER}" -- psql "$_PG_DSN" -v ON_ERROR_STOP=1 -c "CREATE DATABASE ${_smoke_db};" \
+            || die "Postgres smoke check FAILED: could not CREATE DATABASE ${_smoke_db} as ${AGENT_USER} (peer auth) over the socket"
+        info "Smoke: created throwaway database '${_smoke_db}' as ${AGENT_USER} (peer auth, no CREATE EXTENSION needed yet)"
+
+        if runuser -u "${AGENT_USER}" -- psql "$_smoke_db_dsn" -v ON_ERROR_STOP=1 \
+                -tAc "SELECT extversion FROM pg_extension WHERE extname='vector';" \
+                -c "CREATE TABLE smoke_vec (id serial PRIMARY KEY, embedding vector(1024));" \
+                -c "INSERT INTO smoke_vec (embedding) VALUES ('${_smoke_vec_literal}');" \
+                -tAc "SELECT count(*) FROM smoke_vec;" > "/tmp/pg-smoke-out.$$" 2>&1; then
+            _smoke_vec_ver="$(sed -n '1p' "/tmp/pg-smoke-out.$$" | tr -d '[:space:]')"
+            _smoke_rowcount="$(tail -n1 "/tmp/pg-smoke-out.$$" | tr -d '[:space:]')"
+            rm -f "/tmp/pg-smoke-out.$$"
+            runuser -u "${AGENT_USER}" -- psql "$_PG_DSN" -v ON_ERROR_STOP=1 -c "DROP DATABASE ${_smoke_db};" \
+                || warn "Smoke: could not drop throwaway database '${_smoke_db}' — clean up manually"
+            if [[ -n "$_smoke_vec_ver" && "$_smoke_rowcount" == "1" ]]; then
+                info "Postgres smoke check passed: '${_smoke_db}' inherited vector v${_smoke_vec_ver} from template1 (no CREATE EXTENSION run), and round-tripped a vector(1024) row as ${AGENT_USER} over the socket"
+            else
+                die "Postgres smoke check FAILED: expected a non-empty vector version and 1 row in smoke_vec, got version='${_smoke_vec_ver}' rows='${_smoke_rowcount}'"
+            fi
         else
-            die "Postgres smoke check FAILED: 'vector' extension not found in '${_PG_DBNAME}' — check pgvector install"
+            _smoke_err="$(cat "/tmp/pg-smoke-out.$$" 2>/dev/null)"
+            rm -f "/tmp/pg-smoke-out.$$"
+            runuser -u "${AGENT_USER}" -- psql "$_PG_DSN" -c "DROP DATABASE IF EXISTS ${_smoke_db};" &>/dev/null || true
+            die "Postgres smoke check FAILED: vector extension not inherited / table/insert failed in '${_smoke_db}' as ${AGENT_USER} — check the template1 extension install: ${_smoke_err}"
         fi
     else
         skip "Postgres smoke check skipped (pass --smoke to run)"

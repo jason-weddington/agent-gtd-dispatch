@@ -111,28 +111,56 @@ with the pgvector extension on a dispatch host. This step is **opt-in and idempo
 re-running on an already-provisioned host is a no-op. Without this flag, no Postgres work
 is performed and the existing host state is unchanged.
 
+Postgres is reachable **only** over the local Unix socket with peer auth — no TCP
+listener, no `pg_hba.conf` edits, no `listen_addresses` change. Postgres's packaged
+defaults are left alone; the only server-side objects created are the role and the
+`template1` extension. (An earlier revision of this step created a separate `kbtest`
+role with loopback trust auth and edited `pg_hba.conf`/`listen_addresses` — that was
+reworked per a pinned decision: trust-on-loopback would let any local account on the
+host connect as a CREATEDB role, which is worse than the ambient-DSN risk it was
+meant to avoid.)
+
 What it does:
 1. Installs `postgresql` + `postgresql-contrib` via the OS package manager (apt or dnf/yum).
 2. Installs pgvector — tries the distro package (`postgresql-XX-pgvector` on apt;
    `pgvector_XX` on dnf) and falls back to building from source if unavailable.
 3. Enables and starts the `postgresql` systemd service.
-4. Creates a PG role named **`AGENT_USER`** (default: `dispatch`) with `LOGIN CREATEDB`.
-   The role name intentionally matches the OS agent user so **peer authentication works
-   on the Unix socket with no password and no `pg_hba.conf` changes**.
-5. Creates a `dispatch_test` database owned by that role.
-6. Runs `CREATE EXTENSION IF NOT EXISTS vector` in `dispatch_test`.
-7. Writes **`KB_TEST_DATABASE_URL=postgresql:///dispatch_test`** into
-   `/home/dispatch-svc/.env` (the canonical service env file) using the same
-   Python line-rewrite pattern as `TALOS_BIN` — preserving all other keys.
-8. When `--smoke` is also passed: runs a post-install sanity check that queries
-   `pg_extension` to confirm the `vector` extension is loaded in `dispatch_test`.
+4. Creates a PG role named **`AGENT_USER`** (default: `dispatch`) with `LOGIN CREATEDB` —
+   no superuser, no password. The role name intentionally matches the OS agent user so
+   **peer authentication works on the Unix socket with no password and no
+   `pg_hba.conf` changes**.
+5. Runs `CREATE EXTENSION IF NOT EXISTS vector` in **`template1`** (as superuser, since
+   pgvector is not a trusted extension) so every database created afterwards —
+   including the throwaway `kb_test_<uuid8>` databases the test suite creates and
+   drops itself — inherits it automatically. No dedicated test database is created
+   here: kb-core's `conftest.py::pg_temp_db` fixture connects to the maintenance
+   `postgres` database, does its own `CREATE DATABASE` / `DROP DATABASE ... WITH
+   (FORCE)`, and the unprivileged test role never needs to run `CREATE EXTENSION`.
+6. Writes **`KB_TEST_DATABASE_URL=postgresql:///postgres`** and
+   **`KB_REQUIRE_POSTGRES_TESTS=1`** into `/home/dispatch-svc/.env` (the canonical
+   service env file) using the same Python line-rewrite pattern as `TALOS_BIN` —
+   preserving all other keys.
+7. When `--smoke` is also passed: connects **as the `AGENT_USER` OS user over the
+   socket** (peer auth), creates a throwaway database, confirms the `vector` extension
+   is present WITHOUT running `CREATE EXTENSION` (proving `template1` inheritance,
+   not a per-database install), creates a table with a `vector(1024)` column, inserts
+   and selects one row, then drops the database.
 
 **`KB_TEST_DATABASE_URL`** is the DSN headless build agents must receive for the
 `@pytest.mark.postgres` test suite (e.g. kb-core) to run instead of skip.
-Connection format: Unix socket, OS user = PG role → no password needed.
-The var is written to the service env file; a follow-up item wires it into
-`engines.py` `COMMON_ENV_KEYS` and the sudoers `env_keep` so it reaches the
-agent subprocess during dispatch runs.
+Connection format: Unix socket, maintenance DB, OS user = PG role → no password needed;
+the suite creates/drops its own throwaway databases against this DSN.
+**`KB_REQUIRE_POSTGRES_TESTS`** is the flag a consuming repo's `conftest.py` can read to
+turn a missing DSN into a hard failure instead of a silent skip (wiring that flag into
+kb-core's own conftest is a separate, later item — see the GTD board). Both vars are
+written to the service env file **and** wired into `engines.py` `COMMON_ENV_KEYS` and
+the sudoers `env_keep` (`templates/sudoers-dispatch-svc.tmpl`), so they reach the agent
+subprocess — including the post-run gate (`ruff`/`mypy`/`pytest`) — during dispatch
+runs; writing the env file alone is a no-op, since `sudo -u dispatch` strips any var
+not in `env_keep`. A host's `dispatch-api` service must be **restarted**
+(`systemctl restart dispatch-api`) after (re-)provisioning for a freshly-written env
+var to take effect if the systemd unit file itself didn't change (Step 6 only
+restarts when the rendered unit differs from what's installed).
 
 **To provision on a dispatch host:**
 ```bash

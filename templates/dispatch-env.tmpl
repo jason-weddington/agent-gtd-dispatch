@@ -116,6 +116,13 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # This points at the PERSONAL KB; personal-kb inherits it (empty MCP env block).
 # KB_DATABASE_URL=
 
+# Local test-Postgres DSN for @pytest.mark.postgres suites (e.g. kb-core) run by
+# dispatched agents, and the flag that turns a missing DSN into a hard test
+# failure rather than a silent skip. Both are written automatically by
+# setup-dispatch-host.sh --with-postgres — do not set these by hand.
+# KB_TEST_DATABASE_URL=
+# KB_REQUIRE_POSTGRES_TESTS=
+
 # Team KB database URL — injected into the team-kb MCP server's env block by
 # setup-dispatch-host.sh (Step 4.6). Required for team-kb registration; if unset,
 # team-kb is skipped. Same personal_kb package, different database.
