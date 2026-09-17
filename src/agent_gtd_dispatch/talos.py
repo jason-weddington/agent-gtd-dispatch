@@ -221,6 +221,10 @@ def build_talos_argv(workspace_dir: Path, task_id: str, attempt: int) -> list[st
     - Does NOT pass ``--run-store`` / ``--offload-dir`` — talos writes artifacts
       to its XDG default (``${XDG_STATE_HOME:-~/.local/state}/talos/<task-id>``),
       OUTSIDE the clone, so the worker's ``git add`` never touches them.
+    - Passes the bare ``--transcript`` flag (no path) so talos writes the full
+      JSONL run transcript into that same XDG state dir, next to ``run.sqlite``,
+      OUTSIDE the clone; talos's ``--state-retention-days`` (default 30) bounds
+      how long those files accumulate.
     - Sudo-wrapped like every other subprocess so the clone owner (dispatch,
       under the two-user split) runs it.
     """
@@ -235,6 +239,7 @@ def build_talos_argv(workspace_dir: Path, task_id: str, attempt: int) -> list[st
         str(attempt),
         "--gate-timeout-secs",
         str(config.TALOS_GATE_TIMEOUT_SECS),
+        "--transcript",
     ]
     return _sudo_wrap(argv)
 

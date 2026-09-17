@@ -625,6 +625,7 @@ class TestBuildTalosArgv:
             "1",
             "--gate-timeout-secs",
             "900",
+            "--transcript",
         ]
 
     def test_argv_sudo_wrapped_when_user_set(self, monkeypatch) -> None:
@@ -667,6 +668,36 @@ class TestBuildTalosArgv:
         argv = build_talos_argv(Path("/workspace/work"), "task-1", attempt=1)
         i = argv.index("--gate-timeout-secs")
         assert argv[i + 1] == "600"
+
+    def test_argv_has_transcript_flag(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import build_talos_argv
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        argv = build_talos_argv(Path("/workspace/work"), "task-123", attempt=1)
+        assert "--transcript" in argv
+
+    def test_argv_transcript_is_bare_no_value_consumed(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import build_talos_argv
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        argv = build_talos_argv(Path("/workspace/work"), "task-123", attempt=1)
+        i = argv.index("--transcript")
+        is_last = i == len(argv) - 1
+        next_is_flag = not is_last and argv[i + 1].startswith("--")
+        assert is_last or next_is_flag
+
+    def test_argv_gate_timeout_secs_still_paired_after_transcript_added(
+        self, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import build_talos_argv
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        argv = build_talos_argv(Path("/workspace/work"), "task-123", attempt=1)
+        i = argv.index("--gate-timeout-secs")
+        assert argv[i + 1] == str(config.TALOS_GATE_TIMEOUT_SECS)
 
 
 # ---------------------------------------------------------------------------
