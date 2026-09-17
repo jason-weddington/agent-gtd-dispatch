@@ -22,6 +22,8 @@ set -euo pipefail
 #                   (Rust tools + gitleaks, Step 4.9) are refreshed (default: dispatch)
 #   SERVICE_NAME    Systemd service unit name (default: dispatch-api)
 #   DISPATCH_INDEX  Homelab wheel index URL (default: https://pypi.lab.jasonweddington.com/simple/)
+#   RUST_DEFAULT_TOOLCHAIN  Rust toolchain pointed at by 'rustup default' when the agent
+#                   user has rustup but no usable default (default: stable)
 #
 # Exit code: 0 if every host succeeded. Non-zero on first failure (other hosts skipped).
 
@@ -34,6 +36,7 @@ SERVICE_USER="${SERVICE_USER:-dispatch-svc}"
 AGENT_USER="${AGENT_USER:-dispatch}"
 SERVICE_NAME="${SERVICE_NAME:-dispatch-api}"
 DISPATCH_INDEX="${DISPATCH_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
+RUST_DEFAULT_TOOLCHAIN="${RUST_DEFAULT_TOOLCHAIN:-stable}"
 
 # --- Dev toolchain data (single source of truth: templates/dev-toolchain.sh) ---
 # deploy.sh runs LOCALLY from a repo checkout, so the tool list is sourced here and
@@ -116,9 +119,22 @@ fi
 # Non-fatal throughout: a failed refresh leaves the agent on its current binaries
 # and must not abort the deploy (only the health check below may exit non-zero).
 _cargo="/home/${AGENT_USER}/.cargo/bin/cargo"
-if [ ! -x "\$_cargo" ]; then
-    echo "[WARN] cargo not found for ${AGENT_USER} — dev toolchain refresh skipped; run 'sudo ./setup-dispatch-host.sh' (Step 4.9) on this host" >&2
+_rustup="/home/${AGENT_USER}/.cargo/bin/rustup"
+
+# Self-heal: a host can have rustup installed with toolchains present but no
+# default set (e.g. r7-research, 2026-09-17) — every cargo invocation then
+# fails. If cargo is unusable but rustup exists, point the default at
+# RUST_DEFAULT_TOOLCHAIN before deciding whether to skip the refresh below.
+if ! sudo -u ${AGENT_USER} -H "\$_cargo" --version >/dev/null 2>&1 && [ -x "\$_rustup" ]; then
+    if sudo -u ${AGENT_USER} -H "\$_rustup" default ${RUST_DEFAULT_TOOLCHAIN} >/dev/null 2>&1; then
+        echo "[OK]   rust default toolchain HEALED for ${AGENT_USER} (was unusable) — set to ${RUST_DEFAULT_TOOLCHAIN}"
+    fi
+fi
+
+if ! sudo -u ${AGENT_USER} -H "\$_cargo" --version >/dev/null 2>&1; then
+    echo "[WARN] no usable rust default toolchain for ${AGENT_USER} — dev toolchain refresh skipped; run 'sudo ./setup-dispatch-host.sh' (Step 4.9) on this host" >&2
 else
+    _tc_failed=""
     for _entry in ${DEV_TOOLCHAIN_PKG_LIST}; do
         _crate="\${_entry%%|*}"
         _bin="\${_entry#*|}"
@@ -127,8 +143,12 @@ else
         else
             echo "[WARN] cargo binstall \$_crate failed for ${AGENT_USER} — agent keeps its current binary. Last output:" >&2
             printf '%s\n' "\$_TC_OUT" | tail -n 5 | sed 's/^/[WARN]   /' >&2
+            _tc_failed="\${_tc_failed} \$_crate"
         fi
     done
+    if [ -n "\$_tc_failed" ]; then
+        echo "[WARN] Dev toolchain incomplete for ${AGENT_USER}:\${_tc_failed} — run 'sudo ./setup-dispatch-host.sh' to retry" >&2
+    fi
 fi
 
 # gitleaks: re-install only when the installed binary differs from the pinned version.

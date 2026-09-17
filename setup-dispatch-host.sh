@@ -67,6 +67,8 @@ DRY_RUN=false
 SMOKE=false
 WITH_TALOS=false
 WITH_POSTGRES=false
+# Toolchain 'rustup default' is pointed at when a host has rustup but no usable default.
+RUST_DEFAULT_TOOLCHAIN="${RUST_DEFAULT_TOOLCHAIN:-stable}"
 
 # --- Colors ---
 if [ -t 1 ]; then
@@ -867,7 +869,7 @@ fi
 # site, in either order, with or without --with-talos.
 # ===========================================================================
 
-# Install rustup (and the default toolchain) for AGENT_USER if absent.
+# Install rustup for AGENT_USER if absent, then guarantee a usable default toolchain.
 ensure_rustup() {
     if [[ -x "${AGENT_HOME}/.cargo/bin/rustup" ]]; then
         skip "rustup already installed for ${AGENT_USER} — already configured"
@@ -881,6 +883,41 @@ ensure_rustup() {
         else
             die "rustup installer ran but ${AGENT_HOME}/.cargo/bin/rustup not found"
         fi
+    fi
+    ensure_rust_default_toolchain
+}
+
+# Guarantee AGENT_USER has a usable `rustup default` toolchain. A host can have
+# rustup installed with toolchains present but no default set (e.g. r7-research,
+# 2026-09-17) — every `cargo ...` invocation then fails with "rustup could not
+# choose a version of cargo to run". Probes cargo directly (the binary that
+# actually failed), not `rustup show active-toolchain`'s exit code, since that
+# varies across rustup releases (this fleet runs rustup 1.29.0).
+ensure_rust_default_toolchain() {
+    if [[ ! -x "${AGENT_HOME}/.cargo/bin/rustup" ]]; then
+        if $DRY_RUN; then would "point 'rustup default' at ${RUST_DEFAULT_TOOLCHAIN} for ${AGENT_USER} after installing rustup"; fi
+        return 0
+    fi
+
+    if _cargo_ver="$(runuser -l "${AGENT_USER}" -c "'${AGENT_HOME}/.cargo/bin/cargo' --version" 2>/dev/null)"; then
+        skip "rust default toolchain already usable for ${AGENT_USER} (${_cargo_ver}) — already configured"
+        return 0
+    fi
+
+    if $DRY_RUN; then
+        would "runuser -l ${AGENT_USER} -- rustup default ${RUST_DEFAULT_TOOLCHAIN}"
+        return 0
+    fi
+
+    _rustup_pre="$(runuser -l "${AGENT_USER}" -c "'${AGENT_HOME}/.cargo/bin/rustup' show active-toolchain" 2>&1 | tr '\n' ' ' || true)"
+    warn "No usable rust default toolchain for ${AGENT_USER} (rustup reported: ${_rustup_pre}) — setting default to ${RUST_DEFAULT_TOOLCHAIN}"
+    runuser -l "${AGENT_USER}" -c "'${AGENT_HOME}/.cargo/bin/rustup' default ${RUST_DEFAULT_TOOLCHAIN}" \
+        || die "rustup default ${RUST_DEFAULT_TOOLCHAIN} failed for ${AGENT_USER}"
+
+    if _cargo_ver="$(runuser -l "${AGENT_USER}" -c "'${AGENT_HOME}/.cargo/bin/cargo' --version" 2>/dev/null)"; then
+        info "Set rustup default to ${RUST_DEFAULT_TOOLCHAIN} for ${AGENT_USER}; cargo now reports: ${_cargo_ver}"
+    else
+        die "rustup default ${RUST_DEFAULT_TOOLCHAIN} succeeded for ${AGENT_USER} but cargo --version still fails"
     fi
 }
 
@@ -1693,6 +1730,7 @@ ensure_cargo_binstall
 # package logs its own [OK]/[SKIP]/[DRY] line (same one-line-per-entry shape as
 # Step 4.6's MCP server loop).
 _agent_cargo="${AGENT_HOME}/.cargo/bin/cargo"
+_tc_failed=()
 for _tc_entry in "${DEV_TOOLCHAIN_CARGO_PKGS[@]}"; do
     _tc_crate="${_tc_entry%%|*}"
     _tc_bin="${_tc_entry#*|}"
@@ -1702,14 +1740,18 @@ for _tc_entry in "${DEV_TOOLCHAIN_CARGO_PKGS[@]}"; do
         would "runuser -l ${AGENT_USER} -- ${_agent_cargo} binstall -y ${_tc_crate}  (provides '${_tc_bin}')"
     else
         runuser -l "$AGENT_USER" -c "'${_agent_cargo}' binstall -y '${_tc_crate}'" \
-            || die "cargo binstall -y ${_tc_crate} failed for ${AGENT_USER}"
+            || { warn "cargo binstall -y ${_tc_crate} failed for ${AGENT_USER} — continuing"; _tc_failed+=("${_tc_crate}"); continue; }
         if runuser -l "$AGENT_USER" -c "command -v '${_tc_bin}'" >/dev/null 2>&1; then
             info "Installed ${_tc_crate} (${_tc_bin}) for ${AGENT_USER}"
         else
-            die "cargo binstall -y ${_tc_crate} ran but '${_tc_bin}' is not on ${AGENT_USER}'s PATH"
+            warn "cargo binstall -y ${_tc_crate} ran but '${_tc_bin}' is not on ${AGENT_USER}'s PATH — continuing"
+            _tc_failed+=("${_tc_crate}")
         fi
     fi
 done
+if [[ ${#_tc_failed[@]} -gt 0 ]]; then
+    warn "Dev toolchain incomplete for ${AGENT_USER}: ${_tc_failed[*]} — provisioning continued; re-run 'sudo ./setup-dispatch-host.sh' to retry"
+fi
 
 # Sub-action C: gitleaks — pinned GitHub release archive, not a cargo crate.
 # Installed with the same `install -m 0755 -o/-g` idiom as the talos binary (4.5b-F).
@@ -1864,15 +1906,36 @@ fi
 # Summary
 # ===========================================================================
 echo ""
-printf "${GREEN}========================================${RESET}\n"
-printf "${GREEN}  Setup complete${RESET}\n"
-printf "${GREEN}========================================${RESET}\n"
+_banner_color="$GREEN"
+_banner_text="Setup complete"
+if [[ ${#_tc_failed[@]} -gt 0 ]]; then
+    _banner_color="$YELLOW"
+    _banner_text="Setup complete (with warnings)"
+fi
+printf "${_banner_color}========================================${RESET}\n"
+printf "${_banner_color}  ${_banner_text}${RESET}\n"
+printf "${_banner_color}========================================${RESET}\n"
 echo ""
 echo "  Agent user:   ${AGENT_USER}  (${AGENT_HOME})"
 echo "  Service user: ${SERVICE_USER}  (${SERVICE_HOME})"
 echo "  Wheel index:  ${DISPATCH_WHEEL_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
 echo "  Env file:     ${SERVICE_ENV}"
 echo "  Service:      ${SERVICE_NAME}  (port ${API_PORT})"
+if [[ ${#_tc_failed[@]} -gt 0 ]]; then
+    echo "  Dev toolchain: INCOMPLETE — missing: ${_tc_failed[*]}"
+else
+    echo "  Dev toolchain: complete"
+fi
+if $DRY_RUN; then
+    would "audit: run cargo --version as ${AGENT_USER}"
+else
+    _audit_cargo="$(runuser -l "${AGENT_USER}" -c "'${AGENT_HOME}/.cargo/bin/cargo' --version" 2>/dev/null || true)"
+    if [[ -n "$_audit_cargo" ]]; then
+        echo "  Rust toolchain: ${_audit_cargo}"
+    else
+        warn "AUDIT: cargo is not runnable for ${AGENT_USER} at end of provisioning despite the Step 4.5b/4.9 guard — the default-toolchain invariant regressed"
+    fi
+fi
 echo ""
 if [[ ! -f "$SERVICE_ENV" ]] || grep -qE '^(ANTHROPIC_API_KEY=sk-ant-\.\.\.|AGENT_GTD_API_KEY=agtd_\.\.\.)' "$SERVICE_ENV" 2>/dev/null; then
     echo "  NEXT STEPS:"

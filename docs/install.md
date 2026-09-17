@@ -21,6 +21,8 @@ This guide covers bootstrapping a fresh Ubuntu host and migrating an existing si
 > `cargo-binstall`, then `cargo-nextest`, `cargo-llvm-cov`, `cargo-deny`,
 > `cargo-machete`, `typos`, `cargo-sort`, `cargo-release`, `cog`, plus a pinned
 > `gitleaks` release binary — see [Dev toolchain (Step 4.9)](#dev-toolchain-step-49)).
+> The `rustup` bootstrap also guarantees a usable default toolchain for the agent
+> user, even when `rustup` was already present with no default configured.
 > All other tooling (`python3`, `visudo`, `systemctl`) ships with standard Ubuntu.
 >
 > **Single-user mode** (`DISPATCH_SINGLE_USER=1`) does **not** require creating extra
@@ -485,7 +487,7 @@ Seven sub-steps, all idempotent:
 | Sub-step | Action | Skip condition |
 |---|---|---|
 | **A** build-essential | `apt-get install -y build-essential` | `dpkg-query` reports already installed |
-| **B** rustup | Installs Rust toolchain for `AGENT_USER` via `sh.rustup.rs` | `~/.cargo/bin/rustup` exists |
+| **B** rustup | Installs Rust toolchain for AGENT_USER via sh.rustup.rs, then guarantees a usable default toolchain (rustup default stable) even when rustup was already present | `~/.cargo/bin/rustup` exists |
 | **C** cargo-nextest | Installs `cargo-binstall` then `cargo-nextest` for `AGENT_USER` | `~/.cargo/bin/cargo-nextest` exists |
 | **D** harness-design clone/pull | Clones or fast-forward pulls `HARNESS_DESIGN_REPO_URL` → `~/harness-design` as `AGENT_USER` | Always runs (pull is idempotent) |
 | **E** cargo build | `cargo build --release -p talos` inside `~/harness-design` as `AGENT_USER` | Always runs (Cargo incremental makes re-run near-instant) |
@@ -802,13 +804,13 @@ Dispatched agents run as the unprivileged `dispatch` user and **cannot install a
 
 ### Design decision — this step does **not** require `--with-talos`
 
-Step 4.9 runs on **every** install and **unconditionally bootstraps `rustup` + `cargo-binstall`** for the agent user when they are absent (same installers as Step 4.5b — `sh.rustup.rs` and `install-from-binstall-release.sh`; the logic lives once in the `ensure_rustup` / `ensure_cargo_binstall` helpers that both steps call).
+Step 4.9 runs on **every** install and **unconditionally bootstraps `rustup` + `cargo-binstall`** for the agent user when they are absent (same installers as Step 4.5b — `sh.rustup.rs` and `install-from-binstall-release.sh`; the logic lives once in the `ensure_rustup` / `ensure_cargo_binstall` helpers that both steps call). The bootstrap also guarantees a usable default toolchain for the agent user.
 
 It deliberately does **not** require or imply `--with-talos`. `--with-talos` is a talos-engine-only opt-in, while `claude-code-*` dispatches are the majority of fleet traffic and need this toolchain just as much. Gating the toolchain behind that flag would leave most hosts unprovisioned, which is exactly the failure this step exists to prevent.
 
 ### What the step does
 
-1. `ensure_rustup` — installs `rustup` for the agent user if `~/.cargo/bin/rustup` is absent (no-op when Step 4.5b already did it).
+1. `ensure_rustup` — installs `rustup` for the agent user if `~/.cargo/bin/rustup` is absent (no-op when Step 4.5b already did it), then points `rustup default` at `stable` (`RUST_DEFAULT_TOOLCHAIN`) when the agent user has `rustup` but no usable default toolchain.
 2. `ensure_cargo_binstall` — installs `cargo-binstall` if `~/.cargo/bin/cargo-binstall` is absent.
 3. For each entry in `templates/dev-toolchain.sh`'s `DEV_TOOLCHAIN_CARGO_PKGS`, runs `cargo binstall -y <crate>` as the agent user — **skipped per package** when its binary is already on the agent's `PATH` (`command -v <binary>`). Each package prints its own `[OK]`/`[SKIP]`/`[DRY]` line.
 4. Downloads the **pinned** `gitleaks` GitHub release archive for the host's architecture, extracts the `gitleaks` binary, and installs it to `/home/dispatch/.local/bin/gitleaks` via `install -m 0755 -o dispatch -g dispatch` — skipped when the installed binary already reports the pinned version.
@@ -850,6 +852,8 @@ Any other architecture prints a `[WARN]` and skips gitleaks rather than guessing
 
 Every `./deploy.sh` re-runs `cargo binstall -y <crate>` for each package and re-installs `gitleaks` when the installed version differs from the pin. `deploy.sh` runs from a repo checkout, so it `source`s `templates/dev-toolchain.sh` **locally** and interpolates the resulting lists into the ssh heredoc — the tool list is never duplicated in `deploy.sh`.
 
+`./deploy.sh` first probes `cargo --version` as the agent user, runs `rustup default stable` when cargo is unusable but `~/.cargo/bin/rustup` exists, and then skips the whole refresh with a single `[WARN] no usable rust default toolchain` line (rather than one WARN per crate) if cargo is still unusable, plus a single `Dev toolchain incomplete` roll-up when individual crates fail.
+
 The whole block is **non-fatal**, exactly like the Claude Code and lefthook refreshes: a failure prints `[WARN] ... — agent keeps its current binary` (with the last 5 lines of output) and the deploy continues. Only the existing health check can make `deploy.sh` exit non-zero.
 
 ### Verifying the dev toolchain install
@@ -869,7 +873,10 @@ sudo -u dispatch -H bash -lc 'gitleaks version'
 # → each prints a version and exits 0 (gitleaks must print the pinned 8.30.1)
 
 # Bootstrap prerequisites:
-sudo -u dispatch -H bash -lc 'rustup --version; cargo binstall -V'
+sudo -u dispatch -H bash -lc 'rustup show active-toolchain; cargo --version; cargo binstall -V'
+# → expected shapes: `stable-<triple> (default)`, then a `cargo 1.x.y ...` line, all exit 0.
+# `rustup --version` ALONE is NOT a sufficient check — it succeeds even on a host with
+# no default toolchain, which is the exact false-green this item fixes.
 
 # One-liner over the whole list:
 for t in cog typos cargo-sort cargo-deny cargo-llvm-cov cargo-machete cargo-nextest cargo-release; do
@@ -877,6 +884,26 @@ for t in cog typos cargo-sort cargo-deny cargo-llvm-cov cargo-machete cargo-next
 done
 sudo -u dispatch -H bash -lc 'gitleaks version' || echo "MISSING: gitleaks"
 ```
+
+### No default rust toolchain
+
+**Symptom**, verbatim:
+
+```
+error: rustup could not choose a version of cargo to run, because one wasn't specified explicitly, and no default is configured.
+```
+
+**Hit on r7-research, 2026-09-17**, while provisioning: `rustup` was installed with toolchains present (`stable`, `1.96.0`, `1.97.0`) but **no default set**, so `rustup show active-toolchain` reported "no active toolchain" and every `cargo ...` invocation failed. `pironman01` and `r7-server` were unaffected — their `rustup` was installed by Step 4.5b, which sets a default as part of the same install run.
+
+**Manual fix** (if you hit this before re-provisioning):
+
+```bash
+sudo -u dispatch -H bash -lc 'rustup default stable'
+```
+
+**Policy decision recorded here**: a failing `cargo binstall` for one crate in the Step 4.9 loop now **WARNs and continues** (matching `deploy.sh`'s existing behaviour) rather than aborting provisioning with `die`, because a `die` there skips Steps 5a–8 and leaves the host without sudoers, systemd unit, or health verification. The counter-cost: a host can now finish provisioning with a dev-toolchain tool missing, which surfaces later as a hook failure inside a dispatched build rather than at provision time — hence the end-of-run `Dev toolchain incomplete` summary WARN, the `Dev toolchain:` line in the Summary block, and the yellow `Setup complete (with warnings)` banner, all meant to make that state visible to whoever ran the installer.
+
+**Limitation**: the gitleaks sub-action (Step 4.9 sub-action C) remains fatal after this change — a gitleaks failure still aborts the script before Step 5a. Step 4.9 is therefore not uniformly non-fatal; only the per-crate `cargo binstall` loop was changed.
 
 ---
 

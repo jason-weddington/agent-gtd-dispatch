@@ -293,7 +293,8 @@ The tools a repo's hooks and gate command then *invoke* — `cog`, `typos`, `car
 `cargo-deny`, `cargo-llvm-cov`, `cargo-machete`, `cargo-nextest`, `cargo-release` and
 `gitleaks` — are provisioned by the same script's **Step 4.9** (item 75b88467), which also
 bootstraps `rustup` + `cargo-binstall` for the agent user unconditionally (it does *not*
-require `--with-talos`). The tool list is data in `templates/dev-toolchain.sh`, shared by
+require `--with-talos`) and guarantees a usable default toolchain for the agent user. The
+tool list is data in `templates/dev-toolchain.sh`, shared by
 `setup-dispatch-host.sh` and `deploy.sh`; see
 [docs/install.md — Dev toolchain (Step 4.9)](install.md#dev-toolchain-step-49). No `PATH`
 change is needed for these binaries: the agent/gate `PATH` already prepends `~/.local/bin`
