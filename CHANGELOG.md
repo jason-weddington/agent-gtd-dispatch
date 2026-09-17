@@ -2,6 +2,20 @@
 
 <!-- version list -->
 
+## v1.24.1 (2026-09-17)
+
+### Bug Fixes
+
+- **dispatch**: Don't burn manage relaunch budget while a child build is healthy (2f5c182f)
+  ([`3d0175c`](https://github.com/repos/agent-gtd-dispatch/commit/3d0175ca6aa9c127ffae3e078668cf861e00a688))
+
+- **setup**: Hold MCP probe stdin open until tools/list answers
+  ([`059e5c6`](https://github.com/repos/agent-gtd-dispatch/commit/059e5c6464d7e536f0da525c3da045f0c32f4aad))
+
+- **setup**: Use the PEP 508 spec form for the personal_kb MCP source
+  ([`ca86541`](https://github.com/repos/agent-gtd-dispatch/commit/ca86541cd545caeeeacfa059ed83d5192d32f1fb))
+
+
 ## v1.24.0 (2026-09-17)
 
 ### Bug Fixes
