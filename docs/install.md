@@ -657,7 +657,7 @@ The never-clobber rule is equally important: silently rotating the key on a true
 1. **Checks** that `$SERVICE_ENV` (`/home/dispatch-svc/.env`) exists — dies if not (Step 3 invariant).
 2. **Reads** the current value of `DISPATCH_API_KEY` from the env file (using the shared `_read_env_var` helper, which strips surrounding quotes).
 3. **Skips** if the value is non-empty AND not the legacy `changeme` placeholder. Prints a `[SKIP]` message. `changeme` is treated as absent and replaced with a freshly minted key (so old-template hosts migrate automatically).
-4. **Mints** if absent, empty, or `changeme`: generates a 43-char URL-safe key via `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`, rewrites the file atomically via `mktemp` + `install -m 0600`, then prints an **ACTION REQUIRED** banner with the minted key value and instructions to register it in the GTD UI before the service restarts in Step 6.
+4. **Mints** if absent, empty, or `changeme`: generates a 43-char URL-safe key via `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`, rewrites the file atomically via `mktemp` + `install -m 0600`, then prints an **ACTION REQUIRED** banner with the minted key value and instructions to register it in the GTD UI. The key takes effect on the *next restart* of the service — Step 6 only restarts when the rendered unit file differs from what's installed (it will not restart just because the env file changed), so the actual restart is either Step 6 (on a unit change) or reported — and, with `--restart-if-stale` and zero active runs, performed — by [Step 6.5](#service-environment-freshness-step-65).
 5. **Dry-run**: prints a `[DRY] Would: mint DISPATCH_API_KEY …` line and makes zero mutations (no key is generated).
 
 ### Verifying the minted key
@@ -907,6 +907,70 @@ sudo -u dispatch -H bash -lc 'rustup default stable'
 
 ---
 
+## Service environment freshness (Step 6.5)
+
+Step 6.5 of the installer compares `$SERVICE_ENV` against the **running** `dispatch-api` process's actual environment (`/proc/<MainPID>/environ`), and reports — loudly — when they disagree.
+
+### Why this matters
+
+systemd's `EnvironmentFile=` directive is read **once**, at service start. Every step that writes a new key into `$SERVICE_ENV` after that point (Step 3, Step 3.5's `DISPATCH_API_KEY` mint, `--with-talos`'s `TALOS_BIN`, `--with-postgres`'s `KB_TEST_DATABASE_URL` / `KB_REQUIRE_POSTGRES_TESTS`) changes the *file* but not the *running process* — and Step 6 only restarts the service when the rendered **unit file** differs from what's installed, not when the env file's content changes. A host can therefore finish provisioning with a completely correct env file and sudoers allowlist while the live process still has the old (or missing) values, and nothing prior to this step says so.
+
+This is exactly the failure this step exists to catch: on 2026-09-17, `setup-dispatch-host.sh --with-postgres` wrote `KB_TEST_DATABASE_URL` and `KB_REQUIRE_POSTGRES_TESTS` into the env file on all three hosts, but each host's `dispatch-api` had started earlier that morning (the `v1.23.0` deploy) and kept running with the old environment. The env file was right, the `COMMON_ENV_KEYS` allowlist was right, the sudoers `env_keep` was right — and dispatched runs still saw neither var, silently, until a personal-kb session caught it.
+
+### What the step does
+
+1. **Resolves** the service's `MainPID` via `systemctl show -p MainPID --value ${SERVICE_NAME}`. If the service is not running, prints a `[SKIP]` line and stops — no stale environment is possible if nothing is running.
+2. **Compares** `$SERVICE_ENV` against `/proc/<MainPID>/environ` using `scripts/env-staleness-check.sh` (see below) — a byte comparison of the *effective* values (after the same quote-stripping `setup-dispatch-host.sh` itself applies via `_read_env_var`), never the raw file text.
+3. **Falls back** to an mtime comparison (`stat` of `$SERVICE_ENV` vs. the service's `ActiveEnterTimestamp`) only if `/proc/<MainPID>/environ` could not be read (e.g. permissions). The mtime fallback cannot name individual stale keys unless this run itself wrote some (tracked via `_note_env_mutation`); otherwise it reports `<unknown: /proc unreadable>`. If neither timestamp is available, the state is `unverified` — it never guesses.
+4. **Reports** a red banner naming every stale key (never a value) plus the exact restart command, when any key differs.
+5. **Never restarts blindly.** With no flag, or with runs possibly in flight, or if the in-flight probe itself fails, Step 6.5 only warns — it does not touch the running service.
+
+### The `--restart-if-stale` gate (kb-01486)
+
+Pass `--restart-if-stale` to let Step 6.5 restart `dispatch-api` automatically when the environment is stale. The restart still only happens when **all** of the following hold:
+
+- `--restart-if-stale` was passed.
+- `GET http://localhost:${API_PORT}/health` succeeds and its `active_runs` field parses as an integer.
+- `active_runs == 0`.
+
+This exists because **a restart looks like run completion to the status poller** (kb-01486) — an earlier revision of the Postgres provisioning that blindly restarted the service on every re-run was reworked specifically to avoid that. Without `--restart-if-stale`, or when any of the above checks fail, Step 6.5 prints a `[WARN]` explaining exactly why it refused (`refused-no-flag`, `refused-in-flight`, `refused-probe-failed`) and leaves the service alone. After an automatic restart, Step 6.5 re-resolves the new `MainPID` and re-runs the same comparison against the **new** process — verifying the actual running state, not just that a restart command was issued — before reporting `restarted-verified` or `restarted-still-stale`.
+
+### Two-consumer model: process env vs. `.claude.json`
+
+Some keys written to `$SERVICE_ENV` are consumed twice: once by the `dispatch-api` **process environment** (this step's concern), and once baked into the agent's `${AGENT_HOME}/.claude.json` by [Step 4.6 — MCP servers](#mcp-servers-for-the-agent-user), which re-reads `$SERVICE_ENV` fresh on every run. For any stale key that is also one of Step 4.6's inputs (`AGENT_GTD_URL`, `AGENT_GTD_API_KEY`, `AGENT_GTD_MCP_SRC`, `PERSONAL_KB_URL`, `PERSONAL_KB_API_KEY`, `TEAM_KB_URL`, `TEAM_KB_API_KEY`, `PERSONAL_KB_MCP_SRC`), Step 6.5's banner adds a line reminding the operator that Step 4.6 already refreshed the `.claude.json` copy this invocation, and that restarting `dispatch-api` does **not** refresh it — the two consumers are independent and need independent thinking about, not just a restart.
+
+### `scripts/env-staleness-check.sh`
+
+The comparison is implemented as a standalone, root-free, unit-testable script — `scripts/env-staleness-check.sh --env-file PATH --environ PATH` — rather than inline in the installer, specifically so it can be driven directly from `pytest` (`tests/test_setup_env_staleness.py`) without any of `setup-dispatch-host.sh`'s root requirement. It:
+
+- Never requires root and never writes any file.
+- Reports stale key **names only** — it never prints a value, so it is safe to point at a file holding live secrets (`DISPATCH_API_KEY`, `AGENT_GTD_API_KEY`, ...).
+- Is one-directional: it reports env-file keys missing from or different in the environ dump, never environ-only keys (`PATH`, `HOME`, `INVOCATION_ID`, ...).
+- Skips (and warns to stderr on) any env-file value containing a backslash — systemd's `EnvironmentFile=` parser unescapes C-style sequences, so a raw byte comparison of such a value would be unreliable.
+
+Exit codes: `0` nothing stale, `1` some keys stale (names on stdout), `2` usage error, `3` a given path is missing or unreadable.
+
+### Durable record
+
+When `logger` is available, Step 6.5 emits exactly one `user.warning` line tagged `dispatch-setup` per run, naming the decision, the PID, which comparison method was used, and the stale key names (again, names only) — a low-cost audit trail in the systemd journal with zero new files created.
+
+### Verifying
+
+```bash
+# Compare the running process against the file directly (same check Step 6.5 runs):
+_pid="$(systemctl show -p MainPID --value dispatch-api)"
+sudo ./scripts/env-staleness-check.sh --env-file /home/dispatch-svc/.env --environ "/proc/${_pid}/environ"; echo "rc=$?"
+
+# Or the raw diff this whole item exists to replace (evidence shape from the
+# incident write-up — compare the file against the process, never trust the
+# file alone):
+sudo cat "/proc/${_pid}/environ" | tr '\0' '\n' | sort > /tmp/proc-env.txt
+sort /home/dispatch-svc/.env > /tmp/file-env.txt
+diff /tmp/file-env.txt /tmp/proc-env.txt
+```
+
+---
+
 ## Rollback procedure
 
 To undo the installer step by step (in reverse order):
@@ -916,6 +980,9 @@ No filesystem state created. Nothing to undo.
 
 ### Step 7 — Health check
 No filesystem state created. Nothing to undo.
+
+### Step 6.5 — Service environment freshness
+No filesystem state created (it only reads `$SERVICE_ENV`, `/proc/<pid>/environ`, and systemd unit properties). Nothing to undo. If it restarted the service under `--restart-if-stale`, that is the same reversible action as the Step 6 rollback below.
 
 ### Step 6 — Systemd unit
 ```bash

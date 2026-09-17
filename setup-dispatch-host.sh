@@ -21,6 +21,10 @@ set -euo pipefail
 #                          CREATEDB role (peer auth over the Unix socket), install pgvector
 #                          into template1, write KB_TEST_DATABASE_URL + KB_REQUIRE_POSTGRES_TESTS
 #                          to the service env (opt-in; default off)
+#   --restart-if-stale     Step 6.5: when the running service environment is stale
+#                          relative to the installed env file AND zero runs are
+#                          active, restart the service automatically (opt-in;
+#                          default off — otherwise Step 6.5 only warns)
 #   -h, --help             Show this help text
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,6 +73,13 @@ WITH_TALOS=false
 WITH_POSTGRES=false
 # Toolchain 'rustup default' is pointed at when a host has rustup but no usable default.
 RUST_DEFAULT_TOOLCHAIN="${RUST_DEFAULT_TOOLCHAIN:-stable}"
+# Step 6.5 (service environment freshness): restart the service automatically
+# when stale AND zero runs are active. ENV_MUTATED_VARS accumulates the names
+# of every var this run wrote into $SERVICE_ENV (via _note_env_mutation),
+# used as the mtime-fallback stale-name list when /proc is unreadable.
+RESTART_IF_STALE=false
+ENV_MUTATED_VARS=()
+ENV_FRESHNESS_STATE="unchecked"
 
 # --- Colors ---
 if [ -t 1 ]; then
@@ -106,6 +117,10 @@ Options:
                          extension into 'template1' so every database the test suite creates
                          inherits it, and write KB_TEST_DATABASE_URL=postgresql:///postgres +
                          KB_REQUIRE_POSTGRES_TESTS=1 to the service env file (opt-in; default off)
+  --restart-if-stale     Step 6.5: when the running service environment is stale
+                         relative to the installed env file AND zero runs are
+                         active, restart the service automatically (opt-in;
+                         default off — otherwise Step 6.5 only warns)
   -h, --help             Show this help text
 
 Environment variables:
@@ -242,6 +257,14 @@ _read_env_var() {  # $1=var name in $SERVICE_ENV; strips surrounding single/doub
     printf '%s' "$v"
 }
 
+# Step 6.5 bookkeeping: record that this run wrote $1 (a var NAME, or the
+# literal '<entire file>' when the whole file was freshly installed) into
+# $SERVICE_ENV. Called from every non-dry-run write site. Consumed by the
+# mtime-fallback path of Step 6.5 when /proc/<pid>/environ is unreadable.
+_note_env_mutation() {
+    ENV_MUTATED_VARS+=("$@")
+}
+
 # ===========================================================================
 # Argument parsing
 # ===========================================================================
@@ -254,6 +277,7 @@ while [[ $# -gt 0 ]]; do
         --smoke)          SMOKE=true;          shift   ;;
         --with-talos)     WITH_TALOS=true;     shift   ;;
         --with-postgres)  WITH_POSTGRES=true;  shift   ;;
+        --restart-if-stale) RESTART_IF_STALE=true; shift ;;
         -h|--help)        usage ;;
         *) die "Unknown option: $1  (run with --help for usage)" ;;
     esac
@@ -652,6 +676,7 @@ else
     chmod 0600 "$SERVICE_ENV"
     chown "${SERVICE_USER}:${SERVICE_GROUP}" "$SERVICE_ENV"
     info "Env file installed: ${SERVICE_ENV} (mode 0600)"
+    _note_env_mutation '<entire file>'
 fi
 
 # In single-user mode, DISPATCH_AGENT_SUBPROCESS_USER must NOT be set —
@@ -664,6 +689,7 @@ if $SINGLE_USER && [[ -f "$SERVICE_ENV" ]]; then
             warn "DISPATCH_AGENT_SUBPROCESS_USER found in ${SERVICE_ENV} — stripping (not applicable in single-user mode; runtime uses direct invocation)"
             sed -i '/^DISPATCH_AGENT_SUBPROCESS_USER=/d' "$SERVICE_ENV"
             info "Stripped DISPATCH_AGENT_SUBPROCESS_USER from ${SERVICE_ENV}"
+            _note_env_mutation DISPATCH_AGENT_SUBPROCESS_USER
         fi
     fi
 fi
@@ -727,16 +753,20 @@ PYEOF
     echo ""
     echo "    ${_minted_key}"
     echo ""
-    echo "  BEFORE Step 6 restarts the service, register this key in:"
+    echo "  Register this key BEFORE the next restart, in:"
     echo "    Agent GTD Settings → Dispatch hosts → this host's API Key"
     echo "  Dispatches will return 401 until this is done."
     echo ""
-    echo "  The key takes effect on:"
+    echo "  The key takes effect on the next restart of:"
     echo "    systemctl restart ${SERVICE_NAME}"
-    echo "  (Step 6 will do this — finish app-side registration first, or"
-    echo "   accept a brief 401 window if Step 6 runs before you register.)"
+    echo "  Step 6 only restarts the service when the rendered unit file differs"
+    echo "  from what's installed — it will NOT restart just because this key"
+    echo "  changed. Step 6.5 (below) reports whether the running process still"
+    echo "  has the old key, and can restart it for you with --restart-if-stale"
+    echo "  once zero runs are active."
     echo ""
     info "Minted and installed DISPATCH_API_KEY in ${SERVICE_ENV}"
+    _note_env_mutation DISPATCH_API_KEY
 fi
 fi  # end: if [[ ! -f "$SERVICE_ENV" ]]; else
 
@@ -1097,6 +1127,7 @@ TALOS_PYEOF
                 "$_talos_tmpfile" "$SERVICE_ENV"
             rm -f "$_talos_tmpfile"
             info "Set TALOS_BIN=${_talos_bin_value} in ${SERVICE_ENV}"
+            _note_env_mutation TALOS_BIN
         fi
     fi
 fi  # end: if ! $WITH_TALOS
@@ -1195,6 +1226,7 @@ SEV_PYEOF
         install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "$_tmp" "$SERVICE_ENV"
         rm -f "$_tmp"
         info "Set ${_name}=${_value} in ${SERVICE_ENV}"
+        _note_env_mutation "$_name"
     }
 
     # Helper: build pgvector from source (fallback when no distro package is available)
@@ -1871,6 +1903,219 @@ else
 fi
 
 # ===========================================================================
+# Step 6.5: Service environment freshness
+# ===========================================================================
+# systemd reads EnvironmentFile ONCE at service start. A setup step that
+# mutates $SERVICE_ENV (Step 3, 3.5, 4.5b-G, --with-postgres) does not by
+# itself change what the *running* dispatch-api process sees — Step 6 only
+# restarts when the rendered unit *file* differs, not when the env file
+# content changes. This step makes that staleness impossible to miss: it
+# compares the installed env file against the running process's actual
+# environment (never the file alone) and reports drift loudly. It NEVER
+# restarts blindly while runs may be in flight (kb-01486: a restart looks
+# like run completion to the status poller) — restart only happens with
+# --restart-if-stale AND a zero-active-runs probe.
+# ===========================================================================
+echo ""
+echo "--- Step 6.5: Service environment freshness ---"
+
+# Two-consumer warning: the exact set of $SERVICE_ENV keys Step 4.6 reads and
+# bakes into ${AGENT_HOME}/.claude.json (see the _read_env_var calls in that
+# step). A restart of ${SERVICE_NAME} does NOT refresh that file — only a
+# re-run of Step 4.6 does — so a stale key from this set needs an extra line
+# telling the operator that restarting alone will not fix the agent side.
+STEP46_KEYS=(AGENT_GTD_URL AGENT_GTD_API_KEY AGENT_GTD_MCP_SRC PERSONAL_KB_URL PERSONAL_KB_API_KEY TEAM_KB_URL TEAM_KB_API_KEY PERSONAL_KB_MCP_SRC)
+
+if $DRY_RUN; then
+    would "compare ${SERVICE_ENV} against the running ${SERVICE_NAME} process environment (/proc/<MainPID>/environ) and, with --restart-if-stale and zero active runs, restart ${SERVICE_NAME}"
+    ENV_FRESHNESS_STATE="dry-run"
+else
+    _main_pid="$(systemctl show -p MainPID --value "${SERVICE_NAME}" 2>/dev/null || true)"
+    [[ "$_main_pid" =~ ^[0-9]+$ ]] || _main_pid=0
+
+    if [[ "$_main_pid" -eq 0 ]]; then
+        skip "${SERVICE_NAME} is not running — no stale environment is possible"
+        ENV_FRESHNESS_STATE="not-running"
+    else
+        [[ -x "${SCRIPT_DIR}/scripts/env-staleness-check.sh" ]] \
+            || die "Missing or non-executable ${SCRIPT_DIR}/scripts/env-staleness-check.sh — this ships in the repo; its absence means a broken checkout"
+
+        _stale_out=""; _stale_rc=0
+        _stale_out="$("${SCRIPT_DIR}/scripts/env-staleness-check.sh" --env-file "$SERVICE_ENV" --environ "/proc/${_main_pid}/environ")" || _stale_rc=$?
+
+        _check_kind="proc"
+        _is_stale=false
+        _names_known=true
+        _stale_names=()
+
+        case "$_stale_rc" in
+            0) : ;;
+            1)
+                _is_stale=true
+                while IFS= read -r _n; do [[ -n "$_n" ]] && _stale_names+=("$_n"); done <<< "$_stale_out"
+                ;;
+            3)
+                _check_kind="mtime-fallback"
+                _svc_start="$(systemctl show -p ActiveEnterTimestamp --value "${SERVICE_NAME}" 2>/dev/null || true)"
+                _svc_start_epoch=""
+                if [[ -n "$_svc_start" && "$_svc_start" != "n/a" ]]; then
+                    _svc_start_epoch="$(date -d "$_svc_start" +%s 2>/dev/null || true)"
+                fi
+                if [[ -z "$_svc_start_epoch" ]]; then
+                    warn "Cannot determine ${SERVICE_NAME} start time (ActiveEnterTimestamp='${_svc_start}') — treating service environment as UNVERIFIED"
+                    ENV_FRESHNESS_STATE="unverified"
+                else
+                    _env_mtime="$(stat -c %Y "$SERVICE_ENV")"
+                    if [[ "$_env_mtime" -gt "$_svc_start_epoch" ]]; then
+                        _is_stale=true
+                        if (( ${#ENV_MUTATED_VARS[@]} == 0 )); then
+                            _names_known=false
+                            _stale_names=("<unknown: /proc unreadable>")
+                        else
+                            _stale_names=(${ENV_MUTATED_VARS[@]+"${ENV_MUTATED_VARS[@]}"})
+                        fi
+                        warn "${SERVICE_ENV} mtime is newer than ${SERVICE_NAME}'s ActiveEnterTimestamp — falling back to an mtime comparison because /proc/${_main_pid}/environ was unreadable"
+                    fi
+                fi
+                ;;
+            2) die "env-staleness-check.sh exited 2 (usage error) — installer bug in the Step 6.5 invocation" ;;
+            *) die "env-staleness-check.sh exited unexpectedly (rc=${_stale_rc}) — installer bug in the Step 6.5 invocation" ;;
+        esac
+
+        if [[ "${ENV_FRESHNESS_STATE}" != "unverified" ]]; then
+            if ! $_is_stale; then
+                info "dispatch-api process environment matches ${SERVICE_ENV} — ${SERVICE_NAME} (PID ${_main_pid})"
+                ENV_FRESHNESS_STATE="current"
+            else
+                _stale_count=${#_stale_names[@]}
+                if $_names_known; then
+                    _suffix=" (${_stale_count} vars)"
+                else
+                    _suffix=" (vars unknown)"
+                fi
+
+                echo ""
+                printf "${RED}========================================${RESET}\n"
+                printf "${RED}  STALE SERVICE ENVIRONMENT            ${RESET}\n"
+                printf "${RED}========================================${RESET}\n"
+                echo ""
+                echo "  ${SERVICE_ENV} was written since ${SERVICE_NAME} last started."
+                echo "  The running process still has the OLD values for:"
+                echo ""
+                for _n in "${_stale_names[@]}"; do
+                    echo "    ${_n}"
+                done
+                echo ""
+                for _n in "${_stale_names[@]}"; do
+                    for _s46 in "${STEP46_KEYS[@]}"; do
+                        if [[ "$_n" == "$_s46" ]]; then
+                            echo "  NOTE: ${_n} is also consumed by the agent's \${AGENT_HOME}/.claude.json,"
+                            echo "        which Step 4.6 already refreshed this invocation — a service"
+                            echo "        restart does not refresh that file."
+                            break
+                        fi
+                    done
+                done
+                echo "  Check for in-flight runs first:"
+                echo "    curl -s http://localhost:${API_PORT}/health"
+                echo "  Then pick up the new values with:"
+                echo "    systemctl restart ${SERVICE_NAME}"
+                echo ""
+
+                _health_json=""
+                _active_runs="unknown"
+                if _health_json="$(curl -sf --max-time 5 "http://localhost:${API_PORT}/health" 2>/dev/null)"; then
+                    _active_runs="$(printf '%s' "$_health_json" | python3 -c "
+import json,sys
+try:
+    d = json.load(sys.stdin)
+    v = d.get('active_runs')
+    print(int(v)) if isinstance(v, int) or (isinstance(v, str) and v.isdigit()) else print('unknown')
+except Exception:
+    print('unknown')
+" 2>/dev/null || echo unknown)"
+                fi
+
+                if ! $RESTART_IF_STALE; then
+                    warn "Not restarting ${SERVICE_NAME} — pass --restart-if-stale to allow an automatic restart when no runs are in flight (observed active_runs=${_active_runs}; kb-01486: a blind restart looks like run completion to the status poller)"
+                    ENV_FRESHNESS_STATE="refused-no-flag${_suffix}"
+                elif [[ "$_active_runs" == "unknown" ]]; then
+                    warn "Cannot verify active_runs (health probe failed or returned a non-integer) — refusing to restart ${SERVICE_NAME} (kb-01486)"
+                    ENV_FRESHNESS_STATE="refused-probe-failed${_suffix}"
+                elif [[ "$_active_runs" -gt 0 ]]; then
+                    warn "Refusing to restart ${SERVICE_NAME} — active_runs=${_active_runs} (kb-01486: a restart looks like run completion to the status poller)"
+                    ENV_FRESHNESS_STATE="refused-in-flight${_suffix}"
+                else
+                    info "active_runs=0 and --restart-if-stale was passed — restarting ${SERVICE_NAME}"
+                    systemctl restart "${SERVICE_NAME}"
+
+                    _restart_ok=false
+                    _rattempts=0
+                    while (( _rattempts < 10 )); do
+                        if curl -sf --max-time 5 "http://localhost:${API_PORT}/health" &>/dev/null; then
+                            _restart_ok=true
+                            break
+                        fi
+                        _rattempts=$((_rattempts + 1))
+                        sleep 3
+                    done
+                    if ! $_restart_ok; then
+                        warn "Restarted ${SERVICE_NAME} but /health did not return 200 within 30s — check: journalctl -u ${SERVICE_NAME} -n 50"
+                    fi
+
+                    _new_main_pid="$(systemctl show -p MainPID --value "${SERVICE_NAME}" 2>/dev/null || true)"
+                    [[ "$_new_main_pid" =~ ^[0-9]+$ ]] || _new_main_pid=0
+                    _post_out=""; _post_rc=0
+                    if [[ "$_new_main_pid" -gt 0 ]]; then
+                        _post_out="$("${SCRIPT_DIR}/scripts/env-staleness-check.sh" --env-file "$SERVICE_ENV" --environ "/proc/${_new_main_pid}/environ")" || _post_rc=$?
+                    else
+                        _post_rc=1
+                        _post_out="<unknown: process not found after restart>"
+                    fi
+
+                    if [[ "$_post_rc" -eq 0 ]]; then
+                        info "Post-restart verification passed — ${SERVICE_NAME} (PID ${_new_main_pid}) environment now matches ${SERVICE_ENV}"
+                        ENV_FRESHNESS_STATE="restarted-verified"
+                    else
+                        _post_names=()
+                        while IFS= read -r _n; do [[ -n "$_n" ]] && _post_names+=("$_n"); done <<< "$_post_out"
+                        echo ""
+                        printf "${RED}========================================${RESET}\n"
+                        printf "${RED}  STALE SERVICE ENVIRONMENT            ${RESET}\n"
+                        printf "${RED}========================================${RESET}\n"
+                        echo ""
+                        echo "  ${SERVICE_NAME} was restarted but still does not match ${SERVICE_ENV} for:"
+                        echo ""
+                        for _n in "${_post_names[@]}"; do
+                            echo "    ${_n}"
+                        done
+                        echo ""
+                        echo "  Check for in-flight runs first:"
+                        echo "    curl -s http://localhost:${API_PORT}/health"
+                        echo "  Then pick up the new values with:"
+                        echo "    systemctl restart ${SERVICE_NAME}"
+                        echo ""
+                        _post_suffix=" (${#_post_names[@]} vars)"
+                        ENV_FRESHNESS_STATE="restarted-still-stale${_post_suffix}"
+                    fi
+                fi
+            fi
+        fi
+
+        # _check_kind is already "proc" or "mtime-fallback" — this branch only
+        # runs once a check was actually attempted against a live PID.
+        _log_stale_vars="none"
+        if [[ ${#_stale_names[@]} -gt 0 ]]; then
+            _log_stale_vars="$(IFS=,; echo "${_stale_names[*]}")"
+        fi
+        if command -v logger &>/dev/null; then
+            logger -t dispatch-setup -p user.warning \
+                "env-freshness decision=${ENV_FRESHNESS_STATE} service=${SERVICE_NAME} env_file=${SERVICE_ENV} main_pid=${_main_pid} check=${_check_kind} stale_count=${#_stale_names[@]} stale_vars=${_log_stale_vars} restart_if_stale=${RESTART_IF_STALE} active_runs=${_active_runs:-unknown}"
+        fi
+    fi
+fi
+
+# ===========================================================================
 # Step 7: Health check
 # ===========================================================================
 echo ""
@@ -1921,6 +2166,7 @@ echo "  Service user: ${SERVICE_USER}  (${SERVICE_HOME})"
 echo "  Wheel index:  ${DISPATCH_WHEEL_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
 echo "  Env file:     ${SERVICE_ENV}"
 echo "  Service:      ${SERVICE_NAME}  (port ${API_PORT})"
+echo "  Env freshness: ${ENV_FRESHNESS_STATE}"
 if [[ ${#_tc_failed[@]} -gt 0 ]]; then
     echo "  Dev toolchain: INCOMPLETE — missing: ${_tc_failed[*]}"
 else
