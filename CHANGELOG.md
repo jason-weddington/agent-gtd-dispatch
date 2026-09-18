@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.25.2 (2026-09-18)
+
+### Bug Fixes
+
+- **release**: Version the protocol package in lockstep and pin it exactly
+  ([`75f4f6d`](https://github.com/repos/agent-gtd-dispatch/commit/75f4f6d586cb251ae9c31e54f76863f3a3c3f176))
+
+
 ## v1.25.1 (2026-09-18)
 
 ### Bug Fixes
