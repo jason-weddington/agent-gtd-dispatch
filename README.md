@@ -148,10 +148,11 @@ sudo --preserve-env=DISPATCH_SINGLE_USER DISPATCH_SINGLE_USER=1 \
 Trade-off: no extra users are created and no sudoers fragment is installed — which also
 means **no POSIX isolation** between the service and the agent subprocesses it spawns.
 You still get the systemd unit, auto-minted `DISPATCH_API_KEY`, MCP registration,
-pre-commit template setup, lefthook, and the Step 4.9 dev toolchain (rustup +
+pre-commit template setup, lefthook, the Step 4.9 dev toolchain (rustup +
 cargo-binstall, then `cargo-nextest`, `cargo-llvm-cov`, `cargo-deny`, `cargo-machete`,
 `typos`, `cargo-sort`, `cargo-release`, `cog`, plus a pinned `gitleaks` binary — the tools
-dispatched repos' hooks and gate commands call) for the agent user. The installer guards
+dispatched repos' hooks and gate commands call), and the Step 4.10 `personal-kb-hook`
+wiring (KB mental-map pushes into each dispatched agent's session) for the agent user. The installer guards
 against mixing modes on one host. Full
 details: [docs/install.md — Single-user mode](docs/install.md#single-user-mode).
 

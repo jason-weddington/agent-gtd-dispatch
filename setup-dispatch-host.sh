@@ -1825,6 +1825,116 @@ else
 fi
 
 # ===========================================================================
+# Step 4.10: personal-kb-hook (agent user)
+# ===========================================================================
+# The personal-kb-hook pushes KB mental-map rosters into a Claude Code session via
+# hook events. Telemetry finding that motivated this step: 2,067 map-push rows since
+# June with build_engine NULL on every one — no dispatched agent has ever received a
+# map directory, which is exactly the audience that needs one (a build agent landing
+# cold in an unfamiliar repo). This step is what keeps the hand-wiring the lead did on
+# pironman01/r7-research/r7-server (2026-09-18) from being clobbered the next time
+# this script runs on those hosts, and gets it onto every new host automatically.
+#
+# PINNING ASYMMETRY (deliberate — do not "fix" by pinning this like Step 4.6 does):
+# the personal_kb MCP server source (PERSONAL_KB_MCP_SRC, Step 4.6) IS pinned to a SHA
+# on production hosts because an upstream rewrite there once silently broke every
+# dispatched agent's KB access (kb-01598). This hook's source is intentionally left
+# UNPINNED: it is changing rapidly upstream, is purely additive, and degrades silently
+# rather than breaking a run — so tracking the branch head is the lower-risk choice
+# here. `--force` on `uv tool install` is both the initial install AND the upgrade
+# path: every re-run reinstalls from whatever the branch head currently is.
+#
+# NO SERVICE RESTART: Claude Code reads the agent user's settings.json when each
+# agent launches (unlike a systemd EnvironmentFile var, which is read once at service
+# start), so this wiring takes effect on the very next dispatched run — contrast with
+# service env vars (0542f656).
+# ===========================================================================
+echo ""
+echo "--- Step 4.10: personal-kb-hook (agent user) ---"
+
+PERSONAL_KB_HOOK_SRC_DEFAULT="git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb#subdirectory=packages/personal-kb-hook"
+# Default hosted personal-KB service URL used across the homelab fleet when the
+# service env doesn't override it — same default host as the KB MCP servers.
+PERSONAL_KB_HOOK_URL_DEFAULT="https://kb.lab.jasonweddington.com"
+HOOK_BIN="${AGENT_HOME}/.local/bin/personal-kb-hook"
+HOOK_KEY_FILE="${AGENT_HOME}/.personal_kb_hook_key"
+HOOK_SETTINGS_DIR="${AGENT_HOME}/.claude"
+HOOK_SETTINGS="${HOOK_SETTINGS_DIR}/settings.json"
+HOOK_MERGE_SCRIPT="${TMPL_DIR}/personal-kb-hook-settings.py"
+
+if [[ -f "$SERVICE_ENV" ]]; then
+    PERSONAL_KB_HOOK_SRC="$(_read_env_var PERSONAL_KB_HOOK_SRC)"; export PERSONAL_KB_HOOK_SRC
+    PERSONAL_KB_URL="$(_read_env_var PERSONAL_KB_URL)";           export PERSONAL_KB_URL
+    PERSONAL_KB_API_KEY="$(_read_env_var PERSONAL_KB_API_KEY)";   export PERSONAL_KB_API_KEY
+fi
+_hook_src="${PERSONAL_KB_HOOK_SRC:-$PERSONAL_KB_HOOK_SRC_DEFAULT}"
+_hook_url="${PERSONAL_KB_URL:-$PERSONAL_KB_HOOK_URL_DEFAULT}"
+
+if $DRY_RUN; then
+    would "runuser -l ${AGENT_USER} -- uv tool install --force --from '${_hook_src}' personal-kb-hook"
+    would "write ${HOOK_KEY_FILE} (owner ${AGENT_USER}, mode 0600) from PERSONAL_KB_API_KEY in ${SERVICE_ENV}"
+    would "merge SessionStart/UserPromptSubmit/Stop/PostToolUse personal-kb-hook blocks into ${HOOK_SETTINGS}, preserving other settings"
+else
+    if [[ ! -f "$HOOK_MERGE_SCRIPT" ]]; then
+        die "personal-kb-hook settings-merge script not found at ${HOOK_MERGE_SCRIPT}"
+    fi
+
+    # Install (also the upgrade path — see PINNING ASYMMETRY note above). Non-fatal:
+    # the hook is additive, so a failed install must not abort provisioning of an
+    # otherwise-healthy host.
+    _hook_install_rc=0
+    _hook_install_out="$(runuser -l "$AGENT_USER" -c "uv tool install --force --from '${_hook_src}' personal-kb-hook" 2>&1)" \
+        || _hook_install_rc=$?
+    if [[ "$_hook_install_rc" -ne 0 ]]; then
+        warn "uv tool install --force --from '${_hook_src}' personal-kb-hook failed for ${AGENT_USER} (rc=${_hook_install_rc}) — continuing without the hook: ${_hook_install_out}"
+    else
+        info "Installed personal-kb-hook for ${AGENT_USER} from ${_hook_src}"
+    fi
+
+    # The hook degrades SILENTLY when its key or URL is missing (no roster, no
+    # telemetry, no error) — a broken install is indistinguishable from no install.
+    # Reuse the host's EXISTING PERSONAL_KB_API_KEY (the same key this host already
+    # uses for its KB MCP server) rather than minting a second, hook-specific key —
+    # a second key on a LAN-only KB is toil, not security (Jason, 2026-09-18).
+    if [[ -z "${PERSONAL_KB_API_KEY:-}" ]]; then
+        warn "PERSONAL_KB_API_KEY not set in ${SERVICE_ENV} — personal-kb-hook will be installed but not wired; it degrades SILENTLY (no roster, no telemetry, no error), so this would look exactly like a working install"
+    else
+        _hook_key_tmp="$(mktemp)"
+        printf '%s' "$PERSONAL_KB_API_KEY" > "$_hook_key_tmp"
+        install -m 0600 -o "$AGENT_USER" -g "$AGENT_GROUP" "$_hook_key_tmp" "$HOOK_KEY_FILE"
+        rm -f "$_hook_key_tmp"
+        info "Wrote personal-kb-hook key file for ${AGENT_USER}: ${HOOK_KEY_FILE} (mode 0600)"
+
+        # Read-modify-write of the parsed JSON — never a wholesale overwrite — so any
+        # other settings already in settings.json (or other hook blocks on the same
+        # events) survive. Creates the file as {} when absent. Idempotent: a
+        # pre-existing personal-kb-hook block per event is REPLACED, not appended, so
+        # re-running this step never accumulates duplicate blocks. The API key itself
+        # is referenced via `$(cat ${HOOK_KEY_FILE})` shell indirection inside the
+        # rendered command — the literal key value never lands in settings.json.
+        mkdir -p "$HOOK_SETTINGS_DIR"
+        chown "${AGENT_USER}:${AGENT_GROUP}" "$HOOK_SETTINGS_DIR" 2>/dev/null || true
+        [[ -f "$HOOK_SETTINGS" ]] || { printf '{}' > "$HOOK_SETTINGS"; chown "${AGENT_USER}:${AGENT_GROUP}" "$HOOK_SETTINGS"; }
+        python3 "$HOOK_MERGE_SCRIPT" "$HOOK_SETTINGS" "$HOOK_BIN" "$HOOK_KEY_FILE" "$_hook_url" \
+            || die "Failed to merge personal-kb-hook blocks into ${HOOK_SETTINGS}"
+        chown "${AGENT_USER}:${AGENT_GROUP}" "$HOOK_SETTINGS"
+        info "Wired personal-kb-hook into ${HOOK_SETTINGS} for ${AGENT_USER} (SessionStart, UserPromptSubmit, Stop, PostToolUse) url=${_hook_url}"
+    fi
+
+    # Verify AS THE AGENT USER, not as root: a binary on root's PATH proves nothing
+    # about the user that actually runs Claude Code (runuser -l gives the agent's own
+    # login PATH, e.g. ~/.local/bin). Non-fatal — the hook is additive, and a failed
+    # hook must never block provisioning a host.
+    _hook_verify_rc=0
+    _hook_verify_out="$(runuser -l "$AGENT_USER" -c "'${HOOK_BIN}' --help" 2>&1)" || _hook_verify_rc=$?
+    if [[ "$_hook_verify_rc" -eq 0 ]]; then
+        info "Verified personal-kb-hook for ${AGENT_USER}: ${HOOK_BIN} --help"
+    else
+        warn "personal-kb-hook --help failed for ${AGENT_USER} (rc=${_hook_verify_rc}): ${_hook_verify_out}"
+    fi
+fi
+
+# ===========================================================================
 # Step 5a: Claude symlink (must precede sudoers so the path exists when
 #           visudo validates the fragment)
 # ===========================================================================

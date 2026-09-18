@@ -20,7 +20,10 @@ This guide covers bootstrapping a fresh Ubuntu host and migrating an existing si
 > **dev toolchain** the agent's hooks and gate commands call (Step 4.9: `rustup` +
 > `cargo-binstall`, then `cargo-nextest`, `cargo-llvm-cov`, `cargo-deny`,
 > `cargo-machete`, `typos`, `cargo-sort`, `cargo-release`, `cog`, plus a pinned
-> `gitleaks` release binary — see [Dev toolchain (Step 4.9)](#dev-toolchain-step-49)).
+> `gitleaks` release binary — see [Dev toolchain (Step 4.9)](#dev-toolchain-step-49)),
+> and **`personal-kb-hook`** (Step 4.10: `uv tool install`, wired into the agent's
+> `~/.claude/settings.json` — see
+> [personal-kb-hook (Step 4.10)](#personal-kb-hook-step-410)).
 > The `rustup` bootstrap also guarantees a usable default toolchain for the agent
 > user, even when `rustup` was already present with no default configured.
 > All other tooling (`python3`, `visudo`, `systemctl`) ships with standard Ubuntu.
@@ -907,6 +910,72 @@ sudo -u dispatch -H bash -lc 'rustup default stable'
 
 ---
 
+## personal-kb-hook (Step 4.10)
+
+Step 4.10 installs the `personal-kb-hook` Claude Code hook for the `dispatch` (agent) user and wires it into that user's `~/.claude/settings.json`, so every dispatched agent gets a KB mental-map roster pushed into its session.
+
+### Why this matters
+
+Telemetry from the KB side: 2,067 map-push rows since June, with `build_engine` **NULL on every one** — no dispatched agent has ever received a map directory, which is exactly the audience that needs one most (a build agent landing cold in an unfamiliar repo). The lead installed and wired the hook by hand on `pironman01`, `r7-research` and `r7-server` on 2026-09-18 so the fleet works today; this step is what keeps a re-run of `setup-dispatch-host.sh` from clobbering that hand-config on those hosts, and gets the same wiring onto every new host automatically — the same failure mode that hit the KB MCP registration on 2026-09-17.
+
+### What the step does
+
+1. Installs `personal-kb-hook` as the agent user: `uv tool install --force --from '<SRC>' personal-kb-hook`, where `<SRC>` defaults to `git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb#subdirectory=packages/personal-kb-hook`, overridable via `PERSONAL_KB_HOOK_SRC` in the service env (same override mechanism as `PERSONAL_KB_MCP_SRC` in [Step 4.6](#mcp-servers-for-the-agent-user)). `--force` is both the install and the upgrade path — every run reinstalls from the current source. Non-fatal: a failed install warns and provisioning continues.
+2. Writes the hook's API key file at `/home/dispatch/.personal_kb_hook_key` (owner `dispatch`, mode `0600`) from the **existing** `PERSONAL_KB_API_KEY` in the service env — the same key this host already uses for its `personal-kb` MCP server. No separate hook-specific key is minted, required, or documented.
+3. Merges four hook blocks into `/home/dispatch/.claude/settings.json` — a read-modify-write of the parsed JSON via `templates/personal-kb-hook-settings.py`, never a wholesale overwrite, so any other settings already in that file survive:
+   - `SessionStart`, `UserPromptSubmit`, `Stop` — no matcher.
+   - `PostToolUse` — matcher `mcp__personal-kb__kb_get|mcp__team-kb__team_kb_get`.
+
+   Each block's command has the shape:
+   ```
+   PERSONAL_KB_LISTENER=1 PERSONAL_KB_URL=<url> PERSONAL_KB_API_KEY=$(cat /home/dispatch/.personal_kb_hook_key 2>/dev/null) /home/dispatch/.local/bin/personal-kb-hook --format=claude-json
+   ```
+   The `--format=claude-json` flag and the `PostToolUse` matcher are copied verbatim from jason-desktop's settings.json. The one deliberate deviation from that desktop copy: the binary is referenced by **absolute path** (`/home/dispatch/.local/bin/personal-kb-hook`), not bare name, so hook execution does not depend on whatever `PATH` the hook process inherits. The key is referenced via `$(cat ...)` shell indirection — the literal key value never appears in `settings.json`.
+4. Re-running the step is idempotent: any pre-existing hook block whose command mentions `personal-kb-hook` is **replaced**, never appended, so a second run still yields exactly four blocks, not eight.
+5. Verifies the install **as the agent user**, not as root: `runuser -l dispatch -c 'personal-kb-hook --help'` (absolute path). A binary on root's `PATH` proves nothing about the user that actually runs Claude Code. Failure only warns — the hook is additive, and a failed hook must never block provisioning a host.
+
+### Why the source is unpinned while the MCP server is pinned
+
+The `personal_kb` MCP server source (`PERSONAL_KB_MCP_SRC`, Step 4.6) **is** pinned to a SHA on production hosts, because an upstream rewrite there once silently broke every dispatched agent's KB access (`kb-01598`). `personal-kb-hook`'s source is **deliberately left unpinned**: it is changing rapidly upstream, is purely additive, and degrades silently rather than breaking a run — so tracking the branch head is the lower-risk choice for it. Do not "fix" this by adding a pin.
+
+### Key reuse — no separate key
+
+The hook reads the same `PERSONAL_KB_API_KEY` this host already has configured for its `personal-kb` MCP server (Step 4.6). It does not mint, require, or document a second hook-specific key — a second key on a LAN-only KB is toil, not security (Jason, 2026-09-18).
+
+### Silent-degradation warning
+
+The hook degrades **silently** when its key or URL is missing: no roster, no telemetry, no error. A broken install is therefore indistinguishable from no install at all. When `PERSONAL_KB_API_KEY` is absent from the service env, the step does not fail — it installs the binary but skips the key file and the settings wiring, and prints:
+
+```
+[WARN] PERSONAL_KB_API_KEY not set in <SERVICE_ENV> — personal-kb-hook will be installed but not wired; it degrades SILENTLY (no roster, no telemetry, no error), so this would look exactly like a working install
+```
+
+### No restart required
+
+Nothing in this step restarts `dispatch-api` or requires one. Claude Code reads the agent user's `settings.json` when each agent **launches**, so the wiring takes effect on the very next dispatched run — contrast with service env vars, which systemd reads once at service start (`0542f656`).
+
+### Deploy refresh
+
+Every `./deploy.sh` re-runs `uv tool install --force --from '<PERSONAL_KB_HOOK_SRC>' personal-kb-hook` as the agent user, non-fatally, printing `[OK]   personal-kb-hook (dispatch): <version-or-present>` or a `[WARN]` line with the last 5 lines of output. Deploy only refreshes the binary — it does **not** touch `settings.json` (wiring is `setup-dispatch-host.sh`'s job) and does **not** restart the service.
+
+### Verifying
+
+```bash
+# As the dispatch user (the user that actually runs Claude Code):
+sudo -u dispatch -H bash -lc 'personal-kb-hook --help'
+
+# Confirm the key file:
+sudo -u dispatch -H stat -c '%a %U' /home/dispatch/.personal_kb_hook_key
+# → 600 dispatch
+
+# Confirm the wiring (no literal key value should appear):
+sudo -u dispatch -H python3 -c "import json; print(json.load(open('/home/dispatch/.claude/settings.json'))['hooks'].keys())"
+```
+
+The cheapest proof the hook actually **ran** during a dispatched build (not just that it's installed) is `~/.cache/personal_kb/whisper-debug-<session>.log` on the host — its presence after a run confirms the hook fired and reached the KB service, without needing to inspect the agent's own transcript.
+
+---
+
 ## Service environment freshness (Step 6.5)
 
 Step 6.5 of the installer compares `$SERVICE_ENV` against the **running** `dispatch-api` process's actual environment (`/proc/<MainPID>/environ`), and reports — loudly — when they disagree.
@@ -1001,6 +1070,24 @@ sudo rm /etc/sudoers.d/dispatch-svc
 ```bash
 sudo rm /usr/local/bin/claude
 ```
+
+### Step 4.10 — personal-kb-hook
+```bash
+sudo -u dispatch -H bash -lc 'uv tool uninstall personal-kb-hook'
+sudo rm -f /home/dispatch/.personal_kb_hook_key
+```
+Then remove the four `personal-kb-hook` blocks from `/home/dispatch/.claude/settings.json` (SessionStart, UserPromptSubmit, Stop, PostToolUse) — either by hand or by re-running the merge script against an emptied file:
+```bash
+sudo -u dispatch -H python3 -c "
+import json
+p = '/home/dispatch/.claude/settings.json'
+d = json.load(open(p))
+for event, entries in list(d.get('hooks', {}).items()):
+    d['hooks'][event] = [e for e in entries if not any('personal-kb-hook' in h.get('command', '') for h in e.get('hooks', []))]
+json.dump(d, open(p, 'w'), indent=2)
+"
+```
+(Same `bash -lc` requirement as Steps 4.7–4.9 — `uv` is not on sudo's search path.)
 
 ### Step 4.9 — Dev toolchain
 ```bash

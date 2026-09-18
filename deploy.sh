@@ -24,6 +24,10 @@ set -euo pipefail
 #   DISPATCH_INDEX  Homelab wheel index URL (default: https://pypi.lab.jasonweddington.com/simple/)
 #   RUST_DEFAULT_TOOLCHAIN  Rust toolchain pointed at by 'rustup default' when the agent
 #                   user has rustup but no usable default (default: stable)
+#   PERSONAL_KB_HOOK_SRC  Source for the personal-kb-hook uv tool refresh (setup-
+#                   dispatch-host.sh Step 4.10). Deliberately unpinned by default —
+#                   see the PINNING ASYMMETRY note in Step 4.10 of setup-dispatch-host.sh.
+#                   (default: git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb#subdirectory=packages/personal-kb-hook)
 #
 # Exit code: 0 if every host succeeded. Non-zero on first failure (other hosts skipped).
 
@@ -37,6 +41,7 @@ AGENT_USER="${AGENT_USER:-dispatch}"
 SERVICE_NAME="${SERVICE_NAME:-dispatch-api}"
 DISPATCH_INDEX="${DISPATCH_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
 RUST_DEFAULT_TOOLCHAIN="${RUST_DEFAULT_TOOLCHAIN:-stable}"
+PERSONAL_KB_HOOK_SRC="${PERSONAL_KB_HOOK_SRC:-git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb#subdirectory=packages/personal-kb-hook}"
 
 # --- Dev toolchain data (single source of truth: templates/dev-toolchain.sh) ---
 # deploy.sh runs LOCALLY from a repo checkout, so the tool list is sourced here and
@@ -178,6 +183,23 @@ else
         echo "[WARN] gitleaks ${GITLEAKS_VERSION} install failed (\$_gl_url) — agent keeps its current binary" >&2
     fi
     rm -rf "\$_gl_tmp"
+fi
+
+# Refresh personal-kb-hook for the agent user (setup-dispatch-host.sh Step 4.10).
+# --force is both the install and the upgrade path, so this always reinstalls from
+# whatever PERSONAL_KB_HOOK_SRC currently resolves to — deliberately UNPINNED (see
+# the PINNING ASYMMETRY note in Step 4.10 of setup-dispatch-host.sh: unlike the
+# personal_kb MCP server, this hook is additive and degrades silently rather than
+# breaking a run, so tracking the branch head is the lower-risk choice). Non-fatal:
+# a failed refresh leaves the agent on its current binary (if any) and must not
+# abort the deploy. Does NOT touch settings.json (wiring is setup's job, not
+# deploy's) and does NOT restart the service.
+if HOOK_OUT=\$(sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/uv tool install --force --from '${PERSONAL_KB_HOOK_SRC}' personal-kb-hook 2>&1); then
+    HOOK_VER=\$(sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/personal-kb-hook --version 2>/dev/null || echo present)
+    echo "[OK]   personal-kb-hook (${AGENT_USER}): \${HOOK_VER}"
+else
+    echo "[WARN] personal-kb-hook install failed for ${AGENT_USER} — agent keeps its current binary (if any). Last output:" >&2
+    printf '%s\n' "\$HOOK_OUT" | tail -n 5 | sed 's/^/[WARN]   /' >&2
 fi
 
 # Restart the service so systemd runs the freshly-installed entry point.
