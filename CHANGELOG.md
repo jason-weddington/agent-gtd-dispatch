@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.25.1 (2026-09-18)
+
+### Bug Fixes
+
+- **protocol**: Bump to 0.1.1 so the new RunStatus member reaches the hosts
+  ([`2066024`](https://github.com/repos/agent-gtd-dispatch/commit/20660247a43219271b788b530b71b41d5ebde03f))
+
+
 ## v1.25.0 (2026-09-18)
 
 ### Features
