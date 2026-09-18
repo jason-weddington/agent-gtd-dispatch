@@ -1,6 +1,6 @@
 [project]
 name = "agent-gtd-dispatch-protocol"
-version = "0.1.1"
+version = "1.25.1"
 description = "Shared wire-contract schemas for the agent-gtd-dispatch API"
 requires-python = ">=3.12"
 dependencies = [

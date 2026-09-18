@@ -4,7 +4,7 @@ version = "1.25.1"
 description = "Dispatch worker API for Agent GTD — runs headless Claude Code agents on isolated infrastructure"
 requires-python = ">=3.12"
 dependencies = [
-    "agent-gtd-dispatch-protocol",
+    "agent-gtd-dispatch-protocol==1.25.1",
     "anthropic[bedrock]>=0.40",
     "fastapi>=0.115",
     "httpx>=0.27",
@@ -108,11 +108,20 @@ source = ["agent_gtd_dispatch", "agent_gtd_dispatch_protocol"]
 fail_under = 90
 
 [tool.semantic_release]
-version_toml = ["pyproject.toml:project.version"]
+# Both the service and the workspace protocol package are versioned in lockstep:
+# the protocol is not independently useful, it ships with the service, and an
+# unbumped protocol silently strands enum/schema changes on the hosts (2026-09-18).
+version_toml = [
+    "pyproject.toml:project.version",
+    "packages/protocol/pyproject.toml:project.version",
+]
 commit_parser = "conventional"
 changelog_file = "CHANGELOG.md"
 commit_message = "chore(release): {version}"
-build_command = "uv lock && git add uv.lock && uv build"
+# sync-protocol-pin.py runs first: it rewrites the protocol dependency to an
+# EXACT pin on the version just cut, so a host cannot satisfy the requirement
+# with a stale protocol wheel it already has installed.
+build_command = "python scripts/sync-protocol-pin.py && uv lock && git add uv.lock pyproject.toml packages/protocol/pyproject.toml && uv build"
 
 [tool.semantic_release.publish]
 upload_to_vcs_release = false

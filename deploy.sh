@@ -86,12 +86,31 @@ set -euo pipefail
 # -H sets HOME=/home/${SERVICE_USER} so uv installs the tool under the service
 # user's ~/.local (not root's HOME); without it the entry point lands in the
 # wrong place and the systemd ExecStart path is missing.
-sudo -u ${SERVICE_USER} -H /home/${SERVICE_USER}/.local/bin/uv tool install --force agent-gtd-dispatch --index ${DISPATCH_INDEX}
+#
+# --refresh is load-bearing, NOT belt-and-braces: --force reinstalls the tool but
+# resolves against uv's CACHED copy of the simple index, so a wheel published
+# moments earlier by release.sh is invisible and the host silently keeps the
+# version it already had. Observed 2026-09-18: 1.25.1 was on the index and all
+# three hosts stayed on 1.25.0 while this script printed "All hosts deployed".
+sudo -u ${SERVICE_USER} -H /home/${SERVICE_USER}/.local/bin/uv tool install --force --refresh agent-gtd-dispatch --index ${DISPATCH_INDEX}
 
 # Gate: uv tool list must show agent-gtd-dispatch after the install.
 if ! sudo -u ${SERVICE_USER} -H /home/${SERVICE_USER}/.local/bin/uv tool list | grep -q '^agent-gtd-dispatch'; then
     echo "[ERR]  uv tool list does not show agent-gtd-dispatch after install" >&2
     exit 1
+fi
+
+# Gate: when the caller states an expected version, the INSTALLED version must
+# match it. "The service is healthy" says nothing about which code is running —
+# a deploy that installs nothing is otherwise indistinguishable from success.
+if [ -n "${EXPECT_VERSION:-}" ]; then
+    _installed=\$(sudo -u ${SERVICE_USER} -H /home/${SERVICE_USER}/.local/bin/uv tool list \\
+        | sed -n 's/^agent-gtd-dispatch v\\([0-9][0-9.]*\\).*/\\1/p' | head -n1)
+    if [ "\$_installed" != "${EXPECT_VERSION}" ]; then
+        echo "[ERR]  expected agent-gtd-dispatch ${EXPECT_VERSION} but \$_installed is installed" >&2
+        exit 1
+    fi
+    echo "[OK]   agent-gtd-dispatch \$_installed (matches expected)"
 fi
 
 # Refresh the agent user's Claude Code. Headless 'claude -p' runs never

@@ -58,4 +58,7 @@ fi
 ./scripts/publish-wheel.sh "$DISPATCH_WHEEL"
 
 # 4. Roll out to the running fleet from the updated index.
-./deploy.sh
+# Pass the version just cut so deploy.sh can GATE on it: uv resolving a stale
+# cached index would otherwise leave hosts on the previous wheel while this
+# script reported success (observed 2026-09-18 with 1.25.1).
+EXPECT_VERSION="$(uv run python -c 'import tomllib,pathlib;print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')" ./deploy.sh

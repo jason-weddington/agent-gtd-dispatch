@@ -61,7 +61,7 @@ dev = [
 
 [[package]]
 name = "agent-gtd-dispatch-protocol"
-version = "0.1.1"
+version = "1.25.1"
 source = { editable = "packages/protocol" }
 dependencies = [
     { name = "pydantic" },
