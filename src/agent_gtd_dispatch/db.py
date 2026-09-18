@@ -163,6 +163,8 @@ async def _migrate_db(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE runs ADD COLUMN push_results TEXT")
     if "callback_token" not in existing:
         await db.execute("ALTER TABLE runs ADD COLUMN callback_token TEXT")
+    if "completion" not in existing:
+        await db.execute("ALTER TABLE runs ADD COLUMN completion TEXT")
     # Idempotent rename: migrate any legacy 'claude' engine rows to 'claude-code'
     await db.execute("UPDATE runs SET engine = 'claude-code' WHERE engine = 'claude'")
     await db.commit()
@@ -237,6 +239,7 @@ async def update_run(
     workspace_path: str | None = None,
     engine_actual: str | None = None,
     push_results: str | None = None,
+    completion: str | None = None,
 ) -> None:
     """Update fields on an existing run."""
     parts: list[str] = []
@@ -265,6 +268,9 @@ async def update_run(
     if push_results is not None:
         parts.append("push_results = ?")
         values.append(push_results)
+    if completion is not None:
+        parts.append("completion = ?")
+        values.append(completion)
 
     if not parts:
         return
@@ -348,6 +354,14 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         # init_db runs the migration, but keep the read tolerant).
         callback_token = None
 
+    # completion column was added in a post-v1.24 migration; tolerate rows that
+    # pre-date it exactly as callback_token does.
+    completion: str | None
+    try:
+        completion = row["completion"]
+    except (KeyError, IndexError):
+        completion = None
+
     return Run(
         id=row["id"],
         item_id=row["item_id"],
@@ -366,5 +380,6 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         completed_at=_parse_dt(row["completed_at"]),
         exit_code=row["exit_code"],
         error=row["error"],
+        completion=completion,
         created_at=_parse_dt(row["created_at"]) or datetime.now(UTC),
     )

@@ -9,6 +9,23 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from agent_gtd_dispatch import dispatch
+from agent_gtd_dispatch.models import PushStatus, RepoPushStatus
+from tests.completion_fixtures import seed_build_evidence
+
+
+def _pushed_status() -> RepoPushStatus:
+    """A single repo that committed and pushed — the ordinary build outcome."""
+    return RepoPushStatus(
+        repo_name="test",
+        branch="feat/abc-fix",
+        status=PushStatus.pushed,
+        local_sha="aabbccdd",
+        remote_sha="aabbccdd",
+        commits_ahead=2,
+        dirty=False,
+    )
+
 
 @pytest.fixture(autouse=True)
 def _env(tmp_path):
@@ -361,6 +378,9 @@ class TestOllamaFallbackDbUpdate:
             mock_dispatch.prepare_workspace.return_value = tmp_path
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt.return_value = "system prompt"
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
+            mock_dispatch.verify_pushes = MagicMock(return_value=[_pushed_status()])
+            seed_build_evidence(tmp_path)
             mock_dispatch.run_agent = AsyncMock(return_value=mock_result)
             mock_dispatch.cleanup_workspace = MagicMock()
 
@@ -429,6 +449,9 @@ class TestOllamaFallbackCommentFailure:
             mock_dispatch.prepare_workspace.return_value = tmp_path
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt.return_value = "system prompt"
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
+            mock_dispatch.verify_pushes = MagicMock(return_value=[_pushed_status()])
+            seed_build_evidence(tmp_path)
             mock_dispatch.run_agent = AsyncMock(return_value=mock_result)
             mock_dispatch.cleanup_workspace = MagicMock()
 
@@ -493,6 +516,9 @@ class TestAttributionVocabulary:
             mock_dispatch.prepare_workspace.return_value = tmp_path
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt.return_value = "system prompt"
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
+            mock_dispatch.verify_pushes = MagicMock(return_value=[_pushed_status()])
+            seed_build_evidence(tmp_path)
             mock_dispatch.run_agent = AsyncMock(return_value=mock_result)
             mock_dispatch.cleanup_workspace = MagicMock()
 
@@ -544,6 +570,9 @@ class TestAttributionVocabulary:
             mock_dispatch.prepare_workspace.return_value = tmp_path
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt.return_value = "system prompt"
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
+            mock_dispatch.verify_pushes = MagicMock(return_value=[_pushed_status()])
+            seed_build_evidence(tmp_path)
             mock_dispatch.run_agent = AsyncMock(return_value=mock_result)
             mock_dispatch.cleanup_workspace = MagicMock()
 
@@ -599,6 +628,9 @@ class TestAttributionVocabulary:
             mock_dispatch.prepare_workspace.return_value = tmp_path
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt.return_value = "system prompt"
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
+            mock_dispatch.verify_pushes = MagicMock(return_value=[_pushed_status()])
+            seed_build_evidence(tmp_path)
             mock_dispatch.run_agent = AsyncMock(return_value=mock_result)
             mock_dispatch.cleanup_workspace = MagicMock()
 
@@ -648,6 +680,9 @@ class TestAttributionVocabulary:
             mock_dispatch.prepare_workspace.return_value = tmp_path
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt.return_value = "system prompt"
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
+            mock_dispatch.verify_pushes = MagicMock(return_value=[_pushed_status()])
+            seed_build_evidence(tmp_path)
             mock_dispatch.run_agent = AsyncMock(
                 side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=1800)
             )
@@ -702,6 +737,9 @@ class TestAttributionVocabulary:
             mock_dispatch.prepare_workspace.return_value = tmp_path
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt.return_value = "system prompt"
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
+            mock_dispatch.verify_pushes = MagicMock(return_value=[_pushed_status()])
+            seed_build_evidence(tmp_path)
             mock_dispatch.run_agent = AsyncMock(return_value=mock_result)
             mock_dispatch.cleanup_workspace = MagicMock()
 

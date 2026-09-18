@@ -17,6 +17,7 @@ class RunStatus(StrEnum):
     failed = "failed"
     timed_out = "timed_out"
     cancelled = "cancelled"
+    already_satisfied = "already_satisfied"
 
 
 class DispatchMode(StrEnum):
@@ -58,6 +59,7 @@ class RunResponse(BaseModel):
     completed_at: datetime | None
     exit_code: int | None
     error: str | None
+    completion: str | None = None
     created_at: datetime
 
 

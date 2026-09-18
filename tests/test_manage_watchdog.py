@@ -123,6 +123,23 @@ class TestAC1Lifespan:
         # After TestClient exits, lifespan shutdown cancels the task
         assert captured_task.done(), "Watchdog task should be done after shutdown"
 
+    async def test_retention_task_created_on_startup_and_cancelled_on_shutdown(
+        self,
+    ) -> None:
+        """The retention sweep runs alongside the watchdog and dies with it."""
+        from fastapi.testclient import TestClient
+
+        from agent_gtd_dispatch import main
+
+        main._retention_task = None
+
+        with TestClient(main.app):
+            captured = main._retention_task
+            assert captured is not None, "Retention task was not created on startup"
+            assert not captured.done()
+
+        assert captured.done(), "Retention task should be done after shutdown"
+
 
 # ---------------------------------------------------------------------------
 # AC-2: Stale rollout with live subprocess triggers recovery

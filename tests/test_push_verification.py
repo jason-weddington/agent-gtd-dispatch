@@ -8,9 +8,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent_gtd_dispatch import config
+from agent_gtd_dispatch import config, dispatch
 from agent_gtd_dispatch.dispatch import verify_pushes
 from agent_gtd_dispatch.models import PushStatus, RepoPushStatus
+from tests.completion_fixtures import seed_build_evidence
 
 
 @pytest.fixture(autouse=True)
@@ -415,6 +416,7 @@ class TestWorkerVerification:
 
             fake_workspace = tmp_path / "repos-testproj-abc"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -422,6 +424,7 @@ class TestWorkerVerification:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
             mock_dispatch.verify_pushes = MagicMock(return_value=[unpushed_result])
             mock_dispatch.cleanup_workspace = MagicMock()
@@ -504,6 +507,7 @@ class TestWorkerVerification:
 
             fake_workspace = tmp_path / "repos-testproj-def"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaxyz")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -511,6 +515,7 @@ class TestWorkerVerification:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
             mock_dispatch.verify_pushes = MagicMock(return_value=[pushed_result])
             mock_dispatch.cleanup_workspace = MagicMock()
@@ -575,6 +580,7 @@ class TestWorkerVerification:
 
             fake_workspace = tmp_path / "repos-testproj-plan"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaxyz")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -582,6 +588,7 @@ class TestWorkerVerification:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
             mock_dispatch.verify_pushes = MagicMock(return_value=[])
             mock_dispatch.cleanup_workspace = MagicMock()
@@ -664,6 +671,7 @@ class TestWorkerVerification:
 
             fake_workspace = tmp_path / "repos-testproj-timeout"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -671,6 +679,7 @@ class TestWorkerVerification:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(
                 side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=600)
             )
@@ -755,6 +764,7 @@ class TestWorkerVerification:
 
             fake_workspace = tmp_path / "repos-testproj-timeout-unpushed"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -762,6 +772,7 @@ class TestWorkerVerification:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(
                 side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=600)
             )
@@ -832,6 +843,7 @@ class TestWorkerVerification:
 
             fake_workspace = tmp_path / "repos-testproj-plan-timeout"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaxyz")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -839,6 +851,7 @@ class TestWorkerVerification:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(
                 side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=600)
             )
@@ -985,6 +998,7 @@ class TestPushBackstop:
 
             fake_workspace = tmp_path / "repos-testproj-backstop-ok"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -992,6 +1006,7 @@ class TestPushBackstop:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
             mock_dispatch.verify_pushes = MagicMock(
                 side_effect=[[unpushed_result], [pushed_after_backstop]]
@@ -1092,6 +1107,7 @@ class TestPushBackstop:
 
             fake_workspace = tmp_path / "repos-testproj-backstop-fail"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -1099,6 +1115,7 @@ class TestPushBackstop:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
             # Still unpushed both before AND after the backstop attempt.
             mock_dispatch.verify_pushes = MagicMock(
@@ -1193,6 +1210,7 @@ class TestPushBackstop:
 
             fake_workspace = tmp_path / "repos-testproj-backstop-nobudget"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -1200,6 +1218,7 @@ class TestPushBackstop:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
             mock_dispatch.verify_pushes = MagicMock(return_value=[unpushed_result])
             mock_dispatch.push_unpushed_repo = MagicMock(
@@ -1280,6 +1299,7 @@ class TestPushBackstop:
 
             fake_workspace = tmp_path / "repos-testproj-backstop-verifyerr"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -1287,6 +1307,7 @@ class TestPushBackstop:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
             mock_dispatch.verify_pushes = MagicMock(return_value=[verify_error_result])
             mock_dispatch.push_unpushed_repo = MagicMock(

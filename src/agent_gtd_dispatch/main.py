@@ -23,7 +23,17 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
 
-from . import config, db, dispatch, gates, gtd_client, rollout_planner, talos
+from . import (
+    completion,
+    config,
+    db,
+    dispatch,
+    gates,
+    gtd_client,
+    retention,
+    rollout_planner,
+    talos,
+)
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
 from .engines import (
     COMMON_ENV_KEYS,
@@ -130,6 +140,7 @@ _pending_queue: list[_PendingDispatch] = []
 # Watchdog state
 _rollout_to_run: dict[str, Run] = {}  # rollout_id → active manage-mode Run
 _watchdog_task: asyncio.Task[None] | None = None  # handle for clean shutdown
+_retention_task: asyncio.Task[None] | None = None  # handle for clean shutdown
 _watchdog_acted: dict[str, float] = {}  # rollout_id → monotonic() of last action
 
 # rollout_id -> lifetime count of UNCOUNTED (free) manage relaunches granted while
@@ -213,7 +224,7 @@ def _verify_api_key(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Initialize config and DB on startup, cancel tasks on shutdown."""
-    global _watchdog_task
+    global _watchdog_task, _retention_task
     config.load()
     if config.AGENT_SUBPROCESS_USER:
         _check_service_repo()
@@ -226,10 +237,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     else:
         logger.info("No orphaned runs found on startup")
     _watchdog_task = asyncio.create_task(_manage_watchdog())
+    _retention_task = asyncio.create_task(_retention_loop())
     yield
-    # Cancel watchdog and active dispatch tasks on shutdown
+    # Cancel watchdog, retention and active dispatch tasks on shutdown
     if _watchdog_task is not None:
         _watchdog_task.cancel()
+    if _retention_task is not None:
+        _retention_task.cancel()
     for task in _active_processes.values():
         task.cancel()
 
@@ -728,6 +742,21 @@ async def _watchdog_tick() -> None:
                 "Watchdog failed to evaluate rollout %s — continuing", rollout_id
             )
     logger.info("watchdog: tick done rollout_count=%d", count)
+
+
+async def _retention_loop() -> None:
+    """Background coroutine: age-prune workspaces and retained run evidence.
+
+    One bad tick must never kill the loop — same shape as ``_manage_watchdog``.
+    """
+    while True:
+        await asyncio.sleep(config.RETENTION_INTERVAL_SECONDS)
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, retention.prune, frozenset(_active_processes)
+            )
+        except Exception:
+            logger.exception("Retention sweep failed — continuing")
 
 
 async def _manage_watchdog() -> None:
@@ -1360,6 +1389,158 @@ async def _run_talos(
         logger.warning("Failed to post talos outcome comment for run %s", run.id)
 
 
+# --- BUILD-mode completion classification -----------------------------------
+
+# Triage classes for a failed build run.  These are `error`-string PREFIXES, not
+# protocol statuses: the dispatch boundary stays binary and the distinctions live
+# in the message.
+BUILD_FAILURE_PREFIXES: frozenset[str] = frozenset(
+    {
+        "no_result_envelope",
+        "result_is_error",
+        "max_turns_exhausted",
+        "stopped_without_assertion",
+        "agent_reported_blocked",
+        "agent_reported_failed",
+        "done_claim_zero_commits",
+        "already_satisfied_gate_failed",
+        "invariant_zero_commit_success",
+    }
+)
+
+_FAILURE_PREFIX_DETAIL: dict[str, str] = {
+    "no_result_envelope": (
+        "The agent CLI produced no parseable result envelope, so there is no"
+        " evidence the run reached a conclusion."
+    ),
+    "result_is_error": "The agent CLI reported its run ended in error.",
+    "max_turns_exhausted": (
+        "The agent ran out of turns; commits and gate result (if any) are"
+        " recorded — review before re-dispatching."
+    ),
+    "stopped_without_assertion": (
+        "The agent wrote no completion artifact, so it never asserted how its"
+        " run ended."
+    ),
+    "agent_reported_blocked": "The agent reported it was blocked.",
+    "agent_reported_failed": "The agent reported it failed.",
+    "done_claim_zero_commits": (
+        "The agent claimed the work was done but produced zero commits across"
+        " every repo."
+    ),
+    "already_satisfied_gate_failed": (
+        "The agent claimed the work was already satisfied, but the project"
+        " quality gate did not pass on the untouched tree."
+    ),
+    "invariant_zero_commit_success": (
+        "A zero-commit build run was about to be recorded as a success — the"
+        " invariant guard coerced it to failed."
+    ),
+}
+
+
+def build_failure_comment(prefix: str, run_id: str, detail: str = "") -> str:
+    """Return the GTD comment body for a failed build run of triage class ``prefix``.
+
+    The wording is derived from the triage class rather than fixed prose, so a
+    max-turns run is never described as a possible silent failure.
+    """
+    body = f"Build run failed ({prefix}) — run `{run_id}`."
+    canned = _FAILURE_PREFIX_DETAIL.get(prefix)
+    if canned:
+        body += f" {canned}"
+    if detail:
+        body += f"\n\n{detail}"
+    return body
+
+
+def build_completion_blob(
+    *,
+    envelope: completion.ResultEnvelope | None,
+    envelope_verdict: str,
+    artifact: completion.CompletionArtifact | None,
+    artifact_reject_reason: str,
+    zero_commits: bool,
+    gate_decision: str | None,
+    evidence_dir: str,
+) -> str:
+    """Serialize the leg-1/leg-2/leg-3 triple persisted on every build terminal.
+
+    This is the only durable carrier of the CLI envelope on a run whose `error` is
+    NULL, and the only way session_id / num_turns / total_cost_usd survive
+    workspace teardown.
+    """
+    state = completion.artifact_state(artifact, artifact_reject_reason)
+    return json.dumps(
+        {
+            "envelope_verdict": envelope_verdict,
+            "envelope_subtype": envelope.subtype if envelope else None,
+            "is_error": envelope.is_error if envelope else None,
+            "num_turns": envelope.num_turns if envelope else None,
+            "stop_reason": envelope.stop_reason if envelope else None,
+            "session_id": envelope.session_id if envelope else None,
+            "total_cost_usd": envelope.total_cost_usd if envelope else None,
+            "artifact": state,
+            "artifact_reject_reason": (
+                None if artifact_reject_reason == "ok" else artifact_reject_reason
+            ),
+            "disposition": artifact.disposition if artifact else None,
+            "zero_commits": zero_commits,
+            "gate_decision": gate_decision,
+            "evidence_dir": evidence_dir,
+        }
+    )
+
+
+async def _record_build_terminal(
+    run_id: str,
+    *,
+    status: RunStatus,
+    push_results_list: list[RepoPushStatus] | None,
+    disposition: str | None = None,
+    envelope_verdict: str | None = None,
+    completed_at: str | None = None,
+    exit_code: int | None = None,
+    error: str | None = None,
+    push_results: str | None = None,
+    completion_blob: str | None = None,
+) -> RunStatus:
+    """Persist a BUILD-mode terminal status through the single invariant choke point.
+
+    The rule this enforces — a zero-commit build run is never a success — already
+    regressed once when an agent re-decided it during a port, and the regression
+    was invisible for weeks.  Construction-time discipline is not enough, so the
+    check runs at runtime immediately before every terminal write and COERCES a
+    violating status rather than trusting the caller.
+    """
+    if (
+        status == RunStatus.succeeded
+        and push_results_list is not None
+        and dispatch.is_zero_commits_run(push_results_list)
+    ):
+        logger.error(
+            "INVARIANT VIOLATION: zero-commit build run about to be recorded"
+            " succeeded run_id=%s disposition=%s envelope_verdict=%s",
+            run_id,
+            disposition,
+            envelope_verdict,
+        )
+        status = RunStatus.failed
+        error = "invariant_zero_commit_success: " + (
+            error or "zero-commit build run reached the success path"
+        )
+    await db.update_run(
+        run_id,
+        status=status,
+        completed_at=completed_at,
+        exit_code=exit_code,
+        error=error,
+        push_results=push_results,
+        completion=completion_blob,
+    )
+    return status
+
+
 async def _dispatch_worker(
     run: Run,
     max_turns: int,
@@ -1425,6 +1606,12 @@ async def _dispatch_worker(
 
     mode = run.mode
     workspace = None
+    # For BUILD mode: list of (repo_name, repo_path, base_sha) passed to
+    # verify_pushes after the agent exits.  None means skip verification
+    # (manage/plan mode or exceptions during workspace prep).  Declared before
+    # the try so the teardown `finally` can capture evidence on every path,
+    # including ones that raise before workspace prep finishes.
+    _verify_repos: list[tuple[str, Path, str]] | None = None
     # For manage mode: preserve workspace on failure for debugging.
     # For build/plan mode: always clean up.
     should_cleanup = True
@@ -1523,10 +1710,6 @@ async def _dispatch_worker(
         # Build workspace
         is_workspace_mode = (project.get("repo_mode") or "") == "workspace"
         workspace_repo_dirs: list[str] | None = None
-        # For BUILD mode: list of (repo_name, repo_path, base_sha) passed to
-        # verify_pushes after the agent exits.  None means skip verification
-        # (manage/plan mode or exceptions during workspace prep).
-        _verify_repos: list[tuple[str, Path, str]] | None = None
         workspace_repos: list[str]
 
         if mode == DispatchMode.MANAGE:
@@ -1743,6 +1926,7 @@ async def _dispatch_worker(
             manage_retry_count=manage_retry_count,
             workspace_repo_dirs=workspace_repo_dirs,
             is_recovery=is_recovery,
+            workspace=workspace,
         )
 
         item_title = item.get("title", f"rollout:{run.rollout_id}")
@@ -1856,7 +2040,75 @@ async def _dispatch_worker(
             _gate_cmd: str = ""
             _gate_result: dispatch.GateResult | None = None
             _stashed_names: list[str] = []
+            _envelope: completion.ResultEnvelope | None = None
+            _verdict = "no_result_envelope"
+            _artifact: completion.CompletionArtifact | None = None
+            _artifact_reason = "absent"
+            _evidence_dir = str(retention.evidence_dir(run.id))
             if _verify_repos is not None:
+                # Leg 1 — the CLI's own result envelope, from the merged-stream
+                # transcript.  Leg 2 — the agent's completion artifact.  Both are
+                # read BEFORE any terminal so every build path can persist them.
+                if workspace is not None:
+                    _envelope = completion.parse_result_envelope(
+                        workspace / "transcript.txt"
+                    )
+                    _artifact, _artifact_reason = completion.read_completion_artifact(
+                        workspace
+                    )
+                    completion.log_artifact_rejection(
+                        run.id, workspace, _artifact_reason
+                    )
+                _verdict = completion.envelope_verdict(_envelope)
+
+                def _build_completion(
+                    outcome: str, gate_decision: str | None = None
+                ) -> str:
+                    """Log the one structured decision line and return the blob.
+
+                    Called immediately before every BUILD terminal write so the
+                    branch taken and the three leg inputs that drove it are both
+                    greppable in the journal and durable on the run row.
+                    """
+                    _results = push_results_list or []
+                    _zero = dispatch.is_zero_commits_run(_results)
+                    _pushed = sum(
+                        1 for _r in _results if _r.status == PushStatus.pushed
+                    )
+                    blob = build_completion_blob(
+                        envelope=_envelope,
+                        envelope_verdict=_verdict,
+                        artifact=_artifact,
+                        artifact_reject_reason=_artifact_reason,
+                        zero_commits=_zero,
+                        gate_decision=gate_decision,
+                        evidence_dir=_evidence_dir,
+                    )
+                    logger.info(
+                        "build completion: run_id=%s outcome=%s envelope_verdict=%s"
+                        " envelope_subtype=%s is_error=%s num_turns=%s"
+                        " stop_reason=%s session_id=%s total_cost_usd=%s"
+                        " artifact=%s artifact_reject_reason=%s disposition=%s"
+                        " zero_commits=%s pushed_repos=%d gate_decision=%s engine=%s",
+                        run.id,
+                        outcome,
+                        _verdict,
+                        _envelope.subtype if _envelope else None,
+                        _envelope.is_error if _envelope else None,
+                        _envelope.num_turns if _envelope else None,
+                        _envelope.stop_reason if _envelope else None,
+                        _envelope.session_id if _envelope else None,
+                        _envelope.total_cost_usd if _envelope else None,
+                        completion.artifact_state(_artifact, _artifact_reason),
+                        None if _artifact_reason == "ok" else _artifact_reason,
+                        _artifact.disposition if _artifact else None,
+                        _zero,
+                        _pushed,
+                        gate_decision,
+                        engine_used.name,
+                    )
+                    return blob
+
                 push_results_list = dispatch.verify_pushes(
                     _verify_repos, run.branch_name or ""
                 )
@@ -1947,6 +2199,7 @@ async def _dispatch_worker(
                         exit_code=result.returncode,
                         error=error_str,
                         push_results=_push_results_json,
+                        completion=_build_completion("failed"),
                     )
                     _publish_run_event(run.id, "failed", completed)
                     should_cleanup = (
@@ -1986,78 +2239,72 @@ async def _dispatch_worker(
                         )
                     return  # exit early — do not mark succeeded
 
-                # Zero-commits guard: all repos idle → may be a silent no-op.
-                # Distinguish intentional no-op (agent posted an explanatory
-                # comment) from a silent failure (agent exited without doing
-                # anything) by counting comments posted since this run started.
-                # Rule: ≥2 comments since run start = dispatch comment + ≥1
-                # agent comment → intentional no-op → pass.  <2 = silent
-                # failure → fail.
-                _all_no_changes = (
-                    isinstance(push_results_list, list)
-                    and bool(push_results_list)
-                    and all(
-                        r.status == PushStatus.no_changes for r in push_results_list
+                # --- BUILD terminal classification -------------------------
+                # Precedence is fixed: envelope verdict, then the presence of the
+                # agent's completion artifact, then what that artifact asserts.
+                # There is NO escape hatch on `done` — a zero-commit build run is
+                # never a success.
+                _zero_commits = dispatch.is_zero_commits_run(push_results_list)
+                _disposition = _artifact.disposition if _artifact else None
+                _already_satisfied_path = False
+                _failure_prefix: str | None = None
+
+                if _verdict != "ok":
+                    _failure_prefix = _verdict
+                elif _artifact is None:
+                    _failure_prefix = "stopped_without_assertion"
+                elif _disposition in {"blocked", "failed"}:
+                    _failure_prefix = f"agent_reported_{_disposition}"
+                elif _disposition == "done" and _zero_commits:
+                    _failure_prefix = "done_claim_zero_commits"
+                elif _disposition == "already_satisfied" and _zero_commits:
+                    _already_satisfied_path = True
+
+                if _failure_prefix is not None:
+                    _detail_parts: list[str] = []
+                    if _artifact is not None and _artifact.summary.strip():
+                        _detail_parts.append(_artifact.summary.strip())
+                    if _artifact is not None and _artifact.decision_needed.strip():
+                        _detail_parts.append(
+                            f"Decision needed: {_artifact.decision_needed.strip()}"
+                        )
+                    if _artifact is None and _artifact_reason not in {"ok", "absent"}:
+                        _detail_parts.append(
+                            f"Completion artifact rejected: {_artifact_reason}."
+                        )
+                    _detail = "\n\n".join(_detail_parts)
+                    error_str = f"{_failure_prefix}: " + (
+                        _detail.replace("\n", " ")
+                        if _detail
+                        else "build run did not assert a usable completion"
                     )
-                )
-                if _all_no_changes:
-                    _is_intentional_noop = False
+                    _push_results_json = json.dumps(
+                        [r.model_dump(mode="json") for r in push_results_list]
+                    )
+                    await db.update_run(
+                        run.id,
+                        status=RunStatus.failed,
+                        completed_at=completed,
+                        exit_code=result.returncode,
+                        error=error_str[:500],
+                        push_results=_push_results_json,
+                        completion=_build_completion("failed"),
+                    )
+                    _publish_run_event(run.id, "failed", completed)
                     if run.item_id is not None:
                         try:
-                            _comments = await gtd_client.list_comments(
-                                run.item_id, token=run.callback_token
+                            await gtd_client.post_comment(
+                                run.item_id,
+                                build_failure_comment(_failure_prefix, run.id, _detail),
+                                created_by=attribution or "agent-gtd-dispatch",
+                                token=run.callback_token,
                             )
-                            _post_start = [
-                                c
-                                for c in _comments
-                                if datetime.fromisoformat(
-                                    c.get("created_at", "1970-01-01T00:00:00+00:00")
-                                )
-                                >= _run_start_dt
-                            ]
-                            _is_intentional_noop = len(_post_start) >= 2
                         except Exception:
                             logger.warning(
-                                "Zero-commits guard: list_comments failed for run %s"
-                                " — treating as silent failure",
+                                "Failed to post build-failure comment for run %s",
                                 run.id,
                             )
-                    if not _is_intentional_noop:
-                        _push_results_json = json.dumps(
-                            [r.model_dump(mode="json") for r in push_results_list]
-                        )
-                        error_str = (
-                            "build run produced zero commits across all repos"
-                            " and pushed no branch"
-                        )
-                        await db.update_run(
-                            run.id,
-                            status=RunStatus.failed,
-                            completed_at=completed,
-                            exit_code=result.returncode,
-                            error=error_str,
-                            push_results=_push_results_json,
-                        )
-                        _publish_run_event(run.id, "failed", completed)
-                        if run.item_id is not None:
-                            try:
-                                await gtd_client.post_comment(
-                                    run.item_id,
-                                    (
-                                        f"Build run produced no commits"
-                                        f" (run `{run.id}`). The agent exited"
-                                        " cleanly but made no changes — possible"
-                                        " silent failure. Check the transcript."
-                                    ),
-                                    created_by=attribution or "agent-gtd-dispatch",
-                                    token=run.callback_token,
-                                )
-                            except Exception:
-                                logger.warning(
-                                    "Failed to post zero-commits comment for run %s",
-                                    run.id,
-                                )
-                        return  # exit early — do not mark succeeded
+                    return  # exit early — do not mark succeeded
 
                 # Post-run gate: run the project's quality gate (non-talos build
                 # runs only) after push verification has succeeded, so a hook
@@ -2074,7 +2321,10 @@ async def _dispatch_worker(
                 _gate_timed_out: bool | None = None
                 _gate_duration: float | None = None
 
-                if _n_pushed == 0:
+                # The zero-pushed-repo short-circuit is conditional: on the
+                # already_satisfied path the gate MUST run even though nothing was
+                # pushed — a no-op claim on a RED repo is a failure, never a skip.
+                if _n_pushed == 0 and not _already_satisfied_path:
                     decision = "skipped_no_pushed_repo"
                 elif not _gate_cmd:
                     decision = "skipped_no_gate_command"
@@ -2157,6 +2407,9 @@ async def _dispatch_worker(
                     else:  # launch_error
                         error_str = "post-run gate failed: launch error"
 
+                    if _already_satisfied_path:
+                        error_str = f"already_satisfied_gate_failed: {error_str}"
+
                     _push_results_json = json.dumps(
                         [r.model_dump(mode="json") for r in push_results_list]
                     )
@@ -2167,6 +2420,7 @@ async def _dispatch_worker(
                         exit_code=result.returncode,
                         error=error_str,
                         push_results=_push_results_json,
+                        completion=_build_completion("failed", decision),
                     )
                     _publish_run_event(run.id, "failed", completed)
                     logger.warning(
@@ -2211,6 +2465,14 @@ async def _dispatch_worker(
                                 f" `{run.branch_name}` was pushed but was not"
                                 " gate-verified."
                             )
+                        if _already_satisfied_path:
+                            _gate_first_line = (
+                                "Build run failed (already_satisfied_gate_failed)"
+                                f" — run `{run.id}`. The agent claimed the work was"
+                                " already satisfied, but the project quality gate"
+                                " did not pass on the untouched tree.\n\n"
+                                + _gate_first_line
+                            )
                         _gate_comment = (
                             _gate_first_line
                             + "\n\nGate output (tail):\n\n````\n"
@@ -2239,19 +2501,102 @@ async def _dispatch_worker(
                             )
                     return  # exit early — do not mark succeeded
 
-            # All pushed (or no BUILD verification needed) — mark succeeded
             if push_results_list is not None:
                 _push_results_json = json.dumps(
                     [r.model_dump(mode="json") for r in push_results_list]
                 )
-            await db.update_run(
-                run.id,
-                status=RunStatus.succeeded,
-                completed_at=completed,
-                exit_code=result.returncode,
-                push_results=_push_results_json,
-            )
-            _publish_run_event(run.id, "succeeded", completed)
+
+            if _verify_repos is not None and _already_satisfied_path:
+                # The agent asserted the work was already done, produced zero
+                # commits, and the project gate is green or absent.  Terminal is
+                # `already_satisfied` — never `succeeded` (the invariant) and
+                # never `failed` (that would recreate a re-dispatch loop).
+                assert _artifact is not None  # noqa: S101
+                _as_reason = _artifact.reason.strip()
+                await db.update_run(
+                    run.id,
+                    status=RunStatus.already_satisfied,
+                    completed_at=completed,
+                    exit_code=result.returncode,
+                    error=f"already_satisfied: {_as_reason}"[:500],
+                    push_results=_push_results_json,
+                    completion=_build_completion("already_satisfied", decision),
+                )
+                _publish_run_event(run.id, "already_satisfied", completed)
+                if run.item_id is not None:
+                    # Status-set is deliberately tolerant: a PATCH failure does
+                    # NOT flip the run status (mirrors the talos paths).
+                    try:
+                        await gtd_client.set_item_status(
+                            run.item_id, "review", token=run.callback_token
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to set item %s status=review (run %s) —"
+                            " run stays already_satisfied",
+                            run.item_id,
+                            run.id,
+                        )
+                    try:
+                        await gtd_client.post_comment(
+                            run.item_id,
+                            (
+                                f"Build run `{run.id}` made no changes: the agent"
+                                " reported the acceptance criteria are already"
+                                f" satisfied.\n\nReason: {_as_reason}\n\n"
+                                f"Quality gate: {decision}. The item is moved to"
+                                " review for a human — it was NOT completed."
+                            ),
+                            created_by=attribution or "agent-gtd-dispatch",
+                            token=run.callback_token,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to post already-satisfied comment for run %s",
+                            run.id,
+                        )
+                return
+
+            # All pushed (or no BUILD verification needed) — mark succeeded
+            if _verify_repos is not None:
+                _final_status = await _record_build_terminal(
+                    run.id,
+                    status=RunStatus.succeeded,
+                    push_results_list=push_results_list,
+                    disposition=_disposition,
+                    envelope_verdict=_verdict,
+                    completed_at=completed,
+                    exit_code=result.returncode,
+                    push_results=_push_results_json,
+                    completion_blob=_build_completion("succeeded", decision),
+                )
+                _publish_run_event(run.id, _final_status.value, completed)
+                if _final_status is not RunStatus.succeeded:
+                    if run.item_id is not None:
+                        try:
+                            await gtd_client.post_comment(
+                                run.item_id,
+                                build_failure_comment(
+                                    "invariant_zero_commit_success", run.id
+                                ),
+                                created_by=attribution or "agent-gtd-dispatch",
+                                token=run.callback_token,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to post invariant-violation comment for run %s",
+                                run.id,
+                            )
+                    return
+            else:
+                await db.update_run(
+                    run.id,
+                    status=RunStatus.succeeded,
+                    completed_at=completed,
+                    exit_code=result.returncode,
+                    push_results=_push_results_json,
+                )
+                _publish_run_event(run.id, "succeeded", completed)
             if _rescued_repos and run.item_id is not None:
                 _rescue_header = (
                     f"Push verification found unpushed work after the agent"
@@ -2303,11 +2648,19 @@ async def _dispatch_worker(
                         run.id,
                     )
         else:
-            # Derive error snippet from transcript (stdout/stderr are always "" with Popen streaming)
+            # Derive error snippet from the transcript (stdout/stderr are always
+            # "" with Popen streaming).  With --output-format json the raw tail is
+            # a truncated mid-object JSON fragment, so prefer the parsed result
+            # envelope and fall back to the raw tail only when there isn't one.
             error_msg = None
             if workspace is not None:
                 transcript_path = workspace / "transcript.txt"
-                if transcript_path.exists():
+                _exit_envelope = completion.parse_result_envelope(transcript_path)
+                if _exit_envelope is not None:
+                    error_msg = (
+                        f"{_exit_envelope.subtype}: {_exit_envelope.result or ''}"
+                    )[:500]
+                elif transcript_path.exists():
                     raw = transcript_path.read_bytes()
                     if raw:
                         error_msg = raw[-500:].decode("utf-8", errors="replace")
@@ -2350,14 +2703,15 @@ async def _dispatch_worker(
                 _push_results_json = json.dumps(
                     [r.model_dump(mode="json") for r in push_results_list]
                 )
-                await db.update_run(
+                _linger_status = await _record_build_terminal(
                     run.id,
                     status=RunStatus.succeeded,
+                    push_results_list=push_results_list,
                     completed_at=_timed_out_at,
                     push_results=_push_results_json,
                 )
-                _publish_run_event(run.id, "succeeded", _timed_out_at)
-                if run.item_id is not None:
+                _publish_run_event(run.id, _linger_status.value, _timed_out_at)
+                if run.item_id is not None and _linger_status is RunStatus.succeeded:
                     await gtd_client.post_comment(
                         run.item_id,
                         f"Agent exceeded the {timeout_seconds // 60}-minute wall-clock "
@@ -2418,6 +2772,17 @@ async def _dispatch_worker(
                 _exit_code,
                 _human_cancelled,
             )
+        # Evidence capture is verdict-free and runs on EVERY terminal path —
+        # success, gate failure, push-verification failure, zero-commit, agent
+        # non-zero exit, timeout, cancellation and the generic exception — and
+        # always BEFORE the workspace is torn down.
+        _evidence_repos: list[tuple[str, Path, str | None]] = [
+            (_n, _p, _b) for _n, _p, _b in (_verify_repos or [])
+        ]
+        try:
+            retention.capture_evidence(run.id, workspace, _evidence_repos)
+        except Exception:
+            logger.exception("evidence capture raised for run %s — continuing", run.id)
         if workspace is not None and should_cleanup:
             dispatch.cleanup_workspace(workspace)
         if run.mode == DispatchMode.MANAGE and run.rollout_id and not _human_cancelled:
@@ -2926,6 +3291,7 @@ async def cancel_run(
         RunStatus.failed,
         RunStatus.timed_out,
         RunStatus.cancelled,
+        RunStatus.already_satisfied,
     }
     if run.status in _terminal:
         return RunResponse(**run.model_dump())

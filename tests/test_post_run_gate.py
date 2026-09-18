@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 import time
-from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,6 +21,7 @@ from agent_gtd_dispatch.models import (
     RepoPushStatus,
     Run,
 )
+from tests.completion_fixtures import seed_build_evidence, write_artifact
 
 
 @pytest.fixture(autouse=True)
@@ -352,7 +353,9 @@ class TestBuildGateSectionPrompt:
     def test_gate_section_contents(self) -> None:
         item = {"id": "item1"}
         project = {"name": "P", "gate_command": "make gate"}
-        prompt = dispatch._build_build_prompt(item, project, "feat/x", 50)
+        prompt = dispatch._build_build_prompt(
+            item, project, "feat/x", 50, workspace=Path("/ws")
+        )
         assert "## Quality Gate" in prompt
         assert "make gate" in prompt
         assert "the dispatch worker re-runs this exact command" in prompt
@@ -361,7 +364,12 @@ class TestBuildGateSectionPrompt:
         item = {"id": "item1"}
         project = {"name": "P", "gate_command": "make gate"}
         prompt = dispatch._build_build_prompt(
-            item, project, "feat/x", 50, workspace_repo_dirs=["a", "b"]
+            item,
+            project,
+            "feat/x",
+            50,
+            workspace=Path("/ws"),
+            workspace_repo_dirs=["a", "b"],
         )
         assert "from the workspace root" in prompt
 
@@ -370,9 +378,11 @@ class TestBuildGateSectionPrompt:
         item = {"id": "item1"}
         project_with = {"name": "P", "gate_command": gate_command}
         project_without = {"name": "P"}
-        prompt_with = dispatch._build_build_prompt(item, project_with, "feat/x", 50)
+        prompt_with = dispatch._build_build_prompt(
+            item, project_with, "feat/x", 50, workspace=Path("/ws")
+        )
         prompt_without = dispatch._build_build_prompt(
-            item, project_without, "feat/x", 50
+            item, project_without, "feat/x", 50, workspace=Path("/ws")
         )
         assert prompt_with == prompt_without
         assert "## Quality Gate" not in prompt_with
@@ -477,7 +487,17 @@ def _no_changes(repo_name="repos-testproj", branch="feat/x"):
     )
 
 
-def _install_common_mocks(mock_gtd, mock_dispatch, *, item_id, project, fake_workspace):
+def _install_common_mocks(
+    mock_gtd,
+    mock_dispatch,
+    *,
+    item_id,
+    project,
+    fake_workspace,
+    disposition="done",
+):
+    seed_build_evidence(fake_workspace, disposition)
+    mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
     mock_gtd.get_item = AsyncMock(
         return_value={"id": item_id, "title": "T", "project_id": "proj1"}
     )
@@ -902,27 +922,28 @@ class TestWorkerPostRunGate:
         assert updated.error.startswith("push verification failed")
         mock_dispatch.run_gate_command.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_all_no_changes_intentional_noop_skips_gate(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    async def _run_already_satisfied(
+        self,
+        tmp_path,
+        caplog,
+        *,
+        gate_result,
+        project,
+        item_id,
+    ):
         from agent_gtd_dispatch.main import _dispatch_worker
 
         await db.init_db()
         run = Run(
-            item_id="item-f",
+            item_id=item_id,
             project_name="TestProject",
             branch_name="feat/f",
             mode=DispatchMode.BUILD,
         )
         await db.insert_run(run)
 
-        fake_workspace = tmp_path / "repos-testproj-f"
+        fake_workspace = tmp_path / f"repos-testproj-{item_id}"
         fake_workspace.mkdir()
-
-        async def _list_comments_now(*args, **kwargs):
-            now_iso = datetime.now(UTC).isoformat()
-            return [{"created_at": now_iso}, {"created_at": now_iso}]
 
         with (
             patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
@@ -932,26 +953,117 @@ class TestWorkerPostRunGate:
             _install_common_mocks(
                 mock_gtd,
                 mock_dispatch,
-                item_id="item-f",
-                project=_default_project(),
+                item_id=item_id,
+                project=project,
                 fake_workspace=fake_workspace,
             )
-            mock_gtd.list_comments = AsyncMock(side_effect=_list_comments_now)
+            write_artifact(
+                fake_workspace,
+                "already_satisfied",
+                reason="ALREADY THERE at foo.py:12",
+            )
+            mock_gtd.set_item_status = AsyncMock()
+            mock_gtd.complete_item = AsyncMock()
             mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
             mock_dispatch.verify_pushes = MagicMock(
                 return_value=[_no_changes(branch="feat/f")]
             )
-            mock_dispatch.run_gate_command = MagicMock()
+            mock_dispatch.run_gate_command = MagicMock(return_value=gate_result)
 
             await _dispatch_worker(run, 50, CLAUDE, 600)
 
         updated = await db.get_run(run.id)
         assert updated is not None
-        assert updated.status.value == "succeeded"
+        return updated, mock_gtd, mock_dispatch
+
+    @pytest.mark.asyncio
+    async def test_already_satisfied_runs_gate_and_lands_already_satisfied(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        gate_result = GateResult(
+            returncode=0, timed_out=False, output="ok", duration_seconds=2.0
+        )
+        updated, mock_gtd, mock_dispatch = await self._run_already_satisfied(
+            tmp_path,
+            caplog,
+            gate_result=gate_result,
+            project=_default_project(),
+            item_id="item-f",
+        )
+        # The gate RUNS even though zero repos were pushed.
+        mock_dispatch.run_gate_command.assert_called_once()
+        assert "decision=skipped_no_pushed_repo" not in caplog.text
+        assert updated.status.value == "already_satisfied"
+        assert updated.error is not None
+        assert updated.error.startswith("already_satisfied: ")
+        assert "ALREADY THERE at foo.py:12" in updated.error
+        assert updated.push_results is not None
+        assert "outcome=already_satisfied" in caplog.text
+        assert "gate_decision=passed" in caplog.text
+        mock_gtd.set_item_status.assert_awaited_once()
+        assert mock_gtd.set_item_status.await_args.args[:2] == ("item-f", "review")
+        mock_gtd.complete_item.assert_not_called()
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any("already satisfied" in b for b in bodies)
+        assert any("ALREADY THERE at foo.py:12" in b for b in bodies)
+
+    @pytest.mark.asyncio
+    async def test_already_satisfied_red_gate_fails_run(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        gate_result = GateResult(
+            returncode=1, timed_out=False, output="boom", duration_seconds=2.0
+        )
+        updated, mock_gtd, _ = await self._run_already_satisfied(
+            tmp_path,
+            caplog,
+            gate_result=gate_result,
+            project=_default_project(),
+            item_id="item-g",
+        )
+        assert updated.status.value == "failed"
+        assert updated.error is not None
+        assert updated.error.startswith("already_satisfied_gate_failed: ")
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any(
+            "Build run failed (already_satisfied_gate_failed)" in b for b in bodies
+        )
+
+    @pytest.mark.asyncio
+    async def test_already_satisfied_gate_timeout_fails_run(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        gate_result = GateResult(
+            returncode=124, timed_out=True, output="slow", duration_seconds=600.0
+        )
+        updated, _mock_gtd, _ = await self._run_already_satisfied(
+            tmp_path,
+            caplog,
+            gate_result=gate_result,
+            project=_default_project(),
+            item_id="item-h",
+        )
+        assert updated.status.value == "failed"
+        assert updated.error is not None
+        assert updated.error.startswith("already_satisfied_gate_failed: ")
+        assert "timed out" in updated.error
+
+    @pytest.mark.asyncio
+    async def test_already_satisfied_without_gate_command_still_terminal(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        updated, mock_gtd, mock_dispatch = await self._run_already_satisfied(
+            tmp_path,
+            caplog,
+            gate_result=None,
+            project=_default_project(gate_command=""),
+            item_id="item-i",
+        )
         mock_dispatch.run_gate_command.assert_not_called()
-        comment_texts = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert not any("Post-run gate" in t for t in comment_texts)
-        assert "decision=skipped_no_pushed_repo" in caplog.text
+        assert updated.status.value == "already_satisfied"
+        assert "gate_decision=skipped_no_gate_command" in caplog.text
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any("skipped_no_gate_command" in b for b in bodies)
 
     @pytest.mark.asyncio
     async def test_plan_mode_skips_gate(self, tmp_path) -> None:
@@ -1239,6 +1351,8 @@ class TestWorkerPostRunGate:
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
             mock_dispatch.cleanup_workspace = MagicMock()
             mock_dispatch._executor = None
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
+            seed_build_evidence(fake_ws_root)
             mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
             mock_dispatch.verify_pushes = MagicMock(
                 return_value=[_pushed(repo_name="repo_a", branch="feat/l")]

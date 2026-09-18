@@ -27,6 +27,15 @@ AGENT_GTD_API_KEY: str = ""
 WORKSPACE_ROOT: Path = Path.home() / "workspace"
 AGENT_SUBPROCESS_USER: str = ""
 
+# Retention — the decay-rate split.
+# Evidence (transcript, completion artifact, patch) is small and stays useful for
+# months; the workspace TREE is hundreds of MB to GB (full clones plus target/,
+# node_modules/, .venv) and its value decays in a day or two.
+EVIDENCE_ROOT: Path = Path.home() / "run-evidence"
+EVIDENCE_RETENTION_DAYS: int = 30
+WORKSPACE_RETENTION_HOURS: int = 48
+RETENTION_INTERVAL_SECONDS: int = 3600
+
 # Agent limits
 MAX_TURNS: int = 100
 TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
@@ -126,6 +135,8 @@ def load() -> None:
     global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
     global PLANNER_PROVIDER, PLANNER_BEDROCK_MODEL, AWS_REGION
     global MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS, MAX_MANAGE_FREE_RELAUNCHES
+    global EVIDENCE_ROOT, EVIDENCE_RETENTION_DAYS, WORKSPACE_RETENTION_HOURS
+    global RETENTION_INTERVAL_SECONDS
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
@@ -153,6 +164,20 @@ def load() -> None:
         WORKSPACE_ROOT = Path.home().parent / AGENT_SUBPROCESS_USER / "workspace"
     else:
         WORKSPACE_ROOT = Path.home() / "workspace"
+    _evidence_env = os.environ.get("DISPATCH_EVIDENCE_ROOT", "")
+    if _evidence_env:
+        EVIDENCE_ROOT = Path(_evidence_env)
+    else:
+        EVIDENCE_ROOT = WORKSPACE_ROOT.parent / "run-evidence"
+    EVIDENCE_RETENTION_DAYS = int(
+        os.environ.get("DISPATCH_EVIDENCE_RETENTION_DAYS", "30")
+    )
+    WORKSPACE_RETENTION_HOURS = int(
+        os.environ.get("DISPATCH_WORKSPACE_RETENTION_HOURS", "48")
+    )
+    RETENTION_INTERVAL_SECONDS = int(
+        os.environ.get("DISPATCH_RETENTION_INTERVAL_SECONDS", "3600")
+    )
     MAX_TURNS = int(os.environ.get("DISPATCH_MAX_TURNS", "100"))
     TIMEOUT_SECONDS = int(os.environ.get("DISPATCH_TIMEOUT_SECONDS", "1800"))
     MANAGE_TIMEOUT_SECONDS = int(

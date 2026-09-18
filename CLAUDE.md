@@ -33,6 +33,9 @@ src/agent_gtd_dispatch/
   engines.py             # Per-engine CLI command builders + env filtering (claude, kiro, ...)
   gates.py               # Pre-launch per-repo gate install: hook-manager detection, .agent-gtd/setup override, live-hook verification
   gtd_client.py          # HTTP client for the Agent GTD API (items, projects, comments)
+  completion.py          # Build completion evidence: CLI result-envelope parsing
+                         #   (leg 1) and the agent completion artifact (leg 2)
+  retention.py           # Verdict-free evidence capture + age-based pruning
   config.py              # Env-var config with load() — shared service config only
   agent_discovery.py     # /agents endpoint backing — runs list_agents.sh
   rollout_planner.py     # POST /plan — in-process Anthropic call that builds rollout DAGs
@@ -58,6 +61,36 @@ tests/
 - **Test style**: `from __future__ import annotations`, test classes with `Test` prefix, `-> None` on methods, docstrings on source but not tests (D rules suppressed for `tests/**`).
 - **Attribution**: `POST /dispatch` accepts `attribution: str | None`. When set, the spawned agent subprocess gets `AGENT_GTD_AGENT_NAME=<attribution>` in its env, so it posts GTD comments under that identity (e.g. `claude-build-abc12345`) rather than the default lead.
 - **Workspace dispatch & push verification**: when the GTD project carries a `workspace_repos` list, `dispatch.py` prepares a multi-repo workspace (`prepare_workspace_multi` / `prepare_manage_workspace_multi`) with service-side branch creation, and verifies pushes service-side after the run (`dispatch.verify_pushes`, `PushStatus`/`RepoPushStatus` in `models.py`).
+
+## Build completion contract
+
+A BUILD run's terminal comes from three independent legs. None of them is "did the agent post a comment" — that heuristic counted the worker's own dispatch comment plus the agent's first `Implementing...` progress comment, so it was permanently open and recorded dead runs as successes.
+
+Leg 1 is the CLI's own result envelope. Every claude-code argv builder emits `--output-format json` immediately before `--print`, so the transcript ends with a `{"type":"result",...}` object. `completion.parse_result_envelope` brace-scans the last 1 MiB of the transcript (stderr is merged into the same file, so `json.loads` on the whole file cannot work) and returns the LAST parseable result object. `completion.envelope_verdict` classifies it as `ok` / `no_result_envelope` / `result_is_error` / `max_turns_exhausted`.
+
+The max-turns branch is evaluated BEFORE the `is_error` branch, and keys on `subtype == "error_max_turns"` OR `terminal_reason == "max_turns"` — never on `stop_reason`. A real exhausted envelope carries `is_error=True` and `stop_reason='tool_use'`, so both of those are load-bearing, not style.
+
+Leg 2 is the agent-authored artifact at the fixed absolute path `<workspace>/.dispatch/completion.json`. `completion.read_completion_artifact` returns `(artifact, reason_literal)` and rejects with an explicit literal (`absent`, `not_json`, `not_object`, `unknown_schema_version`, `unknown_disposition`, `missing_reason`, `missing_decision_needed`, `oversize`, `ambiguous_location`) so telemetry distinguishes malformed from absent while the terminal stays binary. The build prompt interpolates the ABSOLUTE path because the build steps tell the agent to `cd` into a repo directory; as belt-and-braces the reader also accepts exactly one `*/.dispatch/completion.json` hit under the workspace.
+
+Leg 3 is the invariant: a zero-commit BUILD run is never `succeeded`. `main._record_build_terminal` is the single choke point in front of every terminal write and coerces a violating status to `failed` with an `invariant_zero_commit_success:` prefix plus an `INVARIANT VIOLATION` ERROR log. This is a runtime tripwire, not a construction-time convention, because the rule already regressed once during a port and stayed invisible for weeks.
+
+The only non-failure zero-commit outcome is the `already_satisfied` terminal: artifact present with `disposition: already_satisfied` and a non-empty `reason`, zero commits, and a gate that did not fail. On that path the post-run gate RUNS despite zero pushed repos (a no-op claim on a red repo is a failure), the worker sets the item to `review` best-effort, and the item is never completed. An ungated project records `gate=skipped_no_gate_command` and still lands `already_satisfied`.
+
+Triage classes live in `error`-string prefixes, never in new protocol members: `no_result_envelope`, `result_is_error`, `max_turns_exhausted`, `stopped_without_assertion`, `agent_reported_blocked`, `agent_reported_failed`, `done_claim_zero_commits`, `already_satisfied_gate_failed`, `invariant_zero_commit_success`. `RunStatus` gained exactly one member, `already_satisfied`.
+
+Every build terminal logs one `build completion:` key=value line and persists the same triple into the runs table's nullable `completion` column — the only durable carrier on a succeeded run, where `error` is NULL.
+
+## Retention
+
+`retention.py` is deliberately verdict-free: no function in it accepts, reads, or branches on a `RunStatus`, a gate result or a push result, and `tests/test_retention.py::test_retention_is_verdict_free` asserts that against the module source and every public annotation string. The runs whose evidence matters most are exactly the ones whose outcome was recorded wrongly, so capture must not be conditional on the outcome.
+
+`retention.capture_evidence(run_id, workspace, repos)` copies `transcript.txt`, `completion.json` and a per-repo `patch.diff` into `<EVIDENCE_ROOT>/<run_id>/` before any `cleanup_workspace` call, on every terminal path. Every step is individually wrapped so capture can never raise into teardown and abort the terminal DB write.
+
+`retention.prune(active_run_ids)` is age-based only — never free-space-based. Workspace directories older than `DISPATCH_WORKSPACE_RETENTION_HOURS` are removed unless the name ends with `-<run_id>` for a live run (workspace names come in three shapes: `{repo}-{run_id}`, `ws-{run_id}` and `repos-{run_id}`, so a prefix match would protect nothing). Evidence directories older than `DISPATCH_EVIDENCE_RETENTION_DAYS` are removed unless the name equals a live run id. Config: `DISPATCH_EVIDENCE_ROOT`, `DISPATCH_EVIDENCE_RETENTION_DAYS` (30), `DISPATCH_WORKSPACE_RETENTION_HOURS` (48), `DISPATCH_RETENTION_INTERVAL_SECONDS` (3600).
+
+Every filesystem read of an agent-created path and every git invocation added here goes through `dispatch._sudo_wrap`, because the artifact is written by the `dispatch` agent user while the worker runs as `dispatch-svc`. `transcript.txt` is NOT a precedent for this — it is opened by the parent process and is service-owned.
+
+`show_run_transcript` falls back to `<EVIDENCE_ROOT>/<run_id>/transcript.txt` when the live-workspace glob misses, so a transcript stays retrievable after teardown. Its output now ends in a single JSON object; pipe through `jq`.
 
 ## Git workflow
 

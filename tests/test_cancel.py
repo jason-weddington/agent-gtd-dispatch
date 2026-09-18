@@ -77,7 +77,7 @@ class TestCancelRun:
 
     @pytest.mark.parametrize(
         "terminal_status",
-        ["succeeded", "failed", "timed_out", "cancelled"],
+        ["succeeded", "failed", "timed_out", "cancelled", "already_satisfied"],
     )
     async def test_cancel_terminal_run_returns_200_no_side_effects(
         self, client, auth_headers, terminal_status
@@ -98,6 +98,10 @@ class TestCancelRun:
         assert data["status"] == terminal_status
         # No comment should have been posted
         mock_gtd.post_comment.assert_not_called()
+        # The persisted row must not have been overwritten with `cancelled`.
+        reread = await db.get_run(run.id)
+        assert reread is not None
+        assert reread.status.value == terminal_status
 
     # ------------------------------------------------------------------
     # AC-1 + AC-2: active run — SIGTERM, wait grace, SIGKILL, DB updated

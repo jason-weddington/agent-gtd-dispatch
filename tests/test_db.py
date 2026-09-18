@@ -242,3 +242,58 @@ class TestPushResultsPersistence:
             assert "push_results" in col_names2
         finally:
             conn2.close()
+
+
+class TestCompletionColumn:
+    async def test_column_exists_after_init(self) -> None:
+        await db.init_db()
+        conn = sqlite3.connect(db.db_path())
+        try:
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(runs)")]
+        finally:
+            conn.close()
+        assert "completion" in cols
+
+    async def test_update_and_read_back(self) -> None:
+        await db.init_db()
+        run = Run(item_id="i", project_name="p", branch_name="feat/x")
+        await db.insert_run(run)
+        blob = json.dumps({"envelope_verdict": "ok", "zero_commits": False})
+        await db.update_run(run.id, status=RunStatus.succeeded, completion=blob)
+        stored = await db.get_run(run.id)
+        assert stored is not None
+        assert stored.completion == blob
+
+    async def test_already_satisfied_status_round_trips(self) -> None:
+        await db.init_db()
+        run = Run(item_id="i", project_name="p", branch_name="feat/x")
+        await db.insert_run(run)
+        await db.update_run(
+            run.id,
+            status=RunStatus.already_satisfied,
+            error="already_satisfied: nothing to do",
+        )
+        stored = await db.get_run(run.id)
+        assert stored is not None
+        assert stored.status is RunStatus.already_satisfied
+
+    async def test_migration_adds_column_to_legacy_table(self) -> None:
+        await db.init_db()
+        db_file = db.db_path()
+        conn = sqlite3.connect(db_file)
+        try:
+            conn.execute("ALTER TABLE runs DROP COLUMN completion")
+            conn.commit()
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(runs)")]
+            assert "completion" not in cols
+        finally:
+            conn.close()
+
+        await db.init_db()
+
+        conn2 = sqlite3.connect(db_file)
+        try:
+            cols2 = [row[1] for row in conn2.execute("PRAGMA table_info(runs)")]
+        finally:
+            conn2.close()
+        assert "completion" in cols2

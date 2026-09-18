@@ -169,6 +169,8 @@ def _build_claude_command(
         str(max_turns),
         "--system-prompt",
         system_prompt,
+        "--output-format",
+        "json",
         "--print",
     ]
     if agent_name:
@@ -212,6 +214,8 @@ def _build_claude_ollama_command(
         str(max_turns),
         "--system-prompt",
         system_prompt,
+        "--output-format",
+        "json",
         "--print",
     ]
     if agent_name:
@@ -253,6 +257,8 @@ def _build_claude_glm_command(
         str(max_turns),
         "--system-prompt",
         system_prompt,
+        "--output-format",
+        "json",
         "--print",
     ]
     if agent_name:
@@ -291,6 +297,8 @@ def _build_claude_sonnet_command(
         str(max_turns),
         "--system-prompt",
         system_prompt,
+        "--output-format",
+        "json",
         "--print",
     ]
     if agent_name:
@@ -315,6 +323,8 @@ def _build_claude_haiku_command(
         str(max_turns),
         "--system-prompt",
         system_prompt,
+        "--output-format",
+        "json",
         "--print",
     ]
     if agent_name:

@@ -79,6 +79,7 @@ class Run(BaseModel):
     completed_at: datetime | None = None
     exit_code: int | None = None
     error: str | None = None
+    completion: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -88,3 +89,4 @@ class RunResponse(_BaseRunResponse):
     engine_actual: str | None = None
     engine_swap: EngineSwap | None = None
     push_results: list[RepoPushStatus] | None = None
+    completion: str | None = None

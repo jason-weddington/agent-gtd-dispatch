@@ -352,11 +352,15 @@ def verify_pushes(
 def is_zero_commits_run(push_results: list[RepoPushStatus]) -> bool:
     """Return True when all repos have no_changes status (zero commits across the run).
 
-    A zero-commits run may be a silent failure (the agent exited without doing
-    anything) or an intentional no-op (the agent determined work was already done
-    and posted an explanatory comment).  The caller is responsible for
-    distinguishing the two cases — for example by checking whether the agent
-    successfully posted a comment to the item after the dispatch comment was posted.
+    A zero-commits run may be a silent failure (the agent died mid-implementation)
+    or a deliberate no-op (the agent determined the work was already done).  The
+    caller distinguishes the two by the completion artifact's ``disposition``
+    written by the agent itself — never by counting activity on the GTD item.
+
+    The invariant this function exists to serve: a zero-commit build run is never
+    success.  The only non-failure zero-commit outcome is ``already_satisfied``,
+    which requires a parseable artifact carrying a reason and a green-or-absent
+    quality gate, and which does not complete the item.
     """
     return bool(push_results) and all(
         r.status == PushStatus.no_changes for r in push_results
@@ -706,12 +710,60 @@ def write_transcript(workspace: Path, result: subprocess.CompletedProcess[str]) 
     """
 
 
-def _setup_git_exclude(workspace: Path) -> None:
-    """Exclude transcript.txt from git before the subprocess starts."""
-    git_exclude = workspace / ".git" / "info" / "exclude"
-    if git_exclude.exists():
+# Run-scoped paths that must never be committed by an agent: the streamed
+# transcript and the completion-artifact directory.
+_GIT_EXCLUDE_LINES: tuple[str, ...] = ("transcript.txt", ".dispatch/")
+
+
+def _append_exclude_lines(git_exclude: Path) -> None:
+    """Append the run-scoped exclude lines to one exclude file, idempotently."""
+    try:
+        existing = {
+            line.strip()
+            for line in git_exclude.read_text().splitlines()
+            if line.strip()
+        }
+    except OSError:
+        return
+    missing = [line for line in _GIT_EXCLUDE_LINES if line not in existing]
+    if not missing:
+        return
+    try:
         with git_exclude.open("a") as f:
-            f.write("\ntranscript.txt\n")
+            f.write("\n" + "\n".join(missing) + "\n")
+    except OSError:
+        return
+
+
+def _setup_git_exclude(workspace: Path) -> None:
+    """Exclude transcript.txt and .dispatch/ from git before the subprocess starts.
+
+    Handles both repo modes.  In monorepo mode the workspace root IS the repo, so
+    ``<workspace>/.git/info/exclude`` exists.  In multi-repo (workspace) mode the
+    root is not a git repo at all and each clone lives in an immediate
+    subdirectory — writing only to the root would silently no-op.
+
+    Repeated calls never duplicate an entry.
+    """
+    root_exclude = workspace / ".git" / "info" / "exclude"
+    if root_exclude.exists():
+        _append_exclude_lines(root_exclude)
+
+    try:
+        children = sorted(workspace.iterdir())
+    except OSError:
+        return
+    for child in children:
+        if not child.is_dir() or not (child / ".git").is_dir():
+            continue
+        repo_exclude = child / ".git" / "info" / "exclude"
+        try:
+            repo_exclude.parent.mkdir(parents=True, exist_ok=True)
+            if not repo_exclude.exists():
+                repo_exclude.write_text("")
+        except OSError:
+            continue
+        _append_exclude_lines(repo_exclude)
 
 
 def _sanitize_filename(filename: str) -> str:
@@ -856,6 +908,7 @@ def build_system_prompt(
     manage_retry_count: int = 0,
     workspace_repo_dirs: list[str] | None = None,
     is_recovery: bool = False,
+    workspace: Path | None = None,
 ) -> str:
     """Build the headless agent system prompt."""
     if mode == DispatchMode.PLAN:
@@ -881,6 +934,7 @@ def build_system_prompt(
         project,
         branch_name or "",
         max_turns,
+        workspace=workspace or Path("."),
         attachments=attachments,
         run_id=run_id,
         workspace_repo_dirs=workspace_repo_dirs,
@@ -1249,7 +1303,9 @@ def _build_manage_workspace_main_prompt(
         Process each item as it completes — don't wait for all before acting on any.
         If a run ended with `failed`, `timed_out`, or `cancelled`: treat as a halt
         candidate (see Halt path) with reason
-        `"build agent <status>: run <run_id> for item <item_id>"`.{gate_exception}
+        `"build agent <status>: run <run_id> for item <item_id>"`.
+        If a run ended with `already_satisfied`: do NOT halt and do NOT reconcile —
+        go straight to the skip-and-advance path below.{gate_exception}
 
         **Step 4 — AC reconciliation**
 
@@ -1366,8 +1422,30 @@ def _build_manage_workspace_main_prompt(
            git fetch origin <branch_name>
            commit_count=$(git rev-list origin/<repo_default_branch>..<branch_name> --count)
            ```
-           If `commit_count` is 0: halt with the multi-repo halt template below —
-           step = `commit-count-guard`.
+           If `commit_count` is 0: the build agent pushed nothing. Before halting,
+           check WHY — call `mcp__agent-gtd__get_run_status(<run_id>)` for that item's
+           child build run and read its `status` field.
+
+           If `status` is exactly `already_satisfied`, the build agent asserted the
+           work was already done and the dispatch worker verified the quality gate.
+           Skip the merge and advance:
+           ```
+           mcp__agent-gtd__complete_item_in_rollout(
+               rollout_id="{rollout_id}",
+               item_id=item_id,
+               outcome="skipped",
+               merge_actor="manager-autonomous",
+               decision_rule="already-satisfied",
+           )
+           ```
+           Then post a comment that NAMES every item id in that call's `newly_ready`
+           list (or states `no downstream items unblocked` when the list is empty),
+           and ADVANCE to the next item. Do NOT halt and do NOT merge this item.
+
+           For ANY other status, halt as described below.
+
+           Otherwise, if `commit_count` is 0: halt with the multi-repo halt template
+           below — step = `commit-count-guard`.
 
         2. Squash merge sequence (inside that repo's directory, against THAT repo's default branch):
            ```bash
@@ -1741,7 +1819,9 @@ def _build_manage_prompt(
         Process each item as it completes — don't wait for all before acting on any.
         If a run ended with `failed`, `timed_out`, or `cancelled`: treat as a halt
         candidate (see Halt path) with reason
-        `"build agent <status>: run <run_id> for item <item_id>"`.{gate_exception}
+        `"build agent <status>: run <run_id> for item <item_id>"`.
+        If a run ended with `already_satisfied`: do NOT halt and do NOT reconcile —
+        go straight to the skip-and-advance path below.{gate_exception}
 
         **Step 4 — AC reconciliation**
 
@@ -1831,8 +1911,28 @@ def _build_manage_prompt(
         git fetch origin <branch_name>
         commit_count=$(git rev-list origin/<default_branch>..<branch_name> --count)
         ```
-        If `commit_count` is 0 (branch has no commits beyond origin/main), the build
-        agent reported success but pushed no commits. Call:
+        If `commit_count` is 0: the build agent pushed nothing. Before halting, check
+        WHY — call `mcp__agent-gtd__get_run_status(<run_id>)` for that item's child
+        build run and read its `status` field.
+
+        If `status` is exactly `already_satisfied`, the build agent asserted the work
+        was already done and the dispatch worker verified the quality gate. Skip the
+        merge and advance:
+        ```
+        mcp__agent-gtd__complete_item_in_rollout(
+            rollout_id="{rollout_id}",
+            item_id=item_id,
+            outcome="skipped",
+            merge_actor="manager-autonomous",
+            decision_rule="already-satisfied",
+        )
+        ```
+        Then post a comment that NAMES every item id in that call's `newly_ready` list
+        (or states `no downstream items unblocked` when the list is empty), and ADVANCE
+        to the next item. Do NOT halt and do NOT merge this item.
+
+        For ANY other status, the build agent reported success but pushed no commits.
+        Call:
         ```
         mcp__agent-gtd__halt_rollout(
             rollout_id="{rollout_id}",
@@ -1993,12 +2093,20 @@ def _build_build_prompt(
     project: dict[str, Any],
     branch_name: str,
     max_turns: int,
+    workspace: Path,
     attachments: list[dict[str, Any]] | None = None,
     run_id: str = "",
     workspace_repo_dirs: list[str] | None = None,
 ) -> str:
-    """System prompt for build mode — implement and push a branch."""
+    """System prompt for build mode — implement and push a branch.
+
+    ``workspace`` is interpolated as an ABSOLUTE path into the completion-artifact
+    instructions.  It must be absolute: the build steps tell the agent to ``cd``
+    into a repo directory, so a relative ``.dispatch/completion.json`` would land
+    inside a repo clone in workspace mode and the worker would never find it.
+    """
     item_id = item["id"]
+    artifact_path = workspace / ".dispatch" / "completion.json"
 
     files_section = _build_supporting_files_section(attachments, run_id)
 
@@ -2065,16 +2173,52 @@ def _build_build_prompt(
         6. **Stop if stuck.** If the task is too ambiguous, you lack information, or
            you cannot complete it cleanly — STOP. Do not guess or produce low-quality work.{att_rule}
 
+        ## Completion Artifact
+
+        Your LAST action on EVERY path — success, no-op, blocked, or failure — is to
+        write the completion artifact to this ABSOLUTE path:
+
+        ```
+        {artifact_path}
+        ```
+
+        Write it at that absolute path regardless of which directory you are currently
+        in (the build steps above may have left you inside a repo subdirectory).
+        Create the parent directory first if needed.
+
+        The file is a single JSON object:
+
+        ```json
+        {{
+          "schema_version": 1,
+          "disposition": "done",
+          "summary": "one line on what happened",
+          "reason": "",
+          "decision_needed": ""
+        }}
+        ```
+
+        `disposition` is exactly one of `done`, `already_satisfied`, `blocked`, `failed`.
+        - `done` — you implemented the item and pushed commits.
+        - `already_satisfied` — the acceptance criteria were already met; `reason` is
+          REQUIRED and must say what already exists and where.
+        - `blocked` — you cannot proceed; `decision_needed` is REQUIRED and must state
+          the decision or information a human must supply.
+        - `failed` — you tried and could not finish.
+
+        A run that ends without this file is recorded as a FAILURE regardless of what
+        it pushed. `summary` is optional.
+
         ## No-Op Case — Work Already Done
 
         Before writing any code, check whether the acceptance criteria are **already satisfied**
         by existing code. If no source changes are needed:
-        - Post a comment describing what already exists and why no changes were needed
-          (e.g. "No changes needed — <feature> already implemented at <file>:<line>").
+        - Write the completion artifact with `"disposition": "already_satisfied"` and a
+          non-empty `reason` naming what already exists (e.g. "<feature> already
+          implemented at <file>:<line>").
         - Do NOT push any commits.
-        - Do NOT set item status to `review`. Leave it unchanged (stays `active`) so the lead
-          has a clear signal that no new code was shipped.
-        - STOP.
+        - STOP. The dispatch worker verifies the quality gate and moves the item on;
+          you do not need to do anything else.
 
         ## Reporting
 

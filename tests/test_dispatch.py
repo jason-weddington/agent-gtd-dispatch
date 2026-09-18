@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import pwd
 import subprocess
@@ -36,6 +38,12 @@ from agent_gtd_dispatch.engines import (
     get_engine,
 )
 from agent_gtd_dispatch.models import DispatchRequest, PushStatus, RepoPushStatus, Run
+from tests.completion_fixtures import (
+    MAX_TURNS_ENVELOPE,
+    seed_build_evidence,
+    write_artifact,
+    write_envelope,
+)
 
 
 def _dispatch_sudo_available() -> bool:
@@ -177,6 +185,8 @@ class TestClaudeCommand:
         assert "--max-turns" in cmd
         assert "20" in cmd
         assert "--print" in cmd
+        assert cmd.index("--output-format") == cmd.index("--print") - 2
+        assert cmd[cmd.index("--output-format") + 1] == "json"
         assert cmd[-1] == "Fix bug"
         assert "--agent" not in cmd
 
@@ -1951,6 +1961,8 @@ class TestClaudeOllamaEngine:
         assert cmd[cmd.index("--model") + 1] == "qwen3.5:35b"
         assert "--dangerously-skip-permissions" in cmd
         assert "--print" in cmd
+        assert cmd.index("--output-format") == cmd.index("--print") - 2
+        assert cmd[cmd.index("--output-format") + 1] == "json"
         assert cmd[-1] == "Fix bug"
 
     def test_vanilla_claude_command_uses_opus_model(self) -> None:
@@ -1973,6 +1985,8 @@ class TestClaudeSonnetEngine:
         assert cmd[2] == "sonnet"
         assert "--dangerously-skip-permissions" in cmd
         assert "--print" in cmd
+        assert cmd.index("--output-format") == cmd.index("--print") - 2
+        assert cmd[cmd.index("--output-format") + 1] == "json"
         assert cmd[-1] == "Fix bug"
 
     def test_env_includes_oauth_token(self, monkeypatch) -> None:
@@ -2009,6 +2023,8 @@ class TestClaudeHaikuEngine:
         assert cmd[2] == "haiku"
         assert "--dangerously-skip-permissions" in cmd
         assert "--print" in cmd
+        assert cmd.index("--output-format") == cmd.index("--print") - 2
+        assert cmd[cmd.index("--output-format") + 1] == "json"
         assert cmd[-1] == "Fix bug"
 
     def test_env_includes_oauth_token(self, monkeypatch) -> None:
@@ -3420,11 +3436,18 @@ class TestIsZeroCommitsRun:
 
 
 class TestZeroCommitsGuard:
-    """Integration tests for the zero-commits guard in _dispatch_worker.
+    """Integration tests for the zero-commits invariant in _dispatch_worker.
 
-    Covers the four cases from the acceptance criteria:
-    1. zero-commits + no agent comment → failure
-    2. zero-commits + agent comment (intentional no-op) → success
+    The invariant: a zero-commit BUILD run is NEVER recorded as a success.  How
+    many comments exist on the item has no bearing on the outcome — the old
+    ``>= 2 comments means intentional no-op`` heuristic counted the worker's own
+    dispatch comment plus the agent's first ``Implementing...`` progress comment
+    and so was permanently open.
+
+    Covers:
+    1. zero commits + a ``done`` claim → failure (``done_claim_zero_commits``)
+    2. zero commits + two post-start comments, no artifact → failure
+       (``stopped_without_assertion``) — comments are irrelevant
     3. normal commit+push → success (regression, happy path)
     4. unpushed commits → failure (regression, existing verify_pushes behaviour)
     """
@@ -3473,11 +3496,8 @@ class TestZeroCommitsGuard:
         """Ensure a fresh in-memory-style DB for each test."""
         monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
 
-    async def test_zero_commits_no_agent_comment_fails_run(self, tmp_path) -> None:
-        """All repos no_changes + only 1 comment (dispatch) → run failed.
-
-        The agent posted no explanatory comment, so this is a silent failure.
-        """
+    async def test_zero_commits_done_claim_fails_run(self, tmp_path) -> None:
+        """All repos no_changes while the agent claims ``done`` → run failed."""
         from unittest.mock import AsyncMock, patch
 
         from agent_gtd_dispatch import db
@@ -3526,6 +3546,7 @@ class TestZeroCommitsGuard:
 
             fake_workspace = tmp_path / "repos-zero-silent"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -3533,6 +3554,7 @@ class TestZeroCommitsGuard:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
             mock_dispatch.verify_pushes = MagicMock(
                 return_value=[self._no_changes_result()]
@@ -3548,19 +3570,17 @@ class TestZeroCommitsGuard:
         assert updated is not None
         assert updated.status.value == "failed"
         assert updated.error is not None
-        assert "zero commits" in updated.error
-        assert "pushed no branch" in updated.error
+        assert updated.error.startswith("done_claim_zero_commits: ")
 
-        # list_comments must have been called to check for agent comment
-        mock_gtd.list_comments.assert_called_once()
+        # The deleted guard's comment lookup must be gone.
+        mock_gtd.list_comments.assert_not_called()
 
-    async def test_zero_commits_with_agent_comment_succeeds_intentional_noop(
-        self, tmp_path
-    ) -> None:
-        """All repos no_changes + 2 comments (dispatch + agent no-op comment) → succeeded.
+    async def test_zero_commits_with_two_comments_still_fails(self, tmp_path) -> None:
+        """Zero commits + 2 post-start comments → FAILED, not an intentional no-op.
 
-        The agent posted an explanatory comment declaring the criteria already
-        satisfied — this is the intentional no-op path and must NOT fail.
+        This is the exact incident fixture: the worker's own dispatch comment plus
+        one ``Implementing...`` progress comment reached the old heuristic's
+        threshold of 2 before the agent had done any work at all.
         """
         from unittest.mock import AsyncMock, patch
 
@@ -3617,6 +3637,8 @@ class TestZeroCommitsGuard:
 
             fake_workspace = tmp_path / "repos-zero-noop"
             fake_workspace.mkdir()
+            # Leg 1 green, leg 2 absent: the agent died mid-implementation.
+            write_envelope(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -3624,6 +3646,7 @@ class TestZeroCommitsGuard:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
             mock_dispatch.verify_pushes = MagicMock(
                 return_value=[self._no_changes_result()]
@@ -3637,7 +3660,10 @@ class TestZeroCommitsGuard:
 
         updated = await db.get_run(run.id)
         assert updated is not None
-        assert updated.status.value == "succeeded"
+        assert updated.status.value == "failed"
+        assert updated.error is not None
+        assert updated.error.startswith("stopped_without_assertion: ")
+        mock_gtd.list_comments.assert_not_called()
 
     async def test_normal_commit_push_succeeds_regression(self, tmp_path) -> None:
         """Happy path: commit + push → succeeded.  Zero-commits guard must not trigger.
@@ -3685,6 +3711,7 @@ class TestZeroCommitsGuard:
 
             fake_workspace = tmp_path / "repos-normal-push"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaxyz")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -3692,6 +3719,7 @@ class TestZeroCommitsGuard:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
             mock_dispatch.verify_pushes = MagicMock(
                 return_value=[self._pushed_result()]
@@ -3758,6 +3786,7 @@ class TestZeroCommitsGuard:
 
             fake_workspace = tmp_path / "repos-unpushed"
             fake_workspace.mkdir()
+            seed_build_evidence(fake_workspace)
             mock_dispatch.prepare_workspace = MagicMock(return_value=fake_workspace)
             mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
             mock_dispatch.repo_name_from_origin = MagicMock(
@@ -3765,6 +3794,7 @@ class TestZeroCommitsGuard:
             )
             mock_dispatch.stage_attachments = AsyncMock(return_value=[])
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+            mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
             mock_dispatch.verify_pushes = MagicMock(
                 return_value=[self._unpushed_result()]
@@ -3782,3 +3812,615 @@ class TestZeroCommitsGuard:
         assert updated.error is not None
         assert "push verification failed" in updated.error
         assert "3 unpushed commit(s)" in updated.error
+
+
+# ---------------------------------------------------------------------------
+# Leg 1 — `--output-format json` on every claude-code argv builder
+# ---------------------------------------------------------------------------
+
+
+class TestOutputFormatJsonArgv:
+    """Every claude-code engine emits `--output-format json` just before --print."""
+
+    CLAUDE_ENGINE_NAMES: ClassVar[list[str]] = [
+        "claude-code",
+        "claude-code-ollama",
+        "claude-code-glm",
+        "claude-code-sonnet",
+        "claude-code-haiku",
+    ]
+
+    @pytest.mark.parametrize("engine_name", CLAUDE_ENGINE_NAMES)
+    def test_output_format_precedes_print(self, engine_name) -> None:
+        cmd = get_engine(engine_name).build_command("sys", "Title", 20, None)
+        assert cmd.index("--output-format") == cmd.index("--print") - 2
+        assert cmd[cmd.index("--output-format") + 1] == "json"
+        assert cmd[-1] == "Title"
+
+    def test_kiro_untouched(self) -> None:
+        cmd = KIRO.build_command("sys", "Title", 20, None)
+        assert "--output-format" not in cmd
+        assert "--print" not in cmd
+
+    def test_talos_untouched(self) -> None:
+        # Talos never reaches run_agent; its build_command is a refusing stub, so
+        # there is no argv to carry the flag pair.
+        with pytest.raises(NotImplementedError):
+            get_engine("talos-sonnet").build_command("sys", "Title", 20, None)
+
+
+class TestAllowedToolsOrderingWithOutputFormat:
+    """`--allowedTools` insertion keeps working, and only for claude-code."""
+
+    async def test_claude_final_argv_order(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(
+                CLAUDE, tmp_path, "sys", "Title", 20, allowed_tools=["Bash"]
+            )
+            cmd = mock_popen.call_args[0][0]
+        of = cmd.index("--output-format")
+        assert cmd[of : of + 6] == [
+            "--output-format",
+            "json",
+            "--allowedTools",
+            "Bash",
+            "--print",
+            "Title",
+        ]
+
+    async def test_sonnet_gets_output_format_but_no_allowed_tools(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(
+                CLAUDE_SONNET, tmp_path, "sys", "Title", 20, allowed_tools=["Bash"]
+            )
+            cmd = mock_popen.call_args[0][0]
+        # Deliberate, unchanged behaviour: the insertion is gated on claude-code.
+        assert "--allowedTools" not in cmd
+        assert cmd.index("--output-format") == cmd.index("--print") - 2
+        assert cmd[cmd.index("--output-format") + 1] == "json"
+
+
+# ---------------------------------------------------------------------------
+# `.dispatch/` git exclusion in BOTH repo modes
+# ---------------------------------------------------------------------------
+
+
+class TestSetupGitExclude:
+    def test_monorepo_idempotent(self, tmp_path) -> None:
+        exclude = tmp_path / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True)
+        exclude.write_text("# git ls-files --others --exclude-from=.git/info/exclude\n")
+
+        dispatch._setup_git_exclude(tmp_path)
+        dispatch._setup_git_exclude(tmp_path)
+
+        lines = exclude.read_text().splitlines()
+        assert lines.count("transcript.txt") == 1
+        assert lines.count(".dispatch/") == 1
+
+    def test_multi_repo_workspace(self, tmp_path) -> None:
+        # Workspace root is NOT a git repo in multi-repo mode.
+        for name in ("repo_a", "repo_b"):
+            info = tmp_path / name / ".git" / "info"
+            info.mkdir(parents=True)
+            (info / "exclude").write_text("")
+
+        dispatch._setup_git_exclude(tmp_path)
+
+        for name in ("repo_a", "repo_b"):
+            text = (tmp_path / name / ".git" / "info" / "exclude").read_text()
+            assert "transcript.txt" in text
+            assert ".dispatch/" in text
+
+    def test_multi_repo_without_exclude_file_does_not_raise(self, tmp_path) -> None:
+        (tmp_path / "repo_a" / ".git").mkdir(parents=True)
+        dispatch._setup_git_exclude(tmp_path)
+        text = (tmp_path / "repo_a" / ".git" / "info" / "exclude").read_text()
+        assert ".dispatch/" in text
+
+    def test_non_repo_subdirs_ignored(self, tmp_path) -> None:
+        (tmp_path / "not_a_repo").mkdir()
+        dispatch._setup_git_exclude(tmp_path)
+        assert not (tmp_path / "not_a_repo" / ".git").exists()
+
+
+# ---------------------------------------------------------------------------
+# Build prompt: completion artifact contract
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPromptCompletionArtifact:
+    def _prompt(self, workspace=Path("/srv/agent/workspace/ws-abc")):
+        return dispatch._build_build_prompt(
+            {"id": "item-1"},
+            {"name": "P", "gate_command": "make gate"},
+            "feat/x",
+            50,
+            workspace=workspace,
+        )
+
+    def test_contains_absolute_artifact_path_and_schema(self) -> None:
+        prompt = self._prompt()
+        assert ".dispatch/completion.json" in prompt
+        assert "/srv/agent/workspace/ws-abc" in prompt
+        assert "schema_version" in prompt
+        for literal in ("done", "already_satisfied", "blocked", "failed"):
+            assert literal in prompt
+
+    def test_no_op_block_rewritten(self) -> None:
+        prompt = self._prompt()
+        assert "stays `active`" not in prompt
+        assert "Post a comment describing what already exists" not in prompt
+        assert "already_satisfied" in prompt
+
+    def test_build_system_prompt_threads_workspace(self) -> None:
+        prompt = build_system_prompt(
+            {"id": "item-1"},
+            {"name": "P"},
+            "feat/x",
+            50,
+            workspace=Path("/ws/root-xyz"),
+        )
+        assert "/ws/root-xyz/.dispatch/completion.json" in prompt
+
+
+class TestManagePromptAlreadySatisfied:
+    def _prompts(self):
+        project = {
+            "id": "p1",
+            "name": "P",
+            "git_origin": "git@host:x/y",
+            "workspace_repos": ["git@host:x/a", "git@host:x/b"],
+        }
+        return (
+            dispatch._build_manage_prompt("ro-1", project, 50),
+            dispatch._build_manage_prompt(
+                "ro-1", project, 50, workspace_repo_dirs=["a", "b"]
+            ),
+        )
+
+    def test_skip_and_advance_present_in_both(self) -> None:
+        for prompt in self._prompts():
+            assert "already_satisfied" in prompt
+            assert 'outcome="skipped"' in prompt
+            assert "newly_ready" in prompt
+            assert "merge_actor" in prompt
+
+    def test_halt_path_preserved_for_other_statuses(self) -> None:
+        monorepo, workspace = self._prompts()
+        assert "halt_rollout" in monorepo
+        assert "commit-count-guard" in workspace
+
+    def test_step_three_disposition_block_mentions_already_satisfied(self) -> None:
+        for prompt in self._prompts():
+            assert (
+                "If a run ended with `already_satisfied`: do NOT halt and do NOT"
+                " reconcile" in prompt
+            )
+
+    def test_local_vocabulary_not_succeeded(self) -> None:
+        for prompt in self._prompts():
+            assert "succeeded" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# BUILD terminal classification — field scenarios and the invariant tripwire
+# ---------------------------------------------------------------------------
+
+
+def _repo_status(status, *, repo="repos-testproj", branch="feat/abc-fix"):
+    return RepoPushStatus(
+        repo_name=repo,
+        branch=branch,
+        status=status,
+        local_sha="deadbeef" if status is not PushStatus.pushed else "aabbccdd",
+        remote_sha="aabbccdd" if status is PushStatus.pushed else None,
+        commits_ahead=2 if status is PushStatus.pushed else 0,
+        dirty=False,
+    )
+
+
+async def _run_build_worker(
+    tmp_path,
+    *,
+    item_id,
+    workspace_name,
+    seed,
+    push_results,
+    project=None,
+    gate_result=None,
+    returncode=0,
+):
+    """Drive _dispatch_worker through one BUILD run and return (run_row, mocks)."""
+    from unittest.mock import AsyncMock
+
+    from agent_gtd_dispatch.main import _dispatch_worker
+    from agent_gtd_dispatch.models import DispatchMode
+
+    await db.init_db()
+    run = Run(
+        item_id=item_id,
+        project_name="TestProject",
+        branch_name="feat/abc-fix",
+        mode=DispatchMode.BUILD,
+    )
+    await db.insert_run(run)
+
+    workspace = tmp_path / workspace_name
+    workspace.mkdir(parents=True, exist_ok=True)
+    seed(workspace)
+
+    completed_result = MagicMock()
+    completed_result.returncode = returncode
+
+    with (
+        patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+        patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+    ):
+        mock_gtd.get_item = AsyncMock(
+            return_value={"id": item_id, "title": "T", "project_id": "proj1"}
+        )
+        mock_gtd.get_project = AsyncMock(
+            return_value=project
+            or {
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@host:repos/testproj",
+            }
+        )
+        mock_gtd.post_comment = AsyncMock()
+        mock_gtd.list_attachments = AsyncMock(return_value=[])
+        mock_gtd.set_item_status = AsyncMock()
+        mock_gtd.complete_item = AsyncMock()
+        mock_dispatch.prepare_workspace = MagicMock(return_value=workspace)
+        mock_dispatch.get_head_sha = MagicMock(return_value="baseshaabc")
+        mock_dispatch.repo_name_from_origin = MagicMock(return_value="repos-testproj")
+        mock_dispatch.stage_attachments = AsyncMock(return_value=[])
+        mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
+        mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
+        mock_dispatch.run_agent = AsyncMock(return_value=completed_result)
+        mock_dispatch.verify_pushes = MagicMock(return_value=push_results)
+        mock_dispatch.run_gate_command = MagicMock(return_value=gate_result)
+        mock_dispatch.cleanup_workspace = MagicMock()
+        mock_dispatch._executor = None
+
+        from agent_gtd_dispatch.engines import CLAUDE
+
+        await _dispatch_worker(run, 50, CLAUDE, 600)
+
+    updated = await db.get_run(run.id)
+    assert updated is not None
+    return updated, mock_gtd, mock_dispatch, workspace
+
+
+class TestFieldScenarioA:
+    """Exit 0, comments on the item, zero commits, NO completion artifact."""
+
+    @pytest.fixture(autouse=True)
+    def _workspace_root(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(config, "EVIDENCE_ROOT", tmp_path / "evidence")
+
+    @pytest.mark.parametrize("comment_count", [2, 10])
+    async def test_zero_commits_without_artifact_fails(
+        self, tmp_path, caplog, comment_count
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        def _seed(ws):
+            write_envelope(ws)  # leg 1 GREEN — isolates leg 2
+
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            updated, mock_gtd, _md, _ws = await _run_build_worker(
+                tmp_path,
+                item_id=f"item-a-{comment_count}",
+                workspace_name=f"repos-a-{comment_count}",
+                seed=_seed,
+                push_results=[_repo_status(PushStatus.no_changes)],
+            )
+            assert isinstance(mock_gtd.post_comment, AsyncMock)
+
+        assert updated.status.value == "failed"
+        assert updated.status.value != "succeeded"
+        assert updated.error is not None
+        assert updated.error.startswith("stopped_without_assertion: ")
+        assert "build completion:" in caplog.text
+        assert "outcome=failed" in caplog.text
+        assert "zero_commits=True" in caplog.text
+        assert updated.completion is not None
+        assert json.loads(updated.completion)["artifact"] == "absent"
+
+    async def test_empty_transcript_is_no_result_envelope(
+        self, tmp_path, caplog
+    ) -> None:
+        def _seed(ws):
+            (ws / "transcript.txt").write_text("")
+
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            updated, _gtd, _md, _ws = await _run_build_worker(
+                tmp_path,
+                item_id="item-a-empty",
+                workspace_name="repos-a-empty",
+                seed=_seed,
+                push_results=[_repo_status(PushStatus.no_changes)],
+            )
+
+        # Exit 0 never excuses a missing envelope, and the envelope verdict is
+        # checked BEFORE the artifact.
+        assert updated.status.value == "failed"
+        assert updated.error is not None
+        assert updated.error.startswith("no_result_envelope: ")
+        assert "outcome=failed" in caplog.text
+        assert "zero_commits=True" in caplog.text
+        assert json.loads(updated.completion or "{}")["artifact"] == "absent"
+
+
+class TestFieldScenarioB:
+    """Exit 0, green envelope, already_satisfied artifact, green gate."""
+
+    @pytest.fixture(autouse=True)
+    def _workspace_root(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(config, "EVIDENCE_ROOT", tmp_path / "evidence")
+
+    async def test_already_satisfied_terminal(self, tmp_path, caplog) -> None:
+        def _seed(ws):
+            write_envelope(ws)
+            write_artifact(
+                ws,
+                "already_satisfied",
+                reason="guard already present at main.py:1806",
+            )
+
+        gate_result = dispatch_module_gate_result()
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            updated, mock_gtd, _md, _ws = await _run_build_worker(
+                tmp_path,
+                item_id="item-b",
+                workspace_name="repos-b",
+                seed=_seed,
+                push_results=[_repo_status(PushStatus.no_changes)],
+                project={
+                    "id": "proj1",
+                    "name": "TestProject",
+                    "git_origin": "git@host:repos/testproj",
+                    "gate_command": "make gate",
+                },
+                gate_result=gate_result,
+            )
+
+        assert updated.status.value == "already_satisfied"
+        assert updated.error is not None
+        assert "guard already present at main.py:1806" in updated.error
+        mock_gtd.set_item_status.assert_awaited_once()
+        assert mock_gtd.set_item_status.await_args.args[:2] == ("item-b", "review")
+        mock_gtd.complete_item.assert_not_called()
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any("guard already present at main.py:1806" in b for b in bodies)
+        assert "outcome=already_satisfied" in caplog.text
+        assert "disposition=already_satisfied" in caplog.text
+        assert "gate_decision=passed" in caplog.text
+        blob = json.loads(updated.completion or "{}")
+        assert blob["disposition"] == "already_satisfied"
+        assert blob["gate_decision"] == "passed"
+        assert blob["zero_commits"] is True
+
+
+def dispatch_module_gate_result():
+    from agent_gtd_dispatch.dispatch import GateResult
+
+    return GateResult(returncode=0, timed_out=False, output="ok", duration_seconds=1.0)
+
+
+class TestBuildTerminalBranches:
+    @pytest.fixture(autouse=True)
+    def _workspace_root(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(config, "EVIDENCE_ROOT", tmp_path / "evidence")
+
+    async def test_max_turns_exhausted(self, tmp_path) -> None:
+        def _seed(ws):
+            write_envelope(ws, **MAX_TURNS_ENVELOPE)
+
+        updated, mock_gtd, _md, _ws = await _run_build_worker(
+            tmp_path,
+            item_id="item-mt",
+            workspace_name="repos-mt",
+            seed=_seed,
+            push_results=[_repo_status(PushStatus.pushed)],
+        )
+        assert updated.status.value == "failed"
+        assert updated.error is not None
+        assert updated.error.startswith("max_turns_exhausted: ")
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any("Build run failed (max_turns_exhausted)" in b for b in bodies)
+        assert any("The agent ran out of turns" in b for b in bodies)
+
+    async def test_result_is_error(self, tmp_path) -> None:
+        def _seed(ws):
+            write_envelope(ws, subtype="error_during_execution", is_error=True)
+
+        updated, _gtd, _md, _ws = await _run_build_worker(
+            tmp_path,
+            item_id="item-err",
+            workspace_name="repos-err",
+            seed=_seed,
+            push_results=[_repo_status(PushStatus.pushed)],
+        )
+        assert updated.status.value == "failed"
+        assert (updated.error or "").startswith("result_is_error: ")
+
+    async def test_agent_reported_blocked(self, tmp_path) -> None:
+        def _seed(ws):
+            write_envelope(ws)
+            write_artifact(ws, "blocked", decision_needed="which API should I use?")
+
+        updated, mock_gtd, _md, _ws = await _run_build_worker(
+            tmp_path,
+            item_id="item-blocked",
+            workspace_name="repos-blocked",
+            seed=_seed,
+            push_results=[_repo_status(PushStatus.no_changes)],
+        )
+        assert updated.status.value == "failed"
+        assert (updated.error or "").startswith("agent_reported_blocked: ")
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any("which API should I use?" in b for b in bodies)
+
+    async def test_agent_reported_failed(self, tmp_path) -> None:
+        def _seed(ws):
+            write_envelope(ws)
+            write_artifact(ws, "failed")
+
+        updated, _gtd, _md, _ws = await _run_build_worker(
+            tmp_path,
+            item_id="item-failed",
+            workspace_name="repos-failed",
+            seed=_seed,
+            push_results=[_repo_status(PushStatus.no_changes)],
+        )
+        assert updated.status.value == "failed"
+        assert (updated.error or "").startswith("agent_reported_failed: ")
+
+    async def test_done_claim_zero_commits(self, tmp_path) -> None:
+        updated, _gtd, _md, _ws = await _run_build_worker(
+            tmp_path,
+            item_id="item-done0",
+            workspace_name="repos-done0",
+            seed=seed_build_evidence,
+            push_results=[_repo_status(PushStatus.no_changes)],
+        )
+        assert updated.status.value == "failed"
+        assert (updated.error or "").startswith("done_claim_zero_commits: ")
+
+    async def test_done_with_commits_succeeds(self, tmp_path) -> None:
+        updated, _gtd, _md, _ws = await _run_build_worker(
+            tmp_path,
+            item_id="item-done1",
+            workspace_name="repos-done1",
+            seed=seed_build_evidence,
+            push_results=[_repo_status(PushStatus.pushed)],
+        )
+        assert updated.status.value == "succeeded"
+        blob = json.loads(updated.completion or "{}")
+        assert blob["envelope_verdict"] == "ok"
+        assert blob["disposition"] == "done"
+        assert blob["zero_commits"] is False
+        assert blob["session_id"] == "s-1"
+        assert blob["num_turns"] == 12
+
+    async def test_evidence_survives_workspace_cleanup(self, tmp_path) -> None:
+        updated, _gtd, mock_dispatch, _workspace = await _run_build_worker(
+            tmp_path,
+            item_id="item-ev",
+            workspace_name="repos-ev",
+            seed=seed_build_evidence,
+            push_results=[_repo_status(PushStatus.pushed)],
+        )
+        assert updated.status.value == "succeeded"
+        mock_dispatch.cleanup_workspace.assert_called_once()
+        evidence = config.EVIDENCE_ROOT / updated.id
+        assert (evidence / "transcript.txt").exists()
+        assert (evidence / "completion.json").exists()
+
+    async def test_evidence_captured_on_agent_nonzero_exit(self, tmp_path) -> None:
+        def _seed(ws):
+            write_envelope(
+                ws,
+                subtype="error_during_execution",
+                is_error=True,
+                result="the agent blew up",
+            )
+
+        updated, _gtd, _md, _ws = await _run_build_worker(
+            tmp_path,
+            item_id="item-nz",
+            workspace_name="repos-nz",
+            seed=_seed,
+            push_results=[_repo_status(PushStatus.pushed)],
+            returncode=2,
+        )
+        assert updated.status.value == "failed"
+        # Envelope-derived snippet, not the raw 500-byte JSON tail.
+        assert updated.error is not None
+        assert updated.error.startswith("error_during_execution: ")
+        assert "the agent blew up" in updated.error
+        evidence = config.EVIDENCE_ROOT / updated.id
+        assert (evidence / "transcript.txt").exists()
+
+    async def test_nonzero_exit_without_envelope_falls_back_to_raw_tail(
+        self, tmp_path
+    ) -> None:
+        def _seed(ws):
+            (ws / "transcript.txt").write_text("plain stderr spew, no envelope")
+
+        updated, _gtd, _md, _ws = await _run_build_worker(
+            tmp_path,
+            item_id="item-nz2",
+            workspace_name="repos-nz2",
+            seed=_seed,
+            push_results=[_repo_status(PushStatus.pushed)],
+            returncode=2,
+        )
+        assert updated.error == "plain stderr spew, no envelope"
+
+
+class TestInvariantTripwire:
+    async def test_wrong_call_is_coerced_and_logged(self, caplog) -> None:
+        from agent_gtd_dispatch.main import _record_build_terminal
+        from agent_gtd_dispatch.models import DispatchMode, RunStatus
+
+        await db.init_db()
+        run = Run(
+            item_id="item-inv",
+            project_name="TestProject",
+            branch_name="feat/x",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        with caplog.at_level(logging.ERROR, logger="agent_gtd_dispatch.main"):
+            result = await _record_build_terminal(
+                run.id,
+                status=RunStatus.succeeded,
+                push_results_list=[_repo_status(PushStatus.no_changes)],
+                disposition="done",
+                envelope_verdict="ok",
+            )
+
+        assert result is RunStatus.failed
+        assert "INVARIANT VIOLATION" in caplog.text
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "failed"
+        assert (updated.error or "").startswith("invariant_zero_commit_success: ")
+
+
+class TestTriageFailureComments:
+    def test_every_prefix_appears_in_its_comment(self) -> None:
+        from agent_gtd_dispatch.main import (
+            BUILD_FAILURE_PREFIXES,
+            build_failure_comment,
+        )
+
+        for prefix in BUILD_FAILURE_PREFIXES:
+            body = build_failure_comment(prefix, "run-123")
+            assert body.startswith(f"Build run failed ({prefix})")
+            assert "run-123" in body
+
+    def test_max_turns_comment_names_the_review_step(self) -> None:
+        from agent_gtd_dispatch.main import build_failure_comment
+
+        body = build_failure_comment("max_turns_exhausted", "run-123")
+        assert (
+            "The agent ran out of turns; commits and gate result (if any) are"
+            " recorded — review before re-dispatching." in body
+        )

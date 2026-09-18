@@ -3,9 +3,13 @@ r"""CLI helper: print the agent transcript for a dispatch run.
 Usage:
     python -m agent_gtd_dispatch.show_run_transcript <run_id>
 
-The transcript lives at ``{WORKSPACE_ROOT}/*-{run_id}/transcript.txt`` and is
-only available while the workspace has not been cleaned up yet (i.e. the run
-is still active, or cleanup_workspace() has not been called).
+The transcript lives at ``{WORKSPACE_ROOT}/*-{run_id}/transcript.txt`` while the
+workspace still exists.  After teardown the retained copy at
+``{EVIDENCE_ROOT}/{run_id}/transcript.txt`` is used instead; the command exits 1
+only when BOTH lookups miss.
+
+Agents run with ``--output-format json``, so the transcript's last top-level JSON
+object is the CLI result envelope — pipe the output through ``jq`` to read it.
 
 Example (SSH to dispatch host)::
 
@@ -46,8 +50,14 @@ def main() -> None:
     workspace_root: Path = config.WORKSPACE_ROOT
     matches = list(workspace_root.glob(f"*-{run_id}/transcript.txt"))
     if not matches:
+        # Workspace already torn down — fall back to the retained evidence copy.
+        evidence = config.EVIDENCE_ROOT / run_id / "transcript.txt"
+        if evidence.exists():
+            matches = [evidence]
+    if not matches:
         print(
-            f"No transcript found for run {run_id!r} under {workspace_root}",
+            f"No transcript found for run {run_id!r} under {workspace_root}"
+            f" or {config.EVIDENCE_ROOT}",
             file=sys.stderr,
         )
         sys.exit(1)

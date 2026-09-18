@@ -29,6 +29,15 @@ export ANTHROPIC_API_KEY="your-anthropic-key"        # required — see note bel
 export DISPATCH_WORKSPACE_ROOT="/path/to/workspaces" # default: ~/workspace
 ```
 
+Retention is configured separately, and splits by decay rate — evidence is small and useful for months, a workspace tree is hundreds of MB to GB and its value decays in a day or two:
+
+```bash
+export DISPATCH_EVIDENCE_ROOT="/path/to/run-evidence"   # default: <workspace root>/../run-evidence
+export DISPATCH_EVIDENCE_RETENTION_DAYS=30              # default: 30
+export DISPATCH_WORKSPACE_RETENTION_HOURS=48            # default: 48
+export DISPATCH_RETENTION_INTERVAL_SECONDS=3600         # default: 3600
+```
+
 > **`ANTHROPIC_API_KEY` is required** — the service raises at startup without it. It
 > powers the in-process rollout planner (`POST /plan`) and is deliberately **not**
 > forwarded to Claude Code subprocesses; those authenticate via
@@ -215,7 +224,7 @@ uv run pytest --cov --cov-report=term-missing
 | GET | `/runs` | Bearer | List runs (query: `item_id`, `status`, `limit`) |
 | GET | `/runs/{run_id}` | Bearer | Get a specific run |
 | GET | `/runs/{run_id}/transcript` | Bearer | Get a run's agent transcript |
-| POST | `/runs/{run_id}/cancel` | Bearer | Cancel a running dispatch |
+| POST | `/runs/{run_id}/cancel` | Bearer | Cancel a running dispatch (idempotent — `already_satisfied` is terminal and returns 200 unchanged) |
 
 All endpoints marked **Bearer** require an `Authorization: Bearer <DISPATCH_API_KEY>` header.
 
@@ -232,6 +241,54 @@ All endpoints marked **Bearer** require an `Authorization: Bearer <DISPATCH_API_
 ```
 
 Returns an empty list if `list_agents.sh` is missing, not executable, times out, or exits non-zero. Never returns a 5xx.
+
+## Build completion contract
+
+A BUILD run's terminal is derived from three independent legs, never from activity on the GTD item.
+
+**Leg 1 — the CLI result envelope.** Every claude-code engine is launched with `--output-format json`, so the agent's transcript ends with a `{"type":"result",...}` object. The worker parses the last such object out of the transcript tail. No parseable envelope means the run failed, regardless of the subprocess exit code.
+
+**Leg 2 — the completion artifact.** The agent's last action on every path is to write `<workspace>/.dispatch/completion.json`: `{"schema_version": 1, "disposition": "done"|"already_satisfied"|"blocked"|"failed", "summary": "...", "reason": "...", "decision_needed": "..."}`. `reason` is required for `already_satisfied`; `decision_needed` is required for `blocked`; `summary` is optional. A missing `schema_version` defaults to 1 and is accepted, so worker/agent version skew degrades gracefully. A run without this file is recorded as a failure regardless of what it pushed.
+
+**Leg 3 — the zero-commit invariant.** A build run that produced zero commits across every repo is NEVER recorded as a success. There is no escape hatch on `done`, and a runtime choke point immediately before every terminal write coerces a violating status to `failed` with an `invariant_zero_commit_success:` error and an `INVARIANT VIOLATION` log line.
+
+### Terminal precedence
+
+1. Push verification already failing — unchanged behaviour.
+2. `envelope_verdict != ok` → failed, error prefixed with the verdict (`no_result_envelope`, `result_is_error`, `max_turns_exhausted`).
+3. No parseable artifact → failed, error prefixed `stopped_without_assertion:`.
+4. `disposition` in `{blocked, failed}` → failed, error prefixed `agent_reported_<disposition>:`.
+5. `disposition == done` with zero commits → failed, error prefixed `done_claim_zero_commits:`.
+6. `disposition == already_satisfied` with zero commits → the already_satisfied terminal below.
+7. Otherwise the existing pushed/gate path.
+
+### The `already_satisfied` terminal
+
+`already_satisfied` is a new `RunStatus` member. It is reached only when the artifact is present and parseable, carries `disposition: already_satisfied` with a non-empty `reason`, the run produced zero commits, and the project quality gate did not fail.
+
+On this path the gate RUNS even though nothing was pushed — a no-op claim on a red repo is a failure, never a skip. A red, timed-out or unlaunchable gate fails the run with the error prefixed `already_satisfied_gate_failed:`. When the project has NO `gate_command` the gate decision is the literal `skipped_no_gate_command` and the run IS `already_satisfied`; both the human-facing comment and the telemetry record that so the reviewer knows the no-op was unverified.
+
+The worker sets the item to `review` (best-effort — a failure there does not change the run status) and posts a comment carrying the verbatim reason and the gate decision. The item is never completed on this path.
+
+### Triage `error` prefixes
+
+The triage distinctions are `error`-string prefixes, not extra protocol statuses: `no_result_envelope`, `result_is_error`, `max_turns_exhausted`, `stopped_without_assertion`, `agent_reported_blocked`, `agent_reported_failed`, `done_claim_zero_commits`, `already_satisfied_gate_failed`, `invariant_zero_commit_success`. The GTD comment on a failed build starts with `Build run failed (<prefix>)` so the class is legible without opening the transcript.
+
+### The `completion` run column
+
+Every build terminal writes a JSON blob into the runs table's nullable `completion` column: `envelope_verdict`, `envelope_subtype`, `is_error`, `num_turns`, `stop_reason`, `session_id`, `total_cost_usd`, `artifact` (`present|absent|malformed`), `artifact_reject_reason`, `disposition`, `zero_commits`, `gate_decision`, `evidence_dir`. This is the only durable carrier of the envelope on a succeeded run (where `error` is NULL) and the only way `session_id` / `num_turns` / `total_cost_usd` survive teardown. The same values are logged as one `build completion:` key=value line, greppable in `journalctl --user -u agent-gtd-dispatch`.
+
+### Retention and evidence
+
+Every terminal run's evidence is captured into `<DISPATCH_EVIDENCE_ROOT>/<run_id>/` BEFORE the workspace is torn down: `transcript.txt`, `completion.json` (when present) and `patch.diff` (a per-repo `git diff <base>..HEAD`). Capture is verdict-free and best-effort — it never raises into a teardown path.
+
+Pruning is age-based only, never free-space-based and never outcome-based. Workspace trees older than `DISPATCH_WORKSPACE_RETENTION_HOURS` and evidence directories older than `DISPATCH_EVIDENCE_RETENTION_DAYS` are deleted, except those belonging to a live run.
+
+To retrieve a transcript after teardown, `show_run_transcript` falls back from the live workspace glob to the retained evidence copy, and exits 1 only when both lookups miss. Its output is now a stream that ENDS in a single JSON object (the result envelope) — pipe it through `jq` to read it:
+
+```bash
+python -m agent_gtd_dispatch.show_run_transcript <run_id> | tail -1 | jq .
+```
 
 ## Dispatch modes and rollouts
 
