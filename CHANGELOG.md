@@ -2,6 +2,20 @@
 
 <!-- version list -->
 
+## v1.25.0 (2026-09-18)
+
+### Features
+
+- **completion**: Derive build terminals from agent evidence, not comment counts (0f59d27b)
+  ([`48617eb`](https://github.com/repos/agent-gtd-dispatch/commit/48617eb2864f5f05415c1354546b15f98c5d264d))
+
+- **setup**: Provision the personal-kb-hook for the agent user (e9fea48f)
+  ([`443a609`](https://github.com/repos/agent-gtd-dispatch/commit/443a60970d91f76cc86be8c4248b62cad1b8c76d))
+
+- **talos**: Map exit 30 (AlreadySatisfied) and 40 (Answer) (d80bcbaa)
+  ([`019195f`](https://github.com/repos/agent-gtd-dispatch/commit/019195f054609416b8e50cf53cf5f36fbf13d16d))
+
+
 ## v1.24.1 (2026-09-17)
 
 ### Bug Fixes
