@@ -711,6 +711,19 @@ _FAILED_SUMMARY = '{"outcome":"Finished","disposition":{"Failed":{"mode":"Loop",
 _STOPPED_WITHOUT_FINISH_SUMMARY = '{"outcome":"StoppedWithoutFinish","disposition":{"Failed":{"mode":"StoppedWithoutFinish","summary":"never called finish"}},"iterations":18}'
 _BACKEND_ERROR_SUMMARY = '{"outcome":"BackendError","disposition":{"Failed":{"mode":"TransientInfra","summary":"llm 500"}},"iterations":1}'
 _PRE_RUN_ERROR = '{"error":"cannot open workspace"}'
+_ALREADY_SATISFIED_SUMMARY = (
+    '{"outcome":"Finished","disposition":{"AlreadySatisfied":'
+    '{"reason":"CLI already validates this at cli.py:42"}},"iterations":1}'
+)
+_ALREADY_SATISFIED_NO_REASON_SUMMARY = (
+    '{"outcome":"Finished","disposition":{"AlreadySatisfied":'
+    '{"reason":""}},"iterations":1}'
+)
+_ANSWER_SUMMARY = (
+    '{"outcome":"Finished","disposition":{"Answer":'
+    '{"result":{"answer":42},"verification":"NoChecksConfigured",'
+    '"change":null}},"iterations":1}'
+)
 
 
 class TestMapTalosResult:
@@ -791,6 +804,110 @@ class TestMapTalosResult:
             assert map_talos_result(code, summary, "err")[1] is False
 
 
+class TestMapTalosResultExit30AlreadySatisfied:
+    """Exit 30 (AlreadySatisfied) — reuses RunStatus.already_satisfied, never
+    pushable, and mirrors the exit-0 malformed-stdout guard."""
+
+    def test_exit_30_with_reason_maps_already_satisfied(self) -> None:
+        from agent_gtd_dispatch.models import RunStatus
+        from agent_gtd_dispatch.talos import map_talos_result
+
+        status, push, text = map_talos_result(30, _ALREADY_SATISFIED_SUMMARY, "")
+        assert status == RunStatus.already_satisfied
+        assert push is False
+        assert "CLI already validates this at cli.py:42" in text
+
+    def test_exit_30_reasonless_disposition_states_reason_absent(self) -> None:
+        from agent_gtd_dispatch.models import RunStatus
+        from agent_gtd_dispatch.talos import map_talos_result
+
+        status, push, text = map_talos_result(
+            30, _ALREADY_SATISFIED_NO_REASON_SUMMARY, ""
+        )
+        assert status == RunStatus.already_satisfied
+        assert push is False
+        # Missing/empty reason must be stated explicitly, never rendered blank.
+        assert "no reason given" in text.lower()
+
+    def test_exit_30_unparseable_stdout_is_engine_broke(self) -> None:
+        from agent_gtd_dispatch.models import RunStatus
+        from agent_gtd_dispatch.talos import map_talos_result
+
+        status, push, text = map_talos_result(30, "not json", "")
+        assert status == RunStatus.failed
+        assert push is False
+        assert "exit 30" in text
+        assert "unparseable" in text.lower()
+
+    def test_exit_30_empty_stdout_is_engine_broke(self) -> None:
+        from agent_gtd_dispatch.models import RunStatus
+        from agent_gtd_dispatch.talos import map_talos_result
+
+        status, push, text = map_talos_result(30, "", "")
+        assert status == RunStatus.failed
+        assert push is False
+        assert "exit 30" in text
+
+
+class TestMapTalosResultExit40Answer:
+    """Exit 40 (Answer) — recognized, distinct triage text, never routed."""
+
+    def test_exit_40_recognized_not_routed(self) -> None:
+        from agent_gtd_dispatch.models import RunStatus
+        from agent_gtd_dispatch.talos import map_talos_result
+
+        status, push, text = map_talos_result(40, _ANSWER_SUMMARY, "")
+        assert status == RunStatus.failed
+        assert push is False
+        assert "answer" in text.lower()
+        assert "unknown exit code" not in text.lower()
+
+
+class TestMapTalosResultExitCodeTable:
+    """One parametrized table covering every mapped exit code plus the
+    catch-all, so exit 30/40 cannot silently regress 0/10/20/1 or the
+    genuinely-unknown-exit-code path."""
+
+    @pytest.mark.parametrize(
+        ("exit_code", "stdout", "stderr", "expected_status", "expected_push"),
+        [
+            (0, _SAMPLE_RUN_SUMMARY, "", "succeeded", True),
+            (10, _BLOCKED_SUMMARY, "", "failed", False),
+            (20, _FAILED_SUMMARY, "", "failed", False),
+            (1, "", _PRE_RUN_ERROR, "failed", False),
+            (1, _BACKEND_ERROR_SUMMARY, "", "failed", False),
+            (30, _ALREADY_SATISFIED_SUMMARY, "", "already_satisfied", False),
+            (40, _ANSWER_SUMMARY, "", "failed", False),
+            (99, "", "", "failed", False),
+        ],
+    )
+    def test_exit_code_table(
+        self,
+        exit_code: int,
+        stdout: str,
+        stderr: str,
+        expected_status: str,
+        expected_push: bool,
+    ) -> None:
+        from agent_gtd_dispatch.models import RunStatus
+        from agent_gtd_dispatch.talos import map_talos_result
+
+        status, push, text = map_talos_result(exit_code, stdout, stderr)
+        assert status == RunStatus(expected_status)
+        assert push is expected_push
+        if exit_code == 99:
+            assert "unknown exit code 99" in text
+
+    def test_catch_all_unchanged_for_unknown_exit_code(self) -> None:
+        from agent_gtd_dispatch.models import RunStatus
+        from agent_gtd_dispatch.talos import map_talos_result
+
+        status, push, text = map_talos_result(99, "", "")
+        assert status == RunStatus.failed
+        assert push is False
+        assert "unknown exit code 99" in text
+
+
 # ---------------------------------------------------------------------------
 # DISPOSITION JSON PARSING — externally-tagged
 # ---------------------------------------------------------------------------
@@ -837,6 +954,25 @@ class TestParseDispositionSummary:
         out = parse_disposition_summary(disposition)
         assert "Loop" in out
         assert "gate never went green" in out
+
+    def test_already_satisfied_with_reason(self) -> None:
+        from agent_gtd_dispatch.talos import parse_disposition_summary
+
+        disposition = {"AlreadySatisfied": {"reason": "CLI already does this"}}
+        out = parse_disposition_summary(disposition)
+        assert "CLI already does this" in out
+
+    def test_already_satisfied_missing_reason_states_absence(self) -> None:
+        from agent_gtd_dispatch.talos import parse_disposition_summary
+
+        assert (
+            "no reason given"
+            in parse_disposition_summary({"AlreadySatisfied": {}}).lower()
+        )
+        assert (
+            "no reason given"
+            in parse_disposition_summary({"AlreadySatisfied": {"reason": ""}}).lower()
+        )
 
 
 class TestFailureModeGuidance:
@@ -1890,6 +2026,170 @@ class TestRunTalosWorkerBranch:
         assert failed_calls, update_run_mock.await_args_list
         # Plain header — no guidance enrichment, no raise.
         assert failed_calls[-1].kwargs["error"] == "talos task failed"
+
+    async def test_exit_30_already_satisfied_sets_item_review_no_rollout(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Non-rollout talos run: item -> review, no rollout completion call."""
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        run, engine, item, project = _make_talos_run()
+        assert run.rollout_id is None
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        complete_in_rollout_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+        monkeypatch.setattr(gtd_client, "complete_in_rollout", complete_in_rollout_mock)
+
+        stdout = (
+            '{"outcome":"Finished","iterations":1,'
+            '"disposition":{"AlreadySatisfied":'
+            '{"reason":"CLI already validates this at cli.py:42"}}}'
+        )
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (stdout.encode(), b"")
+        mock_proc.returncode = 30
+
+        run_mock = MagicMock()
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", run_mock),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        # No git subprocess.run calls (no commit, no push).
+        run_mock.assert_not_called()
+        # Run terminal persisted as already_satisfied.
+        assert any(
+            call.kwargs.get("status") == RunStatus.already_satisfied
+            for call in update_run_mock.await_args_list
+        )
+        # Item moved to review — same routing as the claude-code path.
+        set_status_mock.assert_awaited_once()
+        assert set_status_mock.await_args.args == ("item-abc", "review")
+        # No rollout_id on this run — no rollout completion attempted.
+        complete_in_rollout_mock.assert_not_awaited()
+        # A comment surfaces the reason and states the item was moved to review.
+        bodies = [c.args[1] for c in post_comment_mock.await_args_list]
+        assert any("CLI already validates this at cli.py:42" in b for b in bodies)
+        assert any("already satisfied" in b for b in bodies)
+        assert any("moved to review" in b for b in bodies)
+
+    async def test_exit_30_already_satisfied_completes_rollout_item_skipped(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A talos run inside a rollout: item -> review AND rollout skip+advance,
+        naming the downstream items the skip unblocked."""
+        from agent_gtd_dispatch import config, db, gtd_client, main
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        run, engine, item, project = _make_talos_run()
+        run.rollout_id = "ro-1"
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        complete_in_rollout_mock = AsyncMock(
+            return_value={"newly_ready": ["item-xyz"], "graph_complete": False}
+        )
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+        monkeypatch.setattr(gtd_client, "complete_in_rollout", complete_in_rollout_mock)
+
+        stdout = (
+            '{"outcome":"Finished","iterations":1,'
+            '"disposition":{"AlreadySatisfied":{"reason":"already done"}}}'
+        )
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (stdout.encode(), b"")
+        mock_proc.returncode = 30
+
+        run_mock = MagicMock()
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", run_mock),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        set_status_mock.assert_awaited_once()
+        assert set_status_mock.await_args.args == ("item-abc", "review")
+        complete_in_rollout_mock.assert_awaited_once()
+        assert complete_in_rollout_mock.await_args.args[0] == "ro-1"
+        assert complete_in_rollout_mock.await_args.args[1] == "item-abc"
+        assert complete_in_rollout_mock.await_args.kwargs["outcome"] == "skipped"
+        bodies = [c.args[1] for c in post_comment_mock.await_args_list]
+        assert any("item-xyz" in b for b in bodies)
+
+    async def test_exit_30_no_downstream_states_none_unblocked(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Empty `newly_ready` renders an explicit 'no downstream' statement."""
+        from agent_gtd_dispatch import config, db, gtd_client, main
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        run, engine, item, project = _make_talos_run()
+        run.rollout_id = "ro-1"
+
+        monkeypatch.setattr(db, "update_run", AsyncMock())
+        post_comment_mock = AsyncMock()
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", AsyncMock())
+        monkeypatch.setattr(
+            gtd_client,
+            "complete_in_rollout",
+            AsyncMock(return_value={"newly_ready": [], "graph_complete": False}),
+        )
+
+        stdout = (
+            '{"outcome":"Finished","iterations":1,'
+            '"disposition":{"AlreadySatisfied":{"reason":"already done"}}}'
+        )
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (stdout.encode(), b"")
+        mock_proc.returncode = 30
+
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", MagicMock()),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        bodies = [c.args[1] for c in post_comment_mock.await_args_list]
+        assert any("no downstream items unblocked" in b.lower() for b in bodies)
 
     # ------------------------------------------------------------------
     # Workspace (multi-repo) branch — workspace_repo_dirs non-empty.

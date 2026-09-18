@@ -9,10 +9,14 @@ functions the worker composes:
 - :func:`build_talos_argv` — the ``talos run --workspace ... --task-id ...``
   argv, sudo-wrapped for the two-user split
 - :func:`map_talos_result` — pure exit-code → (RunStatus, push, comment) mapper
-  covering all four talos exit codes (0/10/20/1) and both exit-1 shapes without
-  ever conflating exit 1 (engine broke) with exit 20 (task failed)
+  covering all six talos exit codes (0/10/20/30/40/1) and both exit-1 shapes
+  without ever conflating exit 1 (engine broke) with exit 20 (task failed).
+  Exit 30 (AlreadySatisfied) reuses the existing ``RunStatus.already_satisfied``
+  protocol member added by 48617eb for the claude-code artifact-disposition
+  path — never a talos-specific status. Exit 40 (Answer) is recognized but
+  deliberately not routed further (see scope note on :func:`map_talos_result`).
 - :func:`parse_disposition_summary` — externally-tagged Disposition JSON parser
-  for the comment-back path (Done/Blocked/Failed)
+  for the comment-back path (Done/Blocked/Failed/AlreadySatisfied)
 """
 
 from __future__ import annotations
@@ -255,6 +259,17 @@ def build_talos_argv(workspace_dir: Path, task_id: str, attempt: int) -> list[st
 #   20 → task failed (RunSummary on stdout, disposition=Failed with mode
 #        Loop|BudgetExhausted|PersistentToolError|StoppedWithoutFinish|
 #        MaxIterations)
+#   30 → AlreadySatisfied (RunSummary on stdout, disposition=AlreadySatisfied with
+#        a required non-empty reason). This is the talos half of the completion
+#        contract shipped as 48617eb — talos `done` now requires an observed tree
+#        change, and the honest no-op is its own disposition whose checks still
+#        ran and were green. Reuses the EXISTING `RunStatus.already_satisfied`
+#        protocol member (never a talos-specific status) and is never pushable.
+#   40 → Answer (RunSummary on stdout, disposition=Answer with {result,
+#        verification, change}). Recognized here so it is never mistaken for an
+#        unknown-exit engine error, but deliberately NOT routed further — Answer
+#        mode is not reachable from build_talos_argv today (no --mode/--question
+#        plumbing exists yet), so this mapping exists ahead of that wiring.
 #   1  → engine/infra error, TWO shapes:
 #        (a) pre-run infra error → stdout empty, one-line {"error":...} on stderr
 #        (b) completed run with outcome=BackendError → full RunSummary on stdout
@@ -268,6 +283,18 @@ def map_talos_result(
     ``push`` is True ONLY for verified Done (exit 0 with a parseable RunSummary).
     Exit codes 1 (engine broke) and 20 (task failed) are NEVER conflated — the
     caller must be able to distinguish them from comment text alone.
+
+    Exit 30 (AlreadySatisfied) maps to ``RunStatus.already_satisfied`` with
+    ``push=False`` — reusing the SAME terminal the claude-code artifact-disposition
+    path uses (48617eb), never a parallel talos-specific status. Like exit 0, an
+    unparseable/empty stdout line on exit 30 is never trusted as evidence and
+    demotes to ``failed`` instead.
+
+    Exit 40 (Answer) maps to ``failed`` with distinct triage text naming answer
+    mode — recognized so it is never mistaken for an unknown exit code, but
+    deliberately NOT routed any further (no item status change): Answer mode
+    is not reachable from :func:`build_talos_argv` today, so this mapping exists
+    ahead of workflow-dispatch plumbing that would make it reachable.
 
     Args:
         exit_code: The talos process's exit code.
@@ -315,6 +342,57 @@ def map_talos_result(
             RunStatus.failed,
             False,
             "talos task failed",
+        )
+    if exit_code == 30:
+        # AlreadySatisfied — mirrors the exit-0 malformed-stdout guard above:
+        # evidence you cannot read is not evidence, so an unparseable/empty
+        # stdout line is NEVER treated as already_satisfied.
+        if not stdout_line:
+            return (
+                RunStatus.failed,
+                False,
+                (
+                    "talos engine error (retryable/investigate): "
+                    "exit 30 with unparseable RunSummary JSON"
+                ),
+            )
+        try:
+            summary = json.loads(stdout_line)
+        except json.JSONDecodeError:
+            return (
+                RunStatus.failed,
+                False,
+                (
+                    "talos engine error (retryable/investigate): "
+                    "exit 30 with unparseable RunSummary JSON"
+                ),
+            )
+        disposition = summary.get("disposition") if isinstance(summary, dict) else None
+        reason_text = (
+            parse_disposition_summary(disposition)
+            if isinstance(disposition, dict)
+            else "AlreadySatisfied: (no reason given by talos)"
+        )
+        # push=False — an AlreadySatisfied run is never pushable, by
+        # construction on the talos side (it observed no tree change).
+        return (
+            RunStatus.already_satisfied,
+            False,
+            f"talos already satisfied — {reason_text}",
+        )
+    if exit_code == 40:
+        # Answer — recognized so it is never mistaken for an unknown-exit
+        # engine error, but deliberately NOT routed further: `failed` is the
+        # conservative terminal here (an answer run is not a build success),
+        # and no item status change happens until workflow dispatch exists.
+        return (
+            RunStatus.failed,
+            False,
+            (
+                "talos answer mode (exit 40): recognized exit code, distinct "
+                "from a genuinely unrecognized one — Answer disposition is not "
+                "routed until workflow dispatch exists (no item status change)"
+            ),
         )
     if exit_code == 1:
         # Two exit-1 shapes — distinguishable by stdout emptiness. Both are
@@ -366,6 +444,11 @@ def parse_disposition_summary(disposition: dict[str, Any]) -> str:
       ``MaxIterations`` LoopOutcome surfaces as disposition mode
       ``BudgetExhausted`` (it collapses in ``into_disposition``), so
       ``MaxIterations`` is NOT a disposition mode.
+    - AlreadySatisfied → ``{"AlreadySatisfied": {"reason": str}}`` (exit code
+      30 only) — the honest no-op disposition; ``reason`` is REQUIRED
+      non-empty on the talos side, but this parser still renders a defensive
+      explicit fallback if it ever arrives missing/empty rather than emitting
+      a blank reason.
 
     Returns a compact human-readable string for the comment body; on Done it
     additionally appends the mechanical verification evidence.
@@ -391,6 +474,12 @@ def parse_disposition_summary(disposition: dict[str, Any]) -> str:
         mode = failed.get("mode", "unknown")
         summary = failed.get("summary", "")
         return f"Failed ({mode}): {summary}"
+    if "AlreadySatisfied" in disposition:
+        already = disposition["AlreadySatisfied"]
+        reason = str(already.get("reason", "")).strip()
+        if not reason:
+            return "AlreadySatisfied: (no reason given by talos)"
+        return f"AlreadySatisfied: {reason}"
     return f"Unknown disposition: {disposition!r}"
 
 

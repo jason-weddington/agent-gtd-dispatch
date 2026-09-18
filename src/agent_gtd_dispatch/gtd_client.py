@@ -121,9 +121,16 @@ async def complete_in_rollout(
     decision_rule: str = "",
     *,
     token: str | None = None,
-) -> None:
-    """POST /api/rollouts/{rollout_id}/complete-item."""
-    await _request(
+) -> dict[str, Any]:
+    """POST /api/rollouts/{rollout_id}/complete-item.
+
+    Returns the response body, which carries ``newly_ready`` (item ids the
+    rollout graph unblocked as a result of this completion) and
+    ``graph_complete`` (whether the rollout just closed) — callers that need to
+    name what a skip/complete unblocked (e.g. a talos already_satisfied skip)
+    read this dict rather than re-deriving it.
+    """
+    result: dict[str, Any] = await _request(
         "POST",
         f"/rollouts/{rollout_id}/complete-item",
         token=token,
@@ -134,6 +141,7 @@ async def complete_in_rollout(
             "decision_rule": decision_rule,
         },
     )
+    return result
 
 
 async def get_rollout(rollout_id: str, *, token: str | None = None) -> dict[str, Any]:

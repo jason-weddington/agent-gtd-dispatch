@@ -878,7 +878,13 @@ async def _run_talos(
       :func:`dispatch.verify_pushes`. On successful push it PATCHes item status
       to ``review`` (best-effort; a failed status set does NOT flip the run to
       failed — mirrors the ollama-fallback comment-post's tolerance).
-    - Exit 10/20/1 (or unpushed after exit 0): no commit, no push, no status set.
+    - Exit 10/20/1/40 (or unpushed after exit 0): no commit, no push, no status set.
+    - Exit 30 (AlreadySatisfied): no commit, no push, but item status IS PATCHed
+      to ``review`` (best-effort) via :func:`_route_already_satisfied_item` — the
+      SAME routing the claude-code already_satisfied path (48617eb) uses. If the
+      run carries a ``rollout_id``, :func:`_complete_rollout_item_skipped` also
+      records the rollout item as skipped so the wave advances (talos has no
+      GTD/MCP access to do this itself, unlike a claude-code manage-mode run).
     - Every terminal exit posts a comment describing the outcome.
     - When ``workspace_repo_dirs`` is a non-empty list (workspace/multi-repo mode),
       the exit-0 git path loops per-repo subdir under ``workspace`` doing
@@ -1372,6 +1378,29 @@ async def _run_talos(
         )
         _publish_run_event(run.id, status.value, now)
 
+    if status == RunStatus.already_satisfied:
+        # Exit 30 (AlreadySatisfied) — identical routing to the claude-code
+        # already_satisfied path shipped in 48617eb: item -> review
+        # (best-effort). Returns early (skipping the generic build_comment_body
+        # tail below) so exactly one set of comments fires for this terminal —
+        # mirrors the workspace success path's early-return precedent above.
+        await _route_already_satisfied_item(
+            item_id,
+            run.id,
+            comment_header,
+            callback_token=run.callback_token,
+            attribution=attribution,
+        )
+        if run.rollout_id is not None:
+            await _complete_rollout_item_skipped(
+                run.rollout_id,
+                item_id,
+                run.id,
+                callback_token=run.callback_token,
+                attribution=attribution,
+            )
+        return
+
     # Comment-back on every terminal exit — talos has no GTD access so this
     # comment is the reviewer's only surface for the mechanical verification
     # evidence embedded in the RunSummary.
@@ -1539,6 +1568,112 @@ async def _record_build_terminal(
         completion=completion_blob,
     )
     return status
+
+
+async def _route_already_satisfied_item(
+    item_id: str,
+    run_id: str,
+    reason: str,
+    *,
+    callback_token: str | None,
+    attribution: str | None,
+    detail: str = "",
+) -> None:
+    """Route an ``already_satisfied`` BUILD terminal to GTD: item -> review + comment.
+
+    SHARED by both already_satisfied paths — the claude-code artifact-disposition
+    path (48617eb) and the talos exit-30 (AlreadySatisfied) path — so the two
+    engines can never diverge in how a no-op terminal reaches GTD (kb-03296: the
+    manage-relaunch bug existed because the same decision was made in two callers
+    and only one carried the guard).
+
+    Status-set is deliberately tolerant: a PATCH failure does NOT flip the run
+    status away from ``already_satisfied`` — mirrors every other status-set in
+    this module.
+    """
+    try:
+        await gtd_client.set_item_status(item_id, "review", token=callback_token)
+    except Exception:
+        logger.warning(
+            "Failed to set item %s status=review (run %s) — run stays already_satisfied",
+            item_id,
+            run_id,
+        )
+    body = (
+        f"Build run `{run_id}` made no changes: the agent reported the "
+        f"acceptance criteria are already satisfied.\n\nReason: {reason}\n\n"
+    )
+    if detail:
+        body += f"{detail} "
+    body += "The item is moved to review for a human — it was NOT completed."
+    try:
+        await gtd_client.post_comment(
+            item_id,
+            body,
+            created_by=attribution or "agent-gtd-dispatch",
+            token=callback_token,
+        )
+    except Exception:
+        logger.warning("Failed to post already-satisfied comment for run %s", run_id)
+
+
+async def _complete_rollout_item_skipped(
+    rollout_id: str,
+    item_id: str,
+    run_id: str,
+    *,
+    callback_token: str | None,
+    attribution: str | None,
+) -> None:
+    """Complete a rollout item with outcome=skipped and name what it unblocked.
+
+    Talos-only today: talos has no GTD/MCP access by design, so the dispatch
+    worker performs the rollout skip-and-advance step directly instead of
+    relying on the manage-mode LLM to notice via polling (which is how the
+    claude-code already_satisfied path reaches this same outcome — see the
+    manage-prompt zero-commit rule in dispatch.py, which now recognizes both
+    engines' already_satisfied terminal identically). Best-effort throughout:
+    a failure here must never affect the run's already-recorded terminal
+    status.
+    """
+    try:
+        result = await gtd_client.complete_in_rollout(
+            rollout_id,
+            item_id,
+            outcome="skipped",
+            merge_actor="dispatch-worker",
+            decision_rule="already-satisfied",
+            token=callback_token,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to complete rollout item %s in rollout %s as skipped (run %s)",
+            item_id,
+            rollout_id,
+            run_id,
+        )
+        return
+    newly_ready = result.get("newly_ready") if isinstance(result, dict) else None
+    if newly_ready:
+        detail = (
+            f"Downstream items unblocked: {', '.join(str(x) for x in newly_ready)}."
+        )
+    else:
+        detail = "No downstream items unblocked."
+    try:
+        await gtd_client.post_comment(
+            item_id,
+            (
+                f"Rollout `{rollout_id}`: item recorded as skipped (already"
+                f" satisfied) — the wave advances. {detail}"
+            ),
+            created_by=attribution or "agent-gtd-dispatch",
+            token=callback_token,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to post rollout skip-and-advance comment for run %s", run_id
+        )
 
 
 async def _dispatch_worker(
@@ -2524,37 +2659,14 @@ async def _dispatch_worker(
                 )
                 _publish_run_event(run.id, "already_satisfied", completed)
                 if run.item_id is not None:
-                    # Status-set is deliberately tolerant: a PATCH failure does
-                    # NOT flip the run status (mirrors the talos paths).
-                    try:
-                        await gtd_client.set_item_status(
-                            run.item_id, "review", token=run.callback_token
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Failed to set item %s status=review (run %s) —"
-                            " run stays already_satisfied",
-                            run.item_id,
-                            run.id,
-                        )
-                    try:
-                        await gtd_client.post_comment(
-                            run.item_id,
-                            (
-                                f"Build run `{run.id}` made no changes: the agent"
-                                " reported the acceptance criteria are already"
-                                f" satisfied.\n\nReason: {_as_reason}\n\n"
-                                f"Quality gate: {decision}. The item is moved to"
-                                " review for a human — it was NOT completed."
-                            ),
-                            created_by=attribution or "agent-gtd-dispatch",
-                            token=run.callback_token,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Failed to post already-satisfied comment for run %s",
-                            run.id,
-                        )
+                    await _route_already_satisfied_item(
+                        run.item_id,
+                        run.id,
+                        _as_reason,
+                        callback_token=run.callback_token,
+                        attribution=attribution,
+                        detail=f"Quality gate: {decision}.",
+                    )
                 return
 
             # All pushed (or no BUILD verification needed) — mark succeeded

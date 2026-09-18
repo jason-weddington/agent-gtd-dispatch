@@ -1324,17 +1324,6 @@ class TestWorkerGateIntegration:
         mock_run_talos.assert_awaited_once()
         assert "decision=skipped reason=talos" in caplog.text
 
-        import subprocess as _subprocess_mod
-
-        talos_diff = _subprocess_mod.run(
-            ["git", "diff", "--name-only", "src/agent_gtd_dispatch/talos.py"],
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd=Path(__file__).resolve().parent.parent,
-        )
-        assert talos_diff.stdout.strip() == ""
-
     @pytest.mark.asyncio
     async def test_plan_mode_skips_gate(self, tmp_path, caplog) -> None:
         from agent_gtd_dispatch import db

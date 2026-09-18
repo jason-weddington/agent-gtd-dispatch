@@ -1427,7 +1427,11 @@ def _build_manage_workspace_main_prompt(
            child build run and read its `status` field.
 
            If `status` is exactly `already_satisfied`, the build agent asserted the
-           work was already done and the dispatch worker verified the quality gate.
+           work was already done. For a claude-code build this means the dispatch
+           worker verified the quality gate on the tree as it stood; for a talos build
+           (talos exit code 30, AlreadySatisfied) talos's own checks already ran and
+           were green before it emitted that disposition — same guarantee, different
+           enforcement point. Either engine, treat `already_satisfied` identically.
            Skip the merge and advance:
            ```
            mcp__agent-gtd__complete_item_in_rollout(
@@ -1916,8 +1920,12 @@ def _build_manage_prompt(
         build run and read its `status` field.
 
         If `status` is exactly `already_satisfied`, the build agent asserted the work
-        was already done and the dispatch worker verified the quality gate. Skip the
-        merge and advance:
+        was already done. For a claude-code build this means the dispatch worker
+        verified the quality gate on the tree as it stood; for a talos build (talos
+        exit code 30, AlreadySatisfied) talos's own checks already ran and were
+        green before it emitted that disposition — same guarantee, different
+        enforcement point. Either engine, treat `already_satisfied` identically.
+        Skip the merge and advance:
         ```
         mcp__agent-gtd__complete_item_in_rollout(
             rollout_id="{rollout_id}",
