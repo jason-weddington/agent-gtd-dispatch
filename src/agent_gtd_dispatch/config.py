@@ -112,6 +112,31 @@ OLLAMA_CLOUD_API_KEY: str = ""
 OLLAMA_CLOUD_BASE_URL: str = "https://ollama.com"
 OLLAMA_CLOUD_MODEL: str = "glm-5.3:cloud"
 
+# --- Run-disposition classifier (tier 2 of disposition.py) -------------------
+#
+# Why every knob here is CONFIG and not a literal in disposition.py: the model
+# is an open-weights one, and open-weights models move fast — GLM 5.4 or 6 will
+# land well before this code is next touched.  Model, base URL, credential
+# source, timeout and the master switch are all env-overridable so moving the
+# classifier to a newer model (or to a different provider entirely) is an env
+# change on the hosts, with no code edit and no redeploy of logic.  This
+# indirection exists for MODEL CHURN; provider OUTAGE is covered by the derived
+# tier, which needs no configuration at all.
+#
+# DISPOSITION_CLASSIFIER_API_KEY_ENV names the env var that holds the
+# credential rather than the credential itself, so switching providers does not
+# require the secret to be re-plumbed through this module.
+DISPOSITION_CLASSIFIER_ENABLED: bool = True
+DISPOSITION_CLASSIFIER_MODEL: str = "glm-5.3-flash"
+DISPOSITION_CLASSIFIER_BASE_URL: str = "https://ollama.com"
+DISPOSITION_CLASSIFIER_API_KEY_ENV: str = "OLLAMA_CLOUD_API_KEY"
+# Hard per-attempt timeout. The classifier runs inside the worker's TERMINAL
+# path, so a hung call delays the run's completion (and, in a rollout, the wave
+# behind it). 45 s x at most 2 attempts = ~90 s worst case, well under
+# POST_RUN_GATE_MIN_SECONDS (600 s) — the smallest slice of run budget the
+# worker ever reserves for post-agent work.
+DISPOSITION_CLASSIFIER_TIMEOUT_SECONDS: int = 45
+
 # talos binary discovery: default 'talos', PATH-resolved by the subprocess machinery
 # (mirrors how the 'claude' binary is resolved for claude-code engines). Override via
 # TALOS_BIN env var when the binary lives at a non-default path on the host.
@@ -140,6 +165,9 @@ def load() -> None:
     global GATE_INSTALL_TIMEOUT_SECONDS, POST_RUN_GATE_MIN_SECONDS
     global OLLAMA_CLOUD_API_KEY, OLLAMA_CLOUD_BASE_URL, OLLAMA_CLOUD_MODEL
     global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS
+    global DISPOSITION_CLASSIFIER_ENABLED, DISPOSITION_CLASSIFIER_MODEL
+    global DISPOSITION_CLASSIFIER_BASE_URL, DISPOSITION_CLASSIFIER_API_KEY_ENV
+    global DISPOSITION_CLASSIFIER_TIMEOUT_SECONDS
     global AGENT_SUBPROCESS_USER
     global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
     global PLANNER_PROVIDER, PLANNER_BEDROCK_MODEL, AWS_REGION
@@ -219,6 +247,24 @@ def load() -> None:
         "OLLAMA_CLOUD_BASE_URL", "https://ollama.com"
     )
     OLLAMA_CLOUD_MODEL = os.environ.get("OLLAMA_CLOUD_MODEL", "glm-5.3:cloud")
+    DISPOSITION_CLASSIFIER_ENABLED = os.environ.get(
+        "DISPATCH_DISPOSITION_CLASSIFIER_ENABLED", "1"
+    ).strip().lower() not in {"0", "false", "no", "off", ""}
+    DISPOSITION_CLASSIFIER_MODEL = (
+        os.environ.get("DISPATCH_DISPOSITION_CLASSIFIER_MODEL", "").strip()
+        or "glm-5.3-flash"
+    )
+    DISPOSITION_CLASSIFIER_BASE_URL = (
+        os.environ.get("DISPATCH_DISPOSITION_CLASSIFIER_BASE_URL", "").strip()
+        or "https://ollama.com"
+    )
+    DISPOSITION_CLASSIFIER_API_KEY_ENV = (
+        os.environ.get("DISPATCH_DISPOSITION_CLASSIFIER_API_KEY_ENV", "").strip()
+        or "OLLAMA_CLOUD_API_KEY"
+    )
+    DISPOSITION_CLASSIFIER_TIMEOUT_SECONDS = int(
+        os.environ.get("DISPATCH_DISPOSITION_CLASSIFIER_TIMEOUT_SECONDS", "45")
+    )
     TALOS_BIN = os.environ.get("TALOS_BIN", "talos")
     TALOS_GATE_TIMEOUT_SECS = int(os.environ.get("TALOS_GATE_TIMEOUT_SECS", "900"))
     OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "qwen3.6:35b")

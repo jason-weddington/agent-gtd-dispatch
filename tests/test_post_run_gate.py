@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent_gtd_dispatch import config, db, dispatch
+from agent_gtd_dispatch import config, db, dispatch, disposition
 from agent_gtd_dispatch.dispatch import GateResult
 from agent_gtd_dispatch.engines import CLAUDE
 from agent_gtd_dispatch.models import (
@@ -1585,24 +1585,69 @@ class TestUnassertedCompletionPath:
         assert any("gate_command" in b for b in bodies)
 
     @pytest.mark.asyncio
-    async def test_absent_artifact_zero_commits_unchanged(
+    async def test_absent_artifact_zero_commits_no_gate_command_is_failure(
         self, tmp_path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """The case the contract exists for — must not be weakened."""
+        """The case the contract exists for — must not be weakened.
+
+        Nothing asserted, nothing pushed and no gate to corroborate anything:
+        the derived tier maps a gate that did not run to `failed`, exactly as
+        before the tiers existed.
+        """
         updated, mock_gtd, mock_dispatch = await self._run(
             tmp_path,
             caplog,
             item_id="item-ua4",
             pushed=False,
+            project=_default_project(gate_command=""),
         )
         assert updated.status.value == "failed"
-        assert updated.error == (
-            "stopped_without_assertion: build run did not assert a usable completion"
-        )
+        assert updated.error is not None
+        assert updated.error.startswith("stopped_without_assertion: ")
+        assert "derived disposition=failed" in updated.error
         blob = json.loads(updated.completion or "{}")
-        assert blob["unasserted"] is False
+        assert blob["unasserted"] is True
+        assert blob["disposition"] == "failed"
+        assert blob["disposition_provenance"] == "derived"
         mock_dispatch.run_gate_command.assert_not_called()
         mock_gtd.set_item_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_absent_artifact_zero_commits_gate_passed_is_already_satisfied(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Tier 3's second rule: no commits + a green gate is a no-op, not a failure.
+
+        This is the case the three-tier design exists for — an agent that found
+        the work already done and exited without writing the artifact used to be
+        indistinguishable from one that died.  The gate now RUNS despite zero
+        pushed repos (as it already did on the asserted already_satisfied path),
+        because its verdict is the evidence that tells the two apart.
+        """
+        updated, mock_gtd, mock_dispatch = await self._run(
+            tmp_path,
+            caplog,
+            item_id="item-ua4b",
+            pushed=False,
+            gate_result=GateResult(
+                returncode=0, timed_out=False, output="ok", duration_seconds=3.0
+            ),
+        )
+        mock_dispatch.run_gate_command.assert_called_once()
+        assert updated.status.value == "already_satisfied"
+        blob = json.loads(updated.completion or "{}")
+        assert blob["disposition"] == "already_satisfied"
+        assert blob["disposition_provenance"] == "derived"
+        # Routed through the EXISTING already_satisfied path: item -> review.
+        mock_gtd.set_item_status.assert_awaited_once()
+        assert mock_gtd.set_item_status.await_args.args[:2] == (
+            "item-ua4b",
+            "review",
+        )
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        # ...but never as though the agent said so.
+        assert any("**derived** mechanically" in b for b in bodies)
+        assert not any("the agent reported the" in b for b in bodies)
 
     @pytest.mark.asyncio
     async def test_malformed_artifact_pushed_gate_passed_surfaces_reason(
@@ -2171,3 +2216,340 @@ class TestBuildCompletionCommentComposition:
         assert "Summary:" not in body
         assert "Reason:" not in body
         assert "Decision needed:" not in body
+
+
+# ---------------------------------------------------------------------------
+# Three-tier disposition: asserted -> inferred -> derived, wired into the worker
+# ---------------------------------------------------------------------------
+
+
+class TestThreeTierDispositionRouting:
+    """Tier 1 wins outright; tiers 2 and 3 route through the EXISTING paths.
+
+    The whole point of the tiering is that a run never ends with a silent gap,
+    and that a verdict the agent did not give is never presented as though it
+    had. Both halves are asserted here.
+    """
+
+    _GREEN = GateResult(
+        returncode=0, timed_out=False, output="ok", duration_seconds=1.0
+    )
+
+    @staticmethod
+    def _spy(**kwargs):
+        return patch.object(disposition, "classify", new=AsyncMock(**kwargs))
+
+    @staticmethod
+    def _inferred(value: str, reason: str = "from the transcript"):
+        return disposition.DispositionResult(
+            disposition=value,
+            reason=reason,
+            provenance="inferred",
+            model="glm-5.3-flash",
+            latency_seconds=1.25,
+        )
+
+    # --- tier 1 wins: no classifier call at all --------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("artifact", "pushed"),
+        [
+            ("done", True),
+            ("already_satisfied", False),
+            ("blocked", True),
+            ("failed", True),
+        ],
+    )
+    async def test_artifact_present_never_calls_the_classifier(
+        self, tmp_path, caplog: pytest.LogCaptureFixture, artifact, pushed
+    ) -> None:
+        """An asserted disposition costs no money and no latency."""
+        with self._spy() as spy:
+            updated, _mock_gtd, _ = await _run_build_worker(
+                tmp_path,
+                caplog,
+                item_id=f"item-t1-{artifact}",
+                artifact=artifact,
+                pushed=pushed,
+                gate_result=self._GREEN,
+            )
+        spy.assert_not_awaited()
+        blob = json.loads(updated.completion or "{}")
+        assert blob["disposition"] == artifact
+        assert blob["disposition_provenance"] == "asserted"
+        assert blob["unasserted"] is False
+
+    @pytest.mark.asyncio
+    async def test_artifact_present_run_is_unchanged_end_to_end(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No-regression: a `done` artifact behaves exactly as it does today."""
+        with self._spy() as spy:
+            updated, mock_gtd, mock_dispatch = await _run_build_worker(
+                tmp_path,
+                caplog,
+                item_id="item-t1-noregress",
+                artifact="done",
+                gate_result=self._GREEN,
+            )
+        spy.assert_not_awaited()
+        assert updated.status.value == "succeeded"
+        assert updated.error is None
+        mock_dispatch.run_gate_command.assert_called_once()
+        mock_gtd.set_item_status.assert_awaited_once()
+        assert mock_gtd.set_item_status.await_args.args[:2] == (
+            "item-t1-noregress",
+            "review",
+        )
+        blob = json.loads(updated.completion or "{}")
+        assert blob["unasserted"] is False
+        assert blob["disposition"] == "done"
+        assert blob["disposition_provenance"] == "asserted"
+        assert blob["classifier_model"] is None
+        assert blob["classifier_failure"] is None
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any("Agent disposition: `done`." in b for b in bodies)
+        assert not any("inferred" in b for b in bodies)
+        assert not any("derived" in b for b in bodies)
+        assert not any("mechanical evidence alone" in b for b in bodies)
+        assert not any(
+            "unasserted build run:" in r.getMessage() for r in caplog.records
+        )
+
+    # --- tier 2 routes exactly as an asserted verdict of the same value ---
+
+    @pytest.mark.asyncio
+    async def test_inferred_done_takes_the_success_path(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with self._spy(return_value=self._inferred("done", "implemented and pushed")):
+            updated, mock_gtd, _ = await _run_build_worker(
+                tmp_path,
+                caplog,
+                item_id="item-t2-done",
+                artifact="absent",
+                gate_result=self._GREEN,
+            )
+        assert updated.status.value == "succeeded"
+        blob = json.loads(updated.completion or "{}")
+        assert blob["disposition"] == "done"
+        assert blob["disposition_provenance"] == "inferred"
+        assert blob["classifier_model"] == "glm-5.3-flash"
+        assert blob["classifier_latency_s"] == 1.25
+        assert blob["unasserted"] is True
+        # The item-status transition shipped in 5cb3125, unchanged.
+        mock_gtd.set_item_status.assert_awaited_once()
+        assert mock_gtd.set_item_status.await_args.args[:2] == (
+            "item-t2-done",
+            "review",
+        )
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any("**inferred**" in b and "glm-5.3-flash" in b for b in bodies)
+        assert any("NOT the agent's own word" in b for b in bodies)
+        assert not any("mechanical evidence alone" in b for b in bodies)
+
+    @pytest.mark.asyncio
+    async def test_inferred_already_satisfied_takes_the_existing_noop_path(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with self._spy(
+            return_value=self._inferred(
+                "already_satisfied", "the guard already exists at foo.py:12"
+            )
+        ):
+            updated, mock_gtd, _ = await _run_build_worker(
+                tmp_path,
+                caplog,
+                item_id="item-t2-as",
+                artifact="absent",
+                pushed=False,
+                gate_result=self._GREEN,
+            )
+        assert updated.status.value == "already_satisfied"
+        assert updated.error is not None
+        assert updated.error.startswith("already_satisfied: ")
+        blob = json.loads(updated.completion or "{}")
+        assert blob["disposition"] == "already_satisfied"
+        assert blob["disposition_provenance"] == "inferred"
+        # Same route as an asserted already_satisfied: item -> review.
+        mock_gtd.set_item_status.assert_awaited_once()
+        assert mock_gtd.set_item_status.await_args.args[:2] == ("item-t2-as", "review")
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        noop = [b for b in bodies if "made no changes" in b]
+        assert len(noop) == 1
+        assert "**inferred**" in noop[0]
+        assert "the agent reported the" not in noop[0]
+        assert "the guard already exists at foo.py:12" in noop[0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["blocked", "failed"])
+    async def test_inferred_blocked_or_failed_fails_the_run(
+        self, tmp_path, caplog: pytest.LogCaptureFixture, value
+    ) -> None:
+        with self._spy(return_value=self._inferred(value, "needs a schema decision")):
+            updated, mock_gtd, _ = await _run_build_worker(
+                tmp_path,
+                caplog,
+                item_id=f"item-t2-{value}",
+                artifact="absent",
+                gate_result=self._GREEN,
+            )
+        assert updated.status.value == "failed"
+        assert updated.error is not None
+        # An existing triage prefix — no new BUILD_FAILURE_PREFIXES member — and
+        # never `agent_reported_*`, which would put words in the agent's mouth.
+        assert updated.error.startswith("stopped_without_assertion: ")
+        assert f"inferred disposition={value}" in updated.error
+        blob = json.loads(updated.completion or "{}")
+        assert blob["disposition"] == value
+        assert blob["disposition_provenance"] == "inferred"
+        # blocked/failed never present themselves as ready for review.
+        mock_gtd.set_item_status.assert_not_awaited()
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any("needs a schema decision" in b for b in bodies)
+        assert any("NOT the agent's own word" in b for b in bodies)
+
+    @pytest.mark.asyncio
+    async def test_inferred_done_with_zero_commits_still_fails(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The zero-commit invariant outranks any tier's `done`."""
+        with self._spy(return_value=self._inferred("done")):
+            updated, mock_gtd, _ = await _run_build_worker(
+                tmp_path,
+                caplog,
+                item_id="item-t2-done-zero",
+                artifact="absent",
+                pushed=False,
+                gate_result=self._GREEN,
+            )
+        assert updated.status.value == "failed"
+        mock_gtd.set_item_status.assert_not_awaited()
+
+    # --- tier 3 fallbacks -------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_classifier_timeout_falls_back_to_derived(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with patch.object(
+            disposition,
+            "classify",
+            new=AsyncMock(
+                return_value=disposition.ClassificationFailure(
+                    reason="timeout", latency_seconds=45.0
+                )
+            ),
+        ):
+            updated, mock_gtd, _ = await _run_build_worker(
+                tmp_path,
+                caplog,
+                item_id="item-t3-timeout",
+                artifact="absent",
+                gate_result=self._GREEN,
+            )
+        assert updated.status.value == "succeeded"
+        blob = json.loads(updated.completion or "{}")
+        assert blob["disposition"] == "done"
+        assert blob["disposition_provenance"] == "derived"
+        assert blob["classifier_failure"] == "timeout"
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any("**derived** mechanically" in b for b in bodies)
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_response_falls_back_to_derived(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A fifth value is not a disposition — it is a classification failure."""
+        with (
+            patch.object(
+                disposition,
+                "_call_model",
+                new=AsyncMock(return_value='{"disposition": "mostly_done"}'),
+            ),
+            patch.object(config, "DISPOSITION_CLASSIFIER_ENABLED", True),
+            patch.dict(os.environ, {"OLLAMA_CLOUD_API_KEY": "k"}),
+        ):
+            updated, _mock_gtd, _ = await _run_build_worker(
+                tmp_path,
+                caplog,
+                item_id="item-t3-nonsense",
+                artifact="absent",
+                gate_result=self._GREEN,
+            )
+        assert updated.status.value == "succeeded"
+        blob = json.loads(updated.completion or "{}")
+        assert blob["disposition"] == "done"
+        assert blob["disposition_provenance"] == "derived"
+        assert blob["classifier_failure"] == "unrecognized_response"
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_config_makes_no_network_call(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        call = AsyncMock()
+        with (
+            patch.object(config, "DISPOSITION_CLASSIFIER_ENABLED", False),
+            patch.object(disposition, "_call_model", new=call),
+        ):
+            updated, _mock_gtd, _ = await _run_build_worker(
+                tmp_path,
+                caplog,
+                item_id="item-t3-disabled",
+                artifact="absent",
+                gate_result=self._GREEN,
+            )
+        call.assert_not_awaited()
+        blob = json.loads(updated.completion or "{}")
+        assert blob["disposition_provenance"] == "derived"
+        assert blob["classifier_failure"] == "disabled"
+
+    @pytest.mark.asyncio
+    async def test_malformed_artifact_also_reaches_the_tiers(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Unparseable == absent for tiering, and the reject reason still shows."""
+        with self._spy(return_value=self._inferred("done")):
+            updated, mock_gtd, _ = await _run_build_worker(
+                tmp_path,
+                caplog,
+                item_id="item-t3-malformed",
+                artifact="malformed",
+                gate_result=self._GREEN,
+            )
+        blob = json.loads(updated.completion or "{}")
+        assert blob["artifact_reject_reason"] == "not_json"
+        assert blob["disposition_provenance"] == "inferred"
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any("Completion artifact rejected: not_json." in b for b in bodies)
+
+    # --- the telemetry line ----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_warning_line_carries_tier_disposition_and_latency(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with self._spy(return_value=self._inferred("done")):
+            await _run_build_worker(
+                tmp_path,
+                caplog,
+                item_id="item-t4-warn",
+                artifact="absent",
+                gate_result=self._GREEN,
+            )
+        record = next(
+            r for r in caplog.records if "unasserted build run:" in r.getMessage()
+        )
+        assert record.levelname == "WARNING"
+        line = record.getMessage()
+        for fragment in (
+            "engine=claude-code",
+            "tier=inferred",
+            "disposition=done",
+            "classifier_model=glm-5.3-flash",
+            "classifier_latency_s=1.25",
+            "gate_decision=passed",
+            "outcome=succeeded",
+        ):
+            assert fragment in line

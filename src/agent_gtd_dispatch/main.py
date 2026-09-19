@@ -35,6 +35,9 @@ from . import (
     rollout_planner,
     talos,
 )
+from . import (
+    disposition as disposition_mod,
+)
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
 from .engines import (
     COMMON_ENV_KEYS,
@@ -1726,6 +1729,7 @@ def build_completion_comment(
     push_results: list[RepoPushStatus] | None,
     gate_decision: str | None,
     artifact: completion.CompletionArtifact | None,
+    resolution: disposition_mod.DispositionResult | None = None,
 ) -> str:
     """Return the GTD comment body for a SUCCESSFUL build terminal.
 
@@ -1755,7 +1759,17 @@ def build_completion_comment(
         lines.append(line)
     if gate_decision:
         lines.append(f"\nQuality gate: `{gate_decision}`.")
-    if artifact is None:
+    if artifact is None and resolution is not None:
+        # Never let a non-asserted verdict read as the agent's own word: name
+        # the tier and, for the inferred tier, the model that produced it.
+        lines.append(f"\n{disposition_mod.provenance_sentence(resolution)}")
+        lines.append(
+            f"{resolution.provenance.capitalize()} disposition:"
+            f" `{resolution.disposition}`."
+        )
+        if resolution.reason.strip():
+            lines.append(f"Reason: {resolution.reason.strip()}")
+    elif artifact is None:
         lines.append(
             "\nThe agent wrote no completion artifact — the facts above are"
             " all there is."
@@ -1781,6 +1795,7 @@ def build_completion_blob(
     gate_decision: str | None,
     evidence_dir: str,
     unasserted: bool = False,
+    resolution: disposition_mod.DispositionResult | None = None,
 ) -> str:
     """Serialize the leg-1/leg-2/leg-3 triple persisted on every build terminal.
 
@@ -1794,8 +1809,25 @@ def build_completion_blob(
     defaults False so every existing caller and every existing assertion on the
     blob's shape is unaffected; its purpose is to make model non-compliance
     countable per engine later.
+
+    ``resolution`` carries the three-tier outcome (:mod:`.disposition`) for a
+    run whose artifact was missing or unusable.  It defaults None — the existing
+    behaviour, where the only disposition on record is the agent's own — so no
+    existing caller changes.  When present, the blob records the disposition AND
+    its PROVENANCE (``asserted`` | ``inferred`` | ``derived``), which is what
+    makes "how often does each tier fire, and does the inferred tier agree with
+    the agent when both exist" a query rather than a guess.
     """
     state = completion.artifact_state(artifact, artifact_reject_reason)
+    if artifact is not None:
+        _disposition: str | None = artifact.disposition
+        _provenance: str | None = "asserted"
+    elif resolution is not None:
+        _disposition = resolution.disposition
+        _provenance = resolution.provenance
+    else:
+        _disposition = None
+        _provenance = None
     return json.dumps(
         {
             "envelope_verdict": envelope_verdict,
@@ -1809,7 +1841,24 @@ def build_completion_blob(
             "artifact_reject_reason": (
                 None if artifact_reject_reason == "ok" else artifact_reject_reason
             ),
-            "disposition": artifact.disposition if artifact else None,
+            "disposition": _disposition,
+            "disposition_provenance": _provenance,
+            "disposition_reason": (
+                resolution.reason if artifact is None and resolution else None
+            ),
+            "classifier_model": (
+                resolution.model
+                if resolution and resolution.provenance == "inferred"
+                else None
+            ),
+            "classifier_failure": (
+                resolution.classifier_failure if resolution else None
+            ),
+            "classifier_latency_s": (
+                round(resolution.latency_seconds, 2)
+                if resolution and resolution.latency_seconds is not None
+                else None
+            ),
             "zero_commits": zero_commits,
             "gate_decision": gate_decision,
             "evidence_dir": evidence_dir,
@@ -1945,6 +1994,7 @@ async def _route_already_satisfied_item(
     callback_token: str | None,
     attribution: str | None,
     detail: str = "",
+    provenance: str = "asserted",
 ) -> None:
     """Route an ``already_satisfied`` BUILD terminal to GTD: item -> review + comment.
 
@@ -1965,10 +2015,30 @@ async def _route_already_satisfied_item(
         callback_token=callback_token,
         terminal="already_satisfied",
     )
-    body = (
-        f"Build run `{run_id}` made no changes: the agent reported the "
-        f"acceptance criteria are already satisfied.\n\nReason: {reason}\n\n"
-    )
+    # The SAME routing for every tier; only the attribution sentence differs.
+    # An inferred or derived no-op must never read as the agent's own word.
+    if provenance == "asserted":
+        _lede = (
+            f"Build run `{run_id}` made no changes: the agent reported the "
+            f"acceptance criteria are already satisfied."
+        )
+    elif provenance == "inferred":
+        _lede = (
+            f"Build run `{run_id}` made no changes. The agent wrote no"
+            " completion artifact, so `already_satisfied` was **inferred**"
+            " from the transcript and the diff by"
+            f" `{config.DISPOSITION_CLASSIFIER_MODEL}` — it is NOT the agent's"
+            " own word."
+        )
+    else:
+        _lede = (
+            f"Build run `{run_id}` made no changes. The agent wrote no"
+            " completion artifact and no classification was available, so"
+            " `already_satisfied` was **derived** mechanically from the absence"
+            " of commits and a passing quality gate — it is NOT the agent's own"
+            " word."
+        )
+    body = f"{_lede}\n\nReason: {reason}\n\n"
     if detail:
         body += f"{detail} "
     body += "The item is moved to review for a human — it was NOT completed."
@@ -2548,6 +2618,9 @@ async def _dispatch_worker(
             _verdict = "no_result_envelope"
             _artifact: completion.CompletionArtifact | None = None
             _artifact_reason = "absent"
+            # Tier 2/3 outcome, filled in after the post-run gate when (and only
+            # when) the agent's own artifact was missing or unusable.
+            _resolution: disposition_mod.DispositionResult | None = None
             _evidence_dir = str(retention.evidence_dir(run.id))
             if _verify_repos is not None:
                 # Leg 1 — the CLI's own result envelope, from the merged-stream
@@ -2591,6 +2664,7 @@ async def _dispatch_worker(
                         gate_decision=gate_decision,
                         evidence_dir=_evidence_dir,
                         unasserted=unasserted,
+                        resolution=_resolution,
                     )
                     logger.info(
                         "build completion: run_id=%s outcome=%s envelope_verdict=%s"
@@ -2776,9 +2850,12 @@ async def _dispatch_worker(
                     # about how the process ended, and the new leniency applies
                     # only to the agent-authored artifact.
                     _failure_prefix = _verdict
-                elif _artifact is None and _zero_commits:
-                    _failure_prefix = "stopped_without_assertion"
                 elif _artifact is None:
+                    # TIER 1 produced nothing.  Nothing is decided HERE: tiers 2
+                    # and 3 both take the post-run gate decision as evidence, so
+                    # the disposition is resolved after the gate has run — the
+                    # zero-commit case included, which is exactly where an
+                    # unwritten `already_satisfied` would otherwise be lost.
                     _unasserted_path = True
                 elif _disposition in {"blocked", "failed"}:
                     _failure_prefix = f"agent_reported_{_disposition}"
@@ -2858,7 +2935,11 @@ async def _dispatch_worker(
                 # The zero-pushed-repo short-circuit is conditional: on the
                 # already_satisfied path the gate MUST run even though nothing was
                 # pushed — a no-op claim on a RED repo is a failure, never a skip.
-                if _n_pushed == 0 and not _already_satisfied_path:
+                # The unasserted path is in the same position for the same reason:
+                # the gate result is the evidence both remaining tiers reason
+                # from, and it is what tells a zero-commit run with no artifact
+                # apart from a genuine no-op.
+                if _n_pushed == 0 and not (_already_satisfied_path or _unasserted_path):
                     decision = "skipped_no_pushed_repo"
                 elif not _gate_cmd:
                     decision = "skipped_no_gate_command"
@@ -2926,30 +3007,110 @@ async def _dispatch_worker(
                     (f"{_gate_duration:.1f}" if _gate_duration is not None else None),
                 )
 
+                _unasserted_ok = False
                 if _unasserted_path:
-                    # One greppable line per non-compliant run.  This is the
-                    # data that would justify (or refute) per-engine prompt work
-                    # later, so it carries the engine and the reject reason.
+                    # TIERS 2 AND 3.  The agent asserted nothing, so the WORKER
+                    # — which cannot skip the step the way a volunteered file
+                    # write can be skipped — resolves the disposition itself:
+                    # a bounded-evidence classification call first, mechanical
+                    # derivation only if that is unavailable.
+                    _evidence = disposition_mod.build_evidence(
+                        run_id=run.id,
+                        engine=engine_used.name,
+                        branch=run.branch_name,
+                        transcript_tail=(
+                            disposition_mod.read_transcript_tail(
+                                workspace / "transcript.txt"
+                            )
+                            if workspace is not None
+                            else ""
+                        ),
+                        repo_lines=[
+                            f"{r.repo_name}: {r.status.value}"
+                            f" ({r.commits_ahead} commit(s))"
+                            for r in push_results_list
+                        ],
+                        total_commits=sum(r.commits_ahead for r in push_results_list),
+                        pushed_repos=_n_pushed,
+                        gate_decision=decision,
+                        gate_output=(
+                            _gate_result.output if _gate_result is not None else None
+                        ),
+                        item=item,
+                        artifact_reject_reason=_artifact_reason,
+                    )
+                    _resolution = await disposition_mod.resolve(
+                        _evidence,
+                        has_commits=not _zero_commits,
+                        gate_decision=decision,
+                    )
+                    _disposition = _resolution.disposition
+
+                    # The resolved verdict now routes through the SAME flags the
+                    # asserted path sets — no parallel routing path (kb-03296).
+                    # The pre-existing unasserted guard survives on top of it:
+                    # with nobody asserting anything, a green gate is the only
+                    # corroboration that exists, so a non-passing gate fails the
+                    # run whatever the tier concluded.
+                    _unasserted_ok = (
+                        decision == "passed"
+                        and _disposition in {"done", "already_satisfied"}
+                        and not (_disposition == "done" and _zero_commits)
+                    )
+                    if (
+                        _unasserted_ok
+                        and _disposition == "already_satisfied"
+                        and _zero_commits
+                    ):
+                        _already_satisfied_path = True
+
+                    # One greppable WARNING per non-asserted run.  This is the
+                    # data that says how often each tier fires, per engine, and
+                    # whether the prompt fixes are working — so it carries the
+                    # engine, the tier, the verdict and the classifier latency.
                     logger.warning(
                         "unasserted build run: run_id=%s engine=%s"
                         " artifact_reject_reason=%s pushed_repos=%d"
-                        " gate_decision=%s outcome=%s",
+                        " gate_decision=%s tier=%s disposition=%s"
+                        " classifier_model=%s classifier_failure=%s"
+                        " classifier_latency_s=%s outcome=%s",
                         run.id,
                         engine_used.name,
                         None if _artifact_reason == "ok" else _artifact_reason,
                         _n_pushed,
                         decision,
-                        "succeeded" if decision == "passed" else "failed",
+                        _resolution.provenance,
+                        _disposition,
+                        _resolution.model,
+                        _resolution.classifier_failure,
+                        (
+                            f"{_resolution.latency_seconds:.2f}"
+                            if _resolution.latency_seconds is not None
+                            else None
+                        ),
+                        (
+                            "already_satisfied"
+                            if _already_satisfied_path
+                            else ("succeeded" if _unasserted_ok else "failed")
+                        ),
                     )
 
-                if _unasserted_path and decision != "passed":
-                    # No assertion AND no green gate: "some commits exist" is not
-                    # evidence of success.  Reuses the existing triage class —
-                    # the dispatch boundary gains no new failure prefix.
+                if _unasserted_path and not _unasserted_ok:
+                    # Nothing asserted and no route to a success terminal.
+                    # Reuses the existing triage class — the dispatch boundary
+                    # gains no new failure prefix — and the class is the honest
+                    # one: whatever tier 2 or 3 concluded, the AGENT still never
+                    # said how its run ended, so `agent_reported_*` would put
+                    # words in its mouth.
+                    assert _resolution is not None  # noqa: S101
                     error_str = (
-                        "stopped_without_assertion: no completion artifact and"
-                        f" the post-run gate did not pass (decision={decision})"
+                        "stopped_without_assertion: no completion artifact;"
+                        f" {_resolution.provenance} disposition="
+                        f"{_resolution.disposition}"
+                        f" (gate decision={decision})"
                     )
+                    if _resolution.reason.strip():
+                        error_str += f" — {_resolution.reason.strip()}"
                     if _reject_detail:
                         error_str += f" {_reject_detail}"
                     _push_results_json = json.dumps(
@@ -2969,11 +3130,17 @@ async def _dispatch_worker(
                     _publish_run_event(run.id, "failed", completed)
                     if run.item_id is not None:
                         _unasserted_detail = (
-                            "The agent pushed commits to"
-                            f" `{run.branch_name}` but wrote no completion"
-                            " artifact, so the run could only be judged"
-                            " mechanically — and the post-run gate did not pass"
-                            f" (decision=`{decision}`)."
+                            disposition_mod.provenance_sentence(_resolution)
+                            + f"\n\n{_resolution.provenance.capitalize()}"
+                            f" disposition: `{_resolution.disposition}`."
+                        )
+                        if _resolution.reason.strip():
+                            _unasserted_detail += f" {_resolution.reason.strip()}"
+                        _unasserted_detail += (
+                            f"\n\nBranch `{run.branch_name}` carries"
+                            f" {_n_pushed} pushed repo(s) and the post-run gate"
+                            f" decision was `{decision}`, so the run is recorded"
+                            " failed."
                         )
                         if decision == "skipped_no_gate_command":
                             _unasserted_detail += (
@@ -3127,8 +3294,17 @@ async def _dispatch_worker(
                 # commits, and the project gate is green or absent.  Terminal is
                 # `already_satisfied` — never `succeeded` (the invariant) and
                 # never `failed` (that would recreate a re-dispatch loop).
-                assert _artifact is not None  # noqa: S101
-                _as_reason = _artifact.reason.strip()
+                # Reason text, whichever tier supplied the verdict: the agent's
+                # own `reason` when it asserted, otherwise the classifier's or
+                # the derivation's.  `already_satisfied` without a reason is the
+                # one thing this terminal must never be.
+                if _artifact is not None:
+                    _as_reason = _artifact.reason.strip()
+                    _as_provenance = "asserted"
+                else:
+                    assert _resolution is not None  # noqa: S101
+                    _as_reason = _resolution.reason.strip()
+                    _as_provenance = _resolution.provenance
                 await db.update_run(
                     run.id,
                     status=RunStatus.already_satisfied,
@@ -3147,6 +3323,7 @@ async def _dispatch_worker(
                         callback_token=run.callback_token,
                         attribution=attribution,
                         detail=f"Quality gate: {decision}.",
+                        provenance=_as_provenance,
                     )
                 return
 
@@ -3247,16 +3424,36 @@ async def _dispatch_worker(
                 and _unasserted_path
                 and run.item_id is not None
             ):
-                # Say plainly that nobody asserted anything: this run is a
-                # success on mechanical evidence alone, so the reviewer — not
-                # the agent — is the one confirming the change matches scope.
-                _unasserted_body = (
-                    f"Build run `{run.id}` is recorded **successful on"
-                    " mechanical evidence alone**. The agent pushed commits to"
-                    f" `{run.branch_name}` and the project quality gate passed"
-                    f" (decision=`{decision}`), but it never wrote a completion"
-                    " artifact, so it never asserted how its run ended."
+                # Say plainly that nobody asserted anything, and name the tier
+                # that stood in for the agent. The reviewer — not the agent —
+                # is the one confirming the change matches scope, and an
+                # inferred verdict must never read as the agent's own word.
+                assert _resolution is not None  # noqa: S101
+                if _resolution.provenance == "inferred":
+                    _unasserted_body = (
+                        f"Build run `{run.id}` is recorded **successful on an"
+                        " inferred disposition**. The agent pushed commits to"
+                        f" `{run.branch_name}` and the project quality gate"
+                        f" passed (decision=`{decision}`), but it never wrote a"
+                        " completion artifact, so it never asserted how its run"
+                        " ended."
+                    )
+                else:
+                    _unasserted_body = (
+                        f"Build run `{run.id}` is recorded **successful on"
+                        " mechanical evidence alone**. The agent pushed commits"
+                        f" to `{run.branch_name}` and the project quality gate"
+                        f" passed (decision=`{decision}`), but it never wrote a"
+                        " completion artifact, so it never asserted how its run"
+                        " ended."
+                    )
+                _unasserted_body += (
+                    f"\n\n{disposition_mod.provenance_sentence(_resolution)}"
+                    f"\n\n{_resolution.provenance.capitalize()} disposition:"
+                    f" `{_resolution.disposition}`."
                 )
+                if _resolution.reason.strip():
+                    _unasserted_body += f" {_resolution.reason.strip()}"
                 if _reject_detail:
                     _unasserted_body += f"\n\n{_reject_detail}"
                 _unasserted_body += (
@@ -3292,6 +3489,7 @@ async def _dispatch_worker(
                             push_results_list,
                             decision,
                             _artifact,
+                            _resolution,
                         ),
                         created_by=attribution or "agent-gtd-dispatch",
                         token=run.callback_token,
