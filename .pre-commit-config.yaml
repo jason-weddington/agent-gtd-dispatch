@@ -2,8 +2,6 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
-      - id: trailing-whitespace
-      - id: end-of-file-fixer
       - id: check-yaml
       - id: check-toml
       - id: check-added-large-files
@@ -18,11 +16,17 @@ repos:
     rev: v0.9.7
     hooks:
       - id: ruff
-        args: [--fix]
       - id: ruff-format
+        args: [--check]
 
   - repo: local
     hooks:
+      - id: check-whitespace
+        name: trailing whitespace / EOF newline (check-only)
+        entry: scripts/check-whitespace.sh
+        language: script
+        types: [text]
+
       - id: bash-syntax
         name: bash -n
         entry: bash -n

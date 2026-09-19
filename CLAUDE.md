@@ -138,6 +138,7 @@ Every filesystem read of an agent-created path and every git invocation added he
 - `./release.sh` cuts a version (semantic-release), pushes main + tags to origin and github, then deploys.
 - Pre-push hook runs full test suite with coverage (threshold from `[tool.coverage.report]` in `pyproject.toml`).
 - All `uv run` in hooks uses `--frozen` to avoid rebuilding mid-hook.
+- Pre-commit hooks CHECK; they never mutate files. Agents FIX. A mutating hook (e.g. `ruff --fix`, `end-of-file-fixer`) would silently destroy a talos worker's single commit attempt, since talos has no retry loop the way Claude Code's commit-retry does. See kb-03099.
 
 ## Coverage
 
