@@ -39,7 +39,21 @@ RETENTION_INTERVAL_SECONDS: int = 3600
 # Agent limits
 MAX_TURNS: int = 100
 TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
-MANAGE_TIMEOUT_SECONDS: int = 4 * 60 * 60  # 4 hours for multi-wave manage runs
+# Manage-mode wall-clock backstop — DERIVED, not authoritative.
+#
+# The single source of truth for the manage timeout is the GTD-side app setting
+# ``dispatch.manager_default_timeout_minutes`` (seeded from
+# ``agent_gtd.dispatch_constants.MANAGER_DEFAULT_TIMEOUT_MINUTES``, 240 min).
+# The dispatch worker resolves it and sends it on the wire as
+# ``DispatchRequest.timeout_minutes``, which wins whenever it is present.
+#
+# This value only applies to a manage dispatch that arrives with NO explicit
+# ``timeout_minutes`` at all, and must stay numerically equal to the
+# authoritative one (240 min = 14400 s).  It used to be one of three
+# independent manage-timeout sources; the third — a duplicate fallback inside
+# ``dispatch.run_agent`` — is gone, and both remaining call sites now route
+# through ``timeout_seconds_for_mode`` below.
+MANAGE_TIMEOUT_SECONDS: int = 4 * 60 * 60  # 4 hours; == MANAGER_DEFAULT_TIMEOUT_MINUTES
 MAX_MANAGE_RETRIES: int = 2  # max auto-recovery relaunches for manage mode
 MAX_CONCURRENT_RUNS: int = 32  # thread-pool ceiling for run_in_executor
 CANCEL_GRACE_SECONDS: int = 5  # seconds between SIGTERM and SIGKILL on cancel
@@ -187,6 +201,32 @@ TALOS_GATE_TIMEOUT_SECS: int = 900
 # invisible in production — all of them precisely the things you need when a
 # dispatch misbehaves.  See `main.configure_logging`.
 LOG_LEVEL: str = "INFO"
+
+
+def timeout_seconds_for_mode(mode: str) -> int:
+    """Return the default run timeout for *mode* when none was supplied.
+
+    The ONE place the dispatch service turns "no explicit timeout" into a
+    number.  Both the HTTP dispatch entrypoint and ``dispatch.run_agent`` call
+    this instead of re-deriving the mode branch themselves, so the two can no
+    longer drift apart.
+
+    Note this is only the backstop: an explicit ``timeout_minutes`` on the
+    dispatch request always wins, and for manage mode the GTD-side
+    ``dispatch.manager_default_timeout_minutes`` setting is authoritative (see
+    the ``MANAGE_TIMEOUT_SECONDS`` comment above).
+
+    Args:
+        mode: The dispatch mode — ``"build"``, ``"plan"`` or ``"manage"``.
+            ``DispatchMode`` is a ``StrEnum``, so members may be passed
+            directly.
+
+    Returns:
+        Default timeout in seconds for that mode.
+    """
+    if mode == "manage":
+        return MANAGE_TIMEOUT_SECONDS
+    return TIMEOUT_SECONDS
 
 
 def load() -> None:

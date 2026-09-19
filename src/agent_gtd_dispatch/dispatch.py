@@ -1034,6 +1034,7 @@ def build_system_prompt(
     is_recovery: bool = False,
     workspace: Path | None = None,
     resume_context: list[dict[str, Any]] | None = None,
+    merge_notes: list[dict[str, Any]] | None = None,
 ) -> str:
     """Build the headless agent system prompt.
 
@@ -1041,6 +1042,10 @@ def build_system_prompt(
     build runs (``{runId, itemId, status}``) the dispatcher already knew about
     when it relaunched the manager. When absent the recovery block renders
     exactly as it did before this parameter existed.
+
+    ``merge_notes`` is the rollout's most recent merge notes (newest first);
+    manage mode renders up to ``MERGE_NOTE_CONTEXT_LIMIT`` of them so the
+    AC-reconciliation step reasons from a durable record rather than memory.
     """
     if mode == DispatchMode.PLAN:
         return _build_plan_prompt(
@@ -1060,6 +1065,7 @@ def build_system_prompt(
             workspace_repo_dirs=workspace_repo_dirs,
             is_recovery=is_recovery,
             resume_context=resume_context,
+            merge_notes=merge_notes,
         )
     return _build_build_prompt(
         item,
@@ -1257,6 +1263,173 @@ def _indent_prompt_block(text: str) -> str:
     return textwrap.indent(text.rstrip("\n"), " " * 8).lstrip(" ")
 
 
+# Number of most-recent merge notes rendered into each manage prompt.
+#
+# Trade-off: every note costs prompt tokens in EVERY subsequent manage launch
+# (including each relaunch), so an unbounded list would grow the prompt with the
+# rollout.  Too few, and the AC-reconciliation step stops seeing the change that
+# actually invalidated the item it is about to dispatch — which is the exact
+# failure this record exists to prevent.  Ten covers a handful of items per wave
+# across two or three waves at a cost of a few hundred tokens.  Raise it only
+# alongside a measurement of manage-prompt size.
+MERGE_NOTE_CONTEXT_LIMIT = 10
+
+
+def _manage_merge_bar_block(
+    gate_command: str, step_label: str, *, workspace: bool
+) -> str:
+    """Warm-up merge-bar step — stored ``gate_command``, or inference fallback.
+
+    The merge bar used to be INFERRED: warm-up had the manager read
+    ``CLAUDE.md`` / ``README.md`` and derive a test/lint/coverage command.  Two
+    managers could infer two different bars for the same repo and apply
+    different standards to consecutive items.  The project record already
+    carries ``gate_command`` — the same command the post-run gate re-runs — so
+    the bar is a stored value, not a guess.
+
+    When ``gate_command`` is empty the prompt says so EXPLICITLY and falls back
+    to the old inference behaviour: a gate-less project must not silently become
+    a rollout with no quality bar.
+    """
+    where = "the workspace root" if workspace else "the repo root"
+    gate = gate_command.strip()
+    if gate:
+        body = f"""\
+**{step_label} — The merge bar is the project's stored `gate_command`**
+
+The merge bar is NOT something you infer. This project has a stored
+`gate_command`, and that command IS the definition of Done — the same command
+the dispatch worker re-runs as the post-run gate. Use it verbatim, from
+{where}:
+
+```bash
+{gate}
+```
+
+Do NOT derive a different test / lint / coverage command from `CLAUDE.md` or
+`README.md` and then merge against that instead. Two managers inferring two
+different bars for the same repo apply two different standards to consecutive
+items — that is a correctness problem, not a style one. The stored
+`gate_command` is the one bar for every item in this rollout.
+
+Still READ `CLAUDE.md` / `README.md`, for project CONVENTIONS — commit style,
+branch rules, directory layout, anything a reviewer should honour. Just do not
+take the executable merge bar from them."""
+    else:
+        body = f"""\
+**{step_label} — The merge bar (this project has an EMPTY `gate_command`)**
+
+This project has NO stored `gate_command`, so you are in FALLBACK mode: you
+must INFER the merge bar. Read `CLAUDE.md` and/or `README.md` and record:
+- Test command (e.g. `uv run pytest`, `npm test`)
+- Lint command (e.g. `uv run ruff check src/ tests/`, `npm run lint`)
+- Coverage threshold (if any)
+- Any project-specific merge conventions
+
+Say the consequence to yourself plainly: a gate-less project is NOT a rollout
+with no quality bar. Run whatever you inferred, from {where}, before every
+merge, and apply the SAME inferred bar to every item in this rollout — do not
+re-derive it per item. If a repo has no discoverable test or lint command at
+all, record `none` for that repo and continue — do NOT halt."""
+    return _indent_prompt_block(body)
+
+
+def _manage_recent_merge_notes_block(merge_notes: list[dict[str, Any]] | None) -> str:
+    """Render the most recent merge notes for this rollout into the prompt.
+
+    This is the read side of the durable record that replaces a manager's
+    in-context memory. A relaunched manager used to lose every cross-item change
+    the previous manager had seen; now it is handed the last
+    ``MERGE_NOTE_CONTEXT_LIMIT`` notes verbatim.
+    """
+    notes = list(merge_notes or [])[:MERGE_NOTE_CONTEXT_LIMIT]
+    if not notes:
+        body = """\
+## Recent Merge Notes — none yet
+
+No item in this rollout has been merged with a merge note yet. You are the
+first: every item you merge must carry one (see **Step 6b** below)."""
+        return _indent_prompt_block(body)
+
+    rows = []
+    for n in notes:
+        item_id = str(n.get("item_id") or "unknown")
+        note = " ".join(str(n.get("note") or "").split())
+        rows.append(f"- item `{item_id}`: {note}")
+    rendered = "\n".join(rows)
+    body = f"""\
+## Recent Merge Notes — the durable cross-item record
+
+These are the last {len(notes)} merge notes recorded for THIS rollout, newest
+first. They are the persisted record of what already-merged items changed that
+could invalidate a later item's spec. Read them as fact, and use them in
+**Step 4 — AC reconciliation** instead of relying on what you happen to
+remember; if you are a relaunched manager, this is context you would otherwise
+have lost entirely.
+
+{rendered}
+
+At most {MERGE_NOTE_CONTEXT_LIMIT} notes are carried here. If an item's spec
+looks inconsistent with something older, read the rollout's full event history
+rather than assuming nothing else changed."""
+    return _indent_prompt_block(body)
+
+
+def _manage_merge_note_block() -> str:
+    """Step 6b — the merge-note instruction, shared by both manage variants."""
+    body = """\
+**Step 6b — Record the MERGE NOTE (required for every item you merge)**
+
+Before you complete the item, write down what the merged work changed that
+could make a LATER item's spec wrong. You pass this as the `merge_note`
+argument of the SAME `complete_item_in_rollout` call you make in Step 7 — it is
+persisted as a durable `merge_note` rollout event and rendered into every
+subsequent manage prompt.
+
+The content requirement is narrow and concrete. Name ONLY:
+- changed or new PUBLIC function / method signatures (module + name + what changed)
+- renamed classes, modules or files
+- changed or new config keys, settings names, env vars, DB columns or API routes
+
+Do NOT write a prose summary of the diff — that is what the commit message is
+for. A vague note is WORSE than no note, because it looks like coverage while
+carrying none. One or two lines. If the merged work changed none of the above,
+write exactly: `no signature, rename or config-key changes`.
+
+Example of the right shape:
+
+```
+resolve_max_turns() gained a third param `mode`; class WaveManager renamed to
+RolloutManager; new config key dispatch.manager_default_timeout_minutes
+```"""
+    return _indent_prompt_block(body)
+
+
+def _manage_commit_type_block() -> str:
+    """Squash-commit type derivation rule, shared by both manage variants."""
+    body = """\
+**Deriving the squash commit TYPE — never hard-code `feat`**
+
+The squash commit drives semantic-release, so its type is a VERSION decision,
+not a formatting one. Derive `<type>` per item with these rules, stopping at the
+first that matches:
+
+1. The item TITLE begins with a conventional-commit prefix
+   (`feat` / `fix` / `chore` / `docs` / `refactor` / `test` / `perf` / `build` /
+   `ci`, with or without a `(scope)`, followed by `:`) → use that type, and
+   strip the prefix from the commit subject so it is not repeated.
+2. Otherwise, the item's LABELS name a type: `bug` or `fix` → `fix`;
+   `feature` or `enhancement` → `feat`; `docs` → `docs`;
+   `refactor` → `refactor`; `chore`, `prep` or `maintenance` → `chore`.
+3. Otherwise → `chore`.
+
+Rule 3 falls back to `chore` ON PURPOSE. An unintended MINOR bump from a wrong
+`feat` is worse than an unintended no-op bump from a `chore`: the no-op is
+invisible, the minor bump is a published claim about what shipped. Never fall
+back to `feat`."""
+    return _indent_prompt_block(body)
+
+
 def _manage_turn_discipline_block() -> str:
     """Turn-discipline section shared by both manage prompt variants.
 
@@ -1306,9 +1479,10 @@ single biggest reason a replacement manager dies before it reaches the wait.
 skipped Phase 1 has NOT recorded default branches, NOT installed dependencies
 and NOT verified that anything is green. Before you merge ANYTHING (Step 6),
 run the skipped Phase 1 steps for every repo you are about to merge into:
-record the default branch, install dependencies, read the merge bar from
-`CLAUDE.md` / `README.md`, and verify that the default branch passes test +
-lint. If that verification fails, halt exactly as Phase 1's green check says.
+record the default branch, install dependencies, establish the merge bar (the
+**Merge bar** warm-up step below says which one applies), and verify that the
+default branch passes it. If that verification fails, halt exactly as Phase 1's
+green check says.
 Merging onto an unverified base is a worse bug than the one this rule avoids.
 """
     )
@@ -1379,6 +1553,7 @@ def _build_manage_workspace_main_prompt(
     project: dict[str, Any],
     max_turns: int,
     workspace_repo_dirs: list[str],
+    merge_notes: list[dict[str, Any]] | None = None,
 ) -> str:
     """Workspace-variant manage prompt: per-repo review, merge, push, cleanup."""
     project_name = project["name"]
@@ -1409,6 +1584,10 @@ def _build_manage_workspace_main_prompt(
     step3 = _manage_step3_block(rollout_id, gate_exception)
     turn_discipline = _manage_turn_discipline_block()
     warmup_skip = _manage_warmup_skip_block(rollout_id)
+    merge_bar = _manage_merge_bar_block(_gate, "3", workspace=True)
+    recent_notes = _manage_recent_merge_notes_block(merge_notes)
+    merge_note_step = _manage_merge_note_block()
+    commit_type = _manage_commit_type_block()
 
     return textwrap.dedent(
         f"""\
@@ -1440,6 +1619,8 @@ def _build_manage_workspace_main_prompt(
         Do NOT treat it as a gate.
 
         {turn_discipline}
+
+        {recent_notes}
 
         ## Phase 1 — Warm-up (run once at start, concurrently with wave-1 builds)
 
@@ -1482,17 +1663,10 @@ def _build_manage_workspace_main_prompt(
         override, the dispatch worker already installed and verified its git hooks before
         you launched — do not reinstall or change them.
 
-        **3. Record the merge bar** — read `CLAUDE.md` and/or `README.md` for this repo:
-        - Test command (e.g. `uv run pytest`, `npm test`)
-        - Lint command (e.g. `uv run ruff check src/ tests/`, `npm run lint`)
-        - Coverage threshold (if any)
-        - Any project-specific merge conventions
+        {merge_bar}
 
-        If a repo has no discoverable test or lint command, record `none` for that repo
-        and continue — do NOT halt.
-
-        **4. Verify that repo's default branch is green** — run the test + lint commands
-        you recorded. If they fail, call:
+        **4. Verify that repo's default branch is green** — run the merge bar you just
+        established. If it fails, call:
         ```
         mcp__agent-gtd__halt_rollout(
             rollout_id="{rollout_id}",
@@ -1548,10 +1722,13 @@ def _build_manage_workspace_main_prompt(
         )
         ```
 
-        After each run completes, call `get_item` on items in later waves that share
-        a module or interface with the just-merged work. Check whether the just-merged
-        code introduced changes (new function signatures, renamed classes, changed
-        config keys) that would cause a later item's AC or spec to be wrong.
+        Start from the **Recent Merge Notes** section above — that is the durable
+        record of what earlier items already changed, and it is authoritative over
+        your own recollection (a relaunched manager has none). Then call `get_item`
+        on items in later waves that share a module or interface with the just-merged
+        work. Check whether the just-merged code introduced changes (new function
+        signatures, renamed classes, changed config keys) that would cause a later
+        item's AC or spec to be wrong.
         If so, call `update_item` to patch that item's description and post a comment
         explaining the change:
         ```
@@ -1611,7 +1788,7 @@ def _build_manage_workspace_main_prompt(
         cd <repo_dir>
         git fetch origin <branch_name>
         git checkout <branch_name>
-        # run that repo's recorded test + lint commands
+        # run the merge bar established in warm-up
         ```
 
         Also inspect the diff for **unrelated manifest changes**. If the diff
@@ -1681,18 +1858,24 @@ def _build_manage_workspace_main_prompt(
            Otherwise, if `commit_count` is 0: halt with the multi-repo halt template
            below — step = `commit-count-guard`.
 
+        {commit_type}
+
         2. Squash merge sequence (inside that repo's directory, against THAT repo's default branch):
            ```bash
            git checkout <repo_default_branch>
            git merge --squash <branch_name>
            git commit -F - <<'COMMITEOF'
-           feat(<item_id short>): <item title>
+           <type>(<item_id short>): <item title>
 
            Rollout: {rollout_id}
            Item: <item_id>
            COMMITEOF
            git push origin <repo_default_branch>
            ```
+
+        `<type>` is the value you derived immediately above — the SAME type in every
+        repo for a given item. Never emit a `feat` type unless the derivation
+        actually produced one.
 
         Record `merged+pushed (<sha>)` for this repo after a successful push.
 
@@ -1716,6 +1899,8 @@ def _build_manage_workspace_main_prompt(
         - Do NOT force-push.
         - Do NOT continue merging remaining repos after a failure.
 
+        {merge_note_step}
+
         **Step 7 — Complete in rollout**
 
         ```
@@ -1725,8 +1910,11 @@ def _build_manage_workspace_main_prompt(
             outcome="completed",
             merge_actor="manager-autonomous",
             decision_rule="agent-judgment",
+            merge_note=<the merge note you wrote in Step 6b>,
         )
         ```
+
+        `merge_note` is REQUIRED on every merged item — never pass an empty string.
 
         `complete_item_in_rollout` does two things for you on `outcome="completed"`:
         1. Cascades the item's GTD status to `done` (no need to call
@@ -1854,8 +2042,14 @@ def _build_manage_prompt(
     workspace_repo_dirs: list[str] | None = None,
     is_recovery: bool = False,
     resume_context: list[dict[str, Any]] | None = None,
+    merge_notes: list[dict[str, Any]] | None = None,
 ) -> str:
-    """System prompt for manage mode — run the rollout-manager executor loop."""
+    """System prompt for manage mode — run the rollout-manager executor loop.
+
+    ``merge_notes`` is the rollout's most recent merge notes (newest first), the
+    durable record of what already-merged items changed.  At most
+    ``MERGE_NOTE_CONTEXT_LIMIT`` are rendered.
+    """
     project_name = project["name"]
     git_origin = project.get("git_origin", "")
     project_id = project.get("id", "")
@@ -1902,7 +2096,7 @@ def _build_manage_prompt(
 
     if workspace_repo_dirs:
         return recovery_block + _build_manage_workspace_main_prompt(
-            rollout_id, project, max_turns, workspace_repo_dirs
+            rollout_id, project, max_turns, workspace_repo_dirs, merge_notes
         )
 
     _gate = (project.get("gate_command") or "").strip()
@@ -1926,6 +2120,10 @@ def _build_manage_prompt(
     step3 = _manage_step3_block(rollout_id, gate_exception)
     turn_discipline = _manage_turn_discipline_block()
     warmup_skip = _manage_warmup_skip_block(rollout_id)
+    merge_bar = _manage_merge_bar_block(_gate, "2", workspace=False)
+    recent_notes = _manage_recent_merge_notes_block(merge_notes)
+    merge_note_step = _manage_merge_note_block()
+    commit_type = _manage_commit_type_block()
 
     main_prompt = textwrap.dedent(
         f"""\
@@ -1956,6 +2154,8 @@ def _build_manage_prompt(
         Do NOT treat it as a gate.
 
         {turn_discipline}
+
+        {recent_notes}
 
         ## Phase 1 — Warm-up (run once at start, concurrently with wave-1 builds)
 
@@ -1991,15 +2191,10 @@ def _build_manage_prompt(
         override, the dispatch worker already installed and verified its git hooks before
         you launched — do not reinstall or change them.
 
-        **2. Record the merge bar** — read `CLAUDE.md` and/or `README.md` and store in
-        your working memory:
-        - Test command (e.g. `uv run pytest`, `npm test`)
-        - Lint command (e.g. `uv run ruff check src/ tests/`, `npm run lint`)
-        - Coverage threshold (if any)
-        - Any project-specific merge conventions
+        {merge_bar}
 
-        **3. Verify `main` is green** — run the test + lint commands you just recorded.
-        If they fail, call:
+        **3. Verify `main` is green** — run the merge bar you just established.
+        If it fails, call:
         ```
         mcp__agent-gtd__halt_rollout(
             rollout_id="{rollout_id}",
@@ -2055,10 +2250,13 @@ def _build_manage_prompt(
         )
         ```
 
-        After each run completes, call `get_item` on items in later waves that share
-        a module or interface with the just-merged work. Check whether the just-merged
-        code introduced changes (new function signatures, renamed classes, changed
-        config keys) that would cause a later item's AC or spec to be wrong.
+        Start from the **Recent Merge Notes** section above — that is the durable
+        record of what earlier items already changed, and it is authoritative over
+        your own recollection (a relaunched manager has none). Then call `get_item`
+        on items in later waves that share a module or interface with the just-merged
+        work. Check whether the just-merged code introduced changes (new function
+        signatures, renamed classes, changed config keys) that would cause a later
+        item's AC or spec to be wrong.
         If so, call `update_item` to patch that item's description and post a comment
         explaining the change:
         ```
@@ -2080,12 +2278,12 @@ def _build_manage_prompt(
         )
         ```
 
-        Check out the build branch in your workspace and run the test + lint commands
-        recorded in warm-up:
+        Check out the build branch in your workspace and run the merge bar
+        established in warm-up:
         ```bash
         git fetch origin <branch_name>
         git checkout <branch_name>
-        # run test + lint commands from warm-up
+        # run the merge bar from warm-up
         ```
 
         Also inspect the diff for **unrelated manifest changes**. If the diff
@@ -2166,11 +2364,13 @@ def _build_manage_prompt(
         ```
         and STOP — do not attempt the squash merge.
 
+        {commit_type}
+
         ```bash
         git checkout <default_branch>
         git merge --squash <branch_name>
         git commit -F - <<'COMMITEOF'
-        feat(<item_id short>): <item title>
+        <type>(<item_id short>): <item title>
 
         Rollout: {rollout_id}
         Item: <item_id>
@@ -2179,6 +2379,11 @@ def _build_manage_prompt(
         git push origin --delete <branch_name>
         git branch -D <branch_name>
         ```
+
+        `<type>` is the value you derived immediately above. Never emit a `feat`
+        type unless the derivation actually produced one.
+
+        {merge_note_step}
 
         **Step 7 — Complete in rollout**
 
@@ -2189,8 +2394,11 @@ def _build_manage_prompt(
             outcome="completed",
             merge_actor="manager-autonomous",
             decision_rule="agent-judgment",
+            merge_note=<the merge note you wrote in Step 6b>,
         )
         ```
+
+        `merge_note` is REQUIRED on every merged item — never pass an empty string.
 
         `complete_item_in_rollout` does two things for you on `outcome="completed"`:
         1. Cascades the item's GTD status to `done` (no need to call
@@ -2513,11 +2721,8 @@ async def run_agent(
     directory; an empty value simply adds no extra exclude line.
     """
     if timeout_seconds is None:
-        timeout_seconds = (
-            config.MANAGE_TIMEOUT_SECONDS
-            if mode == DispatchMode.MANAGE
-            else config.TIMEOUT_SECONDS
-        )
+        # Single source for the mode default — see config.timeout_seconds_for_mode.
+        timeout_seconds = config.timeout_seconds_for_mode(mode)
     if engine.name == "kiro":
         (workspace / "system_prompt.md").write_text(
             f"{system_prompt}\n\n---\n\n## Task\n\n{title}"

@@ -5211,3 +5211,187 @@ class TestCommitsAheadOfBase:
             )
             assert dispatch.commits_ahead_of_base(Path("/repo"), base_branch="dev") == 0
         detect.assert_not_called()
+
+
+class TestManagePromptMergeBarAndNotes:
+    """Prompt guards for the rollout-prep changes to both manage variants.
+
+    Each guard is asserted against BOTH the monorepo and the workspace variant —
+    the two prompts drift apart easily and every one of these rules has to hold
+    in each.
+    """
+
+    _project: ClassVar[dict] = {
+        "name": "wave-project",
+        "id": "proj-abc123",
+        "git_origin": "git@host:repos/wp",
+        "gate_command": "uv run pytest -q && uv run ruff check .",
+    }
+    _repo_dirs: ClassVar[list[str]] = ["agent_gtd", "agent-gtd-dispatch"]
+
+    def _prompts(
+        self,
+        *,
+        gate_command: str | None = None,
+        merge_notes: list[dict] | None = None,
+    ) -> list[str]:
+        """Return [monorepo_prompt, workspace_prompt] for the given inputs."""
+        project = dict(self._project)
+        if gate_command is not None:
+            project["gate_command"] = gate_command
+        return [
+            dispatch._build_manage_prompt(
+                "wr-abc123",
+                project,
+                100,
+                workspace_repo_dirs=repo_dirs,
+                merge_notes=merge_notes,
+            )
+            for repo_dirs in (None, self._repo_dirs)
+        ]
+
+    # --- merge bar is the stored gate_command ---
+
+    def test_both_variants_use_gate_command_as_merge_bar(self) -> None:
+        for prompt in self._prompts():
+            assert "uv run pytest -q && uv run ruff check ." in prompt
+            assert "stored `gate_command`" in prompt
+
+    def test_both_variants_stop_inferring_the_bar_when_gate_present(self) -> None:
+        for prompt in self._prompts():
+            assert "Record the merge bar" not in prompt
+            assert "Coverage threshold (if any)" not in prompt
+
+    def test_both_variants_still_read_conventions_from_claude_md(self) -> None:
+        """Only the executable bar becomes stored — conventions stay inferred."""
+        for prompt in self._prompts():
+            assert "for project CONVENTIONS" in prompt
+            assert "CLAUDE.md" in prompt
+
+    # --- empty gate_command → explicit fallback ---
+
+    def test_both_variants_state_the_empty_gate_fallback(self) -> None:
+        for prompt in self._prompts(gate_command=""):
+            assert "EMPTY `gate_command`" in prompt
+            assert "FALLBACK mode" in prompt
+            assert "NOT a rollout\nwith no quality bar" in prompt
+
+    def test_empty_gate_fallback_restores_inference_instructions(self) -> None:
+        for prompt in self._prompts(gate_command=""):
+            assert "Coverage threshold (if any)" in prompt
+            assert "`uv run pytest`" in prompt
+
+    def test_missing_gate_key_behaves_like_empty(self) -> None:
+        project = {k: v for k, v in self._project.items() if k != "gate_command"}
+        prompt = dispatch._build_manage_prompt("wr-abc123", project, 100)
+        assert "EMPTY `gate_command`" in prompt
+
+    # --- merge note instruction ---
+
+    def test_both_variants_carry_the_merge_note_instruction(self) -> None:
+        for prompt in self._prompts():
+            assert "Step 6b — Record the MERGE NOTE" in prompt
+            assert "merge_note=<the merge note you wrote in Step 6b>" in prompt
+
+    def test_merge_note_instruction_is_narrow_not_a_prose_summary(self) -> None:
+        for prompt in self._prompts():
+            assert "Do NOT write a prose summary of the diff" in prompt
+            assert "PUBLIC function / method signatures" in prompt
+            assert "renamed classes, modules or files" in prompt
+            assert "config keys" in prompt
+
+    # --- recent merge notes rendered into the prompt ---
+
+    def test_last_n_merge_notes_appear_in_both_variants(self) -> None:
+        notes = [
+            {"item_id": "item-aaa", "note": "resolve_max_turns() gained `mode`"},
+            {"item_id": "item-bbb", "note": "class WaveManager renamed RolloutManager"},
+        ]
+        for prompt in self._prompts(merge_notes=notes):
+            assert "Recent Merge Notes" in prompt
+            assert "item-aaa" in prompt
+            assert "resolve_max_turns() gained `mode`" in prompt
+            assert "item-bbb" in prompt
+
+    def test_merge_notes_are_capped_at_the_named_constant(self) -> None:
+        notes = [
+            {"item_id": f"item-{n:03d}", "note": f"note {n}"}
+            for n in range(dispatch.MERGE_NOTE_CONTEXT_LIMIT + 5)
+        ]
+        for prompt in self._prompts(merge_notes=notes):
+            rendered = [n["item_id"] for n in notes if n["item_id"] in prompt]
+            assert len(rendered) == dispatch.MERGE_NOTE_CONTEXT_LIMIT
+            # Newest-first: the tail of the list is what gets dropped.
+            assert "item-000" in prompt
+            assert notes[-1]["item_id"] not in prompt
+
+    def test_no_notes_yet_renders_an_explicit_empty_section(self) -> None:
+        for prompt in self._prompts(merge_notes=[]):
+            assert "Recent Merge Notes — none yet" in prompt
+
+    def test_ac_reconciliation_points_at_the_notes(self) -> None:
+        for prompt in self._prompts():
+            assert "Start from the **Recent Merge Notes** section above" in prompt
+
+    # --- derived squash commit type ---
+
+    def test_neither_variant_hardcodes_feat_as_the_squash_type(self) -> None:
+        for prompt in self._prompts():
+            assert "feat(" not in prompt
+            assert "<type>(<item_id short>): <item title>" in prompt
+
+    def test_both_variants_state_the_commit_type_derivation_rule(self) -> None:
+        for prompt in self._prompts():
+            assert "Deriving the squash commit TYPE" in prompt
+            assert "`bug` or `fix` → `fix`" in prompt
+            assert "Otherwise → `chore`" in prompt
+
+    def test_commit_type_fallback_is_chore_and_says_why(self) -> None:
+        for prompt in self._prompts():
+            assert "falls back to `chore` ON PURPOSE" in prompt
+            assert "Never fall\nback to `feat`" in prompt
+
+    # --- dedent sanity: interpolated blocks must not break textwrap.dedent ---
+
+    def test_prompts_are_not_left_uniformly_indented(self) -> None:
+        for prompt in self._prompts(merge_notes=[{"item_id": "x", "note": "y"}]):
+            assert prompt.startswith("You are a headless rollout-manager executor")
+            assert "\n        ## Phase 1" not in prompt
+
+
+class TestManageTimeoutSingleSource:
+    """The manage timeout resolves through exactly one helper."""
+
+    def test_timeout_for_mode_manage(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "MANAGE_TIMEOUT_SECONDS", 14400)
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 1800)
+        assert config.timeout_seconds_for_mode("manage") == 14400
+
+    def test_timeout_for_mode_build_and_plan(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "MANAGE_TIMEOUT_SECONDS", 14400)
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 1800)
+        assert config.timeout_seconds_for_mode("build") == 1800
+        assert config.timeout_seconds_for_mode("plan") == 1800
+
+    def test_manage_backstop_matches_the_authoritative_gtd_default(self) -> None:
+        """config.MANAGE_TIMEOUT_SECONDS derives from the GTD-side 240 minutes."""
+        assert config.MANAGE_TIMEOUT_SECONDS == 240 * 60
+
+    def test_run_agent_resolves_through_the_helper(self, tmp_path) -> None:
+        """run_agent no longer carries its own mode branch."""
+        import inspect
+
+        src = inspect.getsource(dispatch.run_agent)
+        assert "timeout_seconds_for_mode" in src
+        assert "config.MANAGE_TIMEOUT_SECONDS" not in src
+
+
+class TestShowRunTranscriptDocstring:
+    """The manage workspace has been repos-{run_id} since dispatch.py:657."""
+
+    def test_docstring_names_the_current_workspace_prefix(self) -> None:
+        from agent_gtd_dispatch import show_run_transcript
+
+        doc = show_run_transcript.__doc__ or ""
+        assert "repos-{run_id}" in doc
+        assert "wave-manager-abc123" not in doc

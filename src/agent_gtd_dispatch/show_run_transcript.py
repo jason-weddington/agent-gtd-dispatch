@@ -16,10 +16,12 @@ Example (SSH to dispatch host)::
     ssh dispatch@pironman01 \\
         'python -m agent_gtd_dispatch.show_run_transcript abc123def456'
 
-Or for a manage-mode run whose workspace is ``wave-manager-{run_id}``::
+Or for a manage-mode run, whose workspace is ``repos-{run_id}`` (see
+``dispatch.prepare_manage_workspace``) — the same ``repos-`` prefix build runs
+use, not the long-gone ``wave-manager-`` one::
 
     ssh dispatch@pironman01 \\
-        'cat /home/dispatch/workspace/wave-manager-abc123/transcript.txt'
+        'cat /home/dispatch/workspace/repos-abc123/transcript.txt'
 """
 
 from __future__ import annotations

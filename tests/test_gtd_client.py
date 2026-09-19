@@ -626,3 +626,41 @@ class TestCallbackTokenAuthHeader:
 
         _, kwargs = mock_client.request.call_args
         assert kwargs["headers"] == {"Authorization": "Bearer test-gtd-key"}
+
+
+class TestGetRolloutMergeNotes:
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_returns_notes_list(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import get_rollout_merge_notes
+
+        notes = [{"item_id": "i-1", "note": "renamed Foo"}]
+        mock_client, _ = _make_client_mock({"merge_notes": notes})
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        assert await get_rollout_merge_notes("ro-1", limit=10) == notes
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_url_and_limit_param(self, mock_cls) -> None:
+        from agent_gtd_dispatch.gtd_client import get_rollout_merge_notes
+
+        mock_client, _ = _make_client_mock({"merge_notes": []})
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        await get_rollout_merge_notes("ro-1", limit=7, token="run-tok")
+
+        mock_client.request.assert_called_once_with(
+            "GET",
+            "http://localhost:9999/api/rollouts/ro-1/merge-notes",
+            headers={"Authorization": "Bearer run-tok"},
+            params={"limit": 7},
+        )
+
+    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
+    async def test_missing_key_yields_empty_list(self, mock_cls) -> None:
+        """A rollout with no notes (or an older API) is not an error."""
+        from agent_gtd_dispatch.gtd_client import get_rollout_merge_notes
+
+        mock_client, _ = _make_client_mock({})
+        mock_cls.return_value.__aenter__.return_value = mock_client
+
+        assert await get_rollout_merge_notes("ro-1", limit=10) == []

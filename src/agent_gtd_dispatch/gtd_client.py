@@ -144,6 +144,28 @@ async def complete_in_rollout(
     return result
 
 
+async def get_rollout_merge_notes(
+    rollout_id: str,
+    *,
+    limit: int,
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    """GET /api/rollouts/{rollout_id}/merge-notes.
+
+    Returns the rollout's most recent merge notes (newest first) — the durable
+    record of what already-merged items changed that could invalidate a later
+    item's spec. Rendered into every manage prompt.
+    """
+    result: dict[str, Any] = await _request(
+        "GET",
+        f"/rollouts/{rollout_id}/merge-notes",
+        token=token,
+        params={"limit": limit},
+    )
+    notes = result.get("merge_notes") or []
+    return list(notes)
+
+
 async def get_rollout(rollout_id: str, *, token: str | None = None) -> dict[str, Any]:
     """GET /api/rollouts/{rollout_id}.
 

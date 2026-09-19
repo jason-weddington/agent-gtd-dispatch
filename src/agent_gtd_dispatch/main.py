@@ -2615,6 +2615,24 @@ async def _dispatch_worker(
                                 )
                     return
 
+        # Durable cross-item context for manage runs: the last N merge notes.
+        # Best effort — a manager with no notes is exactly today's behaviour, so a
+        # failed fetch must never block the dispatch.
+        merge_notes: list[dict[str, Any]] = []
+        if mode == DispatchMode.MANAGE and run.rollout_id:
+            try:
+                merge_notes = await gtd_client.get_rollout_merge_notes(
+                    run.rollout_id,
+                    limit=dispatch.MERGE_NOTE_CONTEXT_LIMIT,
+                    token=run.callback_token,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to fetch merge notes for rollout %s — the manage "
+                    "prompt will render without them",
+                    run.rollout_id,
+                )
+
         system_prompt = dispatch.build_system_prompt(
             item,
             project,
@@ -2629,6 +2647,7 @@ async def _dispatch_worker(
             is_recovery=is_recovery,
             workspace=workspace,
             resume_context=resume_context,
+            merge_notes=merge_notes,
         )
 
         item_title = item.get("title", f"rollout:{run.rollout_id}")
@@ -4168,11 +4187,11 @@ async def dispatch_item(
 
     max_turns = body.max_turns
     if body.timeout_minutes:
+        # Authoritative when present: for manage runs this carries the GTD-side
+        # `dispatch.manager_default_timeout_minutes` setting.
         timeout_seconds = body.timeout_minutes * 60
-    elif body.mode == DispatchMode.MANAGE:
-        timeout_seconds = config.MANAGE_TIMEOUT_SECONDS
     else:
-        timeout_seconds = config.TIMEOUT_SECONDS
+        timeout_seconds = config.timeout_seconds_for_mode(body.mode)
 
     run = Run(
         item_id=item_id_for_run,
