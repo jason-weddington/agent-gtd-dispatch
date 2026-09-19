@@ -46,10 +46,29 @@ class Engine:
     build_command: Callable[[str, str, int, str | None], list[str]]
     extra_env_fn: Callable[[], dict[str, str]] | None = None
 
+    @property
+    def is_claude_code_family(self) -> bool:
+        """True when this engine drives the Claude Code harness.
+
+        Derived from the engine's BINARY rather than from a list of engine
+        name literals, so a future ``claude-code-*`` engine is included the
+        moment it is registered.  Consumers use this for capability gates that
+        belong to the harness (which tools/env a manager needs to drive a
+        multi-wave loop), not to a particular model: ``claude-code``,
+        ``claude-code-sonnet``, ``claude-code-haiku``, ``claude-code-ollama``
+        and ``claude-code-glm`` all answer True; ``kiro`` and the talos family
+        answer False.
+        """
+        return self.binary == "claude"
+
 
 # Manage-mode env exposure
 # DISPATCH_LOCAL_URL and DISPATCH_API_KEY are passed to manage-mode claude executors
-# so they can call back to the dispatch worker's /ci-gate endpoint.
+# so they can call back to the dispatch worker's /ci-gate endpoint AND so the
+# manager can dispatch its own child runs.  Withholding them from a manager does
+# not look like an env problem at runtime — it looks like the model "mysteriously
+# cannot dispatch" — so the gate below keys off the claude-code FAMILY rather than
+# the `claude-code` name literal.
 _MANAGE_EXECUTOR_ENV_KEYS: tuple[str, ...] = ("DISPATCH_LOCAL_URL", "DISPATCH_API_KEY")
 
 
@@ -120,8 +139,11 @@ def build_env(
     ``templates/mcp-servers.sh`` (host reprovisioning is an operator step).
     """
     allowed = COMMON_ENV_KEYS | engine.env_keys
-    # Manage-mode env exposure: add dispatch URL + key for claude manage-mode executors
-    if engine.name == "claude-code" and mode == DispatchMode.MANAGE:
+    # Manage-mode env exposure: add dispatch URL + key for ANY claude-code-family
+    # manage-mode executor (not just the default `claude-code`), so a manager
+    # running on claude-code-glm / -sonnet / -haiku / -ollama can still dispatch
+    # its children. See Engine.is_claude_code_family.
+    if engine.is_claude_code_family and mode == DispatchMode.MANAGE:
         allowed = allowed | frozenset(_MANAGE_EXECUTOR_ENV_KEYS)
     env = {k: v for k, v in os.environ.items() if k in allowed}
     env["HOME"] = str(Path.home())

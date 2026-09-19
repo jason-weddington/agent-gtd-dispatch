@@ -30,12 +30,15 @@ from agent_gtd_dispatch.dispatch import (
     run_agent,
 )
 from agent_gtd_dispatch.engines import (
+    _MANAGE_EXECUTOR_ENV_KEYS,
     CLAUDE,
+    CLAUDE_GLM,
     CLAUDE_HAIKU,
     CLAUDE_OLLAMA,
     CLAUDE_SONNET,
     COMMON_ENV_KEYS,
     KIRO,
+    TALOS_SONNET,
     Engine,
     build_env,
     get_engine,
@@ -1718,6 +1721,57 @@ class TestManageEnvKeys:
         monkeypatch.setenv("DISPATCH_LOCAL_URL", "http://localhost:8080")
         env = build_env(KIRO, mode="manage")
         assert "DISPATCH_LOCAL_URL" not in env
+
+    def test_build_env_excludes_dispatch_keys_for_manage_talos(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("DISPATCH_LOCAL_URL", "http://localhost:8080")
+        env = build_env(TALOS_SONNET, mode="manage")
+        assert "DISPATCH_LOCAL_URL" not in env
+
+    @pytest.mark.parametrize(
+        "engine",
+        [CLAUDE_SONNET, CLAUDE_HAIKU, CLAUDE_GLM, CLAUDE_OLLAMA],
+        ids=lambda e: e.name,
+    )
+    def test_build_env_includes_dispatch_keys_for_non_default_claude_family(
+        self, engine, monkeypatch
+    ) -> None:
+        """A manager on a NON-default claude-code engine gets every manage key.
+
+        This is the seam that would otherwise be mis-diagnosed: without the
+        dispatch URL + key a manager cannot dispatch its children, and the
+        failure presents as a model problem rather than an env problem.
+        """
+        monkeypatch.setenv("DISPATCH_LOCAL_URL", "http://localhost:8080")
+        monkeypatch.setenv("DISPATCH_API_KEY", "mgr-key")
+        env = build_env(engine, mode="manage")
+        for key in _MANAGE_EXECUTOR_ENV_KEYS:
+            assert key in env, f"{engine.name} manage run is missing {key}"
+        assert env["DISPATCH_LOCAL_URL"] == "http://localhost:8080"
+        assert env["DISPATCH_API_KEY"] == "mgr-key"
+
+    @pytest.mark.parametrize(
+        "engine",
+        [CLAUDE_SONNET, CLAUDE_HAIKU, CLAUDE_GLM, CLAUDE_OLLAMA],
+        ids=lambda e: e.name,
+    )
+    def test_build_env_excludes_dispatch_keys_for_build_claude_family(
+        self, engine, monkeypatch
+    ) -> None:
+        """The manage keys stay manage-only for the rest of the family too."""
+        monkeypatch.setenv("DISPATCH_LOCAL_URL", "http://localhost:8080")
+        monkeypatch.setenv("DISPATCH_API_KEY", "mgr-key")
+        env = build_env(engine, mode="build")
+        for key in _MANAGE_EXECUTOR_ENV_KEYS:
+            assert key not in env
+
+    def test_is_claude_code_family_flags(self) -> None:
+        """The family check is derived from the binary, not a name allowlist."""
+        for engine in (CLAUDE, CLAUDE_SONNET, CLAUDE_HAIKU, CLAUDE_GLM, CLAUDE_OLLAMA):
+            assert engine.is_claude_code_family is True
+        for engine in (KIRO, TALOS_SONNET):
+            assert engine.is_claude_code_family is False
 
     async def test_manage_mode_passed_to_run_agent_env(
         self, tmp_path, monkeypatch
