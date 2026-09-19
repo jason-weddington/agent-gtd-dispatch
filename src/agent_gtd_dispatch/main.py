@@ -315,6 +315,37 @@ def start() -> None:  # pragma: no cover
 # --- Background dispatch worker ---
 
 
+async def _comment_on_in_flight_items(
+    rollout_id: str,
+    in_flight: list[dict[str, Any]] | None,
+    render: Callable[[dict[str, Any]], str],
+    *,
+    log_label: str,
+) -> None:
+    """Post one comment per in-flight build run, on that run's own item.
+
+    Fans out across every entry rather than ``in_flight[0]``: in a multi-item
+    wave, commenting only on the first item leaves the other items' reviewers
+    with no record that their build was left running without a manager.
+    A failure to comment on one item must not suppress the others.
+    """
+    for entry in in_flight or []:
+        item_id = entry.get("itemId")
+        if not item_id:
+            continue
+        try:
+            await gtd_client.post_comment(
+                str(item_id), render(entry), created_by="agent-gtd-dispatch"
+            )
+        except Exception:
+            logger.exception(
+                "Failed to post %s comment for rollout %s item %s",
+                log_label,
+                rollout_id,
+                item_id,
+            )
+
+
 async def _do_manage_recovery(
     rollout_id: str,
     run: Run | None,
@@ -326,6 +357,7 @@ async def _do_manage_recovery(
     halt_reason: str,
     count_toward_cap: bool = True,
     known_retry_count: int = 0,
+    resume_context: list[dict[str, Any]] | None = None,
 ) -> None:
     """Shared manage-recovery: kill stale subprocess (if any), increment retry, relaunch or halt.
 
@@ -349,6 +381,11 @@ async def _do_manage_recovery(
         known_retry_count: retry_count to report/forward when count_toward_cap
             is False (relaunch_manage_rollout is not called on that path, so
             the caller must supply the rollout's current manage_retry_count).
+        resume_context: The rollout's in-flight build runs
+            (``{runId, itemId, status}``) as known at decision time. Threaded
+            into the replacement manager's prompt so it does not have to
+            rediscover the wave, and used to make a cap-exceeded halt legible
+            by commenting on every stranded item. None on the watchdog path.
     """
     source = "watchdog" if halt_reason == "manage_watchdog_stale" else "exit-path"
     run_id = run.id if run is not None else "none"
@@ -418,6 +455,24 @@ async def _do_manage_recovery(
                 logger.exception(
                     "Failed to halt rollout %s after cap exceeded", rollout_id
                 )
+            # Make the consequence legible: every build still executing at the
+            # halt is now orphaned — no manager will review or merge it. Comment
+            # on EVERY in-flight item, not just the first.
+            await _comment_on_in_flight_items(
+                rollout_id,
+                resume_context,
+                lambda r: (
+                    f"\U0001f6d1 Rollout halted — `{halt_reason}` "
+                    f"(manage_retry_count={retry_count} > cap {MAX_MANAGE_RETRIES}). "
+                    f"Build run `{r.get('runId')}` for item `{r.get('itemId')}` was "
+                    f"still executing (status `{r.get('status')}`) when the rollout "
+                    "halted, and there is now NO rollout manager attached to it. "
+                    "The run will finish on its own, but nobody will review, gate or "
+                    "merge its branch — this item needs manual review and merge by a "
+                    "lead."
+                ),
+                log_label="cap-exceeded halt",
+            )
             return
 
         logger.info(
@@ -468,6 +523,7 @@ async def _do_manage_recovery(
             attribution=attribution,
             manage_retry_count=retry_count,
             is_recovery=True,
+            resume_context=resume_context,
         )
     )
     _active_processes[new_run.id] = task
@@ -615,23 +671,20 @@ async def _maybe_relaunch_manage(
         # mark-before-await pattern the watchdog itself uses.
         _watchdog_acted[rollout_id] = time.monotonic()
 
-        comment_run_id = in_flight[0]["runId"]
-        comment_item_id = in_flight[0]["itemId"]
-        comment = (
-            "manage-recovery: free relaunch — the rollout manager exited while "
-            f"build run `{comment_run_id}` is still in flight. `manage_retry_count` "
-            f"is unchanged at {int(rollout.get('manage_retry_count', 0))}; "
-            f"free relaunch {new_free_relaunches}/{config.MAX_MANAGE_FREE_RELAUNCHES}; "
-            f"manager uptime {manager_uptime_seconds:.0f}s."
+        _current_retry_count = int(rollout.get("manage_retry_count", 0))
+        await _comment_on_in_flight_items(
+            rollout_id,
+            in_flight,
+            lambda r: (
+                "manage-recovery: free relaunch — the rollout manager exited while "
+                f"build run `{r.get('runId')}` is still in flight. "
+                f"`manage_retry_count` is unchanged at {_current_retry_count}; "
+                f"free relaunch {new_free_relaunches}/"
+                f"{config.MAX_MANAGE_FREE_RELAUNCHES}; "
+                f"manager uptime {manager_uptime_seconds:.0f}s."
+            ),
+            log_label="free-relaunch",
         )
-        try:
-            await gtd_client.post_comment(
-                comment_item_id, comment, created_by="agent-gtd-dispatch"
-            )
-        except Exception:
-            logger.exception(
-                "Failed to post free-relaunch comment for rollout %s", rollout_id
-            )
 
         await _do_manage_recovery(
             rollout_id,
@@ -642,7 +695,8 @@ async def _maybe_relaunch_manage(
             attribution,
             halt_reason="manage_relaunch_cap_exceeded",
             count_toward_cap=False,
-            known_retry_count=int(rollout.get("manage_retry_count", 0)),
+            known_retry_count=_current_retry_count,
+            resume_context=in_flight,
         )
         return
 
@@ -654,6 +708,7 @@ async def _maybe_relaunch_manage(
         timeout_seconds,
         attribution,
         halt_reason="manage_relaunch_cap_exceeded",
+        resume_context=in_flight,
     )
 
 
@@ -1772,6 +1827,7 @@ async def _dispatch_worker(
     attribution: str | None = None,
     manage_retry_count: int = 0,
     is_recovery: bool = False,
+    resume_context: list[dict[str, Any]] | None = None,
 ) -> None:
     """Background task that executes a dispatch run."""
     _run_start_dt: datetime = datetime.now(UTC)
@@ -2149,6 +2205,7 @@ async def _dispatch_worker(
             workspace_repo_dirs=workspace_repo_dirs,
             is_recovery=is_recovery,
             workspace=workspace,
+            resume_context=resume_context,
         )
 
         item_title = item.get("title", f"rollout:{run.rollout_id}")

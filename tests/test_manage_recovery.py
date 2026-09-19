@@ -1170,3 +1170,263 @@ class TestExitPathBuildInFlight:
         mock_relaunch.assert_awaited_once()
         _, kwargs = mock_relaunch.call_args
         assert kwargs["run_timed_out"] is True
+
+
+# ---------------------------------------------------------------------------
+# Item 3889efbb: the exact path that halted rollout 1cc5161c — a manager that
+# exits in a NON-polling phase (e.g. re-running warm-up) WHILE child builds are
+# still in flight. Branch 2 of the ladder short-circuits before branch 3, so
+# the free-relaunch exemption never applies and the retry budget is charged.
+# ---------------------------------------------------------------------------
+
+
+class TestCountedNotPollingWithBuildsInFlight:
+    """Regression coverage for the counted-not-polling + in-flight combination."""
+
+    @staticmethod
+    def _warm_up_rollout(in_flight: list[dict], retry_count: int = 0) -> dict:
+        return _rollout(
+            "running",
+            retry_count=retry_count,
+            manager_phase="warm_up",
+            manager_current_step="Verifying main is green",
+            manager_state_updated_at=(
+                datetime.now(UTC) - timedelta(seconds=60)
+            ).isoformat(),
+            in_flight=in_flight,
+        )
+
+    async def test_not_polling_with_builds_in_flight_charges_retry_budget(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Exiting in warm_up while a build runs is COUNTED, not free."""
+        run = _make_run()
+        engine = MagicMock()
+        rollout = self._warm_up_rollout(
+            [{"runId": "run-1", "itemId": "item-1", "status": "running"}]
+        )
+
+        with (
+            _full_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            ctx.gtd.get_rollout = AsyncMock(return_value=rollout)
+            ctx.gtd.relaunch_manage_rollout = AsyncMock(
+                return_value=_rollout("running", retry_count=1)
+            )
+            ctx.gtd.halt_rollout = AsyncMock()
+            ctx.gtd.post_comment = AsyncMock()
+            ctx.db.insert_run = AsyncMock()
+
+            await _maybe_relaunch_manage(
+                run,
+                100,
+                engine,
+                3600,
+                None,
+                manager_uptime_seconds=1800.0,
+                run_timed_out=False,
+            )
+
+        # The retry budget was charged even though a healthy build was running.
+        ctx.gtd.relaunch_manage_rollout.assert_awaited_once_with(run.rollout_id)
+        ctx.gtd.halt_rollout.assert_not_called()
+        assert run.rollout_id not in ctx.free_relaunches
+        assert any(
+            "decision=counted-not-polling" in r.getMessage()
+            and "in_flight_builds=1" in r.getMessage()
+            for r in caplog.records
+        )
+
+    async def test_branch_2_short_circuits_before_branch_3(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Ordering guard: not-polling wins over no-build-in-flight.
+
+        Both ladder conditions are true here (phase != polling AND no in-flight
+        builds). The logged decision pins branch 2 ahead of branch 3 so the
+        order cannot be silently flipped by a later refactor.
+        """
+        run = _make_run()
+        engine = MagicMock()
+        rollout = self._warm_up_rollout([])
+
+        with (
+            _full_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            ctx.gtd.get_rollout = AsyncMock(return_value=rollout)
+            ctx.gtd.relaunch_manage_rollout = AsyncMock(
+                return_value=_rollout("running", retry_count=1)
+            )
+            ctx.gtd.halt_rollout = AsyncMock()
+            ctx.gtd.post_comment = AsyncMock()
+            ctx.db.insert_run = AsyncMock()
+
+            await _maybe_relaunch_manage(
+                run,
+                100,
+                engine,
+                3600,
+                None,
+                manager_uptime_seconds=1800.0,
+                run_timed_out=False,
+            )
+
+        decisions = [
+            m.split("decision=")[1]
+            for m in (r.getMessage() for r in caplog.records)
+            if "decision=" in m and "exit-path" in m
+        ]
+        assert decisions == ["counted-not-polling"]
+
+    async def test_halt_comments_on_every_in_flight_item(self) -> None:
+        """A cap-exceeded halt comments on BOTH stranded items, not just the first."""
+        run = _make_run()
+        engine = MagicMock()
+        in_flight = [
+            {"runId": "run-a", "itemId": "item-a", "status": "running"},
+            {"runId": "run-b", "itemId": "item-b", "status": "running"},
+        ]
+        rollout = self._warm_up_rollout(in_flight, retry_count=MAX_MANAGE_RETRIES)
+
+        with _full_patch_stack() as ctx:
+            ctx.gtd.get_rollout = AsyncMock(return_value=rollout)
+            ctx.gtd.relaunch_manage_rollout = AsyncMock(
+                return_value=_rollout("running", retry_count=MAX_MANAGE_RETRIES + 1)
+            )
+            ctx.gtd.halt_rollout = AsyncMock()
+            ctx.gtd.post_comment = AsyncMock()
+            ctx.db.insert_run = AsyncMock()
+
+            await _maybe_relaunch_manage(
+                run,
+                100,
+                engine,
+                3600,
+                None,
+                manager_uptime_seconds=1800.0,
+                run_timed_out=False,
+            )
+
+        ctx.gtd.halt_rollout.assert_awaited_once()
+        ctx.db.insert_run.assert_not_called()
+        commented = {c.args[0] for c in ctx.gtd.post_comment.await_args_list}
+        assert commented == {"item-a", "item-b"}
+        bodies = {c.args[0]: c.args[1] for c in ctx.gtd.post_comment.await_args_list}
+        assert "run-a" in bodies["item-a"]
+        assert "run-b" in bodies["item-b"]
+        for body in bodies.values():
+            assert "manage_relaunch_cap_exceeded" in body
+            assert "manual review and merge" in body
+
+    async def test_halt_comment_failure_does_not_suppress_other_items(self) -> None:
+        """One failing comment post must not hide the other stranded item."""
+        run = _make_run()
+        engine = MagicMock()
+        in_flight = [
+            {"runId": "run-a", "itemId": "item-a", "status": "running"},
+            {"runId": "run-b", "itemId": "item-b", "status": "running"},
+        ]
+        rollout = self._warm_up_rollout(in_flight, retry_count=MAX_MANAGE_RETRIES)
+
+        with _full_patch_stack() as ctx:
+            ctx.gtd.get_rollout = AsyncMock(return_value=rollout)
+            ctx.gtd.relaunch_manage_rollout = AsyncMock(
+                return_value=_rollout("running", retry_count=MAX_MANAGE_RETRIES + 1)
+            )
+            ctx.gtd.halt_rollout = AsyncMock()
+            ctx.gtd.post_comment = AsyncMock(side_effect=[Exception("boom"), None])
+            ctx.db.insert_run = AsyncMock()
+
+            await _maybe_relaunch_manage(
+                run,
+                100,
+                engine,
+                3600,
+                None,
+                manager_uptime_seconds=1800.0,
+                run_timed_out=False,
+            )
+
+        assert [c.args[0] for c in ctx.gtd.post_comment.await_args_list] == [
+            "item-a",
+            "item-b",
+        ]
+
+    async def test_free_relaunch_comments_on_every_in_flight_item(self) -> None:
+        """The free-relaunch path also fans out across every in-flight item."""
+        run = _make_run()
+        engine = MagicMock()
+        in_flight = [
+            {"runId": "run-a", "itemId": "item-a", "status": "running"},
+            {"runId": "run-b", "itemId": "item-b", "status": "running"},
+        ]
+        rollout = _rollout(
+            "running",
+            retry_count=MAX_MANAGE_RETRIES,
+            manager_phase="polling",
+            manager_current_step="Waiting for build runs to complete",
+            manager_state_updated_at=(
+                datetime.now(UTC) - timedelta(seconds=60)
+            ).isoformat(),
+            in_flight=in_flight,
+        )
+
+        with _full_patch_stack() as ctx:
+            ctx.gtd.get_rollout = AsyncMock(return_value=rollout)
+            ctx.gtd.relaunch_manage_rollout = AsyncMock()
+            ctx.gtd.halt_rollout = AsyncMock()
+            ctx.gtd.post_comment = AsyncMock()
+            ctx.db.insert_run = AsyncMock()
+
+            await _maybe_relaunch_manage(
+                run,
+                100,
+                engine,
+                3600,
+                None,
+                manager_uptime_seconds=1800.0,
+                run_timed_out=False,
+            )
+
+        ctx.gtd.relaunch_manage_rollout.assert_not_called()
+        ctx.gtd.halt_rollout.assert_not_called()
+        bodies = {c.args[0]: c.args[1] for c in ctx.gtd.post_comment.await_args_list}
+        assert set(bodies) == {"item-a", "item-b"}
+        assert "run-a" in bodies["item-a"]
+        assert "run-b" in bodies["item-b"]
+
+    async def test_resume_context_forwarded_to_relaunched_worker(self) -> None:
+        """The in-flight list reaches the replacement worker as resume_context."""
+        from agent_gtd_dispatch.main import _do_manage_recovery
+
+        run = _make_run()
+        engine = MagicMock()
+        in_flight = [{"runId": "run-a", "itemId": "item-a", "status": "running"}]
+
+        with (
+            _full_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._dispatch_worker") as mock_worker,
+        ):
+            ctx.gtd.relaunch_manage_rollout = AsyncMock(
+                return_value=_rollout("running", retry_count=1)
+            )
+            ctx.gtd.halt_rollout = AsyncMock()
+            ctx.gtd.post_comment = AsyncMock()
+            ctx.db.insert_run = AsyncMock()
+
+            await _do_manage_recovery(
+                "rollout-abc",
+                run,
+                100,
+                engine,
+                3600,
+                None,
+                halt_reason="manage_relaunch_cap_exceeded",
+                resume_context=in_flight,
+            )
+
+        kwargs = mock_worker.call_args.kwargs
+        assert kwargs["resume_context"] == in_flight
+        assert kwargs["is_recovery"] is True

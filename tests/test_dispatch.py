@@ -4658,3 +4658,186 @@ class TestGitOutputExcerpt:
             == dispatch.ERROR_TEXT_MAX_CHARS
         )
         assert main.ERROR_TEXT_MAX_CHARS == dispatch.ERROR_TEXT_MAX_CHARS
+
+
+# ---------------------------------------------------------------------------
+# Item 3889efbb — manage prompt Step 3 must wait in the FOREGROUND.
+#
+# The defect that halted rollout 1cc5161c was pure prompt text: Step 3 told the
+# manager to arm a background poller and wait for a `<task-notification>`, which
+# under `claude --print` means "end your turn" — i.e. exit. No code-level test
+# would have caught it, so these text guards are the regression protection.
+# ---------------------------------------------------------------------------
+
+_MANAGE_VARIANTS = [
+    pytest.param(None, id="monorepo"),
+    pytest.param(["repo-a", "repo-b"], id="workspace"),
+]
+
+
+def _manage_prompt(
+    workspace_repo_dirs: list[str] | None,
+    **kwargs,
+) -> str:
+    return build_system_prompt(
+        item={"id": "item-1", "title": "ignored for manage mode"},
+        project={
+            "id": "proj-1",
+            "name": "wave-project",
+            "git_origin": "git@host:repos/wp",
+        },
+        branch_name=None,
+        max_turns=100,
+        mode="manage",
+        rollout_id="wr-abc123",
+        workspace_repo_dirs=workspace_repo_dirs,
+        **kwargs,
+    )
+
+
+def _step3_region(prompt: str) -> str:
+    """The Step 3 body only, so guards cannot be satisfied by other sections."""
+    start = prompt.index("**Step 3 —")
+    end = prompt.index("**Step 4 —", start)
+    return prompt[start:end]
+
+
+@pytest.mark.parametrize("workspace_repo_dirs", _MANAGE_VARIANTS)
+class TestManagePromptForegroundWait:
+    """Text guards for the foreground-wait rewrite of Step 3."""
+
+    def test_step3_has_no_background_poller(self, workspace_repo_dirs) -> None:
+        region = _step3_region(_manage_prompt(workspace_repo_dirs))
+        assert "run_in_background" not in region
+        assert "task-notification" not in region
+        assert "sleep 30" not in region
+        assert "background poller" not in region
+        assert "burn turns on a foreground sleep loop" not in region
+
+    def test_step3_uses_blocking_run_status_waiter(self, workspace_repo_dirs) -> None:
+        region = _step3_region(_manage_prompt(workspace_repo_dirs))
+        assert "agent-gtd run-status <run_id> --wait --timeout 540" in region
+        assert "FOREGROUND" in region
+
+    def test_step3_states_sequential_waiting_is_correct(
+        self, workspace_repo_dirs
+    ) -> None:
+        region = _step3_region(_manage_prompt(workspace_repo_dirs))
+        assert "SEQUENTIALLY" in region
+        assert "one run_id at a time" in region
+        assert "status immediately when its turn comes" in region
+
+    def test_step3_documents_waiter_exit_codes(self, workspace_repo_dirs) -> None:
+        region = _step3_region(_manage_prompt(workspace_repo_dirs))
+        assert "`0` — terminal SUCCESS" in region
+        assert "`2` — terminal FAILURE" in region
+        assert "`124` — the client `--timeout` elapsed" in region
+        assert "`1` — operational error" in region
+
+    def test_step3_exit_124_is_not_a_failure_and_re_arms(
+        self, workspace_repo_dirs
+    ) -> None:
+        region = _step3_region(_manage_prompt(workspace_repo_dirs))
+        assert "STILL RUNNING" in region
+        assert "NOT a failure" in region
+        assert "re-issue the EXACT same command for the SAME run_id" in region
+        assert "keep" in region and "until the command exits 0, 2 or 1" in region
+
+    def test_turn_discipline_sentence_present(self, workspace_repo_dirs) -> None:
+        prompt = _manage_prompt(workspace_repo_dirs)
+        assert "Turn Discipline" in prompt
+        assert "NEVER invoke a run wait\nwith `run_in_background: true`" in prompt
+        assert (
+            "Do NOT end your turn\nor session while any dispatched build run is "
+            "still in flight.**" in prompt
+        )
+        assert "`claude --print`" in prompt
+
+    def test_time_budget_line_no_longer_says_on_timeout(
+        self, workspace_repo_dirs
+    ) -> None:
+        prompt = _manage_prompt(workspace_repo_dirs)
+        assert "automatic relaunches on timeout" not in prompt
+        assert "consumes the relaunch budget" in prompt
+        assert "exiting while any build run is still in flight is itself a failure" in (
+            prompt
+        )
+
+    def test_warm_up_skip_instruction_present(self, workspace_repo_dirs) -> None:
+        prompt = _manage_prompt(workspace_repo_dirs)
+        assert "**SKIP Phase 1 when work is already in flight.**" in prompt
+        assert 'mcp__agent-gtd__advance_rollout(rollout_id="wr-abc123")' in prompt
+        assert "`in_progress` list is NOT empty" in prompt
+
+    def test_warm_up_skip_defers_but_does_not_drop_verification(
+        self, workspace_repo_dirs
+    ) -> None:
+        prompt = _manage_prompt(workspace_repo_dirs)
+        assert "Deferred, not discarded — verify before your FIRST merge." in prompt
+        assert "Before you merge ANYTHING" in prompt
+        assert "Merging onto an unverified base" in prompt
+
+    def test_polling_state_publish_preserved(self, workspace_repo_dirs) -> None:
+        region = _step3_region(_manage_prompt(workspace_repo_dirs))
+        assert 'phase="polling"' in region
+        assert "mcp__agent-gtd__update_rollout_state(" in region
+
+
+_EXPECTED_RECOVERY_BLOCK = (
+    "## ⚠️ Recovery Context\n"
+    "\n"
+    "You are a *recovery* manage agent — a previous manager for this rollout "
+    "exited unexpectedly\n"
+    "(retry attempt 1 of 2). The rollout is already in `running`\n"
+    "state. Read its current state via `advance_rollout` and continue normally. "
+    "Items already terminal\n"
+    "may have unmerged work waiting; process those first before dispatching new "
+    "ones.\n"
+    "\n"
+)
+
+
+@pytest.mark.parametrize("workspace_repo_dirs", _MANAGE_VARIANTS)
+class TestManageResumeContext:
+    """The dispatcher's in-flight list must reach the recovery prompt verbatim."""
+
+    _IN_FLIGHT: ClassVar[list[dict[str, str]]] = [
+        {"runId": "32c0a2b7", "itemId": "item-a", "status": "running"},
+        {"runId": "db7f8e53", "itemId": "item-b", "status": "running"},
+    ]
+
+    def test_in_flight_runs_and_items_named(self, workspace_repo_dirs) -> None:
+        prompt = _manage_prompt(
+            workspace_repo_dirs,
+            manage_retry_count=1,
+            is_recovery=True,
+            resume_context=self._IN_FLIGHT,
+        )
+        for entry in self._IN_FLIGHT:
+            assert f"run `{entry['runId']}`" in prompt
+            assert f"item `{entry['itemId']}`" in prompt
+        assert "do NOT rediscover it" in prompt
+        assert "SKIP Phase 1 warm-up" in prompt
+
+    def test_absent_resume_context_renders_block_unchanged(
+        self, workspace_repo_dirs
+    ) -> None:
+        """No resume context → the recovery block is byte-identical to before."""
+        without = _manage_prompt(
+            workspace_repo_dirs, manage_retry_count=1, is_recovery=True
+        )
+        explicit_none = _manage_prompt(
+            workspace_repo_dirs,
+            manage_retry_count=1,
+            is_recovery=True,
+            resume_context=None,
+        )
+        empty = _manage_prompt(
+            workspace_repo_dirs,
+            manage_retry_count=1,
+            is_recovery=True,
+            resume_context=[],
+        )
+        assert without == explicit_none == empty
+        assert without.startswith(_EXPECTED_RECOVERY_BLOCK)
+        assert "do NOT rediscover it" not in without
