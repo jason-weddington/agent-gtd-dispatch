@@ -53,6 +53,57 @@ GATE_STASH_MESSAGE: str = "agent-gtd-post-run-gate"
 # group, then `/bin/sh -c` runs the gate_command string itself.
 _GATE_SHIM: str = 'exec timeout --kill-after="$1" "$2" /bin/sh -c "$3"'
 
+# ONE budget for every operator-facing run error string.  Two independent
+# truncation layers used to clip these — a 300-char stderr TAIL here and a
+# 500-char clip when agent_gtd mirrors the remote run — and the pair silently
+# discarded the failing pre-commit hook (only `(no files to check) Skipped`
+# lines survived).  Both layers now quote this one constant so they cannot
+# drift apart again.
+ERROR_TEXT_MAX_CHARS: int = 2000
+
+# How that budget is split when excerpting git/hook output.  The HEAD is the
+# end that matters: the FIRST failing hook and git's own message appear there,
+# while the tail is usually per-hook "Skipped" noise.
+GIT_EXCERPT_HEAD_CHARS: int = 1500
+GIT_EXCERPT_TAIL_CHARS: int = ERROR_TEXT_MAX_CHARS - GIT_EXCERPT_HEAD_CHARS
+
+
+def git_output_excerpt(
+    proc: subprocess.CompletedProcess[bytes],
+    *,
+    head: int = GIT_EXCERPT_HEAD_CHARS,
+    tail: int = GIT_EXCERPT_TAIL_CHARS,
+) -> str:
+    """Excerpt a failed git invocation's output for an operator-facing error string.
+
+    Combines the captured stdout AND stderr — stdout first, because git forwards
+    hook stdout on its own stream and the previous stderr-only excerpt threw that
+    away entirely — then keeps the HEAD of the result.
+
+    When the combined output does not fit in ``head + tail`` characters the middle
+    is dropped and replaced by a marker naming how many characters went missing,
+    so the operator can tell an excerpt from a complete message.  Keeping the head
+    is the whole point: the first failing pre-commit hook and git's own message
+    are at the top, and a tail-only excerpt of a long hook run shows nothing but
+    ``(no files to check) Skipped`` lines.
+    """
+    parts: list[str] = []
+    for stream in (proc.stdout, proc.stderr):
+        # Non-bytes (an unset attribute on a test double, None from a call made
+        # without capture_output) contributes nothing rather than its repr.
+        if not isinstance(stream, bytes) or not stream:
+            continue
+        text = stream.decode("utf-8", errors="replace")
+        if text.strip():
+            parts.append(text)
+    combined = "\n".join(parts).strip()
+    budget = head + tail
+    if len(combined) <= budget:
+        return combined
+    dropped = len(combined) - budget
+    tail_text = combined[len(combined) - tail :] if tail > 0 else ""
+    return f"{combined[:head]}\n[... {dropped} characters elided ...]\n{tail_text}"
+
 
 def _sudo_wrap(cmd: list[str]) -> list[str]:
     """Prepend sudo -u <user> -H when AGENT_SUBPROCESS_USER is set."""

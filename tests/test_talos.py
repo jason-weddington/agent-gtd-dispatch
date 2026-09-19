@@ -2700,3 +2700,88 @@ class TestBuildCommentBody:
         assert "re-dispatch" not in body
         assert "stalled / no convergence" not in body
         assert "unrecognized failure mode" not in body
+
+
+class TestGitFailureErrorKeepsHead:
+    """The reported regression: `git commit failed: …` held only Skipped lines.
+
+    The excerpt was a 300-char STDERR TAIL, so the first failing pre-commit hook
+    (at the head) and git's own message (on stdout) were both discarded.
+    """
+
+    async def test_commit_failure_error_keeps_failing_hook_and_stdout(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from agent_gtd_dispatch import config, db, gtd_client, main
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", AsyncMock())
+        monkeypatch.setattr(gtd_client, "set_item_status", AsyncMock())
+
+        hook_head = (
+            "mypy....................................................Failed\n"
+            "- hook id: mypy\n"
+            "src/x.py:12: error: Incompatible return value type\n"
+        )
+        skipped_tail = "".join(
+            f"hook-{i:02d}.....................(no files to check) Skipped\n"
+            for i in range(60)
+        )
+
+        stdout = (
+            '{"outcome":"Finished","iterations":3,'
+            '"disposition":{"Done":{"summary":"ok",'
+            '"verification":"NoChecksConfigured"}}}'
+        )
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (stdout.encode(), b"")
+        mock_proc.returncode = 0
+
+        def _fake_run(cmd, **_kwargs):
+            rc = MagicMock()
+            rc.stdout = b""
+            rc.stderr = b""
+            if "commit" in cmd and "-m" in cmd:
+                rc.returncode = 1
+                rc.stdout = (hook_head + skipped_tail).encode()
+                rc.stderr = b"error: cannot commit\n"
+            elif "status" in cmd and "--porcelain" in cmd:
+                rc.returncode = 0  # clean tree — no retry
+            else:
+                rc.returncode = 0
+            return rc
+
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        errors = [
+            str(c.kwargs.get("error") or "")
+            for c in update_run_mock.await_args_list
+            if c.kwargs.get("error")
+        ]
+        assert errors, update_run_mock.await_args_list
+        error = errors[-1]
+        assert error.startswith("git commit failed: ")
+        # The head survives: the failing hook AND git's own stdout message.
+        assert "- hook id: mypy" in error
+        assert "Incompatible return value type" in error
+        # The middle is elided rather than the head being thrown away.
+        assert "characters elided" in error

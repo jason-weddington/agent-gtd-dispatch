@@ -74,11 +74,19 @@ Leg 2 is the agent-authored artifact at the fixed absolute path `<workspace>/.di
 
 Leg 3 is the invariant: a zero-commit BUILD run is never `succeeded`. `main._record_build_terminal` is the single choke point in front of every terminal write and coerces a violating status to `failed` with an `invariant_zero_commit_success:` prefix plus an `INVARIANT VIOLATION` ERROR log. This is a runtime tripwire, not a construction-time convention, because the rule already regressed once during a port and stayed invisible for weeks.
 
+Leg 2 has exactly one exception, added after three `claude-code-glm` runs that implemented their item, pushed, passed the gate and were still recorded `failed`: an ABSENT or unparseable artifact on a run that DID push commits is not fatal by itself. Writing the artifact is a cooperative act and weak models intermittently skip it, so such a run takes the `_unasserted_path` — it falls through to the post-run gate, and the gate decides. Gate `passed` -> `succeeded` (same success writer) with `unasserted: true` in the completion blob, a WARNING `unasserted build run:` line carrying the engine for later per-engine aggregation, an explanatory GTD comment, and a guarded best-effort nudge of the item to `review` (never when it is already `review`/`done`). Any other gate decision — including `skipped_no_gate_command`, since with no assertion and no gate "some commits exist" proves nothing — is `failed` under the existing `stopped_without_assertion` prefix naming the decision. Zero commits keeps the old strict behaviour, and a non-`ok` envelope verdict still outranks all of this: the envelope is the CLI's own statement about how the process ended, and the leniency applies only to the agent-authored artifact. The root cause is model compliance, NOT the prompt — `_build_build_prompt` is deliberately untouched.
+
 The only non-failure zero-commit outcome is the `already_satisfied` terminal: artifact present with `disposition: already_satisfied` and a non-empty `reason`, zero commits, and a gate that did not fail. On that path the post-run gate RUNS despite zero pushed repos (a no-op claim on a red repo is a failure), the worker sets the item to `review` best-effort, and the item is never completed. An ungated project records `gate=skipped_no_gate_command` and still lands `already_satisfied`.
 
 Triage classes live in `error`-string prefixes, never in new protocol members: `no_result_envelope`, `result_is_error`, `max_turns_exhausted`, `stopped_without_assertion`, `agent_reported_blocked`, `agent_reported_failed`, `done_claim_zero_commits`, `already_satisfied_gate_failed`, `invariant_zero_commit_success`. `RunStatus` gained exactly one member, `already_satisfied`.
 
 Every build terminal logs one `build completion:` key=value line and persists the same triple into the runs table's nullable `completion` column — the only durable carrier on a succeeded run, where `error` is NULL.
+
+## Operator-facing error text
+
+Run `error` strings carry ONE budget, `dispatch.ERROR_TEXT_MAX_CHARS` (2000), mirrored by `agent_gtd.dispatch_worker.ERROR_MSG_MAX_CHARS` on the GTD side. Both columns are TEXT; the caps are policy, not schema. Keep them equal — when they differed (a 300-char excerpt under a 500-char clip) the lower one bound silently and a fix to the other would have half-survived.
+
+`dispatch.git_output_excerpt(proc)` builds every git/hook failure excerpt. It combines stdout AND stderr (stdout first — git forwards hook stdout on its own stream, and a stderr-only excerpt threw it away) and keeps the HEAD, eliding the middle with a marker naming the dropped character count. The head is what matters: the first failing pre-commit hook and git's own message are at the top, while a tail-only excerpt of a long hook run shows nothing but `(no files to check) Skipped` lines. `retention.py`'s `[-200:]` tail is NOT this surface and correctly keeps the tail.
 
 ## Retention
 

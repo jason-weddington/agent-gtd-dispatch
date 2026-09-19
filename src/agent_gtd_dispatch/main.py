@@ -187,6 +187,10 @@ def _publish_run_event(run_id: str, status: str, completed_at: str | None) -> No
 MAX_MANAGE_RETRIES = config.MAX_MANAGE_RETRIES  # re-exported for tests
 MANAGE_RETRY_BACKOFF_SECONDS = 30
 
+# The single budget for operator-facing run error strings, shared with the
+# git/hook excerpts in dispatch.py so the two truncation layers cannot drift.
+ERROR_TEXT_MAX_CHARS: int = dispatch.ERROR_TEXT_MAX_CHARS
+
 # Frozenset of rollout statuses that indicate a clean/terminal manage exit
 _CLEAN_EXIT_STATUSES: frozenset[str] = frozenset({"completed", "halted", "cancelled"})
 
@@ -1060,7 +1064,7 @@ async def _run_talos(
                     capture_output=True,
                 )
                 if add_rc.returncode != 0:
-                    _err = add_rc.stderr.decode("utf-8", errors="replace")[-300:]
+                    _err = dispatch.git_output_excerpt(add_rc)
                     await db.update_run(
                         run.id,
                         status=RunStatus.failed,
@@ -1092,7 +1096,7 @@ async def _run_talos(
                     capture_output=True,
                 )
                 if diff_rc.returncode not in (0, 1):
-                    _err = diff_rc.stderr.decode("utf-8", errors="replace")[-300:]
+                    _err = dispatch.git_output_excerpt(diff_rc)
                     await db.update_run(
                         run.id,
                         status=RunStatus.failed,
@@ -1125,7 +1129,7 @@ async def _run_talos(
                     str(repo_path), git_ident_flags, commit_msg
                 )
                 if commit_rc.returncode != 0:
-                    _err = commit_rc.stderr.decode("utf-8", errors="replace")[-300:]
+                    _err = dispatch.git_output_excerpt(commit_rc)
                     await db.update_run(
                         run.id,
                         status=RunStatus.failed,
@@ -1158,7 +1162,7 @@ async def _run_talos(
                     capture_output=True,
                 )
                 if push_rc.returncode != 0:
-                    _err = push_rc.stderr.decode("utf-8", errors="replace")[-300:]
+                    _err = dispatch.git_output_excerpt(push_rc)
                     await db.update_run(
                         run.id,
                         status=RunStatus.failed,
@@ -1258,7 +1262,7 @@ async def _run_talos(
             capture_output=True,
         )
         if add_rc.returncode != 0:
-            _err = add_rc.stderr.decode("utf-8", errors="replace")[-300:]
+            _err = dispatch.git_output_excerpt(add_rc)
             await db.update_run(
                 run.id,
                 status=RunStatus.failed,
@@ -1280,7 +1284,7 @@ async def _run_talos(
 
         commit_rc = _commit_with_retry(str(workspace), git_ident_flags, commit_msg)
         if commit_rc.returncode != 0:
-            _err = commit_rc.stderr.decode("utf-8", errors="replace")[-300:]
+            _err = dispatch.git_output_excerpt(commit_rc)
             await db.update_run(
                 run.id,
                 status=RunStatus.failed,
@@ -1311,7 +1315,7 @@ async def _run_talos(
             capture_output=True,
         )
         if push_rc.returncode != 0:
-            _err = push_rc.stderr.decode("utf-8", errors="replace")[-300:]
+            _err = dispatch.git_output_excerpt(push_rc)
             await db.update_run(
                 run.id,
                 status=RunStatus.failed,
@@ -1492,12 +1496,20 @@ def build_completion_blob(
     zero_commits: bool,
     gate_decision: str | None,
     evidence_dir: str,
+    unasserted: bool = False,
 ) -> str:
     """Serialize the leg-1/leg-2/leg-3 triple persisted on every build terminal.
 
     This is the only durable carrier of the CLI envelope on a run whose `error` is
     NULL, and the only way session_id / num_turns / total_cost_usd survive
     workspace teardown.
+
+    ``unasserted`` marks a run that reached its terminal WITHOUT a usable
+    completion artifact — the agent never asserted anything and the terminal was
+    decided on mechanical evidence (commits pushed + gate green) alone.  It
+    defaults False so every existing caller and every existing assertion on the
+    blob's shape is unaffected; its purpose is to make model non-compliance
+    countable per engine later.
     """
     state = completion.artifact_state(artifact, artifact_reject_reason)
     return json.dumps(
@@ -1517,6 +1529,7 @@ def build_completion_blob(
             "zero_commits": zero_commits,
             "gate_decision": gate_decision,
             "evidence_dir": evidence_dir,
+            "unasserted": unasserted,
         }
     )
 
@@ -1570,6 +1583,33 @@ async def _record_build_terminal(
     return status
 
 
+async def _best_effort_set_item_status(
+    item_id: str,
+    status: str,
+    run_id: str,
+    *,
+    callback_token: str | None,
+    terminal: str,
+) -> None:
+    """PATCH an item's status, tolerating failure.
+
+    SHARED by every worker path that nudges an item after a terminal write.  A
+    PATCH failure must NEVER flip the run's already-recorded terminal — the run
+    row is the source of truth about what happened and a flaky GTD call is not
+    evidence that the build failed.
+    """
+    try:
+        await gtd_client.set_item_status(item_id, status, token=callback_token)
+    except Exception:
+        logger.warning(
+            "Failed to set item %s status=%s (run %s) — run stays %s",
+            item_id,
+            status,
+            run_id,
+            terminal,
+        )
+
+
 async def _route_already_satisfied_item(
     item_id: str,
     run_id: str,
@@ -1591,14 +1631,13 @@ async def _route_already_satisfied_item(
     status away from ``already_satisfied`` — mirrors every other status-set in
     this module.
     """
-    try:
-        await gtd_client.set_item_status(item_id, "review", token=callback_token)
-    except Exception:
-        logger.warning(
-            "Failed to set item %s status=review (run %s) — run stays already_satisfied",
-            item_id,
-            run_id,
-        )
+    await _best_effort_set_item_status(
+        item_id,
+        "review",
+        run_id,
+        callback_token=callback_token,
+        terminal="already_satisfied",
+    )
     body = (
         f"Build run `{run_id}` made no changes: the agent reported the "
         f"acceptance criteria are already satisfied.\n\nReason: {reason}\n\n"
@@ -2197,7 +2236,10 @@ async def _dispatch_worker(
                 _verdict = completion.envelope_verdict(_envelope)
 
                 def _build_completion(
-                    outcome: str, gate_decision: str | None = None
+                    outcome: str,
+                    gate_decision: str | None = None,
+                    *,
+                    unasserted: bool = False,
                 ) -> str:
                     """Log the one structured decision line and return the blob.
 
@@ -2218,13 +2260,15 @@ async def _dispatch_worker(
                         zero_commits=_zero,
                         gate_decision=gate_decision,
                         evidence_dir=_evidence_dir,
+                        unasserted=unasserted,
                     )
                     logger.info(
                         "build completion: run_id=%s outcome=%s envelope_verdict=%s"
                         " envelope_subtype=%s is_error=%s num_turns=%s"
                         " stop_reason=%s session_id=%s total_cost_usd=%s"
                         " artifact=%s artifact_reject_reason=%s disposition=%s"
-                        " zero_commits=%s pushed_repos=%d gate_decision=%s engine=%s",
+                        " zero_commits=%s pushed_repos=%d gate_decision=%s engine=%s"
+                        " unasserted=%s",
                         run.id,
                         outcome,
                         _verdict,
@@ -2241,6 +2285,7 @@ async def _dispatch_worker(
                         _pushed,
                         gate_decision,
                         engine_used.name,
+                        unasserted,
                     )
                     return blob
 
@@ -2379,21 +2424,47 @@ async def _dispatch_worker(
                 # agent's completion artifact, then what that artifact asserts.
                 # There is NO escape hatch on `done` — a zero-commit build run is
                 # never a success.
+                #
+                # One exception, and only one: an ABSENT (or unparseable —
+                # "unparseable == absent") artifact on a run that DID push
+                # commits is not fatal by itself.  Writing the artifact is a
+                # cooperative act and some engines intermittently skip it; when
+                # legs 2 and 3 (commits pushed, project gate green) are
+                # mechanically satisfied, failing the run is a false negative
+                # that halts healthy rollout waves.  Such a run falls through to
+                # the post-run gate via `_unasserted_path` and the gate decides.
+                # Zero commits keeps the old behaviour: nothing asserted AND
+                # nothing pushed leaves no evidence to fall back on.
                 _zero_commits = dispatch.is_zero_commits_run(push_results_list)
                 _disposition = _artifact.disposition if _artifact else None
                 _already_satisfied_path = False
+                _unasserted_path = False
                 _failure_prefix: str | None = None
 
                 if _verdict != "ok":
+                    # Strict precedence: the envelope is the CLI's own statement
+                    # about how the process ended, and the new leniency applies
+                    # only to the agent-authored artifact.
                     _failure_prefix = _verdict
-                elif _artifact is None:
+                elif _artifact is None and _zero_commits:
                     _failure_prefix = "stopped_without_assertion"
+                elif _artifact is None:
+                    _unasserted_path = True
                 elif _disposition in {"blocked", "failed"}:
                     _failure_prefix = f"agent_reported_{_disposition}"
                 elif _disposition == "done" and _zero_commits:
                     _failure_prefix = "done_claim_zero_commits"
                 elif _disposition == "already_satisfied" and _zero_commits:
                     _already_satisfied_path = True
+
+                # Why the artifact was unusable, when it was there but rejected.
+                # Shared by the failure paths and the unasserted-success path —
+                # a rejected artifact must reach the operator either way.
+                _reject_detail = (
+                    f"Completion artifact rejected: {_artifact_reason}."
+                    if _artifact is None and _artifact_reason not in {"ok", "absent"}
+                    else ""
+                )
 
                 if _failure_prefix is not None:
                     _detail_parts: list[str] = []
@@ -2403,10 +2474,8 @@ async def _dispatch_worker(
                         _detail_parts.append(
                             f"Decision needed: {_artifact.decision_needed.strip()}"
                         )
-                    if _artifact is None and _artifact_reason not in {"ok", "absent"}:
-                        _detail_parts.append(
-                            f"Completion artifact rejected: {_artifact_reason}."
-                        )
+                    if _reject_detail:
+                        _detail_parts.append(_reject_detail)
                     _detail = "\n\n".join(_detail_parts)
                     error_str = f"{_failure_prefix}: " + (
                         _detail.replace("\n", " ")
@@ -2421,7 +2490,7 @@ async def _dispatch_worker(
                         status=RunStatus.failed,
                         completed_at=completed,
                         exit_code=result.returncode,
-                        error=error_str[:500],
+                        error=error_str[:ERROR_TEXT_MAX_CHARS],
                         push_results=_push_results_json,
                         completion=_build_completion("failed"),
                     )
@@ -2526,6 +2595,88 @@ async def _dispatch_worker(
                     _gate_timed_out or None,
                     (f"{_gate_duration:.1f}" if _gate_duration is not None else None),
                 )
+
+                if _unasserted_path:
+                    # One greppable line per non-compliant run.  This is the
+                    # data that would justify (or refute) per-engine prompt work
+                    # later, so it carries the engine and the reject reason.
+                    logger.warning(
+                        "unasserted build run: run_id=%s engine=%s"
+                        " artifact_reject_reason=%s pushed_repos=%d"
+                        " gate_decision=%s outcome=%s",
+                        run.id,
+                        engine_used.name,
+                        None if _artifact_reason == "ok" else _artifact_reason,
+                        _n_pushed,
+                        decision,
+                        "succeeded" if decision == "passed" else "failed",
+                    )
+
+                if _unasserted_path and decision != "passed":
+                    # No assertion AND no green gate: "some commits exist" is not
+                    # evidence of success.  Reuses the existing triage class —
+                    # the dispatch boundary gains no new failure prefix.
+                    error_str = (
+                        "stopped_without_assertion: no completion artifact and"
+                        f" the post-run gate did not pass (decision={decision})"
+                    )
+                    if _reject_detail:
+                        error_str += f" {_reject_detail}"
+                    _push_results_json = json.dumps(
+                        [r.model_dump(mode="json") for r in push_results_list]
+                    )
+                    await db.update_run(
+                        run.id,
+                        status=RunStatus.failed,
+                        completed_at=completed,
+                        exit_code=result.returncode,
+                        error=error_str[:ERROR_TEXT_MAX_CHARS],
+                        push_results=_push_results_json,
+                        completion=_build_completion(
+                            "failed", decision, unasserted=True
+                        ),
+                    )
+                    _publish_run_event(run.id, "failed", completed)
+                    if run.item_id is not None:
+                        _unasserted_detail = (
+                            "The agent pushed commits to"
+                            f" `{run.branch_name}` but wrote no completion"
+                            " artifact, so the run could only be judged"
+                            " mechanically — and the post-run gate did not pass"
+                            f" (decision=`{decision}`)."
+                        )
+                        if decision == "skipped_no_gate_command":
+                            _unasserted_detail += (
+                                " This project has no `gate_command`, so there"
+                                " was nothing to verify the pushed work with."
+                                " Setting a project `gate_command` is what would"
+                                " let a run like this be recorded successful."
+                            )
+                        if _reject_detail:
+                            _unasserted_detail += f"\n\n{_reject_detail}"
+                        if _gate_result is not None and _gate_result.output:
+                            _unasserted_detail += (
+                                "\n\nGate output (tail):\n\n````\n"
+                                + _gate_result.output.rstrip("\n")
+                                + "\n````"
+                            )
+                        try:
+                            await gtd_client.post_comment(
+                                run.item_id,
+                                build_failure_comment(
+                                    "stopped_without_assertion",
+                                    run.id,
+                                    _unasserted_detail,
+                                ),
+                                created_by=attribution or "agent-gtd-dispatch",
+                                token=run.callback_token,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to post unasserted-failure comment for run %s",
+                                run.id,
+                            )
+                    return  # exit early — do not mark succeeded
 
                 if _gate_result is not None and not _gate_result.passed:
                     if decision == "timed_out":
@@ -2680,7 +2831,9 @@ async def _dispatch_worker(
                     completed_at=completed,
                     exit_code=result.returncode,
                     push_results=_push_results_json,
-                    completion_blob=_build_completion("succeeded", decision),
+                    completion_blob=_build_completion(
+                        "succeeded", decision, unasserted=_unasserted_path
+                    ),
                 )
                 _publish_run_event(run.id, _final_status.value, completed)
                 if _final_status is not RunStatus.succeeded:
@@ -2759,6 +2912,64 @@ async def _dispatch_worker(
                         "Failed to post post-run gate pass comment for run %s",
                         run.id,
                     )
+            if (
+                _verify_repos is not None
+                and _unasserted_path
+                and run.item_id is not None
+            ):
+                # Say plainly that nobody asserted anything: this run is a
+                # success on mechanical evidence alone, so the reviewer — not
+                # the agent — is the one confirming the change matches scope.
+                _unasserted_body = (
+                    f"Build run `{run.id}` is recorded **successful on"
+                    " mechanical evidence alone**. The agent pushed commits to"
+                    f" `{run.branch_name}` and the project quality gate passed"
+                    f" (decision=`{decision}`), but it never wrote a completion"
+                    " artifact, so it never asserted how its run ended."
+                )
+                if _reject_detail:
+                    _unasserted_body += f"\n\n{_reject_detail}"
+                _unasserted_body += (
+                    "\n\nNothing here says the agent believes it finished the"
+                    " item — please confirm the change actually matches the"
+                    " item's scope before accepting it."
+                )
+                try:
+                    await gtd_client.post_comment(
+                        run.item_id,
+                        _unasserted_body,
+                        created_by=attribution or "agent-gtd-dispatch",
+                        token=run.callback_token,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to post unasserted-success comment for run %s",
+                        run.id,
+                    )
+                # An agent that skipped the artifact write plausibly skipped its
+                # own status update too.  Nudge the item to review — but never
+                # regress one a human (or the agent) already moved on.
+                try:
+                    _cur_item = await gtd_client.get_item(
+                        run.item_id, token=run.callback_token
+                    )
+                    _cur_status = str(_cur_item.get("status") or "")
+                except Exception:
+                    logger.warning(
+                        "Failed to read item %s status (run %s) — leaving it"
+                        " untouched on the unasserted-success path",
+                        run.item_id,
+                        run.id,
+                    )
+                else:
+                    if _cur_status not in {"review", "done"}:
+                        await _best_effort_set_item_status(
+                            run.item_id,
+                            "review",
+                            run.id,
+                            callback_token=run.callback_token,
+                            terminal="succeeded",
+                        )
         else:
             # Derive error snippet from the transcript (stdout/stderr are always
             # "" with Popen streaming).  With --output-format json the raw tail is

@@ -4424,3 +4424,105 @@ class TestTriageFailureComments:
             "The agent ran out of turns; commits and gate result (if any) are"
             " recorded — review before re-dispatching." in body
         )
+
+
+# ---------------------------------------------------------------------------
+# git_output_excerpt — keep the HEAD of git/hook output
+# ---------------------------------------------------------------------------
+
+
+def _proc(stdout: bytes = b"", stderr: bytes = b""):
+    return subprocess.CompletedProcess(
+        args=["git", "commit"], returncode=1, stdout=stdout, stderr=stderr
+    )
+
+
+# A realistic pre-commit run: the FIRST hook is the one that failed, and the
+# remaining ~40 hooks each print a "Skipped" line. A tail-only excerpt of this
+# shows nothing but noise — which is exactly the reported regression.
+_FAILING_HOOK = (
+    "ruff-format...............................................................Failed\n"
+    "- hook id: ruff-format\n"
+    "- files were modified by this hook\n"
+    "\n"
+    "1 file reformatted\n"
+)
+_SKIPPED_TAIL = "".join(
+    f"check-hook-{i:02d}..........................(no files to check) Skipped\n"
+    for i in range(60)
+)
+
+
+class TestGitOutputExcerpt:
+    def test_short_output_passes_through_unchanged(self) -> None:
+        assert dispatch.git_output_excerpt(_proc(stderr=b"boom")) == "boom"
+
+    def test_empty_streams_give_empty_string(self) -> None:
+        assert dispatch.git_output_excerpt(_proc()) == ""
+
+    def test_stdout_appears_when_stderr_is_empty(self) -> None:
+        """git forwards hook stdout on its own stream — a stderr-only excerpt lost it."""
+        assert dispatch.git_output_excerpt(_proc(stdout=b"hook said this")) == (
+            "hook said this"
+        )
+
+    def test_both_streams_appear_stdout_first(self) -> None:
+        out = dispatch.git_output_excerpt(
+            _proc(stdout=b"from-stdout", stderr=b"from-stderr")
+        )
+        assert "from-stdout" in out
+        assert "from-stderr" in out
+        assert out.index("from-stdout") < out.index("from-stderr")
+
+    def test_undecodable_bytes_are_replaced_not_raised(self) -> None:
+        assert "�" in dispatch.git_output_excerpt(_proc(stderr=b"\xff\xfe bad"))
+
+    def test_non_bytes_stream_contributes_nothing(self) -> None:
+        """A test double whose .stdout was never set must not leak its repr."""
+        proc = MagicMock()
+        proc.stdout = MagicMock()
+        proc.stderr = b"real stderr"
+        assert dispatch.git_output_excerpt(proc) == "real stderr"
+
+    def test_long_output_keeps_first_line_and_drops_the_middle(self) -> None:
+        raw = (_FAILING_HOOK + _SKIPPED_TAIL).encode()
+        out = dispatch.git_output_excerpt(_proc(stderr=raw))
+        assert len(raw.decode()) > dispatch.ERROR_TEXT_MAX_CHARS
+        assert out.startswith("ruff-format")
+        # The failing hook — the ONLY useful part — survives.
+        assert "- hook id: ruff-format" in out
+        assert "1 file reformatted" in out
+        # The tail is still shown, and it is the Skipped noise.
+        assert out.rstrip().endswith("Skipped")
+        # The middle is gone.
+        assert out.count("Skipped") < _SKIPPED_TAIL.count("Skipped")
+
+    def test_elision_marker_names_the_dropped_count(self) -> None:
+        raw = ("x" * 5000).encode()
+        out = dispatch.git_output_excerpt(_proc(stderr=raw))
+        dropped = 5000 - dispatch.ERROR_TEXT_MAX_CHARS
+        assert f"[... {dropped} characters elided ...]" in out
+        assert out.startswith("x" * dispatch.GIT_EXCERPT_HEAD_CHARS)
+
+    def test_exactly_at_budget_is_not_elided(self) -> None:
+        raw = ("y" * dispatch.ERROR_TEXT_MAX_CHARS).encode()
+        assert dispatch.git_output_excerpt(_proc(stderr=raw)) == (
+            "y" * dispatch.ERROR_TEXT_MAX_CHARS
+        )
+
+    def test_head_and_tail_are_overridable(self) -> None:
+        out = dispatch.git_output_excerpt(_proc(stderr=b"abcdefghij"), head=2, tail=2)
+        assert out.startswith("ab")
+        assert out.endswith("ij")
+        assert "6 characters elided" in out
+
+    def test_budget_constants_agree(self) -> None:
+        """One named constant governs both truncation layers — they cannot drift."""
+        from agent_gtd_dispatch import main
+
+        assert dispatch.ERROR_TEXT_MAX_CHARS == 2000
+        assert (
+            dispatch.GIT_EXCERPT_HEAD_CHARS + dispatch.GIT_EXCERPT_TAIL_CHARS
+            == dispatch.ERROR_TEXT_MAX_CHARS
+        )
+        assert main.ERROR_TEXT_MAX_CHARS == dispatch.ERROR_TEXT_MAX_CHARS
