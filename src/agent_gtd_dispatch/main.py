@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -230,6 +231,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Initialize config and DB on startup, cancel tasks on shutdown."""
     global _watchdog_task, _retention_task
     config.load()
+    # Before config.load() there is no LOG_LEVEL to honour, and after this line
+    # every logger.info in the package reaches the journal.
+    configure_logging()
     if config.AGENT_SUBPROCESS_USER:
         _check_service_repo()
     dispatch.init_executor()
@@ -253,6 +257,50 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
 
 app = FastAPI(title="Agent GTD Dispatch", lifespan=lifespan)
+
+
+# Marks the handler this function owns, so repeated calls replace it instead of
+# stacking duplicates (lifespan runs per-app; tests construct several).
+_LOG_HANDLER_NAME = "agent-gtd-dispatch"
+
+
+def configure_logging(level: str | None = None) -> None:
+    """Attach a stdout handler to THIS package's logger at ``level``.
+
+    `uvicorn.run()` applies its own dictConfig, which names only the `uvicorn*`
+    loggers and leaves the root logger untouched.  The practical effect on a
+    systemd host was that the journal showed uvicorn access lines and nothing
+    else: every `logger.info(...)` in this package was dropped on the floor, and
+    warnings reached stderr only via logging's lastResort fallback, unformatted
+    and without the logger name.  Gate-install decisions, post-run gate results,
+    the manage-recovery ladder and the unasserted-run WARNING were all invisible
+    in production — the exact signals needed to debug a misbehaving dispatch.
+
+    Configures the package logger rather than the root logger so that uvicorn's
+    own configuration is left alone.
+
+    Propagation is deliberately left ON.  Silencing it would be marginally
+    tidier in production (the root logger has no handler there, so propagating
+    records go nowhere), but pytest's `caplog` captures by attaching a handler
+    to the ROOT logger and relies on propagation to see anything — turning it
+    off broke 52 existing tests.  Observability that costs us the test suite's
+    ability to assert on log output is a bad trade.
+    """
+    resolved = (level or config.LOG_LEVEL or "INFO").strip().upper()
+    pkg_logger = logging.getLogger(__package__ or "agent_gtd_dispatch")
+
+    for existing in list(pkg_logger.handlers):
+        if getattr(existing, "name", None) == _LOG_HANDLER_NAME:
+            pkg_logger.removeHandler(existing)
+
+    handler = logging.StreamHandler(stream=sys.stdout)
+    handler.name = _LOG_HANDLER_NAME
+    handler.setFormatter(
+        logging.Formatter("%(levelname)s [%(name)s] %(message)s"),
+    )
+    pkg_logger.addHandler(handler)
+    # An unknown level string must not silence the service: fall back to INFO.
+    pkg_logger.setLevel(getattr(logging, resolved, logging.INFO))
 
 
 def start() -> None:  # pragma: no cover

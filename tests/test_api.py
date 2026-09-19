@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+
+from agent_gtd_dispatch import main
 
 
 @pytest.fixture(autouse=True)
@@ -1888,3 +1891,77 @@ class TestPreflightItemFetch:
             if "preflight" in str(call).lower()
         ]
         assert len(preflight_comments) == 0
+
+
+class TestConfigureLogging:
+    """The package logger must actually emit — uvicorn configures only its own.
+
+    Regression guard for 2026-09-19: the service ran for months with no logging
+    configuration at all, so every gate-install decision, post-run gate result
+    and manage-recovery branch was invisible in the journal.
+    """
+
+    @staticmethod
+    def _reset() -> None:
+        pkg_logger = logging.getLogger("agent_gtd_dispatch")
+        for handler in list(pkg_logger.handlers):
+            pkg_logger.removeHandler(handler)
+        pkg_logger.setLevel(logging.NOTSET)
+        pkg_logger.propagate = True
+
+    def test_info_records_are_emitted_with_logger_name(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._reset()
+        try:
+            main.configure_logging("INFO")
+            logging.getLogger("agent_gtd_dispatch.gates").info(
+                "gate: decision=%s", "ok"
+            )
+            out = capsys.readouterr().out
+        finally:
+            self._reset()
+
+        assert "gate: decision=ok" in out
+        # The logger name is what lets you tell a gate line from a worker line.
+        assert "agent_gtd_dispatch.gates" in out
+        assert "INFO" in out
+
+    def test_repeated_calls_do_not_stack_handlers(self) -> None:
+        self._reset()
+        try:
+            main.configure_logging("INFO")
+            main.configure_logging("INFO")
+            main.configure_logging("DEBUG")
+            owned = [
+                h
+                for h in logging.getLogger("agent_gtd_dispatch").handlers
+                if getattr(h, "name", None) == main._LOG_HANDLER_NAME
+            ]
+        finally:
+            self._reset()
+
+        assert len(owned) == 1, "each call must replace its handler, not add one"
+
+    def test_unknown_level_falls_back_to_info_rather_than_silencing(self) -> None:
+        self._reset()
+        try:
+            main.configure_logging("NOT_A_LEVEL")
+            level = logging.getLogger("agent_gtd_dispatch").level
+        finally:
+            self._reset()
+
+        assert level == logging.INFO
+
+    def test_level_is_honoured(self, capsys: pytest.CaptureFixture[str]) -> None:
+        self._reset()
+        try:
+            main.configure_logging("WARNING")
+            logging.getLogger("agent_gtd_dispatch.worker").info("quiet")
+            logging.getLogger("agent_gtd_dispatch.worker").warning("loud")
+            out = capsys.readouterr().out
+        finally:
+            self._reset()
+
+        assert "quiet" not in out
+        assert "loud" in out

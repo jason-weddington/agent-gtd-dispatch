@@ -120,6 +120,15 @@ TALOS_BIN: str = "talos"
 # survive a COLD fmt+clippy+nextest gate run on the Pi (pironman01).
 TALOS_GATE_TIMEOUT_SECS: int = 900
 
+# Root log level for THIS package's loggers.  `uvicorn.run()` configures only
+# uvicorn's own loggers and leaves the root logger alone, so before 2026-09-19
+# every `logger.info(...)` in this package went nowhere: the journal carried
+# uvicorn access lines and nothing else.  That made the gate-install decisions,
+# the post-run gate, the manage-recovery ladder and the unasserted-run WARNING
+# invisible in production — all of them precisely the things you need when a
+# dispatch misbehaves.  See `main.configure_logging`.
+LOG_LEVEL: str = "INFO"
+
 
 def load() -> None:
     """Load configuration from environment. Call once at startup."""
@@ -137,6 +146,9 @@ def load() -> None:
     global MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS, MAX_MANAGE_FREE_RELAUNCHES
     global EVIDENCE_ROOT, EVIDENCE_RETENTION_DAYS, WORKSPACE_RETENTION_HOURS
     global RETENTION_INTERVAL_SECONDS
+    global LOG_LEVEL
+
+    LOG_LEVEL = os.environ.get("DISPATCH_LOG_LEVEL", "INFO").strip().upper() or "INFO"
 
     DISPATCH_API_KEY = _require("DISPATCH_API_KEY")
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
