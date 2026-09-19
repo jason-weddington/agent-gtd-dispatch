@@ -2,6 +2,43 @@
 
 <!-- version list -->
 
+## v1.26.0 (2026-09-19)
+
+### Bug Fixes
+
+- Convert the fixer hooks to checkers so a talos commit survives
+  ([`4556913`](https://github.com/repos/agent-gtd-dispatch/commit/45569133d6774eb81f7975fc530a9c4fd13940cf))
+
+- **dispatch**: Don't fail a pushed, gate-green run for a missing completion artifact
+  ([`86ee4a6`](https://github.com/repos/agent-gtd-dispatch/commit/86ee4a69a645bfd612ce92acb113bd360496138c))
+
+- **dispatch**: Keep the git identity and HEADLESS_BUILD_ENGINE across the sudo boundary
+  ([`57086bb`](https://github.com/repos/agent-gtd-dispatch/commit/57086bbaf2c70f00f6c03d22c250d6000a0e6e3a))
+
+- **logging**: Configure the package logger so service logs reach the journal
+  ([`964e749`](https://github.com/repos/agent-gtd-dispatch/commit/964e7497f442942989006262f695c2d7b32253b2))
+
+- **prompt**: Make the completion artifact the build prompt's actual last section
+  ([`6c8e5f1`](https://github.com/repos/agent-gtd-dispatch/commit/6c8e5f19838a8c84eb0b3217d26a3e94e3a9743c))
+
+- **rollout**: Defer the cap-exceeded halt while child builds are in flight
+  ([`716783c`](https://github.com/repos/agent-gtd-dispatch/commit/716783cb9db75bb539f31017d551beda2cce39ca))
+
+- **rollout**: The manage prompt now waits for builds in the foreground
+  ([`9aecce1`](https://github.com/repos/agent-gtd-dispatch/commit/9aecce1a9fc00517063e4627e8efe53fc8cd9159))
+
+### Features
+
+- **disposition**: Three-tier run disposition — asserted, inferred, derived
+  ([`e5381f1`](https://github.com/repos/agent-gtd-dispatch/commit/e5381f16972502376b297c7404826326accc9839))
+
+- **engines**: Grant manage env keys to any claude-code-family engine
+  ([`b06a3a7`](https://github.com/repos/agent-gtd-dispatch/commit/b06a3a7d4cc49c88990fa143941c73bd53b78c1c))
+
+- **prompt**: Collapse the build agent's terminal actions into one bounded pick
+  ([`5cb3125`](https://github.com/repos/agent-gtd-dispatch/commit/5cb3125aaefab9f09c66aa40f7dd1fe80ac58826))
+
+
 ## v1.25.2 (2026-09-18)
 
 ### Bug Fixes
