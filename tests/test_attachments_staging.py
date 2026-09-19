@@ -268,7 +268,8 @@ class TestPromptAugmentation:
         )
         assert "## Supporting Files" not in prompt
 
-    def test_build_mode_includes_do_not_commit_rule(self) -> None:
+    def test_build_mode_has_no_git_add_rule_for_attachments(self) -> None:
+        """The exclusion is mechanical now — the prompt must not re-state it."""
         attachments = [
             {
                 "id": "att-1",
@@ -286,9 +287,10 @@ class TestPromptAugmentation:
             attachments=attachments,
             run_id="run-xyz",
         )
-        # Rule 7 about not committing the attachments dir
         assert "run-xyz-attachments" in prompt
-        assert "git add" in prompt.lower() or "Do not `git add`" in prompt
+        assert "git add" not in prompt.lower()
+        assert "Ignore the `run-xyz-attachments/` directory" not in prompt
+        assert "git-excluded" in prompt
 
     def test_plan_mode_with_attachments_includes_supporting_files(self) -> None:
         attachments = [
@@ -343,7 +345,7 @@ class TestPromptAugmentation:
         )
         assert "1.5 KB" in prompt
 
-    def test_do_not_commit_note_in_supporting_files_section(self) -> None:
+    def test_git_exclude_note_in_supporting_files_section(self) -> None:
         attachments = [
             {
                 "id": "att-1",
@@ -361,6 +363,8 @@ class TestPromptAugmentation:
             attachments=attachments,
             run_id="run-xyz",
         )
-        # The "DO NOT commit" note must appear in the prompt
-        assert "DO NOT" in prompt
+        # The directory is stated as already git-excluded, not as a rule the
+        # agent has to obey.
         assert "run-xyz-attachments" in prompt
+        assert "already git-excluded for you" in prompt
+        assert "DO NOT** commit" not in prompt

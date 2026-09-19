@@ -601,9 +601,14 @@ class TestBuildSystemPrompt:
         assert "headless coding agent" in prompt
         assert "Claude Code" not in prompt
 
-    def test_verify_remote_ref_guidance_present(self) -> None:
+    def test_no_remote_ref_verification_instruction(self) -> None:
+        """The worker verifies every push itself — the agent must not re-do it."""
         prompt = self._prompt()
-        assert "verify the remote ref advanced" in prompt or "git ls-remote" in prompt
+        assert "git ls-remote" not in prompt
+        assert "verify the remote ref advanced" not in prompt
+        assert "git rev-parse HEAD" not in prompt
+        # ...and it is told WHY it does not have to.
+        assert "You do not need to verify the push landed" in prompt
 
     def test_no_op_guidance_present(self) -> None:
         prompt = self._prompt()
@@ -803,6 +808,32 @@ class TestRunAgent:
             args, _kwargs = mock_popen.call_args
             assert args[0][0] == "claude"
             assert "--dangerously-skip-permissions" in args[0]
+
+    async def test_run_id_excludes_that_runs_attachments_dir(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        exclude = tmp_path / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True)
+        exclude.write_text("")
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, "sys", "T", 20, run_id="run-xyz")
+        text = exclude.read_text()
+        assert "run-xyz-attachments/" in text
+        assert "transcript.txt" in text
+
+    async def test_no_run_id_adds_no_extra_exclude(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        exclude = tmp_path / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True)
+        exclude.write_text("")
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, "sys", "T", 20)
+        assert "attachments" not in exclude.read_text()
 
     async def test_passes_workspace_as_cwd(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
@@ -4117,6 +4148,57 @@ class TestSetupGitExclude:
         dispatch._setup_git_exclude(tmp_path)
         assert not (tmp_path / "not_a_repo" / ".git").exists()
 
+    def test_run_scoped_attachments_dir_excluded_monorepo(self, tmp_path) -> None:
+        exclude = tmp_path / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True)
+        exclude.write_text("")
+
+        dispatch._setup_git_exclude(
+            tmp_path, [dispatch.attachments_exclude_line("run-xyz")]
+        )
+        dispatch._setup_git_exclude(
+            tmp_path, [dispatch.attachments_exclude_line("run-xyz")]
+        )
+
+        lines = exclude.read_text().splitlines()
+        assert lines.count("run-xyz-attachments/") == 1
+        assert lines.count("transcript.txt") == 1
+
+    def test_run_scoped_attachments_dir_excluded_multi_repo(self, tmp_path) -> None:
+        for name in ("repo_a", "repo_b"):
+            info = tmp_path / name / ".git" / "info"
+            info.mkdir(parents=True)
+            (info / "exclude").write_text("")
+
+        dispatch._setup_git_exclude(
+            tmp_path, [dispatch.attachments_exclude_line("run-xyz")]
+        )
+
+        for name in ("repo_a", "repo_b"):
+            text = (tmp_path / name / ".git" / "info" / "exclude").read_text()
+            assert "run-xyz-attachments/" in text
+
+    def test_module_constant_never_accumulates_run_state(self, tmp_path) -> None:
+        """A second run must not inherit the first run's attachments path."""
+        exclude = tmp_path / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True)
+        exclude.write_text("")
+
+        dispatch._setup_git_exclude(
+            tmp_path, [dispatch.attachments_exclude_line("run-one")]
+        )
+        assert dispatch._GIT_EXCLUDE_LINES == ("transcript.txt", ".dispatch/")
+
+        other = tmp_path / "second"
+        (other / ".git" / "info").mkdir(parents=True)
+        (other / ".git" / "info" / "exclude").write_text("")
+        dispatch._setup_git_exclude(
+            other, [dispatch.attachments_exclude_line("run-two")]
+        )
+        text = (other / ".git" / "info" / "exclude").read_text()
+        assert "run-two-attachments/" in text
+        assert "run-one-attachments/" not in text
+
 
 # ---------------------------------------------------------------------------
 # Build prompt: completion artifact contract
@@ -4180,10 +4262,10 @@ class TestBuildPromptCompletionArtifact:
             for line in on_success.splitlines()
             if line.strip()[:2] in {"1.", "2.", "3."}
         ]
+        assert len(steps) == 2
         assert steps[0].startswith("1. Post a final comment")
-        assert steps[1].startswith("2. Set the item status to `review`")
-        assert "completion artifact" in steps[2]
-        assert "**Completion Artifact**" in steps[2]
+        assert "completion artifact" in steps[1]
+        assert "**Completion Artifact**" in steps[1]
 
     def test_opening_sentence_does_not_claim_a_contradicted_last_action(self) -> None:
         prompt = self._prompt()
@@ -4946,3 +5028,89 @@ class TestManageResumeContext:
         assert without == explicit_none == empty
         assert without.startswith(_EXPECTED_RECOVERY_BLOCK)
         assert "do NOT rediscover it" not in without
+
+
+# ---------------------------------------------------------------------------
+# Build prompt: one bounded terminal action
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPromptTerminalActionCollapse:
+    """Guards for the instructions the worker now materializes itself.
+
+    No behavioural test can catch a prompt-text regression, so every removed
+    instruction is pinned absent and the surviving turn-discipline rule is
+    pinned present.
+    """
+
+    def _prompt(self, **kwargs):
+        return dispatch._build_build_prompt(
+            {"id": "item-1"},
+            {"name": "P", "gate_command": "make gate"},
+            "feat/x",
+            50,
+            workspace=Path("/srv/agent/workspace/ws-abc"),
+            **kwargs,
+        )
+
+    def test_agent_is_not_asked_to_set_item_status(self) -> None:
+        prompt = self._prompt()
+        assert "Set the item status" not in prompt
+        assert "set item status to `review`" not in prompt
+        assert "status to `review` using `update_item`" not in prompt
+
+    def test_prompt_says_the_worker_owns_the_transition(self) -> None:
+        prompt = self._prompt()
+        assert "Do NOT set the item's status" in prompt
+        assert "derived from the disposition you report" in prompt
+
+    def test_no_remote_ref_verification(self) -> None:
+        prompt = self._prompt()
+        assert "git ls-remote" not in prompt
+        assert "git rev-parse HEAD" not in prompt
+        assert "Compare the returned SHA" not in prompt
+
+    def test_foreground_push_rule_survives(self) -> None:
+        """Turn discipline, not verification — it must not be collateral damage."""
+        prompt = self._prompt()
+        assert "**in the\n   foreground**" in prompt
+        assert "NEVER invoke `git push` with `run_in_background`" in prompt
+        assert "Do not end your turn or session while a `git push`" in prompt
+
+    def test_scripted_milestone_comments_are_gone(self) -> None:
+        prompt = self._prompt()
+        assert "Implementing..." not in prompt
+        assert "Running tests..." not in prompt
+        assert "Post a comment at each milestone" not in prompt
+
+    def test_genuine_progress_comments_survive(self) -> None:
+        prompt = self._prompt()
+        assert "Post progress comments to the GTD item as you work" in prompt
+        assert "add_comment" in prompt
+
+    def test_no_attachments_git_add_rule(self) -> None:
+        prompt = self._prompt(
+            attachments=[
+                {
+                    "id": "a1",
+                    "filename": "spec.md",
+                    "mime_type": "text/markdown",
+                    "size_bytes": 10,
+                }
+            ],
+            run_id="run-xyz",
+        )
+        assert "run-xyz-attachments" in prompt  # still told where the files are
+        assert "git add" not in prompt.lower()
+        assert "Ignore the `run-xyz-attachments/` directory" not in prompt
+
+    def test_disposition_to_item_status_mapping_is_stated(self) -> None:
+        prompt = self._prompt()
+        section = prompt[prompt.index("## Completion Artifact") :]
+        assert "The worker materializes that pick" in section
+        assert "move the item to `review`" in section
+        assert "never presents itself as ready for review" in section
+
+    def test_final_summary_comment_survives(self) -> None:
+        prompt = self._prompt()
+        assert "Post a final comment with: what you did" in prompt

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 from agent_gtd_dispatch_protocol.branches import make_branch_name
 from agent_gtd_dispatch_protocol.models import DispatchMode
@@ -762,12 +762,21 @@ def write_transcript(workspace: Path, result: subprocess.CompletedProcess[str]) 
 
 
 # Run-scoped paths that must never be committed by an agent: the streamed
-# transcript and the completion-artifact directory.
+# transcript and the completion-artifact directory.  Both names are static.  The
+# staged-attachments directory is ALSO run-scoped but its name embeds the run id
+# (``{run_id}-attachments/``), so it is passed per call via ``extra_lines``
+# rather than mutating this constant — a module-level list that accumulated
+# run-scoped entries would leak one run's paths into the next run's excludes.
 _GIT_EXCLUDE_LINES: tuple[str, ...] = ("transcript.txt", ".dispatch/")
 
 
-def _append_exclude_lines(git_exclude: Path) -> None:
-    """Append the run-scoped exclude lines to one exclude file, idempotently."""
+def attachments_exclude_line(run_id: str) -> str:
+    """Git-exclude entry for a run's staged-attachments directory."""
+    return f"{run_id}-attachments/"
+
+
+def _append_exclude_lines(git_exclude: Path, lines: Sequence[str]) -> None:
+    """Append the given exclude lines to one exclude file, idempotently."""
     try:
         existing = {
             line.strip()
@@ -776,7 +785,7 @@ def _append_exclude_lines(git_exclude: Path) -> None:
         }
     except OSError:
         return
-    missing = [line for line in _GIT_EXCLUDE_LINES if line not in existing]
+    missing = [line for line in lines if line not in existing]
     if not missing:
         return
     try:
@@ -786,8 +795,12 @@ def _append_exclude_lines(git_exclude: Path) -> None:
         return
 
 
-def _setup_git_exclude(workspace: Path) -> None:
-    """Exclude transcript.txt and .dispatch/ from git before the subprocess starts.
+def _setup_git_exclude(workspace: Path, extra_lines: Sequence[str] = ()) -> None:
+    """Exclude the run-scoped paths from git before the subprocess starts.
+
+    Always excludes ``transcript.txt`` and ``.dispatch/``; ``extra_lines`` adds
+    per-run entries (the staged ``{run_id}-attachments/`` directory) without the
+    module-level constant ever carrying run state between calls.
 
     Handles both repo modes.  In monorepo mode the workspace root IS the repo, so
     ``<workspace>/.git/info/exclude`` exists.  In multi-repo (workspace) mode the
@@ -796,9 +809,10 @@ def _setup_git_exclude(workspace: Path) -> None:
 
     Repeated calls never duplicate an entry.
     """
+    lines = (*_GIT_EXCLUDE_LINES, *extra_lines)
     root_exclude = workspace / ".git" / "info" / "exclude"
     if root_exclude.exists():
-        _append_exclude_lines(root_exclude)
+        _append_exclude_lines(root_exclude, lines)
 
     try:
         children = sorted(workspace.iterdir())
@@ -814,7 +828,7 @@ def _setup_git_exclude(workspace: Path) -> None:
                 repo_exclude.write_text("")
         except OSError:
             continue
-        _append_exclude_lines(repo_exclude)
+        _append_exclude_lines(repo_exclude, lines)
 
 
 def _sanitize_filename(filename: str) -> str:
@@ -894,8 +908,9 @@ def _build_supporting_files_section(
         "The human attached these files to this item. They're available in the\n"
         f"`{run_id}-attachments/` directory of your workspace:\n\n"
         f"{file_list}\n\n"
-        "Read them when relevant to your task. **DO NOT** commit the\n"
-        f"`{run_id}-attachments/` directory — it exists only for this run."
+        "Read them when relevant to your task. The\n"
+        f"`{run_id}-attachments/` directory exists only for this run and is\n"
+        "already git-excluded for you — you cannot commit it by accident."
     )
 
 
@@ -2262,14 +2277,10 @@ def _build_build_prompt(
 
     files_section = _build_supporting_files_section(attachments, run_id)
 
-    att_rule = ""
-    if files_section and run_id:
-        att_rule = (
-            f"\n7. **Ignore the `{run_id}-attachments/` directory.** "
-            "It is run-scoped context, not part of the repo. "
-            "Do not `git add` it, do not reference it in commit messages."
-        )
-
+    # No attachments rule here: the staged `{run_id}-attachments/` directory is
+    # git-excluded mechanically by `_setup_git_exclude` before the agent starts,
+    # so asking the agent not to `git add` it would be a second signal for a
+    # constraint the worker already enforces.
     prompt = textwrap.dedent(
         f"""\
         You are a headless coding agent dispatched by Agent GTD.
@@ -2315,31 +2326,28 @@ def _build_build_prompt(
            async/background execution mechanism. Pre-push hooks may run the full test
            suite and take several minutes — that is expected; wait for the command to
            exit. Do not end your turn or session while a `git push` you started is
-           still running. Only after `git push` exits 0 do you proceed to verify the
-           remote ref advanced — run:
-           ```bash
-           git ls-remote origin refs/heads/{branch_name}
-           ```
-           Compare the returned SHA against `git rev-parse HEAD`. If the SHAs do not match
-           (or no SHA is returned), post a failure comment and do NOT set item status to `review`.
+           still running. You do not need to verify the push landed — the dispatch
+           worker verifies every repo's remote ref itself and fails the run if any
+           commit did not reach origin.
         6. **Stop if stuck.** If the task is too ambiguous, you lack information, or
-           you cannot complete it cleanly — STOP. Do not guess or produce low-quality work.{att_rule}
+           you cannot complete it cleanly — STOP. Do not guess or produce low-quality work.
 
         ## Reporting
 
         Post progress comments to the GTD item as you work. Use `add_comment`
-        with item_id="{item_id}". Keep comments terse — one line is fine.
-
-        Post a comment at each milestone:
-        - When starting implementation: "Implementing..."
-        - When running tests: "Running tests..."
+        with item_id="{item_id}". Keep comments terse — one line is fine. Only post
+        what a reader could not get from the run itself — a decision you made, a
+        surprise you hit. Do not narrate the phases of your work.
 
         **On success:**
         1. Post a final comment with: what you did, the branch name (`{branch_name}`), notes for the reviewer
-        2. Set the item status to `review` using `update_item` with the item's current version
-        3. Write the completion artifact described in the **Completion Artifact**
+        2. Write the completion artifact described in the **Completion Artifact**
            section — the last section of this prompt. Reporting does not end here: it
            hands off to that section, and the artifact is what actually ends the run.
+
+        Do NOT set the item's status. The dispatch worker moves the item itself,
+        derived from the disposition you report in the artifact — that disposition is
+        the only statement you make about how the run ended.
 
         **On failure/blocked**, your comment should include:
         - Why you stopped
@@ -2358,7 +2366,7 @@ def _build_build_prompt(
         This is the last section of this prompt: nothing comes after it, and nothing you
         do comes after the action it describes. On EVERY path — success, no-op, blocked,
         or failure — writing this file is the final action of the run, performed after
-        the final comment and after any status change, with no further work behind it.
+        the final comment, with no further work behind it.
         Write the completion artifact to this ABSOLUTE path:
 
         ```
@@ -2388,6 +2396,11 @@ def _build_build_prompt(
         - `blocked` — you cannot proceed; `decision_needed` is REQUIRED and must state
           the decision or information a human must supply.
         - `failed` — you tried and could not finish.
+
+        The worker materializes that pick — you do not. `done` and
+        `already_satisfied` move the item to `review` for a human; `blocked` and
+        `failed` leave the item where it is and record the run failed, so a blocked
+        run never presents itself as ready for review.
 
         `summary` is optional.
 
@@ -2430,12 +2443,16 @@ async def run_agent(
     attribution: str | None = None,
     popen_callback: Callable[[subprocess.Popen[bytes]], None] | None = None,
     callback_token: str | None = None,
+    run_id: str = "",
 ) -> subprocess.CompletedProcess[str]:
     """Run a headless agent CLI as a subprocess.
 
     ``callback_token`` is the run's per-run GTD JWT (scoped to the dispatching
     user). It is threaded into ``build_env`` so the agent's own agent-gtd MCP
     identity authenticates as that user; when None, the static host key is used.
+
+    ``run_id`` is used only to git-exclude this run's staged-attachments
+    directory; an empty value simply adds no extra exclude line.
     """
     if timeout_seconds is None:
         timeout_seconds = (
@@ -2466,7 +2483,10 @@ async def run_agent(
 
     cmd = _sudo_wrap(cmd)
     transcript_path = workspace / "transcript.txt"
-    _setup_git_exclude(workspace)  # exclude transcript.txt BEFORE subprocess starts
+    # Exclude transcript.txt, .dispatch/ and this run's staged attachments
+    # BEFORE the subprocess starts — the agent is never asked not to commit
+    # them, it is prevented from doing so.
+    _setup_git_exclude(workspace, [attachments_exclude_line(run_id)] if run_id else [])
 
     def _stream() -> subprocess.CompletedProcess[str]:
         with transcript_path.open("wb") as f:

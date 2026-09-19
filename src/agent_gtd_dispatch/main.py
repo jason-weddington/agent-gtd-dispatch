@@ -1720,6 +1720,57 @@ def build_failure_comment(prefix: str, run_id: str, detail: str = "") -> str:
     return body
 
 
+def build_completion_comment(
+    run_id: str,
+    branch_name: str | None,
+    push_results: list[RepoPushStatus] | None,
+    gate_decision: str | None,
+    artifact: completion.CompletionArtifact | None,
+) -> str:
+    """Return the GTD comment body for a SUCCESSFUL build terminal.
+
+    Composed entirely from facts the worker holds — branch, per-repo commit
+    counts, push outcomes, gate decision — and ENRICHED with the agent's
+    artifact fields when it wrote one.  The agent no longer has to report any of
+    the mechanical half, and a run that dies without writing an artifact still
+    leaves the reviewer the mechanical facts instead of silence.
+
+    Failure terminals and the ``already_satisfied`` terminal compose their own
+    comments (:func:`build_failure_comment`,
+    :func:`_route_already_satisfied_item`) and do not use this one.
+    """
+    results = push_results or []
+    total_commits = sum(r.commits_ahead for r in results)
+    lines = [
+        f"Build run `{run_id}` finished on branch `{branch_name or '(unknown)'}` —"
+        f" {total_commits} commit(s) across {len(results)} repo(s)."
+    ]
+    for r in results:
+        line = (
+            f"- {r.repo_name}: {r.status.value}"
+            f" ({r.commits_ahead} commit(s), {(r.local_sha or '')[:8]})"
+        )
+        if r.dirty:
+            line += " [dirty working tree]"
+        lines.append(line)
+    if gate_decision:
+        lines.append(f"\nQuality gate: `{gate_decision}`.")
+    if artifact is None:
+        lines.append(
+            "\nThe agent wrote no completion artifact — the facts above are"
+            " all there is."
+        )
+    else:
+        lines.append(f"\nAgent disposition: `{artifact.disposition}`.")
+        if artifact.summary.strip():
+            lines.append(f"Summary: {artifact.summary.strip()}")
+        if artifact.reason.strip():
+            lines.append(f"Reason: {artifact.reason.strip()}")
+        if artifact.decision_needed.strip():
+            lines.append(f"Decision needed: {artifact.decision_needed.strip()}")
+    return "\n".join(lines)
+
+
 def build_completion_blob(
     *,
     envelope: completion.ResultEnvelope | None,
@@ -1841,6 +1892,49 @@ async def _best_effort_set_item_status(
             run_id,
             terminal,
         )
+
+
+async def _nudge_item_to_review(
+    item_id: str,
+    run_id: str,
+    *,
+    callback_token: str | None,
+    terminal: str,
+) -> None:
+    """Move an item to ``review`` unless it is already there (or ``done``).
+
+    The worker — not the agent — materializes the item transition that follows
+    from a build terminal.  The mapping, stated once:
+
+    * ``done``               -> ``review``  (this function)
+    * no artifact (unasserted success) -> ``review``  (this function)
+    * ``already_satisfied``  -> ``review``, via :func:`_route_already_satisfied_item`
+    * ``blocked`` / ``failed`` -> NOT moved; those runs exit on the failure path
+      and must never present themselves as ready for review.
+
+    Reading the item first is the guard: never regress one a human already moved
+    on.  A read failure leaves the item untouched, and a PATCH failure never
+    flips the run's already-recorded terminal.
+    """
+    try:
+        current = await gtd_client.get_item(item_id, token=callback_token)
+        current_status = str(current.get("status") or "")
+    except Exception:
+        logger.warning(
+            "Failed to read item %s status (run %s) — leaving it untouched",
+            item_id,
+            run_id,
+        )
+        return
+    if current_status in {"review", "done"}:
+        return
+    await _best_effort_set_item_status(
+        item_id,
+        "review",
+        run_id,
+        callback_token=callback_token,
+        terminal=terminal,
+    )
 
 
 async def _route_already_satisfied_item(
@@ -2436,6 +2530,7 @@ async def _dispatch_worker(
             attribution=attribution,
             popen_callback=_register_subprocess,
             callback_token=run.callback_token,
+            run_id=run.id,
         )
         _exit_code = result.returncode
 
@@ -3181,30 +3276,41 @@ async def _dispatch_worker(
                         "Failed to post unasserted-success comment for run %s",
                         run.id,
                     )
-                # An agent that skipped the artifact write plausibly skipped its
-                # own status update too.  Nudge the item to review — but never
-                # regress one a human (or the agent) already moved on.
+            if _verify_repos is not None and run.item_id is not None:
+                # ALWAYS: the worker's own account of a successful build run.
+                # The agent's prompt no longer asks it to report the mechanical
+                # half (branch, commits, push, gate) or to set the item status —
+                # both are materialized here, from what the worker already
+                # holds, and enriched with the artifact when there is one.  A
+                # run that wrote no artifact still leaves the reviewer facts.
                 try:
-                    _cur_item = await gtd_client.get_item(
-                        run.item_id, token=run.callback_token
+                    await gtd_client.post_comment(
+                        run.item_id,
+                        build_completion_comment(
+                            run.id,
+                            run.branch_name,
+                            push_results_list,
+                            decision,
+                            _artifact,
+                        ),
+                        created_by=attribution or "agent-gtd-dispatch",
+                        token=run.callback_token,
                     )
-                    _cur_status = str(_cur_item.get("status") or "")
                 except Exception:
                     logger.warning(
-                        "Failed to read item %s status (run %s) — leaving it"
-                        " untouched on the unasserted-success path",
-                        run.item_id,
+                        "Failed to post build completion comment for run %s",
                         run.id,
                     )
-                else:
-                    if _cur_status not in {"review", "done"}:
-                        await _best_effort_set_item_status(
-                            run.item_id,
-                            "review",
-                            run.id,
-                            callback_token=run.callback_token,
-                            terminal="succeeded",
-                        )
+                # Disposition -> item status, materialized by the worker (the
+                # agent no longer sets it).  `done` and the unasserted
+                # no-artifact success both land on `review`; `already_satisfied`
+                # routed itself above; `blocked`/`failed` never reach here.
+                await _nudge_item_to_review(
+                    run.item_id,
+                    run.id,
+                    callback_token=run.callback_token,
+                    terminal="succeeded",
+                )
         else:
             # Derive error snippet from the transcript (stdout/stderr are always
             # "" with Popen streaming).  With --output-format json the raw tail is
