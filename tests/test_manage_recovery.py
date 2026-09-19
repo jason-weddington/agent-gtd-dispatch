@@ -615,7 +615,11 @@ class TestExitPathBuildInFlight:
             _full_patch_stack() as ctx,
             caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
         ):
-            ctx.gtd.get_rollout = AsyncMock(return_value=rollout)
+            # Second fetch = the fresh in-flight read at the halt site; the
+            # build has gone terminal by then, so the halt is NOT deferred.
+            ctx.gtd.get_rollout = AsyncMock(
+                side_effect=[rollout, _rollout("running", in_flight=[])]
+            )
             ctx.gtd.relaunch_manage_rollout = AsyncMock(
                 return_value=_rollout("running", retry_count=MAX_MANAGE_RETRIES + 1)
             )
@@ -1291,7 +1295,12 @@ class TestCountedNotPollingWithBuildsInFlight:
         rollout = self._warm_up_rollout(in_flight, retry_count=MAX_MANAGE_RETRIES)
 
         with _full_patch_stack() as ctx:
-            ctx.gtd.get_rollout = AsyncMock(return_value=rollout)
+            # Both builds reach terminal between the ladder's read and the
+            # fresh read at the halt site, so the halt goes ahead — and both
+            # items still get their "nobody merged this" comment.
+            ctx.gtd.get_rollout = AsyncMock(
+                side_effect=[rollout, _rollout("running", in_flight=[])]
+            )
             ctx.gtd.relaunch_manage_rollout = AsyncMock(
                 return_value=_rollout("running", retry_count=MAX_MANAGE_RETRIES + 1)
             )
@@ -1331,7 +1340,9 @@ class TestCountedNotPollingWithBuildsInFlight:
         rollout = self._warm_up_rollout(in_flight, retry_count=MAX_MANAGE_RETRIES)
 
         with _full_patch_stack() as ctx:
-            ctx.gtd.get_rollout = AsyncMock(return_value=rollout)
+            ctx.gtd.get_rollout = AsyncMock(
+                side_effect=[rollout, _rollout("running", in_flight=[])]
+            )
             ctx.gtd.relaunch_manage_rollout = AsyncMock(
                 return_value=_rollout("running", retry_count=MAX_MANAGE_RETRIES + 1)
             )
@@ -1349,6 +1360,7 @@ class TestCountedNotPollingWithBuildsInFlight:
                 run_timed_out=False,
             )
 
+        ctx.gtd.halt_rollout.assert_awaited_once()
         assert [c.args[0] for c in ctx.gtd.post_comment.await_args_list] == [
             "item-a",
             "item-b",
@@ -1430,3 +1442,228 @@ class TestCountedNotPollingWithBuildsInFlight:
         kwargs = mock_worker.call_args.kwargs
         assert kwargs["resume_context"] == in_flight
         assert kwargs["is_recovery"] is True
+
+
+# ---------------------------------------------------------------------------
+# Item 39a77ede: a cap-exceeded halt must never strand a running child build.
+# When the retry cap is blown but a build is STILL IN FLIGHT (read fresh at
+# the halt site, not from the ladder's older copy), the halt is deferred: the
+# rollout stays `running`, no replacement manager is launched, and every
+# in-flight item is told what happened. The watchdog halts it later, once the
+# builds are terminal (see tests/test_manage_watchdog.py).
+# ---------------------------------------------------------------------------
+
+
+class TestCapExceededHaltDeferredWhileBuildsInFlight:
+    """The cap-exceeded halt is deferred, not cancelled, while builds run."""
+
+    @staticmethod
+    def _warm_up_rollout(in_flight: list[dict], retry_count: int = 0) -> dict:
+        # A non-polling phase, so the ladder takes `counted-not-polling` and
+        # the retry cap is genuinely charged — the reachable crash-loop shape.
+        return _rollout(
+            "running",
+            retry_count=retry_count,
+            manager_phase="warm_up",
+            manager_current_step="Verifying main is green",
+            manager_state_updated_at=(
+                datetime.now(UTC) - timedelta(seconds=60)
+            ).isoformat(),
+            in_flight=in_flight,
+        )
+
+    async def test_cap_exceeded_with_builds_in_flight_does_not_halt(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No halt, no replacement worker, WARNING logged, every item commented."""
+        run = _make_run()
+        engine = MagicMock()
+        in_flight = [
+            {"runId": "run-a", "itemId": "item-a", "status": "running"},
+            {"runId": "run-b", "itemId": "item-b", "status": "running"},
+        ]
+        rollout = self._warm_up_rollout(in_flight, retry_count=MAX_MANAGE_RETRIES)
+        exceeded = MAX_MANAGE_RETRIES + 1
+
+        with (
+            _full_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            ctx.gtd.get_rollout = AsyncMock(return_value=rollout)
+            ctx.gtd.relaunch_manage_rollout = AsyncMock(
+                return_value=_rollout("running", retry_count=exceeded)
+            )
+            ctx.gtd.halt_rollout = AsyncMock()
+            ctx.gtd.post_comment = AsyncMock()
+            ctx.db.insert_run = AsyncMock()
+
+            await _maybe_relaunch_manage(
+                run,
+                100,
+                engine,
+                3600,
+                None,
+                manager_uptime_seconds=1800.0,
+                run_timed_out=False,
+            )
+
+        # The rollout is left running so both builds can finish.
+        ctx.gtd.halt_rollout.assert_not_called()
+        # Deferring is not a retry: no replacement manager.
+        ctx.db.insert_run.assert_not_called()
+        ctx.create_task.assert_not_called()
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            "decision=deferred-halt-build-in-flight" in m
+            and f"rollout_id={run.rollout_id}" in m
+            and f"retry_count={exceeded}" in m
+            and "run-a" in m
+            and "run-b" in m
+            for m in warnings
+        ), f"expected a deferred-halt WARNING, got: {warnings}"
+
+        bodies = {c.args[0]: c.args[1] for c in ctx.gtd.post_comment.await_args_list}
+        assert set(bodies) == {"item-a", "item-b"}
+        assert "run-a" in bodies["item-a"]
+        assert "run-b" in bodies["item-b"]
+        for body in bodies.values():
+            assert "DEFERRED" in body
+            assert "manage_relaunch_cap_exceeded" in body
+            assert "review and merge" in body
+
+    async def test_cap_exceeded_with_no_builds_in_flight_still_halts(self) -> None:
+        """No-regression: with nothing in flight the halt fires exactly as before."""
+        run = _make_run()
+        engine = MagicMock()
+        rollout = self._warm_up_rollout([], retry_count=MAX_MANAGE_RETRIES)
+
+        with _full_patch_stack() as ctx:
+            ctx.gtd.get_rollout = AsyncMock(return_value=rollout)
+            ctx.gtd.relaunch_manage_rollout = AsyncMock(
+                return_value=_rollout("running", retry_count=MAX_MANAGE_RETRIES + 1)
+            )
+            ctx.gtd.halt_rollout = AsyncMock()
+            ctx.gtd.post_comment = AsyncMock()
+            ctx.db.insert_run = AsyncMock()
+
+            await _maybe_relaunch_manage(
+                run,
+                100,
+                engine,
+                3600,
+                None,
+                manager_uptime_seconds=1800.0,
+                run_timed_out=False,
+            )
+
+        ctx.gtd.halt_rollout.assert_awaited_once_with(
+            run.rollout_id, reason="manage_relaunch_cap_exceeded"
+        )
+        ctx.db.insert_run.assert_not_called()
+        ctx.create_task.assert_not_called()
+
+    async def test_in_flight_state_is_re_read_at_the_halt_site(self) -> None:
+        """A build that STARTED after the ladder's read still defers the halt."""
+        run = _make_run()
+        engine = MagicMock()
+        # Ladder sees nothing in flight; by the halt site a build is running.
+        stale_view = self._warm_up_rollout([], retry_count=MAX_MANAGE_RETRIES)
+        fresh_view = self._warm_up_rollout(
+            [{"runId": "run-late", "itemId": "item-late", "status": "running"}],
+            retry_count=MAX_MANAGE_RETRIES + 1,
+        )
+
+        with _full_patch_stack() as ctx:
+            ctx.gtd.get_rollout = AsyncMock(side_effect=[stale_view, fresh_view])
+            ctx.gtd.relaunch_manage_rollout = AsyncMock(
+                return_value=_rollout("running", retry_count=MAX_MANAGE_RETRIES + 1)
+            )
+            ctx.gtd.halt_rollout = AsyncMock()
+            ctx.gtd.post_comment = AsyncMock()
+            ctx.db.insert_run = AsyncMock()
+
+            await _maybe_relaunch_manage(
+                run,
+                100,
+                engine,
+                3600,
+                None,
+                manager_uptime_seconds=1800.0,
+                run_timed_out=False,
+            )
+
+        assert ctx.gtd.get_rollout.await_count == 2
+        ctx.gtd.halt_rollout.assert_not_called()
+        assert [c.args[0] for c in ctx.gtd.post_comment.await_args_list] == [
+            "item-late"
+        ]
+
+    async def test_fresh_read_failure_falls_back_to_in_hand_copy(self) -> None:
+        """If the re-read fails we defer rather than risk stranding a build."""
+        run = _make_run()
+        engine = MagicMock()
+        rollout = self._warm_up_rollout(
+            [{"runId": "run-a", "itemId": "item-a", "status": "running"}],
+            retry_count=MAX_MANAGE_RETRIES,
+        )
+
+        with _full_patch_stack() as ctx:
+            ctx.gtd.get_rollout = AsyncMock(
+                side_effect=[rollout, Exception("gtd unreachable")]
+            )
+            ctx.gtd.relaunch_manage_rollout = AsyncMock(
+                return_value=_rollout("running", retry_count=MAX_MANAGE_RETRIES + 1)
+            )
+            ctx.gtd.halt_rollout = AsyncMock()
+            ctx.gtd.post_comment = AsyncMock()
+            ctx.db.insert_run = AsyncMock()
+
+            await _maybe_relaunch_manage(
+                run,
+                100,
+                engine,
+                3600,
+                None,
+                manager_uptime_seconds=1800.0,
+                run_timed_out=False,
+            )
+
+        ctx.gtd.halt_rollout.assert_not_called()
+        assert [c.args[0] for c in ctx.gtd.post_comment.await_args_list] == ["item-a"]
+
+    async def test_deferred_halt_repeated_never_relaunches(self) -> None:
+        """Repeated deferrals stay bounded: never a halt, never a new manager."""
+        run = _make_run()
+        engine = MagicMock()
+        rollout = self._warm_up_rollout(
+            [{"runId": "run-a", "itemId": "item-a", "status": "running"}],
+            retry_count=MAX_MANAGE_RETRIES,
+        )
+
+        with _full_patch_stack() as ctx:
+            ctx.gtd.get_rollout = AsyncMock(return_value=rollout)
+            ctx.gtd.relaunch_manage_rollout = AsyncMock(
+                return_value=_rollout("running", retry_count=MAX_MANAGE_RETRIES + 1)
+            )
+            ctx.gtd.halt_rollout = AsyncMock()
+            ctx.gtd.post_comment = AsyncMock()
+            ctx.db.insert_run = AsyncMock()
+
+            for _ in range(3):
+                await _maybe_relaunch_manage(
+                    run,
+                    100,
+                    engine,
+                    3600,
+                    None,
+                    manager_uptime_seconds=1800.0,
+                    run_timed_out=False,
+                )
+
+            ctx.gtd.halt_rollout.assert_not_called()
+            ctx.db.insert_run.assert_not_called()
+            ctx.create_task.assert_not_called()
+            ctx.sleep.assert_not_called()

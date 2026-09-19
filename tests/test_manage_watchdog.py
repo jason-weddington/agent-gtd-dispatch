@@ -234,6 +234,11 @@ class TestAC3RecoveryBranches:
             patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
         ):
             mock_gtd.list_running_rollouts = AsyncMock(return_value=[stale])
+            # The fresh in-flight re-read at the halt site: nothing running,
+            # so the cap-exceeded halt is not deferred.
+            mock_gtd.get_rollout = AsyncMock(
+                return_value={**stale, "inFlightBuildRuns": []}
+            )
             mock_gtd.relaunch_manage_rollout = AsyncMock(
                 return_value={**stale, "manage_retry_count": exceeded}
             )
@@ -766,3 +771,201 @@ class TestInFlightBuildPredicate:
 
             mock_gtd.relaunch_manage_rollout.assert_called_once_with(stale["id"])
             mock_create_task.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Item 39a77ede: the watchdog resolves a DEFERRED cap-exceeded halt.
+# _do_manage_recovery refuses to halt a rollout whose child builds are still
+# in flight, leaving it `running` with no manager. The watchdog is what
+# eventually closes that window — once, and only once the builds are terminal.
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredCapExceededHalt:
+    """The watchdog halts an over-cap rollout once its builds go terminal."""
+
+    @staticmethod
+    def _over_cap_rollout(
+        in_flight_builds: list | None = None,
+        *,
+        status: str = "running",
+        manager_phase: str = "polling",
+    ) -> dict:
+        from agent_gtd_dispatch.main import MAX_MANAGE_RETRIES
+
+        rollout = _stale_rollout(
+            status=status,
+            manager_phase=manager_phase,
+            in_flight_builds=in_flight_builds,
+        )
+        rollout["manage_retry_count"] = MAX_MANAGE_RETRIES + 1
+        return rollout
+
+    async def test_over_cap_with_terminal_builds_is_halted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """All builds terminal → halt with reason manage_relaunch_cap_exceeded."""
+        from agent_gtd_dispatch import main
+
+        over_cap = self._over_cap_rollout(in_flight_builds=[])
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._active_processes", {}),
+            patch("agent_gtd_dispatch.main._rollout_to_run", {}),
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}) as acted,
+            patch("agent_gtd_dispatch.main.db") as mock_db,
+            patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()),
+            patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[over_cap])
+            mock_gtd.relaunch_manage_rollout = AsyncMock()
+            mock_gtd.halt_rollout = AsyncMock()
+            mock_db.insert_run = AsyncMock()
+            mock_create_task.return_value = MagicMock()
+
+            await main._watchdog_tick()
+
+            mock_gtd.halt_rollout.assert_awaited_once_with(
+                over_cap["id"], reason="manage_relaunch_cap_exceeded"
+            )
+            # The cap is exhausted — no further manager, no further increment.
+            mock_gtd.relaunch_manage_rollout.assert_not_called()
+            mock_create_task.assert_not_called()
+            assert over_cap["id"] in acted
+
+        assert any(
+            "decision=deferred-halt-resolved" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    async def test_over_cap_with_build_in_flight_is_still_skipped(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A live build keeps the existing decision=skipped-build-in-flight skip."""
+        from agent_gtd_dispatch import main
+
+        over_cap = self._over_cap_rollout(
+            in_flight_builds=[
+                {"runId": "run-1", "itemId": "item-1", "status": "running"}
+            ]
+        )
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._active_processes", {}),
+            patch("agent_gtd_dispatch.main._rollout_to_run", {}),
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+            patch("agent_gtd_dispatch.main.db") as mock_db,
+            patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()),
+            patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[over_cap])
+            mock_gtd.relaunch_manage_rollout = AsyncMock()
+            mock_gtd.halt_rollout = AsyncMock()
+            mock_db.insert_run = AsyncMock()
+            mock_create_task.return_value = MagicMock()
+
+            await main._watchdog_tick()
+
+            mock_gtd.halt_rollout.assert_not_called()
+            mock_gtd.relaunch_manage_rollout.assert_not_called()
+            mock_create_task.assert_not_called()
+
+        assert any(
+            "decision=skipped-build-in-flight" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.INFO
+        ), "the pre-existing polling/in-flight skip must be undisturbed"
+
+    async def test_over_cap_non_polling_with_build_in_flight_is_deferred(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Outside the polling skip, a live build still defers the halt."""
+        from agent_gtd_dispatch import main
+
+        over_cap = self._over_cap_rollout(
+            manager_phase="warm_up",
+            in_flight_builds=[
+                {"runId": "run-1", "itemId": "item-1", "status": "running"}
+            ],
+        )
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._active_processes", {}),
+            patch("agent_gtd_dispatch.main._rollout_to_run", {}),
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+            patch("agent_gtd_dispatch.main.db") as mock_db,
+            patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()),
+            patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[over_cap])
+            mock_gtd.relaunch_manage_rollout = AsyncMock()
+            mock_gtd.halt_rollout = AsyncMock()
+            mock_db.insert_run = AsyncMock()
+            mock_create_task.return_value = MagicMock()
+
+            await main._watchdog_tick()
+
+            mock_gtd.halt_rollout.assert_not_called()
+            mock_gtd.relaunch_manage_rollout.assert_not_called()
+            mock_create_task.assert_not_called()
+
+        assert any(
+            "decision=deferred-halt-build-in-flight" in r.getMessage()
+            for r in caplog.records
+        )
+
+    async def test_over_cap_terminal_rollout_is_not_halted_again(self) -> None:
+        """No double-halt: an already-halted rollout is skipped as terminal."""
+        from agent_gtd_dispatch import main
+
+        halted = self._over_cap_rollout(in_flight_builds=[], status="halted")
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[halted])
+            mock_gtd.relaunch_manage_rollout = AsyncMock()
+            mock_gtd.halt_rollout = AsyncMock()
+
+            await main._watchdog_evaluate_rollout(
+                halted, halted["id"], datetime.now(UTC)
+            )
+
+            mock_gtd.halt_rollout.assert_not_called()
+
+    async def test_over_cap_respects_watchdog_acted_stamp(self) -> None:
+        """A tick within the idempotency window does not re-halt."""
+        import time
+
+        from agent_gtd_dispatch import main
+
+        over_cap = self._over_cap_rollout(in_flight_builds=[])
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main._active_processes", {}),
+            patch("agent_gtd_dispatch.main._rollout_to_run", {}),
+            patch("agent_gtd_dispatch.main._watchdog_acted", {}),
+            patch("agent_gtd_dispatch.main.db") as mock_db,
+            patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()),
+            patch("agent_gtd_dispatch.main.asyncio.create_task") as mock_create_task,
+        ):
+            mock_gtd.list_running_rollouts = AsyncMock(return_value=[over_cap])
+            mock_gtd.relaunch_manage_rollout = AsyncMock()
+            mock_gtd.halt_rollout = AsyncMock()
+            mock_db.insert_run = AsyncMock()
+            mock_create_task.return_value = MagicMock()
+
+            await main._watchdog_tick()
+            assert main._watchdog_acted[over_cap["id"]] <= time.monotonic()
+            await main._watchdog_tick()
+
+            assert mock_gtd.halt_rollout.await_count == 1

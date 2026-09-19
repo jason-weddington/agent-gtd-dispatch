@@ -215,6 +215,34 @@ def _in_flight_build_runs(rollout: dict[str, Any]) -> list[Any]:
     return rollout.get("inFlightBuildRuns") or []
 
 
+async def _fresh_in_flight_build_runs(
+    rollout_id: str, fallback: list[dict[str, Any]] | None
+) -> list[Any]:
+    """Re-read the rollout and return its in-flight build runs RIGHT NOW.
+
+    The cap-exceeded halt decision must never be made from a copy of the
+    rollout fetched before the relaunch call: minutes of backoff, HTTP and
+    subprocess teardown can pass in between, and a build that was in flight
+    then may be terminal now (or vice versa). Halting on a stale read is
+    exactly how running builds get stranded.
+
+    On a fetch failure we fall back to ``fallback`` (the caller's in-hand
+    copy, or None on the watchdog path). That biases towards DEFERRING the
+    halt when we last saw a build running — the watchdog resolves a deferred
+    halt later, whereas a wrongly-issued halt strands the build permanently.
+    """
+    try:
+        rollout = await gtd_client.get_rollout(rollout_id)
+    except Exception:
+        logger.exception(
+            "Failed to re-read rollout %s for the in-flight check — falling back "
+            "to the in-hand copy",
+            rollout_id,
+        )
+        return list(fallback or [])
+    return _in_flight_build_runs(rollout)
+
+
 security = HTTPBearer()
 
 
@@ -361,6 +389,13 @@ async def _do_manage_recovery(
 ) -> None:
     """Shared manage-recovery: kill stale subprocess (if any), increment retry, relaunch or halt.
 
+    When the incremented retry count exceeds ``MAX_MANAGE_RETRIES`` the halt is
+    DEFERRED (not cancelled) if a freshly-read child build run is still in
+    flight — halting there would strand a running build with no manager to
+    review or merge it. The deferred halt is resolved by
+    ``_watchdog_evaluate_rollout`` once those builds reach terminal. Deferring
+    never launches a replacement manager: the cap really is exhausted.
+
     Called from both _maybe_relaunch_manage (exit-path, run already finished) and
     _manage_watchdog (stale-detection path, run still alive). When the existing run
     is still in _active_processes the task is cancelled and its subprocess terminated
@@ -444,6 +479,54 @@ async def _do_manage_recovery(
         )
 
         if retry_count > MAX_MANAGE_RETRIES:
+            # Never halt on top of a running build. Stranding an in-flight
+            # build is the worst outcome this system can produce: the build
+            # finishes, pushes its branch, and then sits there with no manager
+            # to review, gate or merge it. The cap decision is DEFERRED (not
+            # cancelled) until those builds reach terminal — at which point
+            # _watchdog_evaluate_rollout issues the same halt.
+            #
+            # Deferring is not a retry: no replacement manager is launched
+            # here either. The run simply ends, leaving the rollout `running`
+            # with its builds finishing under no manager.
+            live_in_flight = await _fresh_in_flight_build_runs(
+                rollout_id, resume_context
+            )
+            if live_in_flight:
+                live_run_ids = (
+                    ",".join(str(r.get("runId")) for r in live_in_flight) or "none"
+                )
+                logger.warning(
+                    "manage-recovery: cap-exceeded halt DEFERRED rollout_id=%s "
+                    "retry_count=%d cap=%d in_flight_builds=%d "
+                    "in_flight_build_run_ids=%s decision=deferred-halt-build-in-flight",
+                    rollout_id,
+                    retry_count,
+                    MAX_MANAGE_RETRIES,
+                    len(live_in_flight),
+                    live_run_ids,
+                )
+                await _comment_on_in_flight_items(
+                    rollout_id,
+                    live_in_flight,
+                    lambda r: (
+                        "⏸️ Rollout manager relaunch cap exhausted "
+                        f"(manage_retry_count={retry_count} > cap "
+                        f"{MAX_MANAGE_RETRIES}) — the halt has been DEFERRED "
+                        f"because build run `{r.get('runId')}` for item "
+                        f"`{r.get('itemId')}` is still executing (status "
+                        f"`{r.get('status')}`). The rollout has been left "
+                        "`running` so the build can finish rather than being "
+                        "stranded mid-flight, and NO replacement manager will "
+                        "be started. Once every build in this wave reaches a "
+                        "terminal state the watchdog halts the rollout with "
+                        "`manage_relaunch_cap_exceeded`. A human must review "
+                        "and merge the result."
+                    ),
+                    log_label="cap-exceeded halt deferred",
+                )
+                return
+
             logger.warning(
                 "Manage retry cap exceeded for rollout %s (count=%d) — halting",
                 rollout_id,
@@ -455,9 +538,11 @@ async def _do_manage_recovery(
                 logger.exception(
                     "Failed to halt rollout %s after cap exceeded", rollout_id
                 )
-            # Make the consequence legible: every build still executing at the
-            # halt is now orphaned — no manager will review or merge it. Comment
-            # on EVERY in-flight item, not just the first.
+            # Make the consequence legible: any build that was in flight when
+            # the ladder decided (and has since gone terminal — the fresh read
+            # above proves nothing is still running) is now orphaned, with no
+            # manager to review or merge it. Comment on EVERY such item, not
+            # just the first.
             await _comment_on_in_flight_items(
                 rollout_id,
                 resume_context,
@@ -465,11 +550,10 @@ async def _do_manage_recovery(
                     f"\U0001f6d1 Rollout halted — `{halt_reason}` "
                     f"(manage_retry_count={retry_count} > cap {MAX_MANAGE_RETRIES}). "
                     f"Build run `{r.get('runId')}` for item `{r.get('itemId')}` was "
-                    f"still executing (status `{r.get('status')}`) when the rollout "
-                    "halted, and there is now NO rollout manager attached to it. "
-                    "The run will finish on its own, but nobody will review, gate or "
-                    "merge its branch — this item needs manual review and merge by a "
-                    "lead."
+                    "in flight when the manager relaunch cap was exhausted and has "
+                    "since reached a terminal state with NO rollout manager attached "
+                    "to it. Nobody reviewed, gated or merged its branch — this item "
+                    "needs manual review and merge by a lead."
                 ),
                 log_label="cap-exceeded halt",
             )
@@ -792,6 +876,52 @@ async def _watchdog_evaluate_rollout(
             manager_phase,
             age_seconds,
         )
+        return
+
+    # Resolve a DEFERRED cap-exceeded halt (see _do_manage_recovery). A rollout
+    # whose manage_retry_count is already past the cap has exhausted its manager
+    # budget and will never get another manager; the exit path deliberately left
+    # it `running` rather than stranding a build that was still executing. Halt
+    # it here, but only once every child build has reached terminal.
+    #
+    # Deliberately placed AFTER the polling/in-flight short-circuit above (so
+    # `decision=skipped-build-in-flight` still wins for a polling manager with a
+    # live build) and after the idempotency guard (so a concurrent tick cannot
+    # double-act). Rollouts already in a terminal status returned at the top of
+    # this function, so a halted rollout is never halted twice.
+    if int(rollout.get("manage_retry_count") or 0) > MAX_MANAGE_RETRIES:
+        cap_in_flight = _in_flight_build_runs(rollout)
+        if cap_in_flight:
+            logger.info(
+                "watchdog: rollout_id=%s manager_phase=%s age_seconds=%.0f "
+                "in_flight_builds=%d decision=deferred-halt-build-in-flight",
+                rollout_id,
+                manager_phase,
+                age_seconds,
+                len(cap_in_flight),
+            )
+            return  # still waiting for the stranded-build window to close
+        logger.warning(
+            "watchdog: rollout_id=%s manager_phase=%s age_seconds=%.0f "
+            "retry_count=%s cap=%d decision=deferred-halt-resolved",
+            rollout_id,
+            manager_phase,
+            age_seconds,
+            rollout.get("manage_retry_count"),
+            MAX_MANAGE_RETRIES,
+        )
+        # Mark acted-on BEFORE awaiting the halt, same as the recovery path.
+        _watchdog_acted[rollout_id] = time.monotonic()
+        try:
+            await gtd_client.halt_rollout(
+                rollout_id, reason="manage_relaunch_cap_exceeded"
+            )
+        except Exception:
+            logger.exception(
+                "Failed to halt rollout %s when resolving the deferred "
+                "cap-exceeded halt",
+                rollout_id,
+            )
         return
 
     logger.warning(
