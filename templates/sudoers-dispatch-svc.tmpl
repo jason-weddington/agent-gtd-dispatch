@@ -37,13 +37,24 @@
 # OLLAMA_THINK             — talos-qwen thinking-mode toggle.
 # OLLAMA_NUM_CTX           — talos-qwen/glm context-window pin (262144 / 1048576).
 # PATH                     — Required so uvx/MCP binaries in ~/.local/bin survive env_reset
+# GIT_AUTHOR_NAME          — Set by engines.build_env to the engine name; without it in
+# GIT_COMMITTER_NAME         env_keep, sudo's env_reset strips it and git falls back to the
+# GIT_AUTHOR_EMAIL           agent user's static global gitconfig, so commits are silently
+# GIT_COMMITTER_EMAIL        attributed to whatever stale identity that host's gitconfig
+#                            happens to carry, not the engine that actually made the commit
+#                            (item 62d9f9b5 — verified via /proc/<pid>/environ on two hosts).
+# HEADLESS_BUILD_ENGINE    — Set by dispatch.py/main.py to the engine name; without it in
+#                            env_keep, KB map-push telemetry (personal-kb-hook) records a
+#                            NULL build_engine on every row instead of the dispatching
+#                            engine, and dispatched runs become indistinguishable from
+#                            interactive control-plane sessions in that telemetry.
 #
 # NOTE: talos per-engine env is built by talos_env_overlay and passed on the
 # subprocess env, but the dispatch-svc→AGENT_USER sudo hop applies env_reset —
 # so every var the talos subprocess needs MUST be listed here or it is stripped.
 # The ollama vars carry no default fallback, so their omission fails the run
 # outright; ANTHROPIC_MODEL's omission fails silently (downgrades to haiku).
-Defaults:{{SERVICE_USER}} env_keep += "CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL AGENT_GTD_URL AGENT_GTD_API_KEY DISPATCH_API_KEY KB_DATABASE_URL KB_TEST_DATABASE_URL KB_REQUIRE_POSTGRES_TESTS OLLAMA_BASE_URL OLLAMA_MODEL OLLAMA_API_KEY OLLAMA_THINK OLLAMA_NUM_CTX TALOS_BACKEND AGENT_GTD_AGENT_NAME PATH"
+Defaults:{{SERVICE_USER}} env_keep += "CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL AGENT_GTD_URL AGENT_GTD_API_KEY DISPATCH_API_KEY KB_DATABASE_URL KB_TEST_DATABASE_URL KB_REQUIRE_POSTGRES_TESTS OLLAMA_BASE_URL OLLAMA_MODEL OLLAMA_API_KEY OLLAMA_THINK OLLAMA_NUM_CTX TALOS_BACKEND AGENT_GTD_AGENT_NAME PATH GIT_AUTHOR_NAME GIT_COMMITTER_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_EMAIL HEADLESS_BUILD_ENGINE"
 
 # Override secure_path to include ~/.cargo/bin and ~/.local/bin for the agent user, so
 # cargo/cargo-nextest (gate command for talos ChecksRunner) and uvx/MCP binaries installed

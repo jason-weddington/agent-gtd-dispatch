@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import pwd
+import re
 import subprocess
 from pathlib import Path
 from typing import ClassVar
@@ -33,7 +34,9 @@ from agent_gtd_dispatch.engines import (
     CLAUDE_HAIKU,
     CLAUDE_OLLAMA,
     CLAUDE_SONNET,
+    COMMON_ENV_KEYS,
     KIRO,
+    Engine,
     build_env,
     get_engine,
 )
@@ -410,6 +413,135 @@ class TestBuildEnv:
         assert "-e AGENT_GTD_API_KEY=" not in text
         # AGENT_GTD_URL is still injected as a literal flag.
         assert "-e AGENT_GTD_URL=" in text
+
+    @staticmethod
+    def _sudoers_env_keep_keys() -> set[str]:
+        tmpl = Path(__file__).parent.parent / "templates" / "sudoers-dispatch-svc.tmpl"
+        env_keep_line = next(
+            line for line in tmpl.read_text().splitlines() if "env_keep +=" in line
+        )
+        quoted = env_keep_line[env_keep_line.index('"') + 1 : env_keep_line.rindex('"')]
+        return set(quoted.split())
+
+    @staticmethod
+    def _stub_build_command(
+        system_prompt: str, title: str, max_turns: int, agent_name: str | None
+    ) -> list[str]:
+        return []
+
+    def test_build_env_injected_keys_all_present_in_sudoers_env_keep(self) -> None:
+        """THE DURABLE GUARD (item 62d9f9b5, AC-5): every env var that
+        build_env injects onto its returned dict AFTER the allowlist filter
+        (i.e. any key not already in COMMON_ENV_KEYS | engine.env_keys) must
+        be listed in the sudoers env_keep, or sudo's env_reset silently
+        strips it at the dispatch-svc -> dispatch boundary. The injected set
+        is derived from the code — a real build_env() call on a stub engine,
+        diffed against the allowlist it was built from — rather than
+        hardcoded, so a variable added to build_env in the future fails THIS
+        test instead of silently vanishing in production. Third occurrence
+        of this failure family after KB_TEST_DATABASE_URL and
+        HEADLESS_BUILD_ENGINE.
+        """
+        stub_engine = Engine(
+            name="stub-guard-engine",
+            binary="stub",
+            auth_env_key="STUB_AUTH_KEY",
+            env_keys=frozenset(),
+            build_command=self._stub_build_command,
+        )
+        allowed = COMMON_ENV_KEYS | stub_engine.env_keys
+        env = build_env(stub_engine)
+        injected_keys = set(env) - allowed
+
+        env_keep_keys = self._sudoers_env_keep_keys()
+        missing = injected_keys - env_keep_keys
+        assert not missing, (
+            f"build_env injects {sorted(injected_keys)} beyond its own "
+            f"allowlist; {sorted(missing)} are missing from sudoers "
+            "env_keep, so sudo silently strips them at the dispatch-svc -> "
+            "dispatch boundary in production."
+        )
+        # Sanity: the guard is actually exercising something, not vacuously
+        # passing because build_env injects nothing.
+        assert injected_keys
+
+    def test_git_identity_vars_are_in_sudoers_env_keep(self) -> None:
+        """AC-1/AC-2: the four git identity vars build_env sets (AC3 of the
+        original engine-attribution work) must survive the sudo boundary, or
+        commits fall back to the agent user's static gitconfig."""
+        env_keep_keys = self._sudoers_env_keep_keys()
+        for var in (
+            "GIT_AUTHOR_NAME",
+            "GIT_COMMITTER_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_EMAIL",
+        ):
+            assert var in env_keep_keys
+
+    def test_headless_build_engine_is_in_sudoers_env_keep(self) -> None:
+        """AC-1: HEADLESS_BUILD_ENGINE (set in dispatch.py/main.py, not
+        build_env — see scope_out of item 62d9f9b5) must also survive the
+        sudo boundary, or KB map-push telemetry records a NULL engine."""
+        env_keep_keys = self._sudoers_env_keep_keys()
+        assert "HEADLESS_BUILD_ENGINE" in env_keep_keys
+
+    def test_sudoers_template_text_lists_all_five_attribution_vars(self) -> None:
+        """AC-6 text guard: a careless edit to the env_keep line is caught
+        even if it doesn't touch the surrounding comment block."""
+        tmpl = Path(__file__).parent.parent / "templates" / "sudoers-dispatch-svc.tmpl"
+        text = tmpl.read_text()
+        for var in (
+            "GIT_AUTHOR_NAME",
+            "GIT_COMMITTER_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_EMAIL",
+            "HEADLESS_BUILD_ENGINE",
+        ):
+            assert var in text
+
+    def test_setup_script_fallback_git_identity_is_neutral(self) -> None:
+        """AC-7: the fallback git identity setup-dispatch-host.sh configures
+        for the agent user must be an obviously generic string — not a
+        model/vendor name. A plausible-looking name is worse than an
+        obviously generic one: 'Claude Haiku 4.5' on a commit actually made
+        by a different engine is indistinguishable from a real model-swap
+        bug, whereas 'agent-gtd-dispatch' is obviously wrong the moment the
+        per-run env override fails (kb-02979, 'engine label is not
+        identity')."""
+        script = Path(__file__).parent.parent / "setup-dispatch-host.sh"
+        text = script.read_text()
+        name_match = re.search(r'_GIT_FALLBACK_NAME="([^"]+)"', text)
+        email_match = re.search(r'_GIT_FALLBACK_EMAIL="([^"]+)"', text)
+        assert name_match, 'expected _GIT_FALLBACK_NAME="..." in setup-dispatch-host.sh'
+        assert email_match, (
+            'expected _GIT_FALLBACK_EMAIL="..." in setup-dispatch-host.sh'
+        )
+
+        combined_lower = f"{name_match.group(1)} {email_match.group(1)}".lower()
+        banned_terms = (
+            "claude",
+            "haiku",
+            "opus",
+            "sonnet",
+            "glm",
+            "anthropic.com",
+        )
+        for term in banned_terms:
+            assert term not in combined_lower, (
+                f"fallback git identity {combined_lower!r} contains banned "
+                f"term {term!r} — it must look obviously generic, not like "
+                "a real model/vendor identity"
+            )
+
+    def test_setup_script_configures_git_identity_as_agent_user(self) -> None:
+        """AC-4: the git identity step must write the AGENT_USER's own
+        gitconfig (runuser -l "$AGENT_USER" ...), not root's — and must be
+        reachable in --dry-run without mutating anything."""
+        script = Path(__file__).parent.parent / "setup-dispatch-host.sh"
+        text = script.read_text()
+        assert 'runuser -l "$AGENT_USER" -c "git config --global user.name' in text
+        assert 'runuser -l "$AGENT_USER" -c "git config --global user.email' in text
+        assert 'would "runuser -l ${AGENT_USER}' in text
 
 
 class TestBuildSystemPrompt:

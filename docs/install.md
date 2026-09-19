@@ -543,6 +543,59 @@ sudo systemctl restart dispatch-api
 
 ---
 
+## Commit attribution: sudoers env_keep + agent git identity (item 62d9f9b5)
+
+Every dispatched agent commit is meant to be attributed to the engine that made it.
+`engines.build_env` sets `GIT_AUTHOR_NAME` / `GIT_COMMITTER_NAME` / `GIT_AUTHOR_EMAIL` /
+`GIT_COMMITTER_EMAIL` to the engine name, and `dispatch.py`/`main.py` additionally set
+`HEADLESS_BUILD_ENGINE` on the subprocess env so KB map-push telemetry can tell a
+headless build run apart from an interactive session. Both only work if those five
+variables survive the `dispatch-svc → dispatch` `sudo` hop.
+
+**`sudo` runs with `env_reset` by default and drops every variable not named in the
+sudoers `env_keep` list** (`/etc/sudoers.d/dispatch-svc`, rendered from
+`templates/sudoers-dispatch-svc.tmpl`). Before this item, none of the five attribution
+variables were in that list, so they were silently stripped: commits fell back to the
+agent user's static global gitconfig (which had drifted independently per host), and
+`HEADLESS_BUILD_ENGINE` never reached the agent process, so `build_engine` was recorded
+`NULL` on every KB telemetry row.
+
+### What changed
+
+1. **`templates/sudoers-dispatch-svc.tmpl`** — `env_keep` now additionally lists
+   `GIT_AUTHOR_NAME GIT_COMMITTER_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_EMAIL
+   HEADLESS_BUILD_ENGINE`, each documented with the silent symptom that occurs when it
+   is stripped.
+2. **Step 4.5a of the installer** (`setup-dispatch-host.sh`, runs right after Step 4.5's
+   Claude Code install) sets a **deliberately neutral** global git identity for the
+   agent user: `user.name = agent-gtd-dispatch`, `user.email =
+   dispatch@agent-gtd-dispatch` (idempotent, `--dry-run`-aware, applied via `runuser -l
+   "$AGENT_USER" -c 'git config --global ...'` so it writes the agent user's own
+   gitconfig, not root's). This is the **fallback** used only when the per-run env
+   override above does not reach the subprocess (e.g. a host whose sudoers fragment
+   predates this item). The identity is intentionally generic rather than a
+   model/vendor name — a plausible-looking name (`Claude Haiku 4.5`) on a commit
+   actually authored by a different engine is indistinguishable from a real
+   model-swap bug, whereas an obviously generic name is obviously wrong the moment
+   the env override fails. See kb-02979 ("engine label is not identity").
+
+### Operator note: existing hosts do not pick this up automatically
+
+**`./deploy.sh` does not rewrite `/etc/sudoers.d/dispatch-svc`.** It updates the
+installed wheel and (conditionally) the systemd unit, but the sudoers fragment is only
+(re)rendered by `setup-dispatch-host.sh`. Until a host's `setup-dispatch-host.sh` is
+re-run, that host's `env_keep` stays stale, the five attribution variables keep getting
+stripped, and dispatched commits on that host keep carrying whatever identity its
+gitconfig happened to have — **the attribution stays wrong until the host is
+re-provisioned**, deploys alone will not fix it.
+
+```bash
+# Re-run on each existing host to pick up the env_keep + git identity changes:
+sudo ./setup-dispatch-host.sh   # existing args (--agent-user, --service-user, etc.) as before
+```
+
+---
+
 ## MCP servers for the agent user
 
 Step 4.6 of the installer registers up to four MCP servers for the `dispatch` (agent)

@@ -887,6 +887,47 @@ else
 fi
 
 # ===========================================================================
+# Step 4.5a: Agent git identity (agent user)
+# ===========================================================================
+# Sets a DELIBERATELY NEUTRAL global git identity for AGENT_USER. This is the
+# fallback used only when the per-run GIT_AUTHOR_NAME / GIT_COMMITTER_NAME /
+# GIT_AUTHOR_EMAIL / GIT_COMMITTER_EMAIL env vars set by engines.build_env do
+# NOT reach the agent subprocess — e.g. a host whose sudoers fragment predates
+# item 62d9f9b5's env_keep additions, so sudo's env_reset strips them at the
+# dispatch-svc→AGENT_USER boundary. The env override still wins in normal
+# operation; this step only matters when it doesn't.
+#
+# The identity is intentionally NOT a model/vendor name. A plausible-looking
+# name (e.g. "Claude Haiku 4.5") on a commit actually authored by a different
+# engine is indistinguishable from a real model-swap bug — quietly wrong. An
+# obviously generic identity ("agent-gtd-dispatch") is instead OBVIOUSLY
+# wrong the moment the env override fails, which is what we want: loud
+# failure beats silent mislabeling (see kb-02979, "engine label is not
+# identity"). Email follows the existing `{engine}@agent-gtd-dispatch`
+# convention from engines.py, generalised to the neutral fallback name.
+#
+# r7-research and pironman01 each carry a stale identity today (drifted
+# independently per host: "Claude Agent" / "Claude Haiku 4.5"); r7-server
+# (provisioned 2026-09-13) has NO user.name/user.email configured at all. So
+# this step is a genuine fix on r7-server and a deliberate overwrite (to the
+# neutral fallback) on the other two. It always writes the same value, so
+# re-running is idempotent in effect.
+echo ""
+echo "--- Step 4.5a: Agent git identity (agent user) ---"
+
+_GIT_FALLBACK_NAME="agent-gtd-dispatch"
+_GIT_FALLBACK_EMAIL="dispatch@agent-gtd-dispatch"
+
+if $DRY_RUN; then
+    would "runuser -l ${AGENT_USER} -- git config --global user.name '${_GIT_FALLBACK_NAME}'"
+    would "runuser -l ${AGENT_USER} -- git config --global user.email '${_GIT_FALLBACK_EMAIL}'"
+else
+    runuser -l "$AGENT_USER" -c "git config --global user.name '${_GIT_FALLBACK_NAME}'"
+    runuser -l "$AGENT_USER" -c "git config --global user.email '${_GIT_FALLBACK_EMAIL}'"
+    info "Set fallback git identity for ${AGENT_USER}: ${_GIT_FALLBACK_NAME} <${_GIT_FALLBACK_EMAIL}>"
+fi
+
+# ===========================================================================
 # Shared Rust bootstrap helpers (used by Step 4.5b-B/C AND Step 4.9)
 # ===========================================================================
 # Two steps need rustup + cargo-binstall for AGENT_USER:
