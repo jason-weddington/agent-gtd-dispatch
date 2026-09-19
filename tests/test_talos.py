@@ -1696,17 +1696,19 @@ class TestRunTalosWorkerBranch:
     async def test_exit_0_commit_clean_tree_no_retry_fails_closed(
         self, tmp_path, monkeypatch
     ) -> None:
-        """Failed commit + clean tree → no retry, run failed, commit exactly once.
+        """Clean tree + NO commits ahead → run failed, commit exactly once.
 
         `git commit` returns rc 1 but `git status --porcelain` is EMPTY — the
         hook did not re-dirty anything, so there is nothing to re-stage. The
         helper must NOT retry: `git commit` appears EXACTLY ONCE with NO retry
-        `git add -A` after it. The caller's failure branch fires.
+        `git add -A` after it. With no commits ahead of base the agent produced
+        nothing, so the caller's failure branch fires — loudly.
         """
-        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch import config, db, dispatch, gtd_client, main
         from agent_gtd_dispatch.models import RunStatus
 
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        monkeypatch.setattr(dispatch, "commits_ahead_of_base", lambda *_a, **_k: 0)
         run, engine, item, project = _make_talos_run()
 
         update_run_mock = AsyncMock()
@@ -1762,8 +1764,15 @@ class TestRunTalosWorkerBranch:
             for call in update_run_mock.await_args_list
         )
         set_status_mock.assert_not_awaited()
+        # The wording names the FACT (no changes), not the symptom.
         comments = [c.args[1] for c in post_comment_mock.await_args_list]
-        assert any("git commit" in c and "failed" in c for c in comments), comments
+        assert any("produced no changes" in c for c in comments), comments
+        errors = [
+            str(c.kwargs.get("error") or "")
+            for c in update_run_mock.await_args_list
+            if c.kwargs.get("error")
+        ]
+        assert any("produced no changes" in e for e in errors), errors
 
         # git commit appears EXACTLY once...
         commit_idxs = [i for i, c in enumerate(commands) if "commit" in c and "-m" in c]
@@ -2752,7 +2761,10 @@ class TestGitFailureErrorKeepsHead:
                 rc.stdout = (hook_head + skipped_tail).encode()
                 rc.stderr = b"error: cannot commit\n"
             elif "status" in cmd and "--porcelain" in cmd:
-                rc.returncode = 0  # clean tree — no retry
+                # Dirty tree — a genuine hook rejection, so the caller keeps
+                # the `git commit failed: …` wording (the excerpt under test).
+                rc.returncode = 0
+                rc.stdout = b" M src/x.py\n"
             else:
                 rc.returncode = 0
             return rc
@@ -2785,3 +2797,369 @@ class TestGitFailureErrorKeepsHead:
         assert "Incompatible return value type" in error
         # The middle is elided rather than the head being thrown away.
         assert "characters elided" in error
+
+
+# ---------------------------------------------------------------------------
+# Redundant-empty-commit disambiguation
+# ---------------------------------------------------------------------------
+
+_TALOS_DONE_STDOUT = (
+    '{"outcome":"Finished","iterations":3,'
+    '"disposition":{"Done":{"summary":"ok",'
+    '"verification":"NoChecksConfigured"}}}'
+)
+
+
+def _done_proc() -> MagicMock:
+    proc = MagicMock()
+    proc.communicate.return_value = (_TALOS_DONE_STDOUT.encode(), b"")
+    proc.returncode = 0
+    return proc
+
+
+class TestFailedCommitDecisionTable:
+    """`git commit` exiting non-zero is AMBIGUOUS — disambiguate on commits-ahead.
+
+    The decision table, per repo:
+
+    | commit rc | tree   | commits ahead of base | outcome                     |
+    |-----------|--------|-----------------------|-----------------------------|
+    | non-zero  | clean  | > 0                   | success — push and continue |
+    | non-zero  | clean  | 0                     | FAIL, "produced no changes" |
+    | non-zero  | dirty  | (not consulted)       | today's retry-then-fail     |
+    """
+
+    async def test_clean_tree_with_commits_ahead_pushes_and_succeeds(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Redundant empty commit: the work is already committed → SUCCESS."""
+        from agent_gtd_dispatch import config, db, dispatch, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(dispatch, "commits_ahead_of_base", lambda *_a, **_k: 2)
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        commands: list[list[str]] = []
+
+        def _fake_run(cmd, **_kwargs):
+            commands.append(cmd)
+            rc = MagicMock()
+            rc.stdout = b""
+            rc.stderr = b"nothing to commit, working tree clean"
+            rc.returncode = 1 if ("commit" in cmd and "-m" in cmd) else 0
+            return rc
+
+        with (
+            patch(
+                "agent_gtd_dispatch.main.subprocess.Popen", return_value=_done_proc()
+            ),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        assert any(
+            call.kwargs.get("status") == RunStatus.succeeded
+            for call in update_run_mock.await_args_list
+        ), update_run_mock.await_args_list
+        assert not any(
+            call.kwargs.get("status") == RunStatus.failed
+            for call in update_run_mock.await_args_list
+        ), update_run_mock.await_args_list
+        set_status_mock.assert_awaited_once()
+        # The normal push path ran.
+        assert any("push" in " ".join(c) for c in commands), commands
+
+    async def test_clean_tree_without_commits_ahead_fails_loudly(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Same symptom, no commits: a do-nothing run must stay a FAILURE."""
+        from agent_gtd_dispatch import config, db, dispatch, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(dispatch, "commits_ahead_of_base", lambda *_a, **_k: 0)
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        commands: list[list[str]] = []
+
+        def _fake_run(cmd, **_kwargs):
+            commands.append(cmd)
+            rc = MagicMock()
+            rc.stdout = b""
+            rc.stderr = b"nothing to commit, working tree clean"
+            rc.returncode = 1 if ("commit" in cmd and "-m" in cmd) else 0
+            return rc
+
+        with (
+            patch(
+                "agent_gtd_dispatch.main.subprocess.Popen", return_value=_done_proc()
+            ),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        assert any(
+            call.kwargs.get("status") == RunStatus.failed
+            for call in update_run_mock.await_args_list
+        ), update_run_mock.await_args_list
+        set_status_mock.assert_not_awaited()
+        # The error names the FACT, not the git symptom.
+        errors = [
+            str(c.kwargs.get("error") or "")
+            for c in update_run_mock.await_args_list
+            if c.kwargs.get("error")
+        ]
+        assert errors, update_run_mock.await_args_list
+        assert "produced no changes" in errors[-1], errors
+        assert not errors[-1].startswith("git commit failed"), errors
+        comments = [c.args[1] for c in post_comment_mock.await_args_list]
+        assert any("produced no changes" in c for c in comments), comments
+        # Nothing was pushed.
+        assert not any("push" in " ".join(c) for c in commands), commands
+
+    async def test_dirty_tree_keeps_retry_then_fail_and_never_asks_commits_ahead(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """No-regression: a real hook rejection still fails, unchanged."""
+        from agent_gtd_dispatch import config, db, dispatch, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        ahead_calls: list[object] = []
+
+        def _never(repo_path, **_kwargs):
+            ahead_calls.append(repo_path)
+            return 99  # would wrongly rescue the run if ever consulted
+
+        monkeypatch.setattr(dispatch, "commits_ahead_of_base", _never)
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        commands: list[list[str]] = []
+
+        def _fake_run(cmd, **_kwargs):
+            commands.append(cmd)
+            rc = MagicMock()
+            rc.stdout = b""
+            rc.stderr = b"hook rejected the commit"
+            if "commit" in cmd and "-m" in cmd:
+                rc.returncode = 1
+            elif "status" in cmd and "--porcelain" in cmd:
+                rc.returncode = 0
+                rc.stdout = b" M src/x.py\n"  # dirty tree
+            else:
+                rc.returncode = 0
+            return rc
+
+        with (
+            patch(
+                "agent_gtd_dispatch.main.subprocess.Popen", return_value=_done_proc()
+            ),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+
+        assert any(
+            call.kwargs.get("status") == RunStatus.failed
+            for call in update_run_mock.await_args_list
+        ), update_run_mock.await_args_list
+        set_status_mock.assert_not_awaited()
+        assert not ahead_calls, "commits-ahead must not be consulted on a dirty tree"
+        errors = [
+            str(c.kwargs.get("error") or "")
+            for c in update_run_mock.await_args_list
+            if c.kwargs.get("error")
+        ]
+        assert errors[-1].startswith("git commit failed"), errors
+        # The re-stage loop still ran: 3 commit attempts (initial + 2 retries).
+        commit_idxs = [i for i, c in enumerate(commands) if "commit" in c and "-m" in c]
+        assert len(commit_idxs) == 3, commands
+        assert not any("push" in " ".join(c) for c in commands), commands
+
+    async def test_workspace_one_repo_already_committed_other_empty_succeeds(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Workspace semantics are PER REPO.
+
+        `agent_gtd` fails its commit with a clean tree but IS ahead of base →
+        pushed and counted as committed. `agent-gtd-dispatch` fails its commit
+        with a clean tree and is NOT ahead → recorded as skipped, and it does
+        NOT condemn the run. One sibling with work is enough for success.
+        """
+        from agent_gtd_dispatch import config, db, dispatch, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        run, engine, item, project = _make_talos_run()
+
+        def _ahead(repo_path, **_kwargs):
+            return 1 if str(repo_path).endswith("agent_gtd") else 0
+
+        monkeypatch.setattr(dispatch, "commits_ahead_of_base", _ahead)
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        calls: list[tuple[list[str], object]] = []
+
+        def _fake_run(cmd, **kwargs):
+            cwd = kwargs.get("cwd")
+            calls.append((cmd, cwd))
+            rc = MagicMock()
+            rc.stdout = b""
+            rc.stderr = b"nothing to commit, working tree clean"
+            if "diff" in cmd and "--cached" in cmd and "--quiet" in cmd:
+                rc.returncode = 1  # both repos look staged
+            elif "commit" in cmd and "-m" in cmd:
+                rc.returncode = 1  # both commits fail on a clean tree
+            else:
+                rc.returncode = 0
+            return rc
+
+        with (
+            patch(
+                "agent_gtd_dispatch.main.subprocess.Popen", return_value=_done_proc()
+            ),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+                workspace_repo_dirs=["agent_gtd", "agent-gtd-dispatch"],
+            )
+
+        assert any(
+            call.kwargs.get("status") == RunStatus.succeeded
+            for call in update_run_mock.await_args_list
+        ), update_run_mock.await_args_list
+        assert not any(
+            call.kwargs.get("status") == RunStatus.failed
+            for call in update_run_mock.await_args_list
+        ), update_run_mock.await_args_list
+        set_status_mock.assert_awaited_once()
+
+        # The ahead repo was pushed; the empty one was not.
+        pushed_cwds = [str(cwd) for cmd, cwd in calls if "push" in " ".join(cmd)]
+        assert pushed_cwds, calls
+        assert all(c.endswith("agent_gtd") for c in pushed_cwds), pushed_cwds
+
+        # The summary comment names the committed repo and skips the empty one.
+        comments = [c.args[1] for c in post_comment_mock.await_args_list]
+        assert len(comments) == 1, comments
+        assert "agent_gtd" in comments[0]
+        assert "skipped (no changes): agent-gtd-dispatch" in comments[0], comments[0]
+
+    async def test_workspace_all_repos_empty_still_fails(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Every repo clean with nothing ahead → the run still fails loudly."""
+        from agent_gtd_dispatch import config, db, dispatch, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(dispatch, "commits_ahead_of_base", lambda *_a, **_k: 0)
+        run, engine, item, project = _make_talos_run()
+
+        update_run_mock = AsyncMock()
+        post_comment_mock = AsyncMock()
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", post_comment_mock)
+        monkeypatch.setattr(gtd_client, "set_item_status", set_status_mock)
+
+        def _fake_run(cmd, **_kwargs):
+            rc = MagicMock()
+            rc.stdout = b""
+            rc.stderr = b"nothing to commit, working tree clean"
+            staged = "diff" in cmd and "--cached" in cmd and "--quiet" in cmd
+            committing = "commit" in cmd and "-m" in cmd
+            rc.returncode = 1 if (staged or committing) else 0
+            return rc
+
+        with (
+            patch(
+                "agent_gtd_dispatch.main.subprocess.Popen", return_value=_done_proc()
+            ),
+            patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+                workspace_repo_dirs=["agent_gtd", "agent-gtd-dispatch"],
+            )
+
+        assert any(
+            call.kwargs.get("status") == RunStatus.failed
+            for call in update_run_mock.await_args_list
+        ), update_run_mock.await_args_list
+        set_status_mock.assert_not_awaited()
+        errors = [
+            str(c.kwargs.get("error") or "")
+            for c in update_run_mock.await_args_list
+            if c.kwargs.get("error")
+        ]
+        assert "no committed changes" in errors[-1], errors

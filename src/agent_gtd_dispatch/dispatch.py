@@ -68,6 +68,25 @@ GIT_EXCERPT_HEAD_CHARS: int = 1500
 GIT_EXCERPT_TAIL_CHARS: int = ERROR_TEXT_MAX_CHARS - GIT_EXCERPT_HEAD_CHARS
 
 
+# ANSI escape sequences emitted by hook runners (lefthook colours its summary
+# box, pre-commit colours PASS/FAIL).  They make a stored ``error_msg``
+# unreadable in a terminal and actively hostile inside JSON, and they carry no
+# information the operator needs.  Matches CSI sequences (``\x1b[38;2;0;0;0m``),
+# OSC sequences (terminated by BEL or ST), the nF charset escapes some runners
+# pair with SGR resets (``\x1b(B``) and the remaining two-character escapes.
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]"
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|[ -/]+[0-~]"
+    r"|[@-Z\\-_])"
+)
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences, leaving the human-readable text intact."""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
 def git_output_excerpt(
     proc: subprocess.CompletedProcess[bytes],
     *,
@@ -79,6 +98,11 @@ def git_output_excerpt(
     Combines the captured stdout AND stderr — stdout first, because git forwards
     hook stdout on its own stream and the previous stderr-only excerpt threw that
     away entirely — then keeps the HEAD of the result.
+
+    ANSI escape sequences are stripped from each stream BEFORE the length budget
+    is applied, so colour codes neither pollute the stored text nor consume the
+    excerpt budget.  Stripping happens here, in the shared helper, so every
+    caller benefits.
 
     When the combined output does not fit in ``head + tail`` characters the middle
     is dropped and replaced by a marker naming how many characters went missing,
@@ -93,7 +117,7 @@ def git_output_excerpt(
         # without capture_output) contributes nothing rather than its repr.
         if not isinstance(stream, bytes) or not stream:
             continue
-        text = stream.decode("utf-8", errors="replace")
+        text = strip_ansi(stream.decode("utf-8", errors="replace"))
         if text.strip():
             parts.append(text)
     combined = "\n".join(parts).strip()
@@ -638,6 +662,40 @@ def _detect_default_branch(repo_path: Path) -> str:
     else:
         default_branch = result.stdout.strip().removeprefix("origin/")
     return default_branch
+
+
+def commits_ahead_of_base(repo_path: Path, *, base_branch: str | None = None) -> int:
+    """Count commits on HEAD that the repo's BASE branch does not have.
+
+    The base is DETECTED per repo via :func:`_detect_default_branch` (never a
+    hardcoded ``main``), and the count is taken against ``origin/<base>`` first,
+    falling back to a local ``<base>`` ref when the remote-tracking ref is
+    absent.
+
+    This is the disambiguator for a ``git commit`` that failed on a CLEAN tree:
+    ahead of base means the agent had already committed its work and merely
+    attempted a redundant final commit; not ahead means the agent produced
+    nothing at all.
+
+    Returns 0 when the count cannot be determined, so an undeterminable base
+    can never promote a do-nothing run to success.
+    """
+    base = base_branch or _detect_default_branch(repo_path)
+    for ref in (f"origin/{base}", base):
+        result = subprocess.run(
+            _sudo_wrap(["git", "rev-list", "--count", f"{ref}..HEAD"]),
+            cwd=repo_path,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            continue
+        try:
+            return int(result.stdout.strip())
+        except (AttributeError, ValueError):
+            continue
+    return 0
 
 
 def prepare_manage_workspace(git_origin: str, run_id: str) -> Path:

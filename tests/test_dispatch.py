@@ -4835,6 +4835,36 @@ class TestGitOutputExcerpt:
         assert out.endswith("ij")
         assert "6 characters elided" in out
 
+    def test_ansi_escapes_are_stripped_and_content_survives(self) -> None:
+        """lefthook colours its summary box; the stored error must not carry it."""
+        raw = (
+            "\x1b[38;2;0;0;0m\u256d\u2500\u2500\u2500\u256e\x1b[0m\n"
+            "\x1b[1;31mruff\x1b[0m: \x1b[32m(skip) no matching staged files\x1b[0m\n"
+            "\x1b]0;lefthook\x07lefthook \x1b[1mdone\x1b[m in 0.00 seconds\n"
+        ).encode()
+        out = dispatch.git_output_excerpt(_proc(stderr=raw))
+        assert "\x1b" not in out
+        assert "[38;2;0;0;0m" not in out
+        assert "(skip) no matching staged files" in out
+        assert "lefthook done in 0.00 seconds" in out
+        assert "ruff:" in out
+
+    def test_ansi_is_stripped_before_the_truncation_budget_applies(self) -> None:
+        """Colour codes must not eat the excerpt budget, and the head still wins."""
+        colourful = "".join(f"\x1b[3{i % 8}mline-{i:03d}\x1b[0m\n" for i in range(400))
+        out = dispatch.git_output_excerpt(_proc(stderr=colourful.encode()))
+        assert "\x1b" not in out
+        assert out.startswith("line-000")
+        assert "characters elided" in out
+        # The elided count is computed on the STRIPPED text, not the raw bytes.
+        stripped_len = len(dispatch.strip_ansi(colourful).strip())
+        dropped = stripped_len - dispatch.ERROR_TEXT_MAX_CHARS
+        assert f"[... {dropped} characters elided ...]" in out
+
+    def test_plain_text_is_untouched_by_the_stripper(self) -> None:
+        text = "nothing to commit, working tree clean\n[main 1a2b3c4] feat: x"
+        assert dispatch.strip_ansi(text) == text
+
     def test_budget_constants_agree(self) -> None:
         """One named constant governs both truncation layers — they cannot drift."""
         from agent_gtd_dispatch import main
@@ -5114,3 +5144,70 @@ class TestBuildPromptTerminalActionCollapse:
     def test_final_summary_comment_survives(self) -> None:
         prompt = self._prompt()
         assert "Post a final comment with: what you did" in prompt
+
+
+class TestCommitsAheadOfBase:
+    """Commits-ahead is measured against the repo's DETECTED base branch."""
+
+    def test_counts_against_origin_of_the_detected_default_branch(self) -> None:
+        with (
+            patch(
+                "agent_gtd_dispatch.dispatch._detect_default_branch",
+                return_value="trunk",
+            ),
+            patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub,
+        ):
+            mock_sub.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="3\n", stderr=""
+            )
+            assert dispatch.commits_ahead_of_base(Path("/repo")) == 3
+        argv = mock_sub.call_args.args[0]
+        assert argv[-1] == "origin/trunk..HEAD"
+
+    def test_falls_back_to_the_local_base_ref(self) -> None:
+        calls: list[list[str]] = []
+
+        def _run(cmd, **_kwargs):
+            calls.append(cmd)
+            if cmd[-1].startswith("origin/"):
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=128, stdout="", stderr="unknown revision"
+                )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="1\n", stderr=""
+            )
+
+        with (
+            patch(
+                "agent_gtd_dispatch.dispatch._detect_default_branch",
+                return_value="main",
+            ),
+            patch("agent_gtd_dispatch.dispatch.subprocess.run", side_effect=_run),
+        ):
+            assert dispatch.commits_ahead_of_base(Path("/repo")) == 1
+        assert [c[-1] for c in calls] == ["origin/main..HEAD", "main..HEAD"]
+
+    def test_undeterminable_base_counts_as_zero(self) -> None:
+        """Never promote a do-nothing run to success on an unreadable count."""
+        with (
+            patch(
+                "agent_gtd_dispatch.dispatch._detect_default_branch",
+                return_value="main",
+            ),
+            patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub,
+        ):
+            mock_sub.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="not-a-number", stderr=""
+            )
+            assert dispatch.commits_ahead_of_base(Path("/repo")) == 0
+
+    def test_explicit_base_branch_skips_detection(self) -> None:
+        with (
+            patch("agent_gtd_dispatch.dispatch._detect_default_branch") as detect,
+            patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_sub,
+        ):
+            mock_sub.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="0\n", stderr=""
+            )
+            assert dispatch.commits_ahead_of_base(Path("/repo"), base_branch="dev") == 0
+        detect.assert_not_called()

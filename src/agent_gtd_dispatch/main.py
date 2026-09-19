@@ -1059,6 +1059,47 @@ def _try_start_pending() -> None:
         _active_processes[pending.run.id] = task
 
 
+# Classification of a non-zero `git commit` in the talos paths. A failed commit
+# is NOT sufficient on its own to fail the run: lefthook/pre-commit report the
+# same surface symptom ("nothing to commit, working tree clean") for a run that
+# already committed everything and for a run that did nothing at all.
+_COMMIT_DIRTY = "dirty"  # real hook rejection / conflict — fail, unchanged
+_COMMIT_ALREADY_COMMITTED = "already_committed"  # redundant commit — success
+_COMMIT_NO_CHANGES = "no_changes"  # the agent produced nothing — fail, loudly
+
+
+def _classify_failed_commit(repo_path: Path) -> str:
+    """Disambiguate a non-zero ``git commit`` in one repo.
+
+    Decision table:
+
+    - tree DIRTY (or ``git status`` itself failed) -> ``_COMMIT_DIRTY``. The
+      caller keeps today's behaviour exactly: a genuine hook rejection or
+      conflict still fails the run.
+    - tree CLEAN and the branch has commits AHEAD of its base ->
+      ``_COMMIT_ALREADY_COMMITTED``. The agent committed its work and then
+      attempted a redundant final commit; git exits non-zero but the run is
+      fine and the caller continues to the normal push path.
+    - tree CLEAN and NO commits ahead of base -> ``_COMMIT_NO_CHANGES``. The
+      agent produced nothing. The run must still fail, and say so plainly.
+
+    The commits-ahead clause is the whole point: without it, "nothing to
+    commit" would read as success and a do-nothing run would report green.
+    """
+    porcelain = subprocess.run(
+        dispatch._sudo_wrap(["git", "status", "--porcelain"]),
+        cwd=str(repo_path),
+        check=False,
+        capture_output=True,
+    )
+    stdout = porcelain.stdout if isinstance(porcelain.stdout, bytes) else b""
+    if porcelain.returncode != 0 or stdout.decode("utf-8", errors="replace").strip():
+        return _COMMIT_DIRTY
+    if dispatch.commits_ahead_of_base(repo_path) > 0:
+        return _COMMIT_ALREADY_COMMITTED
+    return _COMMIT_NO_CHANGES
+
+
 def _commit_with_retry(
     repo_dir: str,
     git_ident_flags: list[str],
@@ -1394,29 +1435,53 @@ async def _run_talos(
                     str(repo_path), git_ident_flags, commit_msg
                 )
                 if commit_rc.returncode != 0:
-                    _err = dispatch.git_output_excerpt(commit_rc)
-                    await db.update_run(
-                        run.id,
-                        status=RunStatus.failed,
-                        completed_at=now,
-                        exit_code=exit_code,
-                        error=f"git commit failed in {repo_dir}: {_err}",
-                    )
-                    _publish_run_event(run.id, "failed", now)
-                    try:
-                        await gtd_client.post_comment(
-                            item_id,
-                            f"talos completed but `git commit` failed in repo "
-                            f"`{repo_dir}`: {_err}",
-                            created_by=attribution or "agent-gtd-dispatch",
-                            token=run.callback_token,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Failed to post git-commit failure comment for %s",
+                    # A non-zero commit is not, on its own, a failed run.
+                    # Workspace semantics are PER REPO: an already-committed
+                    # repo continues to push, and a repo that produced nothing
+                    # is merely skipped — a sibling repo's work still counts.
+                    verdict = _classify_failed_commit(repo_path)
+                    if verdict == _COMMIT_NO_CHANGES:
+                        logger.info(
+                            "talos run %s: repo %s has a clean tree and no commits "
+                            "ahead of base — recording it as unchanged",
                             run.id,
+                            repo_dir,
                         )
-                    return
+                        skipped.append(repo_dir)
+                        continue
+                    if verdict == _COMMIT_ALREADY_COMMITTED:
+                        logger.info(
+                            "talos run %s: redundant empty commit in repo %s — the "
+                            "branch already has commits ahead of base; pushing",
+                            run.id,
+                            repo_dir,
+                        )
+                    else:
+                        _err = dispatch.git_output_excerpt(commit_rc)
+                        # Dirty tree — a genuine hook rejection or conflict.
+                        # Unchanged behaviour: the whole run fails.
+                        await db.update_run(
+                            run.id,
+                            status=RunStatus.failed,
+                            completed_at=now,
+                            exit_code=exit_code,
+                            error=f"git commit failed in {repo_dir}: {_err}",
+                        )
+                        _publish_run_event(run.id, "failed", now)
+                        try:
+                            await gtd_client.post_comment(
+                                item_id,
+                                f"talos completed but `git commit` failed in repo "
+                                f"`{repo_dir}`: {_err}",
+                                created_by=attribution or "agent-gtd-dispatch",
+                                token=run.callback_token,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to post git-commit failure comment for %s",
+                                run.id,
+                            )
+                        return
 
                 push_rc = subprocess.run(
                     dispatch._sudo_wrap(
@@ -1549,27 +1614,52 @@ async def _run_talos(
 
         commit_rc = _commit_with_retry(str(workspace), git_ident_flags, commit_msg)
         if commit_rc.returncode != 0:
-            _err = dispatch.git_output_excerpt(commit_rc)
-            await db.update_run(
+            # A non-zero commit is not, on its own, a failed run: the agent may
+            # have committed everything and then attempted a redundant final
+            # commit. Disambiguate on commits-ahead-of-base.
+            verdict = _classify_failed_commit(workspace)
+            if verdict != _COMMIT_ALREADY_COMMITTED:
+                if verdict == _COMMIT_NO_CHANGES:
+                    # The loud case: nothing to commit AND nothing committed.
+                    error_text = (
+                        "talos reported Done but the agent produced no changes: "
+                        "nothing to commit and no commits ahead of the base branch"
+                    )
+                    comment_text = (
+                        f"talos reported Done but produced no changes — nothing to "
+                        f"commit and the branch has no commits ahead of its base "
+                        f"(run `{run.id}`, branch `{branch_name}`)."
+                    )
+                else:
+                    # Dirty tree — a genuine hook rejection or conflict.
+                    _err = dispatch.git_output_excerpt(commit_rc)
+                    error_text = f"git commit failed: {_err}"
+                    comment_text = f"talos completed but `git commit` failed: {_err}"
+                await db.update_run(
+                    run.id,
+                    status=RunStatus.failed,
+                    completed_at=now,
+                    exit_code=exit_code,
+                    error=error_text,
+                )
+                _publish_run_event(run.id, "failed", now)
+                try:
+                    await gtd_client.post_comment(
+                        item_id,
+                        comment_text,
+                        created_by=attribution or "agent-gtd-dispatch",
+                        token=run.callback_token,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to post git-commit failure comment for %s", run.id
+                    )
+                return
+            logger.info(
+                "talos run %s: redundant empty commit — the branch already has "
+                "commits ahead of base; continuing to push",
                 run.id,
-                status=RunStatus.failed,
-                completed_at=now,
-                exit_code=exit_code,
-                error=f"git commit failed: {_err}",
             )
-            _publish_run_event(run.id, "failed", now)
-            try:
-                await gtd_client.post_comment(
-                    item_id,
-                    f"talos completed but `git commit` failed: {_err}",
-                    created_by=attribution or "agent-gtd-dispatch",
-                    token=run.callback_token,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to post git-commit failure comment for %s", run.id
-                )
-            return
 
         push_rc = subprocess.run(
             dispatch._sudo_wrap(
