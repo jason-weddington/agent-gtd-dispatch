@@ -126,8 +126,42 @@ OLLAMA_CLOUD_MODEL: str = "glm-5.3:cloud"
 # DISPOSITION_CLASSIFIER_API_KEY_ENV names the env var that holds the
 # credential rather than the credential itself, so switching providers does not
 # require the secret to be re-plumbed through this module.
+#
+# ---------------------------------------------------------------------------
+# TRANSPORT/MODEL COMPATIBILITY — read this before changing the model
+# ---------------------------------------------------------------------------
+# The classifier speaks the ANTHROPIC-COMPATIBLE wire (`POST /v1/messages`,
+# driven by the `anthropic` SDK in disposition.py).  Ollama Cloud exposes TWO
+# wires and they do NOT serve the same set of models:
+#
+#   * native   `POST /api/chat`   — serves `glm-5.3-flash:cloud` (verified 200)
+#   * anthropic `POST /v1/messages` — does NOT serve flash; serves `glm-5.3:cloud`
+#
+# Measured against the live service with a valid host credential:
+#
+#   | endpoint       | model                | result |
+#   |----------------|----------------------|--------|
+#   | /v1/messages   | glm-5.3-flash:cloud  | 401    |
+#   | /v1/messages   | glm-5.3-flash        | 401    |
+#   | /v1/messages   | glm-5.3:cloud        | 200    |
+#   | /api/chat      | glm-5.3-flash:cloud  | 200    |
+#
+# THE TRAP: Ollama Cloud answers **401, not 404**, for a model it will not
+# serve on that endpoint.  A model-availability problem is therefore
+# INDISTINGUISHABLE from an auth problem unless you test both — and the first
+# shipped default (`glm-5.3-flash` on /v1/messages) read as a credential fault
+# and never once returned 200 in production.  That cost the feature silently:
+# every run fell through to the derived tier for a week.
+#
+# So: a model named here must have been observed returning 200 ON THIS
+# ENDPOINT.  Do not infer availability from the native `ollama run` wire, from
+# the talos engine pins (talos uses /api/chat, which is why flash works there),
+# or from the model list on ollama.com.  Issue a real /v1/messages request.
+# The one-shot reachability probe in disposition.py exists so that a wrong
+# pairing announces itself at WARNING on startup instead of being discovered
+# from false-negative run dispositions days later.
 DISPOSITION_CLASSIFIER_ENABLED: bool = True
-DISPOSITION_CLASSIFIER_MODEL: str = "glm-5.3-flash"
+DISPOSITION_CLASSIFIER_MODEL: str = "glm-5.3:cloud"
 DISPOSITION_CLASSIFIER_BASE_URL: str = "https://ollama.com"
 DISPOSITION_CLASSIFIER_API_KEY_ENV: str = "OLLAMA_CLOUD_API_KEY"
 # Hard per-attempt timeout. The classifier runs inside the worker's TERMINAL
@@ -250,9 +284,12 @@ def load() -> None:
     DISPOSITION_CLASSIFIER_ENABLED = os.environ.get(
         "DISPATCH_DISPOSITION_CLASSIFIER_ENABLED", "1"
     ).strip().lower() not in {"0", "false", "no", "off", ""}
+    # Default model: see the TRANSPORT/MODEL COMPATIBILITY note above. Only a
+    # model verified to return 200 on the Anthropic-compatible /v1/messages
+    # endpoint belongs here; flash is served ONLY by the native /api/chat wire.
     DISPOSITION_CLASSIFIER_MODEL = (
         os.environ.get("DISPATCH_DISPOSITION_CLASSIFIER_MODEL", "").strip()
-        or "glm-5.3-flash"
+        or "glm-5.3:cloud"
     )
     DISPOSITION_CLASSIFIER_BASE_URL = (
         os.environ.get("DISPATCH_DISPOSITION_CLASSIFIER_BASE_URL", "").strip()

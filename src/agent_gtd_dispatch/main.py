@@ -145,6 +145,9 @@ _pending_queue: list[_PendingDispatch] = []
 _rollout_to_run: dict[str, Run] = {}  # rollout_id → active manage-mode Run
 _watchdog_task: asyncio.Task[None] | None = None  # handle for clean shutdown
 _retention_task: asyncio.Task[None] | None = None  # handle for clean shutdown
+# One-shot disposition-classifier reachability probe (see lifespan). Held only
+# so shutdown can cancel it — nothing awaits its result.
+_classifier_probe_task: asyncio.Task[None] | None = None
 _watchdog_acted: dict[str, float] = {}  # rollout_id → monotonic() of last action
 
 # rollout_id -> lifetime count of UNCOUNTED (free) manage relaunches granted while
@@ -257,10 +260,26 @@ def _verify_api_key(
     return credentials.credentials
 
 
+async def _probe_disposition_classifier() -> None:
+    """Startup wrapper around the classifier's one-shot reachability probe.
+
+    Swallows everything.  A probe is diagnostics: it must never take the
+    service down, and it must never turn a dead provider into a failed startup.
+    """
+    try:
+        await disposition_mod.warn_if_unreachable_once()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "disposition classifier reachability probe raised", exc_info=True
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Initialize config and DB on startup, cancel tasks on shutdown."""
-    global _watchdog_task, _retention_task
+    global _watchdog_task, _retention_task, _classifier_probe_task
     config.load()
     # Before config.load() there is no LOG_LEVEL to honour, and after this line
     # every logger.info in the package reaches the journal.
@@ -277,12 +296,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         logger.info("No orphaned runs found on startup")
     _watchdog_task = asyncio.create_task(_manage_watchdog())
     _retention_task = asyncio.create_task(_retention_loop())
+    # One probe of the disposition classifier, in the BACKGROUND and never
+    # fatal: a misconfigured classifier degrades silently by design (every
+    # failure falls through to the derived tier), so without this it is
+    # discovered from wrong verdicts days later rather than from one WARNING at
+    # startup. Backgrounded because startup must not block on a provider, and
+    # non-fatal because the derived tier is the designed fallback — the service
+    # must still start with the classifier completely dead.
+    _classifier_probe_task = asyncio.create_task(_probe_disposition_classifier())
     yield
     # Cancel watchdog, retention and active dispatch tasks on shutdown
     if _watchdog_task is not None:
         _watchdog_task.cancel()
     if _retention_task is not None:
         _retention_task.cancel()
+    if _classifier_probe_task is not None:
+        _classifier_probe_task.cancel()
     for task in _active_processes.values():
         task.cancel()
 
@@ -1846,13 +1875,23 @@ def build_completion_blob(
             "disposition_reason": (
                 resolution.reason if artifact is None and resolution else None
             ),
-            "classifier_model": (
-                resolution.model
-                if resolution and resolution.provenance == "inferred"
-                else None
-            ),
+            # Recorded WHATEVER the outcome — on an inferred verdict this is
+            # the model that answered, on a derived fallback the model that was
+            # tried and did not. It was `null` on the run that exposed a tier 2
+            # which had never worked, discarding the one field that pointed at
+            # the cause.
+            "classifier_model": (resolution.model if resolution else None),
+            # The full diagnostic line: class, status code, model, base URL,
+            # attempt. `api_error` on its own could not tell a transient 429
+            # from a permanently misconfigured endpoint.
             "classifier_failure": (
                 resolution.classifier_failure if resolution else None
+            ),
+            "classifier_failure_class": (
+                resolution.classifier_failure_class if resolution else None
+            ),
+            "classifier_status_code": (
+                resolution.classifier_status_code if resolution else None
             ),
             "classifier_latency_s": (
                 round(resolution.latency_seconds, 2)
@@ -3052,8 +3091,20 @@ async def _dispatch_worker(
                     # with nobody asserting anything, a green gate is the only
                     # corroboration that exists, so a non-passing gate fails the
                     # run whatever the tier concluded.
+                    # The pre-existing rule was `decision == "passed"`, which
+                    # made an ungated project a place where an ASSERTED `done`
+                    # succeeds (there is no gate result to fail) and an
+                    # otherwise identical unasserted run fails. Same project,
+                    # same absent gate, opposite verdicts based only on whether
+                    # the agent happened to write a file. `skipped_no_gate_command`
+                    # is INCONCLUSIVE, not negative, so it is admitted here and
+                    # the tiers decide on the remaining evidence — which for
+                    # zero commits is still nothing, and still fails.
+                    # Every OTHER non-passing decision (`failed`, `timed_out`,
+                    # `launch_error`, `skipped_no_pushed_repo`) keeps failing
+                    # the run outright: those are gate verdicts ABOUT the tree.
                     _unasserted_ok = (
-                        decision == "passed"
+                        decision in {"passed", "skipped_no_gate_command"}
                         and _disposition in {"done", "already_satisfied"}
                         and not (_disposition == "done" and _zero_commits)
                     )
@@ -3136,18 +3187,27 @@ async def _dispatch_worker(
                         )
                         if _resolution.reason.strip():
                             _unasserted_detail += f" {_resolution.reason.strip()}"
-                        _unasserted_detail += (
-                            f"\n\nBranch `{run.branch_name}` carries"
-                            f" {_n_pushed} pushed repo(s) and the post-run gate"
-                            f" decision was `{decision}`, so the run is recorded"
-                            " failed."
-                        )
                         if decision == "skipped_no_gate_command":
+                            # The gate did NOT run — do not imply it returned a
+                            # verdict. No gate configured is inconclusive, not
+                            # negative; what fails the run here is the absence
+                            # of the other evidence, not the absent gate.
                             _unasserted_detail += (
-                                " This project has no `gate_command`, so there"
-                                " was nothing to verify the pushed work with."
-                                " Setting a project `gate_command` is what would"
-                                " let a run like this be recorded successful."
+                                f"\n\nBranch `{run.branch_name}` carries"
+                                f" {_n_pushed} pushed repo(s). No quality gate"
+                                " is configured for this project, so the gate"
+                                " did not run and the verdict rests on the"
+                                " pushed commits alone — which do not support a"
+                                " successful outcome here. Setting a project"
+                                " `gate_command` would make an outcome like this"
+                                " verifiable."
+                            )
+                        else:
+                            _unasserted_detail += (
+                                f"\n\nBranch `{run.branch_name}` carries"
+                                f" {_n_pushed} pushed repo(s) and the post-run"
+                                f" gate decision was `{decision}`, so the run is"
+                                " recorded failed."
                             )
                         if _reject_detail:
                             _unasserted_detail += f"\n\n{_reject_detail}"
@@ -3429,23 +3489,40 @@ async def _dispatch_worker(
                 # is the one confirming the change matches scope, and an
                 # inferred verdict must never read as the agent's own word.
                 assert _resolution is not None  # noqa: S101
+                # NEVER say the gate passed when it did not run. On an ungated
+                # project the gate is skipped, and describing that as a pass
+                # sends a reviewer looking for a test result that never existed.
+                if decision == "skipped_no_gate_command":
+                    _gate_clause = (
+                        "no quality gate is configured for this project"
+                        f" (decision=`{decision}`), so the gate did not run and"
+                        " the verdict rests on the pushed commits alone"
+                    )
+                else:
+                    _gate_clause = (
+                        f"the project quality gate passed (decision=`{decision}`)"
+                    )
                 if _resolution.provenance == "inferred":
                     _unasserted_body = (
                         f"Build run `{run.id}` is recorded **successful on an"
                         " inferred disposition**. The agent pushed commits to"
-                        f" `{run.branch_name}` and the project quality gate"
-                        f" passed (decision=`{decision}`), but it never wrote a"
-                        " completion artifact, so it never asserted how its run"
-                        " ended."
+                        f" `{run.branch_name}` and {_gate_clause}, but it never"
+                        " wrote a completion artifact, so it never asserted how"
+                        " its run ended."
                     )
                 else:
                     _unasserted_body = (
                         f"Build run `{run.id}` is recorded **successful on"
                         " mechanical evidence alone**. The agent pushed commits"
-                        f" to `{run.branch_name}` and the project quality gate"
-                        f" passed (decision=`{decision}`), but it never wrote a"
-                        " completion artifact, so it never asserted how its run"
-                        " ended."
+                        f" to `{run.branch_name}` and {_gate_clause}, but it"
+                        " never wrote a completion artifact, so it never"
+                        " asserted how its run ended."
+                    )
+                if decision == "skipped_no_gate_command":
+                    _unasserted_body += (
+                        " Setting a project `gate_command` is what would make"
+                        " an outcome like this verifiable rather than merely"
+                        " plausible."
                     )
                 _unasserted_body += (
                     f"\n\n{disposition_mod.provenance_sentence(_resolution)}"

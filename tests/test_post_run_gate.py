@@ -1566,9 +1566,19 @@ class TestUnassertedCompletionPath:
         assert any("boom" in b for b in bodies)
 
     @pytest.mark.asyncio
-    async def test_absent_artifact_pushed_no_gate_command_is_failure(
+    async def test_absent_artifact_pushed_no_gate_command_succeeds(
         self, tmp_path, caplog: pytest.LogCaptureFixture
     ) -> None:
+        """An ungated project must not fail an unasserted run that pushed work.
+
+        This inverts the original behaviour, and deliberately: on the ASSERTED
+        path a `done` artifact on a project with no `gate_command` succeeds
+        (there is no gate result to fail), so the same project, the same absent
+        gate and the same pushed commits used to produce opposite verdicts
+        based only on whether the agent happened to write a file. Four
+        consecutive false negatives on complete, correct branches came from
+        exactly this. `skipped_no_gate_command` is INCONCLUSIVE, not negative.
+        """
         updated, mock_gtd, mock_dispatch = await self._run(
             tmp_path,
             caplog,
@@ -1576,13 +1586,60 @@ class TestUnassertedCompletionPath:
             project=_default_project(gate_command=""),
         )
         mock_dispatch.run_gate_command.assert_not_called()
-        assert updated.status.value == "failed"
-        assert updated.error is not None
-        assert updated.error.startswith("stopped_without_assertion: ")
-        assert "decision=skipped_no_gate_command" in updated.error
+        assert updated.status.value == "succeeded"
+        assert updated.error is None
+        blob = json.loads(updated.completion or "{}")
+        assert blob["unasserted"] is True
+        assert blob["disposition"] == "done"
+        assert blob["disposition_provenance"] == "derived"
+        assert blob["gate_decision"] == "skipped_no_gate_command"
         bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        # The operator is told what would make such a run pass.
+        # The operator is told what would make such a run VERIFIABLE...
         assert any("gate_command" in b for b in bodies)
+        # ...and is never told a gate passed, or failed, when none ran.
+        assert not any("quality gate passed" in b for b in bodies)
+        assert not any("gate did not pass" in b for b in bodies)
+        assert any("no quality gate is configured" in b for b in bodies)
+
+    @pytest.mark.asyncio
+    async def test_asserted_and_unasserted_agree_on_an_ungated_project(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """End-to-end: same project, same absent gate, same commits, same verdict."""
+        ungated = _default_project(gate_command="")
+        (tmp_path / "asserted").mkdir()
+        (tmp_path / "unasserted").mkdir()
+        asserted, _gtd_a, _d_a = await self._run(
+            tmp_path / "asserted",
+            caplog,
+            item_id="item-agree-asserted",
+            artifact="done",
+            project=ungated,
+        )
+        unasserted, _gtd_u, _d_u = await self._run(
+            tmp_path / "unasserted",
+            caplog,
+            item_id="item-agree-unasserted",
+            project=ungated,
+        )
+        assert asserted.status.value == unasserted.status.value == "succeeded"
+        assert json.loads(asserted.completion or "{}")["disposition"] == "done"
+        assert json.loads(unasserted.completion or "{}")["disposition"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_a_gate_that_ran_and_failed_still_fails_the_run(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No-regression: relaxing the SKIPPED case must not relax the RAN case."""
+        updated, _mock_gtd, _ = await self._run(
+            tmp_path,
+            caplog,
+            item_id="item-ua3b",
+            gate_result=GateResult(
+                returncode=1, timed_out=False, output="boom", duration_seconds=2.0
+            ),
+        )
+        assert updated.status.value == "failed"
 
     @pytest.mark.asyncio
     async def test_absent_artifact_zero_commits_no_gate_command_is_failure(
@@ -2482,7 +2539,11 @@ class TestThreeTierDispositionRouting:
         blob = json.loads(updated.completion or "{}")
         assert blob["disposition"] == "done"
         assert blob["disposition_provenance"] == "derived"
-        assert blob["classifier_failure"] == "unrecognized_response"
+        assert blob["classifier_failure_class"] == "parse"
+        assert "unrecognized_response" in blob["classifier_failure"]
+        # Recorded even on FAILURE: this field was `null` on the run that
+        # exposed a tier 2 which had never once worked.
+        assert blob["classifier_model"] == "glm-5.3:cloud"
 
     @pytest.mark.asyncio
     async def test_disabled_by_config_makes_no_network_call(
