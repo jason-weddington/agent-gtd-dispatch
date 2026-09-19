@@ -3212,6 +3212,11 @@ async def _dispatch_worker(
                     # Every OTHER non-passing decision (`failed`, `timed_out`,
                     # `launch_error`, `skipped_no_pushed_repo`) keeps failing
                     # the run outright: those are gate verdicts ABOUT the tree.
+                    # `already_satisfied` can only arrive here from TIER 2: the
+                    # classifier reads the transcript and can see a stated
+                    # reason, so it is entitled to that verdict. The derived
+                    # tier is not and never returns it (see `derive`), so a
+                    # zero-commit run with no classification lands `failed`.
                     _unasserted_ok = (
                         decision in {"passed", "skipped_no_gate_command"}
                         and _disposition in {"done", "already_satisfied"}
@@ -3296,7 +3301,27 @@ async def _dispatch_worker(
                         )
                         if _resolution.reason.strip():
                             _unasserted_detail += f" {_resolution.reason.strip()}"
-                        if decision == "skipped_no_gate_command":
+                        if _zero_commits and _resolution.provenance == "derived":
+                            # Nothing asserted, nothing classified, nothing
+                            # pushed. Say ONLY what is known — a green gate on
+                            # an unchanged tree is the base commit passing, so
+                            # it is not evidence the work already existed. This
+                            # is the wording that replaced a derived
+                            # `already_satisfied`, which told a lead that a run
+                            # producing nothing was work already done.
+                            _unasserted_detail += (
+                                f"\n\nBranch `{run.branch_name}` carries no"
+                                " commits and the run wrote no completion"
+                                " artifact, so what the agent did — or whether"
+                                " it did anything at all — could not be"
+                                " established. An unchanged tree passes a"
+                                " quality gate trivially (gate decision:"
+                                f" `{decision}`), so the gate cannot tell a"
+                                " genuine no-op apart from a run that produced"
+                                " nothing. The outcome is UNKNOWN: this item"
+                                " needs a human or a re-dispatch."
+                            )
+                        elif decision == "skipped_no_gate_command":
                             # The gate did NOT run — do not imply it returned a
                             # verdict. No gate configured is inconclusive, not
                             # negative; what fails the run here is the absence

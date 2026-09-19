@@ -311,17 +311,41 @@ class TestDerive:
         assert result.provenance == "derived"
         assert result.reason
 
-    def test_no_commits_and_green_gate_is_already_satisfied(self) -> None:
+    def test_no_commits_and_a_passing_gate_is_failed_not_already_satisfied(
+        self,
+    ) -> None:
+        """THE regression (run c2a8072e2e25): a do-nothing run read as a no-op.
+
+        A 22-minute run produced no branch, no commits and no artifact; the
+        classifier was unavailable, so this tier derived `already_satisfied`
+        and the item was reported to its lead as work that was already done.
+
+        An unchanged tree passes a test-suite gate TRIVIALLY — it is the base
+        commit, and the base is green — so "the criteria were already met" and
+        "the agent did nothing" leave byte-identical mechanical evidence. The
+        honest verdict is `failed`, which is loud and re-dispatchable.
+        """
         result = disposition.derive(has_commits=False, gate_decision="passed")
-        assert result.disposition == "already_satisfied"
+        assert result.disposition == "failed"
         assert result.reason
+        # Says what happened, and never speculates that the work may exist.
+        assert "no commits" in result.reason
+        assert "could not be established" in result.reason
+        assert "already" not in result.reason.replace("already_satisfied", "")
+
+    def test_no_commits_and_a_skipped_gate_is_failed(self) -> None:
+        """No commits is `failed` whatever the gate did — including not running."""
+        for gate in ("skipped_no_gate_command", "skipped_no_pushed_repo", None):
+            result = disposition.derive(has_commits=False, gate_decision=gate)
+            assert result.disposition == "failed", gate
+            assert result.reason
 
     # The FULL table. Every decision the post-run gate can emit appears here
     # exactly once per commit state; a decision that is not in this table is a
     # decision nobody decided what to do with.
     _TABLE: ClassVar[list[tuple[str | None, bool, str]]] = [
         ("passed", True, "done"),
-        ("passed", False, "already_satisfied"),
+        ("passed", False, "failed"),
         ("skipped_no_gate_command", True, "done"),
         ("skipped_no_gate_command", False, "failed"),
         ("failed", True, "failed"),
@@ -372,7 +396,9 @@ class TestDerive:
         """No-regression: relaxing the SKIPPED case must not relax the RAN case."""
         result = disposition.derive(has_commits=has_commits, gate_decision=gate)
         assert result.disposition == "failed"
-        assert "did not pass" in result.reason
+        # With commits the gate verdict is the reason; with none, the absence
+        # of commits is the reason and outranks whatever the gate said.
+        assert ("did not pass" if has_commits else "no commits") in result.reason
 
     @pytest.mark.parametrize("has_commits", [True, False])
     def test_no_pushed_repo_still_derives_failed(self, has_commits) -> None:
@@ -430,6 +456,48 @@ class TestDerive:
         assert result.disposition != "blocked"
         assert result.disposition in disposition.VALID_DISPOSITIONS
 
+    # Every gate decision the module knows about, plus the two it does not:
+    # a missing decision and a string from some future gate change.
+    _EVERY_INPUT: ClassVar[list[str | None]] = [
+        *disposition.GATE_DECISIONS,
+        None,
+        "some_future_decision_string",
+    ]
+
+    @pytest.mark.parametrize("gate", _EVERY_INPUT)
+    @pytest.mark.parametrize("has_commits", [True, False])
+    def test_already_satisfied_is_never_derived(self, gate, has_commits) -> None:
+        """The second never-derived invariant, exhaustive over every input.
+
+        `already_satisfied` is a CLAIM ABOUT WHY carrying a REQUIRED reason
+        that only the agent — or a classifier reading the transcript — can
+        supply. Mechanical evidence cannot support it: a green gate on an
+        unchanged tree is the base commit passing, not proof the work existed.
+        """
+        result = disposition.derive(has_commits=has_commits, gate_decision=gate)
+        assert result.disposition != "already_satisfied"
+
+    @pytest.mark.parametrize("gate", _EVERY_INPUT)
+    @pytest.mark.parametrize("has_commits", [True, False])
+    def test_the_derived_tier_only_ever_returns_done_or_failed(
+        self, gate, has_commits
+    ) -> None:
+        """Both invariants at once: the derived tier has a TWO-value range.
+
+        Mechanical evidence can support `done` and `failed`. It cannot support
+        either disposition that asserts a reason.
+        """
+        result = disposition.derive(has_commits=has_commits, gate_decision=gate)
+        assert result.disposition in {"done", "failed"}
+        assert result.reason
+        assert result.provenance == "derived"
+
+    def test_both_never_derived_invariants_are_stated_in_the_docstring(self) -> None:
+        """A reader of `derive` must not have to reconstruct its range."""
+        doc = disposition.derive.__doc__ or ""
+        assert "NEVER returns ``blocked``" in doc
+        assert "NEVER returns ``already_satisfied``" in doc
+
 
 # ---------------------------------------------------------------------------
 # resolve() — tier 2, then tier 3, always labelled
@@ -471,7 +539,8 @@ class TestResolve:
             _evidence(), has_commits=False, gate_decision="passed"
         )
         assert result.provenance == "derived"
-        assert result.disposition == "already_satisfied"
+        # No commits and no classification: `failed`, never `already_satisfied`.
+        assert result.disposition == "failed"
         assert result.classifier_failure == "disabled"
         assert result.classifier_failure_class == "disabled"
 

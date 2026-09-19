@@ -1670,16 +1670,20 @@ class TestUnassertedCompletionPath:
         mock_gtd.set_item_status.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_absent_artifact_zero_commits_gate_passed_is_already_satisfied(
+    async def test_absent_artifact_zero_commits_gate_passed_is_a_failure(
         self, tmp_path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Tier 3's second rule: no commits + a green gate is a no-op, not a failure.
+        """THE regression (run c2a8072e2e25): a do-nothing run read as a no-op.
 
-        This is the case the three-tier design exists for — an agent that found
-        the work already done and exited without writing the artifact used to be
-        indistinguishable from one that died.  The gate now RUNS despite zero
-        pushed repos (as it already did on the asserted already_satisfied path),
-        because its verdict is the evidence that tells the two apart.
+        This case used to derive `already_satisfied` — which routed the item to
+        `review`, recorded a rollout child as skipped so the wave ADVANCED past
+        it, and told a human the work already existed.  It did not: the agent
+        produced nothing.  An unchanged tree passes a test-suite gate trivially,
+        so a green gate cannot tell a genuine no-op apart from a run that did
+        nothing, and the derived tier must not pretend otherwise.
+
+        The gate still RUNS despite zero pushed repos — its verdict is still
+        evidence, it just is not evidence of THIS.
         """
         updated, mock_gtd, mock_dispatch = await self._run(
             tmp_path,
@@ -1691,20 +1695,24 @@ class TestUnassertedCompletionPath:
             ),
         )
         mock_dispatch.run_gate_command.assert_called_once()
-        assert updated.status.value == "already_satisfied"
+        assert updated.status.value == "failed"
+        assert updated.error is not None
+        assert updated.error.startswith("stopped_without_assertion: ")
+        assert "derived disposition=failed" in updated.error
         blob = json.loads(updated.completion or "{}")
-        assert blob["disposition"] == "already_satisfied"
+        assert blob["disposition"] == "failed"
         assert blob["disposition_provenance"] == "derived"
-        # Routed through the EXISTING already_satisfied path: item -> review.
-        mock_gtd.set_item_status.assert_awaited_once()
-        assert mock_gtd.set_item_status.await_args.args[:2] == (
-            "item-ua4b",
-            "review",
-        )
+        # NEVER routed to review, and never recorded as a no-op.
+        mock_gtd.set_item_status.assert_not_awaited()
         bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        # ...but never as though the agent said so.
-        assert any("**derived** mechanically" in b for b in bodies)
-        assert not any("the agent reported the" in b for b in bodies)
+        assert not any("made no changes" in b for b in bodies)
+        assert not any("already satisfied" in b for b in bodies)
+        # The honest report: what happened is UNKNOWN, and a human must look.
+        unknown = [b for b in bodies if "could not be established" in b]
+        assert len(unknown) == 1
+        assert "no commits" in unknown[0]
+        assert "passes a quality gate trivially" in unknown[0]
+        assert "needs a human or a re-dispatch" in unknown[0]
 
     @pytest.mark.asyncio
     async def test_malformed_artifact_pushed_gate_passed_surfaces_reason(
@@ -2614,3 +2622,114 @@ class TestThreeTierDispositionRouting:
             "outcome=succeeded",
         ):
             assert fragment in line
+
+
+# ---------------------------------------------------------------------------
+# already_satisfied survives — only its mechanical DERIVATION is gone
+# ---------------------------------------------------------------------------
+
+
+class TestAlreadySatisfiedIsStillAssertableAndInferable:
+    """No-regression for the two tiers that ARE entitled to the disposition.
+
+    Removing the derived tier's ability to INFER `already_satisfied` must not
+    remove the disposition itself. An agent that ASSERTS it with a reason, and
+    a classifier that READS one out of the transcript and the diff, both still
+    land the `already_satisfied` terminal, still move the item to `review`, and
+    still let a rollout wave skip and advance past the item.
+    """
+
+    _GREEN = GateResult(
+        returncode=0, timed_out=False, output="ok", duration_seconds=1.0
+    )
+
+    @pytest.mark.asyncio
+    async def test_asserted_already_satisfied_is_untouched(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        updated, mock_gtd, mock_dispatch = await _run_build_worker(
+            tmp_path,
+            caplog,
+            item_id="item-as-asserted",
+            artifact="already_satisfied",
+            pushed=False,
+            gate_result=self._GREEN,
+        )
+        # Zero commits, green gate, an artifact carrying a reason.
+        mock_dispatch.run_gate_command.assert_called_once()
+        assert updated.status.value == "already_satisfied"
+        assert updated.error is not None
+        assert updated.error.startswith("already_satisfied: ")
+        blob = json.loads(updated.completion or "{}")
+        assert blob["disposition"] == "already_satisfied"
+        assert blob["disposition_provenance"] == "asserted"
+        assert blob["unasserted"] is False
+        # Item -> review, via the unchanged `_route_already_satisfied_item`.
+        mock_gtd.set_item_status.assert_awaited_once()
+        assert mock_gtd.set_item_status.await_args.args[:2] == (
+            "item-as-asserted",
+            "review",
+        )
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        noop = [b for b in bodies if "made no changes" in b]
+        assert len(noop) == 1
+        # The agent's own word, said as such.
+        assert "the agent reported the" in noop[0]
+        assert "**derived** mechanically" not in noop[0]
+
+    @pytest.mark.asyncio
+    async def test_inferred_already_satisfied_is_untouched(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The classifier sees a STATED reason, so it is entitled to the verdict.
+
+        Same mechanical evidence as the derived case that now fails — zero
+        commits and a passing gate — but here the transcript was read and a
+        reason came back with the verdict. That is the difference, and it is
+        why this tier keeps the disposition the derived tier loses.
+        """
+        inferred = disposition.DispositionResult(
+            disposition="already_satisfied",
+            reason="the guard already exists at foo.py:12",
+            provenance="inferred",
+            model="glm-5.3-flash",
+            latency_seconds=0.9,
+        )
+        with patch.object(
+            disposition, "classify", new=AsyncMock(return_value=inferred)
+        ):
+            updated, mock_gtd, _ = await _run_build_worker(
+                tmp_path,
+                caplog,
+                item_id="item-as-inferred",
+                artifact="absent",
+                pushed=False,
+                gate_result=self._GREEN,
+            )
+        assert updated.status.value == "already_satisfied"
+        blob = json.loads(updated.completion or "{}")
+        assert blob["disposition"] == "already_satisfied"
+        assert blob["disposition_provenance"] == "inferred"
+        mock_gtd.set_item_status.assert_awaited_once()
+        assert mock_gtd.set_item_status.await_args.args[:2] == (
+            "item-as-inferred",
+            "review",
+        )
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        noop = [b for b in bodies if "made no changes" in b]
+        assert len(noop) == 1
+        # Labelled as the model's verdict — never the agent's own word.
+        assert "**inferred**" in noop[0]
+        assert "the guard already exists at foo.py:12" in noop[0]
+        assert "the agent reported the" not in noop[0]
+
+    @pytest.mark.asyncio
+    async def test_the_classifier_keeps_the_full_closed_set(self) -> None:
+        """The closed set tier 2 picks from is unchanged by this item."""
+        assert disposition.VALID_DISPOSITIONS == (
+            "done",
+            "already_satisfied",
+            "blocked",
+            "failed",
+        )
+        assert "already_satisfied" in disposition._SYSTEM_PROMPT

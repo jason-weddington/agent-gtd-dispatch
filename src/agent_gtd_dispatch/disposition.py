@@ -602,7 +602,12 @@ _GATE_RAN_AND_FAILED: frozenset[str] = frozenset(
 
 
 def derive(*, has_commits: bool, gate_decision: str | None) -> DispositionResult:
-    """TIER 3. Compute a disposition mechanically. NEVER returns ``blocked``.
+    """TIER 3. Compute a disposition mechanically.
+
+    NEVER returns ``blocked``.  NEVER returns ``already_satisfied``.  The only
+    two values this tier can produce are ``done`` and ``failed``, under every
+    combination of inputs — see the two invariants at the bottom of this
+    docstring, both of which are enforced by exhaustive tests.
 
     The full table, and only this table:
 
@@ -610,7 +615,7 @@ def derive(*, has_commits: bool, gate_decision: str | None) -> DispositionResult
     gate decision                commits      disposition
     ===========================  ===========  ==================
     ``passed``                   yes          ``done``
-    ``passed``                   no           ``already_satisfied``
+    ``passed``                   no           ``failed``
     ``skipped_no_gate_command``  yes          ``done``
     ``skipped_no_gate_command``  no           ``failed``
     ``failed``                   either       ``failed``
@@ -620,71 +625,109 @@ def derive(*, has_commits: bool, gate_decision: str | None) -> DispositionResult
     ``None`` / unrecognized      either       ``failed``
     ===========================  ===========  ==================
 
-    The load-bearing distinction is between a gate that RAN and said no and a
-    gate that never ran at all.  ``skipped_no_gate_command`` means the project
-    has no ``gate_command`` configured: that is INCONCLUSIVE, not negative, and
-    treating it as negative made every artifact-missing run on every ungated
-    project derive ``failed`` regardless of the work — four consecutive false
-    negatives on branches that were complete and correct.
+    Read the ``commits`` column first: NO commits is ``failed`` whatever the
+    gate said, and the gate decision only ever chooses between ``done`` and
+    ``failed`` for a run that actually pushed something.
+
+    The load-bearing distinction among the gate decisions is between a gate
+    that RAN and said no and a gate that never ran at all.
+    ``skipped_no_gate_command`` means the project has no ``gate_command``
+    configured: that is INCONCLUSIVE, not negative, and treating it as negative
+    made every artifact-missing run on every ungated project derive ``failed``
+    regardless of the work — four consecutive false negatives on branches that
+    were complete and correct.
 
     It also contradicted the asserted tier.  A ``done`` artifact on an ungated
     project SUCCEEDS (there is no gate result to fail), so the same project,
     same absent gate and same pushed commits produced opposite verdicts based
     only on whether the agent happened to write a file.  The two paths must
-    agree, so with commits pushed this now derives ``done`` as well; the reason
+    agree, so with commits pushed this derives ``done`` as well; the reason
     text says plainly that the verdict rests on the commits alone.
 
-    Zero commits and no gate stays ``failed``: nothing was pushed and nothing
-    was verified, so there is no evidence that anything happened at all.  (The
-    ASSERTED path can still land ``already_satisfied`` there, because the agent
-    supplied the one thing missing here — a stated reason.)
+    --- The two never-derived invariants ---
 
     ``blocked`` is deliberately underivable.  Nothing mechanical distinguishes
     "the agent stopped because a human must decide" from "the agent stopped
     because it broke", and guessing ``blocked`` would be worse than admitting
     this tier cannot tell — a wrong ``blocked`` parks an item on a human who
     has no question to answer.
+
+    ``already_satisfied`` is underivable for the SAME reason, and more
+    strongly.  This tier shipped mapping zero commits plus a passing gate to
+    ``already_satisfied``, and within hours a run that produced nothing at all
+    was reported to its lead as work that was already done.  An unchanged tree
+    passes a test-suite gate TRIVIALLY — it is the base commit, and the base is
+    green — so "the criteria were already met" and "the agent did nothing"
+    leave byte-identical mechanical evidence.  The gate distinguishes broken
+    from not-broken; it cannot distinguish already-done from not-attempted.
+    ``already_satisfied`` is also a CLAIM ABOUT WHY that carries a REQUIRED
+    reason only the agent (or a classifier reading the transcript) can supply,
+    and it is not a neutral label: it routes the item to ``review``, records a
+    rollout child as skipped so the wave ADVANCES past it, and tells a human
+    the work exists.  A ``failed`` run is loud and re-dispatchable; a false
+    ``already_satisfied`` is a silent hole in a wave that looks like progress.
+
+    Both remaining tiers keep the disposition: an agent that ASSERTS
+    ``already_satisfied`` with a reason still lands it, and so does a
+    CLASSIFIER that reads one out of the transcript and the diff.  Only
+    mechanical derivation of it is gone.
     """
     decision = gate_decision or "not_run"
 
-    if decision == "passed":
-        if has_commits:
-            return DispositionResult(
-                disposition="done",
-                reason=(
-                    "derived mechanically: commits were pushed and the project"
-                    " quality gate passed"
-                ),
-                provenance="derived",
-            )
+    # Not a decision this module knows about — a string a future gate change
+    # introduced.  Say so loudly instead of quietly adopting some neighbour's
+    # meaning; every branch below maps an unrecognized value to `failed`.
+    if decision != "not_run" and decision not in GATE_DECISIONS:
+        logger.warning(
+            "disposition: unrecognized gate decision %r — deriving `failed`."
+            " Add it to GATE_DECISIONS and to derive()'s table.",
+            decision,
+        )
+
+    if not has_commits:
+        # THE regression this branch exists to prevent (run c2a8072e2e25): a
+        # 22-minute run that produced no branch, no commits and no artifact was
+        # derived `already_satisfied` and reported as work already done.  The
+        # honest report is that the outcome is UNKNOWN.  Do not speculate in
+        # either direction — a genuine no-op and a do-nothing run are
+        # indistinguishable from here.
         return DispositionResult(
-            disposition="already_satisfied",
+            disposition="failed",
             reason=(
-                "derived mechanically: no commits were produced and the"
-                " project quality gate passed on the untouched tree"
+                "derived mechanically: the run produced no commits and no"
+                " completion artifact, so what the agent did — or whether it"
+                " did anything at all — could not be established"
+                f" (gate decision={decision}). An unchanged tree passes a"
+                " quality gate trivially, so the gate cannot tell a genuine"
+                " no-op apart from a run that produced nothing. The outcome is"
+                " unknown; this item needs a human or a re-dispatch"
+            ),
+            provenance="derived",
+        )
+
+    # --- From here on the run DID push commits. ---------------------------
+    # Each gate decision is enumerated; there is no catch-all `else` above the
+    # final branch precisely so that an unrecognized value reaches it alone.
+
+    if decision == "passed":
+        return DispositionResult(
+            disposition="done",
+            reason=(
+                "derived mechanically: commits were pushed and the project"
+                " quality gate passed"
             ),
             provenance="derived",
         )
 
     if decision == "skipped_no_gate_command":
-        if has_commits:
-            return DispositionResult(
-                disposition="done",
-                reason=(
-                    "derived mechanically: commits were pushed; no quality gate"
-                    " is configured for this project, so the gate did not run"
-                    " and the verdict rests on the pushed commits alone."
-                    " Setting a project `gate_command` would make this outcome"
-                    " verifiable"
-                ),
-                provenance="derived",
-            )
         return DispositionResult(
-            disposition="failed",
+            disposition="done",
             reason=(
-                "derived mechanically: no commits were pushed and no quality"
-                " gate is configured for this project, so there is no evidence"
-                " the work was done"
+                "derived mechanically: commits were pushed; no quality gate"
+                " is configured for this project, so the gate did not run"
+                " and the verdict rests on the pushed commits alone."
+                " Setting a project `gate_command` would make this outcome"
+                " verifiable"
             ),
             provenance="derived",
         )
@@ -709,16 +752,7 @@ def derive(*, has_commits: bool, gate_decision: str | None) -> DispositionResult
             provenance="derived",
         )
 
-    # Not a decision this module knows about — `not_run`, or a string a future
-    # gate change introduced.  There is no catch-all `else` above precisely so
-    # that this branch is reached ONLY by an unrecognized value, and says so
-    # loudly instead of quietly adopting some neighbour's meaning.
-    if decision != "not_run":
-        logger.warning(
-            "disposition: unrecognized gate decision %r — deriving `failed`."
-            " Add it to GATE_DECISIONS and to derive()'s table.",
-            decision,
-        )
+    # `not_run`, or the unrecognized value warned about above.
     return DispositionResult(
         disposition="failed",
         reason=(
