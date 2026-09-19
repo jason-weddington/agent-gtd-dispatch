@@ -4093,6 +4093,57 @@ class TestBuildPromptCompletionArtifact:
         assert "Post a comment describing what already exists" not in prompt
         assert "already_satisfied" in prompt
 
+    def test_artifact_section_comes_after_reporting(self) -> None:
+        prompt = self._prompt()
+        artifact_at = prompt.index("## Completion Artifact")
+        reporting_at = prompt.index("## Reporting")
+        important_at = prompt.index("## Important")
+        assert reporting_at < artifact_at
+        assert important_at < artifact_at
+
+    def test_artifact_section_is_the_last_section(self) -> None:
+        prompt = self._prompt()
+        headings = [
+            line.strip()
+            for line in prompt.splitlines()
+            if line.strip().startswith("## ")
+        ]
+        assert headings, "prompt rendered without any '##' sections"
+        assert headings[-1] == "## Completion Artifact"
+
+    def test_no_op_case_not_orphaned_before_artifact_section(self) -> None:
+        prompt = self._prompt()
+        assert prompt.index("## Completion Artifact") < prompt.index(
+            "No-Op Case — Work Already Done"
+        )
+
+    def test_reporting_on_success_hands_off_to_artifact(self) -> None:
+        prompt = self._prompt()
+        on_success = prompt[prompt.index("**On success:**") :]
+        on_success = on_success[: on_success.index("**On failure/blocked**")]
+        steps = [
+            line.strip()
+            for line in on_success.splitlines()
+            if line.strip()[:2] in {"1.", "2.", "3."}
+        ]
+        assert steps[0].startswith("1. Post a final comment")
+        assert steps[1].startswith("2. Set the item status to `review`")
+        assert "completion artifact" in steps[2]
+        assert "**Completion Artifact**" in steps[2]
+
+    def test_opening_sentence_does_not_claim_a_contradicted_last_action(self) -> None:
+        prompt = self._prompt()
+        assert "Your LAST action on EVERY path" not in prompt
+        section = prompt[prompt.index("## Completion Artifact") :]
+        assert "nothing comes after it" in section
+        assert "final action of the run" in section
+
+    def test_stale_failure_consequence_sentence_is_gone(self) -> None:
+        prompt = self._prompt()
+        assert "recorded as a FAILURE regardless of what" not in prompt
+        assert "unasserted" in prompt
+        assert "only a run with no commits, or a failing" in prompt
+
     def test_build_system_prompt_threads_workspace(self) -> None:
         prompt = build_system_prompt(
             {"id": "item-1"},

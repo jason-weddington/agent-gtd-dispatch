@@ -2325,10 +2325,41 @@ def _build_build_prompt(
         6. **Stop if stuck.** If the task is too ambiguous, you lack information, or
            you cannot complete it cleanly — STOP. Do not guess or produce low-quality work.{att_rule}
 
+        ## Reporting
+
+        Post progress comments to the GTD item as you work. Use `add_comment`
+        with item_id="{item_id}". Keep comments terse — one line is fine.
+
+        Post a comment at each milestone:
+        - When starting implementation: "Implementing..."
+        - When running tests: "Running tests..."
+
+        **On success:**
+        1. Post a final comment with: what you did, the branch name (`{branch_name}`), notes for the reviewer
+        2. Set the item status to `review` using `update_item` with the item's current version
+        3. Write the completion artifact described in the **Completion Artifact**
+           section — the last section of this prompt. Reporting does not end here: it
+           hands off to that section, and the artifact is what actually ends the run.
+
+        **On failure/blocked**, your comment should include:
+        - Why you stopped
+        - What information or clarification you need
+        - Any partial progress (if you pushed commits)
+
+        ## Important
+
+        - You have max {max_turns} turns. Budget them wisely.
+        - Never force-push, never push to main, never delete branches you didn't create.
+        - Never modify CI/CD configs, deployment scripts, or secrets.
+        - Focus only on this task. Don't fix unrelated issues you notice.
+
         ## Completion Artifact
 
-        Your LAST action on EVERY path — success, no-op, blocked, or failure — is to
-        write the completion artifact to this ABSOLUTE path:
+        This is the last section of this prompt: nothing comes after it, and nothing you
+        do comes after the action it describes. On EVERY path — success, no-op, blocked,
+        or failure — writing this file is the final action of the run, performed after
+        the final comment and after any status change, with no further work behind it.
+        Write the completion artifact to this ABSOLUTE path:
 
         ```
         {artifact_path}
@@ -2358,10 +2389,19 @@ def _build_build_prompt(
           the decision or information a human must supply.
         - `failed` — you tried and could not finish.
 
-        A run that ends without this file is recorded as a FAILURE regardless of what
-        it pushed. `summary` is optional.
+        `summary` is optional.
 
-        ## No-Op Case — Work Already Done
+        What happens if you skip it, stated accurately so you can weigh it yourself: a
+        run that pushed commits and whose post-run gate passes is still recorded
+        successful, but flagged `unasserted` — only a run with no commits, or a failing
+        gate, is failed outright for a missing artifact. So this is not a trap; it is the
+        only channel you have. The artifact is the ONLY way to report `already_satisfied`,
+        `blocked` or `failed` instead of having your outcome guessed from what you
+        happened to push, and the ONLY carrier of the no-op `reason` and the
+        `decision_needed` text a human reads to unblock you. Without it your run is
+        judged on mechanical evidence alone and everything you concluded is lost.
+
+        ### No-Op Case — Work Already Done
 
         Before writing any code, check whether the acceptance criteria are **already satisfied**
         by existing code. If no source changes are needed:
@@ -2371,31 +2411,6 @@ def _build_build_prompt(
         - Do NOT push any commits.
         - STOP. The dispatch worker verifies the quality gate and moves the item on;
           you do not need to do anything else.
-
-        ## Reporting
-
-        Post progress comments to the GTD item as you work. Use `add_comment`
-        with item_id="{item_id}". Keep comments terse — one line is fine.
-
-        Post a comment at each milestone:
-        - When starting implementation: "Implementing..."
-        - When running tests: "Running tests..."
-
-        **On success:**
-        1. Post a final comment with: what you did, the branch name (`{branch_name}`), notes for the reviewer
-        2. Set the item status to `review` using `update_item` with the item's current version
-
-        **On failure/blocked**, your comment should include:
-        - Why you stopped
-        - What information or clarification you need
-        - Any partial progress (if you pushed commits)
-
-        ## Important
-
-        - You have max {max_turns} turns. Budget them wisely.
-        - Never force-push, never push to main, never delete branches you didn't create.
-        - Never modify CI/CD configs, deployment scripts, or secrets.
-        - Focus only on this task. Don't fix unrelated issues you notice.
     """
     )
 
