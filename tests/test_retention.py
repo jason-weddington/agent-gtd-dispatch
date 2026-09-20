@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -96,6 +97,40 @@ def _make_repo(root: Path, name: str) -> tuple[Path, str]:
     return repo, base
 
 
+def _make_repo_full(root: Path, name: str) -> tuple[Path, str]:
+    """A repo exhibiting all three change shapes relative to ``base``.
+
+    Committed (a second commit after base), uncommitted-tracked (a modification
+    to a tracked file, never staged) and untracked (a brand new file never
+    ``git add``-ed) — the exact combination the talos failure shape needs
+    covered, since talos work is uncommitted and often adds new modules.
+    """
+    repo = root / name
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "T")
+    (repo / "f.txt").write_text("base\n")
+    (repo / "tracked.txt").write_text("tracked-base\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    # committed change
+    (repo / "f.txt").write_text("base\nCOMMITTED-LINE\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "committed change")
+    # uncommitted modification to a tracked file — never staged
+    (repo / "tracked.txt").write_text("tracked-base\nUNCOMMITTED-LINE\n")
+    # brand new untracked file — never git-added
+    (repo / "new_module.py").write_text("NEW-UNTRACKED-CONTENT\n")
+    return repo, base
+
+
 class TestCaptureEvidence:
     def test_two_repo_fixture_produces_patch_with_both_headers(self, tmp_path) -> None:
         workspace = config.WORKSPACE_ROOT / "ws-run1"
@@ -127,7 +162,10 @@ class TestCaptureEvidence:
         (workspace / "transcript.txt").write_text("t")
         target = retention.capture_evidence("run2", workspace, [])
         assert (target / "transcript.txt").exists()
-        assert (target / "patch.diff").read_text() == ""
+        # No repos means no "# repo:" chunks, but the header is unconditional.
+        patch_text = (target / "patch.diff").read_text()
+        assert "# dispatch_run_id: run2" in patch_text
+        assert "# repo:" not in patch_text
 
     def test_missing_transcript_does_not_raise(self, tmp_path) -> None:
         workspace = config.WORKSPACE_ROOT / "ws-run3"
@@ -190,8 +228,17 @@ class TestCaptureEvidence:
 
         monkeypatch.setattr(subprocess, "run", _fake_run)
         retention.repo_diff(Path("/srv/repo"), "abc")
-        assert seen[0][:4] == ["sudo", "-u", "dispatch", "-H"]
-        assert "git" in seen[0]
+        # add -A, diff --cached, and the throwaway-index cleanup — all cross-user.
+        assert len(seen) == 3
+        for argv in seen:
+            assert argv[:4] == ["sudo", "-u", "dispatch", "-H"]
+        # add/diff go through the bash wrapper that sets GIT_INDEX_FILE inline,
+        # since sudo would otherwise strip an env var not in env_keep.
+        assert seen[0][4] == "bash"
+        assert "add" in seen[0] and "-A" in seen[0]
+        assert seen[1][4] == "bash"
+        assert "diff" in seen[1] and "--cached" in seen[1] and "abc" in seen[1]
+        assert seen[2][4:6] == ["rm", "-f"]
 
     def test_diff_command_has_no_sudo_prefix_when_unset(self, monkeypatch) -> None:
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
@@ -208,7 +255,119 @@ class TestCaptureEvidence:
 
         monkeypatch.setattr(subprocess, "run", _fake_run)
         retention.repo_diff(Path("/srv/repo"), "abc")
-        assert seen[0][0] == "git"
+        assert len(seen) == 3
+        assert seen[0][0] == "bash"
+        assert seen[1][0] == "bash"
+        assert seen[2][:2] == ["rm", "-f"]
+
+    def test_captures_uncommitted_untracked_and_committed_changes(
+        self, tmp_path
+    ) -> None:
+        workspace = config.WORKSPACE_ROOT / "ws-run8"
+        workspace.mkdir(parents=True)
+        repo, base = _make_repo_full(workspace, "repo_a")
+
+        target = retention.capture_evidence("run8", workspace, [("repo_a", repo, base)])
+
+        patch_text = (target / "patch.diff").read_text()
+        assert "COMMITTED-LINE" in patch_text
+        assert "UNCOMMITTED-LINE" in patch_text
+        assert "NEW-UNTRACKED-CONTENT" in patch_text
+
+        # The real index/working tree must be untouched by capture.
+        status = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert "?? new_module.py" in status  # still untracked, never staged
+        assert " M tracked.txt" in status  # still an unstaged modification
+
+    def test_no_change_repo_produces_empty_body_and_warning(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        workspace = config.WORKSPACE_ROOT / "ws-run9"
+        workspace.mkdir(parents=True)
+        repo, _base = _make_repo(workspace, "repo_a")
+        # _make_repo leaves one committed change past base; reset base to HEAD
+        # so this repo has NO difference of any kind from its "base".
+        head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        with caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.retention"):
+            target = retention.capture_evidence(
+                "run9", workspace, [("repo_a", repo, head)]
+            )
+
+        patch_text = (target / "patch.diff").read_text()
+        assert "# repo: repo_a" in patch_text
+        assert "essentially empty patch" in caplog.text
+        assert "run_id=run9" in caplog.text
+        assert "repo=repo_a" in caplog.text
+
+    def test_header_carries_both_ids_and_utc_timestamp(self, tmp_path) -> None:
+        workspace = config.WORKSPACE_ROOT / "ws-run10"
+        workspace.mkdir(parents=True)
+
+        target = retention.capture_evidence(
+            "run10", workspace, [], agent_gtd_run_id="gtd-abc123"
+        )
+
+        patch_text = (target / "patch.diff").read_text()
+        assert "# dispatch_run_id: run10" in patch_text
+        assert "# agent_gtd_run_id: gtd-abc123" in patch_text
+        assert re.search(
+            r"# captured_at: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", patch_text
+        )
+
+    def test_header_says_agent_gtd_run_id_unknown_when_not_supplied(
+        self, tmp_path
+    ) -> None:
+        workspace = config.WORKSPACE_ROOT / "ws-run11"
+        workspace.mkdir(parents=True)
+
+        target = retention.capture_evidence("run11", workspace, [])
+
+        patch_text = (target / "patch.diff").read_text()
+        assert "# agent_gtd_run_id: unknown" in patch_text
+
+    def test_headered_patch_applies_cleanly(self, tmp_path) -> None:
+        workspace = config.WORKSPACE_ROOT / "ws-run12"
+        workspace.mkdir(parents=True)
+        repo, base = _make_repo_full(workspace, "repo_a")
+
+        target = retention.capture_evidence(
+            "run12", workspace, [("repo_a", repo, base)]
+        )
+        patch_text = (target / "patch.diff").read_text()
+
+        scratch = tmp_path / "scratch"
+        subprocess.run(
+            ["git", "clone", "-q", str(repo), str(scratch)],
+            check=True,
+            capture_output=True,
+        )
+        _git(scratch, "checkout", "-q", base)
+
+        result = subprocess.run(
+            ["git", "apply", "-"],
+            input=patch_text,
+            text=True,
+            cwd=scratch,
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+        assert (scratch / "f.txt").read_text() == "base\nCOMMITTED-LINE\n"
+        assert (scratch / "tracked.txt").read_text() == (
+            "tracked-base\nUNCOMMITTED-LINE\n"
+        )
+        assert (scratch / "new_module.py").read_text() == "NEW-UNTRACKED-CONTENT\n"
 
 
 # ---------------------------------------------------------------------------

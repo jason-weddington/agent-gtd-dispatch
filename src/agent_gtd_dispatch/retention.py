@@ -17,9 +17,11 @@ clones plus build output, and its value decays within a day or two.
 from __future__ import annotations
 
 import logging
+import secrets
 import shutil
 import subprocess
 import time
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from . import config
@@ -69,34 +71,115 @@ def _read_cross_user(path: Path) -> bytes | None:
     return result.stdout
 
 
+def _throwaway_index_path(repo_path: Path) -> Path:
+    """A unique, never-reused path for a scratch git index inside ``repo_path``.
+
+    Lives under ``.git/`` so it is owned by whichever user owns the clone (the
+    same user every ``_git_with_index`` call below runs as), and is removed by
+    the caller once done. It is a NEW file, never ``.git/index`` — the real
+    index is never touched.
+    """
+    return repo_path / ".git" / f"evidence-index-{secrets.token_hex(8)}"
+
+
+def _git_with_index(
+    repo_path: Path, index_file: Path, args: list[str]
+) -> subprocess.CompletedProcess[bytes]:
+    """Run ``git -C repo_path <args>`` against a throwaway ``GIT_INDEX_FILE``.
+
+    The index path is given as an argument to a ``bash -c`` wrapper rather than
+    via ``subprocess.run(env=...)`` because when cross-user (``_sudo_wrap``)
+    sudo resets the environment and ``GIT_INDEX_FILE`` is not in this project's
+    sudoers ``env_keep`` allowlist — and adding it there would need a host
+    redeploy this fix cannot assume. ``bash`` is already NOPASSWD-authorised
+    for the agent user, so setting the var *inside* the sudo'd process needs no
+    sudoers change.
+    """
+    script = 'export GIT_INDEX_FILE="$1"; shift; exec "$@"'
+    inner = ["git", "-C", str(repo_path), *args]
+    cmd = ["bash", "-c", script, "bash", str(index_file), *inner]
+    return subprocess.run(_sudo_wrap(cmd), capture_output=True, check=False)  # noqa: S603
+
+
 def repo_diff(repo_path: Path, base_sha: str) -> str:
-    """Return ``git diff <base_sha>..HEAD`` for a repo, cross-user.
+    """Return the full diff of a repo against ``base_sha``, cross-user.
+
+    Covers everything ``base_sha`` does not have: committed changes up to
+    ``HEAD``, uncommitted modifications to tracked files, AND newly created
+    untracked files. A plain ``git diff <base>..HEAD`` only sees the commit
+    graph, which is empty by design for engines (talos) that never commit —
+    exactly the runs whose evidence matters most.
+
+    Achieved via a throwaway index (``GIT_INDEX_FILE`` pointed at a scratch
+    file, never ``.git/index``): ``git add -A`` stages the CURRENT working
+    tree — tracked, modified and untracked files alike — into that scratch
+    index, then ``git diff --cached base_sha`` compares it to the base tree.
+    The repo's real index is never read or written.
 
     Raises ``RuntimeError`` when git refuses or the repo is unreadable; callers
     treat that as "no diff captured" and continue.
     """
-    result = subprocess.run(  # noqa: S603
-        _sudo_wrap(["git", "-C", str(repo_path), "diff", f"{base_sha}..HEAD"]),
-        capture_output=True,
-        check=False,
+    index_file = _throwaway_index_path(repo_path)
+    try:
+        add_result = _git_with_index(repo_path, index_file, ["add", "-A"])
+        if add_result.returncode != 0:
+            tail = add_result.stderr.decode("utf-8", errors="replace")[-200:]
+            msg = f"git add exited {add_result.returncode}: {tail}"
+            raise RuntimeError(msg)
+
+        diff_result = _git_with_index(
+            repo_path, index_file, ["diff", "--cached", base_sha]
+        )
+        if diff_result.returncode != 0:
+            tail = diff_result.stderr.decode("utf-8", errors="replace")[-200:]
+            msg = f"git diff exited {diff_result.returncode}: {tail}"
+            raise RuntimeError(msg)
+        return diff_result.stdout.decode("utf-8", errors="replace")
+    finally:
+        subprocess.run(  # noqa: S603
+            _sudo_wrap(["rm", "-f", str(index_file)]), capture_output=True, check=False
+        )
+
+
+def _patch_header(run_id: str, agent_gtd_run_id: str | None) -> str:
+    """Build the self-identifying header prepended to every captured patch.
+
+    Stamps both run identifiers — the dispatch run id (always known here) and
+    the agent_gtd run id (known only when a future caller plumbs it through;
+    the dispatch service has no field for it today and none is added by this
+    change) — plus the capture time in ISO-8601 UTC, since evidence directory
+    mtimes are host-local while run records are UTC and the skew makes a
+    correct candidate look wrong.
+    """
+    captured_at = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    agent_gtd_line = (
+        agent_gtd_run_id
+        if agent_gtd_run_id
+        else "unknown (not available to the dispatch worker at capture time)"
     )
-    if result.returncode != 0:
-        tail = result.stderr.decode("utf-8", errors="replace")[-200:]
-        msg = f"git diff exited {result.returncode}: {tail}"
-        raise RuntimeError(msg)
-    return result.stdout.decode("utf-8", errors="replace")
+    return (
+        f"# dispatch_run_id: {run_id}\n"
+        f"# agent_gtd_run_id: {agent_gtd_line}\n"
+        f"# captured_at: {captured_at}\n"
+    )
 
 
 def capture_evidence(
     run_id: str,
     workspace: Path | None,
     repos: list[tuple[str, Path, str | None]],
+    agent_gtd_run_id: str | None = None,
 ) -> Path:
     """Copy a run's durable evidence out of the workspace before teardown.
 
     ``repos`` is a list of ``(repo_name, repo_path, base_sha)``.  Callers that run
     before the base SHAs exist (timeout, cancellation, clone failure, generic
     exception) supply an empty list.
+
+    ``agent_gtd_run_id`` is stamped into the patch header when the caller has
+    it; today no caller does (the dispatch service has no plumbing back to the
+    agent_gtd-side run id and none is added here — see the header docstring),
+    so it defaults to ``None`` and the header says so explicitly.
 
     Every step is individually best-effort: this function is called from teardown
     and must NEVER raise, because an exception escaping here would abort the
@@ -131,14 +214,24 @@ def capture_evidence(
             logger.warning("evidence capture: artifact copy failed run_id=%s", run_id)
 
     try:
-        chunks: list[str] = []
+        chunks: list[str] = [_patch_header(run_id, agent_gtd_run_id)]
         for repo_name, repo_path, base_sha in repos:
             chunks.append(f"# repo: {repo_name}\n")
             if base_sha is None:
                 chunks.append("# no diff captured: no base sha recorded\n")
                 continue
             try:
-                chunks.append(repo_diff(repo_path, base_sha))
+                diff_text = repo_diff(repo_path, base_sha)
+                chunks.append(diff_text)
+                diff_bytes = len(diff_text.encode("utf-8"))
+                if not diff_text.strip():
+                    logger.warning(
+                        "evidence capture: essentially empty patch "
+                        "run_id=%s repo=%s bytes=%d",
+                        run_id,
+                        repo_name,
+                        diff_bytes,
+                    )
             except Exception as exc:  # best effort — record and keep going
                 chunks.append(f"# no diff captured: {exc}\n")
         (target / PATCH_NAME).write_text("".join(chunks))
