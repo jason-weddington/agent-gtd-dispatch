@@ -3251,11 +3251,18 @@ for it and continue — do NOT halt for that alone."""
         - the remote has a branch the comment did not list: unreported work.
 
         If NO repo has the branch: read the child run's terminal status in the
-        envelope above. `already_satisfied` means the build agent asserted the
-        work was already done and the worker verified the quality gate on the
-        tree as it stood — return `skip`. Any other status with no branch is a
-        `halt` (or a `re-dispatch`, if the run failed for a reason another build
-        would plausibly not hit).
+        envelope above. `already_satisfied` can now only come from a talos child,
+        where the talos harness itself ran the item's checks and exited 30 to say
+        the criteria were already met — it is the harness's verdict, not anything
+        the agent claimed, and a `claude-code` child can no longer produce it at
+        all. Return `skip`. Any other status with no branch is a `halt` (or a
+        `re-dispatch`, if the run failed for a reason another build would
+        plausibly not hit).
+
+        Do NOT infer "the work was already done" from a green gate plus no
+        commits. An unchanged tree passes a gate trivially because it IS the base
+        commit, and treating that as evidence of a completed no-op is what
+        discarded four agents' worth of real work in a single night.
 
         ## Step 3 — Reconcile the acceptance criteria against the diff
 
