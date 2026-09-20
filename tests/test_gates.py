@@ -30,6 +30,7 @@ from agent_gtd_dispatch.gates import (
     run_as_agent,
     run_gate_steps,
 )
+from tests.worker_mocks import stub_rescue
 
 
 @pytest.fixture(autouse=True)
@@ -1106,6 +1107,7 @@ class TestWorkerGateIntegration:
             mock_dispatch.verify_pushes = MagicMock(return_value=[])
             mock_dispatch.cleanup_workspace = MagicMock()
             mock_dispatch._executor = None
+            stub_rescue(mock_dispatch)
 
             with caplog.at_level(logging.INFO):
                 await _dispatch_worker(run, 50, CLAUDE, 600)
@@ -1191,6 +1193,7 @@ class TestWorkerGateIntegration:
             mock_dispatch.verify_pushes = MagicMock(return_value=[])
             mock_dispatch.cleanup_workspace = MagicMock()
             mock_dispatch._executor = None
+            stub_rescue(mock_dispatch)
 
             await _dispatch_worker(run, 50, CLAUDE, 600)
 
@@ -1445,6 +1448,7 @@ class TestWorkerGateIntegration:
             mock_dispatch.verify_pushes = MagicMock(return_value=[])
             mock_dispatch.cleanup_workspace = MagicMock()
             mock_dispatch._executor = None
+            stub_rescue(mock_dispatch)
 
             await _dispatch_worker(run, 50, CLAUDE, 600)
 
@@ -1511,6 +1515,7 @@ class TestWorkerGateManageHalt:
             mock_dispatch.prepare_manage_workspace.return_value = tmp_path
             mock_dispatch.repo_name_from_origin = MagicMock(return_value="repo")
             mock_dispatch._executor = None
+            stub_rescue(mock_dispatch)
             mock_dispatch.cleanup_workspace = MagicMock()
 
             await _dispatch_worker(run, 50, CLAUDE, 600)
@@ -1582,6 +1587,7 @@ class TestWorkerGateManageHalt:
             mock_dispatch.prepare_manage_workspace.return_value = tmp_path
             mock_dispatch.repo_name_from_origin = MagicMock(return_value="repo")
             mock_dispatch._executor = None
+            stub_rescue(mock_dispatch)
             mock_dispatch.cleanup_workspace = MagicMock()
 
             await _dispatch_worker(run, 50, CLAUDE, 600)

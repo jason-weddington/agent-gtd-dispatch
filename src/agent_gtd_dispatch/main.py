@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -35,9 +36,6 @@ from . import (
     gtd_client,
     retention,
     talos,
-)
-from . import (
-    disposition as disposition_mod,
 )
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
 from .engines import (
@@ -146,7 +144,6 @@ _watchdog_task: asyncio.Task[None] | None = None  # handle for clean shutdown
 _retention_task: asyncio.Task[None] | None = None  # handle for clean shutdown
 # One-shot disposition-classifier reachability probe (see lifespan). Held only
 # so shutdown can cancel it — nothing awaits its result.
-_classifier_probe_task: asyncio.Task[None] | None = None
 _watchdog_acted: dict[str, float] = {}  # rollout_id → monotonic() of last action
 
 # rollout_id -> lifetime count of UNCOUNTED (free) manage relaunches granted while
@@ -259,26 +256,10 @@ def _verify_api_key(
     return credentials.credentials
 
 
-async def _probe_disposition_classifier() -> None:
-    """Startup wrapper around the classifier's one-shot reachability probe.
-
-    Swallows everything.  A probe is diagnostics: it must never take the
-    service down, and it must never turn a dead provider into a failed startup.
-    """
-    try:
-        await disposition_mod.warn_if_unreachable_once()
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.warning(
-            "disposition classifier reachability probe raised", exc_info=True
-        )
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Initialize config and DB on startup, cancel tasks on shutdown."""
-    global _watchdog_task, _retention_task, _classifier_probe_task
+    global _watchdog_task, _retention_task
     global _readoption_task
     config.load()
     # Before config.load() there is no LOG_LEVEL to honour, and after this line
@@ -300,22 +281,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     # deploy restart would otherwise silently stop every running rollout from
     # advancing. Backgrounded so startup never blocks on the GTD API.
     _readoption_task = asyncio.create_task(_readopt_running_rollouts())
-    # One probe of the disposition classifier, in the BACKGROUND and never
-    # fatal: a misconfigured classifier degrades silently by design (every
-    # failure falls through to the derived tier), so without this it is
-    # discovered from wrong verdicts days later rather than from one WARNING at
-    # startup. Backgrounded because startup must not block on a provider, and
-    # non-fatal because the derived tier is the designed fallback — the service
-    # must still start with the classifier completely dead.
-    _classifier_probe_task = asyncio.create_task(_probe_disposition_classifier())
     yield
     # Cancel watchdog, retention and active dispatch tasks on shutdown
     if _watchdog_task is not None:
         _watchdog_task.cancel()
     if _retention_task is not None:
         _retention_task.cancel()
-    if _classifier_probe_task is not None:
-        _classifier_probe_task.cancel()
     if _readoption_task is not None:
         _readoption_task.cancel()
     for task in _active_processes.values():
@@ -1789,11 +1760,7 @@ BUILD_FAILURE_PREFIXES: frozenset[str] = frozenset(
         "no_result_envelope",
         "result_is_error",
         "max_turns_exhausted",
-        "stopped_without_assertion",
-        "agent_reported_blocked",
-        "agent_reported_failed",
-        "done_claim_zero_commits",
-        "already_satisfied_gate_failed",
+        "zero_commits",
         "invariant_zero_commit_success",
     }
 )
@@ -1808,19 +1775,11 @@ _FAILURE_PREFIX_DETAIL: dict[str, str] = {
         "The agent ran out of turns; commits and gate result (if any) are"
         " recorded — review before re-dispatching."
     ),
-    "stopped_without_assertion": (
-        "The agent wrote no completion artifact, so it never asserted how its"
-        " run ended."
-    ),
-    "agent_reported_blocked": "The agent reported it was blocked.",
-    "agent_reported_failed": "The agent reported it failed.",
-    "done_claim_zero_commits": (
-        "The agent claimed the work was done but produced zero commits across"
-        " every repo."
-    ),
-    "already_satisfied_gate_failed": (
-        "The agent claimed the work was already satisfied, but the project"
-        " quality gate did not pass on the untouched tree."
+    "zero_commits": (
+        "The agent ended its run without producing a single commit on any repo,"
+        " so there is nothing to review. The project gate was NOT run: an"
+        " unchanged tree passes trivially, which would say the base commit is"
+        " green and nothing at all about this run."
     ),
     "invariant_zero_commit_success": (
         "A zero-commit build run was about to be recorded as a success — the"
@@ -1849,20 +1808,12 @@ def build_completion_comment(
     branch_name: str | None,
     push_results: list[RepoPushStatus] | None,
     gate_decision: str | None,
-    artifact: completion.CompletionArtifact | None,
-    resolution: disposition_mod.DispositionResult | None = None,
 ) -> str:
     """Return the GTD comment body for a SUCCESSFUL build terminal.
 
-    Composed entirely from facts the worker holds — branch, per-repo commit
-    counts, push outcomes, gate decision — and ENRICHED with the agent's
-    artifact fields when it wrote one.  The agent no longer has to report any of
-    the mechanical half, and a run that dies without writing an artifact still
-    leaves the reviewer the mechanical facts instead of silence.
+    Composed ENTIRELY from facts the worker observed — branch, per-repo commit counts, push outcomes, gate decision. It used to be enriched with the agent's own account of its run, read from a file the agent wrote; nothing here reads anything the agent produced any more. The agent's own comments appear on the item separately, posted by the agent under its own attribution, which is where a reader can weigh them as a claim rather than as a finding.
 
-    Failure terminals and the ``already_satisfied`` terminal compose their own
-    comments (:func:`build_failure_comment`,
-    :func:`_route_already_satisfied_item`) and do not use this one.
+    Failure terminals and the talos ``already_satisfied`` terminal compose their own comments (:func:`build_failure_comment`, :func:`_route_already_satisfied_item`) and do not use this one.
     """
     results = push_results or []
     total_commits = sum(r.commits_ahead for r in results)
@@ -1880,29 +1831,6 @@ def build_completion_comment(
         lines.append(line)
     if gate_decision:
         lines.append(f"\nQuality gate: `{gate_decision}`.")
-    if artifact is None and resolution is not None:
-        # Never let a non-asserted verdict read as the agent's own word: name
-        # the tier and, for the inferred tier, the model that produced it.
-        lines.append(f"\n{disposition_mod.provenance_sentence(resolution)}")
-        lines.append(
-            f"{resolution.provenance.capitalize()} disposition:"
-            f" `{resolution.disposition}`."
-        )
-        if resolution.reason.strip():
-            lines.append(f"Reason: {resolution.reason.strip()}")
-    elif artifact is None:
-        lines.append(
-            "\nThe agent wrote no completion artifact — the facts above are"
-            " all there is."
-        )
-    else:
-        lines.append(f"\nAgent disposition: `{artifact.disposition}`.")
-        if artifact.summary.strip():
-            lines.append(f"Summary: {artifact.summary.strip()}")
-        if artifact.reason.strip():
-            lines.append(f"Reason: {artifact.reason.strip()}")
-        if artifact.decision_needed.strip():
-            lines.append(f"Decision needed: {artifact.decision_needed.strip()}")
     return "\n".join(lines)
 
 
@@ -1910,45 +1838,16 @@ def build_completion_blob(
     *,
     envelope: completion.ResultEnvelope | None,
     envelope_verdict: str,
-    artifact: completion.CompletionArtifact | None,
-    artifact_reject_reason: str,
     zero_commits: bool,
     gate_decision: str | None,
     evidence_dir: str,
-    unasserted: bool = False,
-    resolution: disposition_mod.DispositionResult | None = None,
 ) -> str:
-    """Serialize the leg-1/leg-2/leg-3 triple persisted on every build terminal.
+    """Serialize the mechanical evidence persisted on every build terminal.
 
-    This is the only durable carrier of the CLI envelope on a run whose `error` is
-    NULL, and the only way session_id / num_turns / total_cost_usd survive
-    workspace teardown.
+    This is the only durable carrier of the CLI envelope on a run whose `error` is NULL, and the only way session_id / num_turns / total_cost_usd survive workspace teardown.
 
-    ``unasserted`` marks a run that reached its terminal WITHOUT a usable
-    completion artifact — the agent never asserted anything and the terminal was
-    decided on mechanical evidence (commits pushed + gate green) alone.  It
-    defaults False so every existing caller and every existing assertion on the
-    blob's shape is unaffected; its purpose is to make model non-compliance
-    countable per engine later.
-
-    ``resolution`` carries the three-tier outcome (:mod:`.disposition`) for a
-    run whose artifact was missing or unusable.  It defaults None — the existing
-    behaviour, where the only disposition on record is the agent's own — so no
-    existing caller changes.  When present, the blob records the disposition AND
-    its PROVENANCE (``asserted`` | ``inferred`` | ``derived``), which is what
-    makes "how often does each tier fire, and does the inferred tier agree with
-    the agent when both exist" a query rather than a guess.
+    Every field here is something the WORKER observed. The blob used to also carry the agent's self-reported disposition, an `artifact` presence flag, a rejection reason, and five `classifier_*` fields recording which model had been asked to guess what the agent meant. All of that is gone with the artifact contract: a run's record should say what happened, not what something claimed about it.
     """
-    state = completion.artifact_state(artifact, artifact_reject_reason)
-    if artifact is not None:
-        _disposition: str | None = artifact.disposition
-        _provenance: str | None = "asserted"
-    elif resolution is not None:
-        _disposition = resolution.disposition
-        _provenance = resolution.provenance
-    else:
-        _disposition = None
-        _provenance = None
     return json.dumps(
         {
             "envelope_verdict": envelope_verdict,
@@ -1958,44 +1857,127 @@ def build_completion_blob(
             "stop_reason": envelope.stop_reason if envelope else None,
             "session_id": envelope.session_id if envelope else None,
             "total_cost_usd": envelope.total_cost_usd if envelope else None,
-            "artifact": state,
-            "artifact_reject_reason": (
-                None if artifact_reject_reason == "ok" else artifact_reject_reason
-            ),
-            "disposition": _disposition,
-            "disposition_provenance": _provenance,
-            "disposition_reason": (
-                resolution.reason if artifact is None and resolution else None
-            ),
-            # Recorded WHATEVER the outcome — on an inferred verdict this is
-            # the model that answered, on a derived fallback the model that was
-            # tried and did not. It was `null` on the run that exposed a tier 2
-            # which had never worked, discarding the one field that pointed at
-            # the cause.
-            "classifier_model": (resolution.model if resolution else None),
-            # The full diagnostic line: class, status code, model, base URL,
-            # attempt. `api_error` on its own could not tell a transient 429
-            # from a permanently misconfigured endpoint.
-            "classifier_failure": (
-                resolution.classifier_failure if resolution else None
-            ),
-            "classifier_failure_class": (
-                resolution.classifier_failure_class if resolution else None
-            ),
-            "classifier_status_code": (
-                resolution.classifier_status_code if resolution else None
-            ),
-            "classifier_latency_s": (
-                round(resolution.latency_seconds, 2)
-                if resolution and resolution.latency_seconds is not None
-                else None
-            ),
             "zero_commits": zero_commits,
             "gate_decision": gate_decision,
             "evidence_dir": evidence_dir,
-            "unasserted": unasserted,
         }
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _RescueOutcome:
+    """Aggregate of a run's pre-teardown rescue across every repo."""
+
+    results: list[dispatch.RescueResult]
+
+    @property
+    def attempted(self) -> list[dispatch.RescueResult]:
+        """Only the repos that actually had work to rescue."""
+        return [r for r in self.results if r.attempted]
+
+    @property
+    def ok(self) -> bool:
+        """True when every repo that had work got it onto origin."""
+        return all(r.pushed for r in self.attempted)
+
+
+async def _rescue_before_teardown(
+    run: Run,
+    repos: list[tuple[str, Path, str | None]],
+    *,
+    attribution: str | None,
+) -> _RescueOutcome | None:
+    """Push anything the agent left behind, then report it on the item.
+
+    Returns None when there was nothing to inspect (no repos recorded, e.g. a run that failed before its workspace was prepared, or a plan/manage run).
+
+    Everything here is best-effort and nothing raises: this runs inside the teardown ``finally``, where an exception would skip the workspace cleanup that follows it. What it must NOT do is fail silently — a rescue that could not push is the one case where the workspace has to be kept, so that outcome is returned to the caller AND written to the run's error text.
+    """
+    if not repos:
+        return None
+    branch = run.branch_name or ""
+    if not branch.startswith("feat/"):
+        # Hard guard on the blast radius: this pushes with hooks disabled, so it
+        # may only ever touch the dispatch worker's own feature branch — never a
+        # default branch, never anything it did not create.
+        return None
+
+    loop = asyncio.get_event_loop()
+    results: list[dispatch.RescueResult] = []
+    for _name, _path, _base in repos:
+        try:
+            results.append(
+                await loop.run_in_executor(
+                    dispatch._executor,
+                    dispatch.rescue_abandoned_work,
+                    _name,
+                    _path,
+                    branch,
+                    run.id,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "rescue raised for repo %s (run %s) — continuing", _name, run.id
+            )
+    outcome = _RescueOutcome(results)
+    if not outcome.attempted:
+        return outcome
+
+    _pushed = [r for r in outcome.attempted if r.pushed]
+    _failed = [r for r in outcome.attempted if not r.pushed]
+    logger.warning(
+        "rescue: run_id=%s branch=%s pushed=%s failed=%s",
+        run.id,
+        branch,
+        ",".join(r.repo_name for r in _pushed) or None,
+        ",".join(r.repo_name for r in _failed) or None,
+    )
+
+    if _failed:
+        _detail = "; ".join(r.error or f"{r.repo_name}: push failed" for r in _failed)
+        try:
+            _existing = await db.get_run(run.id)
+            _prefix = (_existing.error + " | ") if _existing and _existing.error else ""
+            await db.update_run(
+                run.id,
+                error=(
+                    f"{_prefix}rescue_push_failed: unpushed work remains in the"
+                    f" workspace, which has been RETAINED at {run.workspace_path}"
+                    f" — {_detail}"
+                )[:ERROR_TEXT_MAX_CHARS],
+            )
+        except Exception:
+            logger.exception("could not record rescue failure for run %s", run.id)
+
+    if run.item_id is not None:
+        if _pushed:
+            _body = (
+                f"Unreviewed partial work from run `{run.id}` was pushed to"
+                f" `{branch}` by the dispatch worker at teardown"
+                f" ({', '.join(r.repo_name for r in _pushed)})."
+                " The agent left it behind; it is incomplete, hooks were skipped"
+                " and it has passed no quality gate. It was pushed only so it"
+                " would not be deleted with the workspace — read it before"
+                " reusing any of it."
+            )
+        else:
+            _body = (
+                f"Run `{run.id}` left unpushed work behind and the dispatch"
+                f" worker could NOT rescue it to `{branch}`. The workspace has"
+                " been retained so the work still exists on the dispatch host."
+                f" Details: {_detail}"
+            )
+        try:
+            await gtd_client.post_comment(
+                run.item_id,
+                _body,
+                created_by=attribution or "agent-gtd-dispatch",
+                token=run.callback_token,
+            )
+        except Exception:
+            logger.warning("Failed to post rescue comment for run %s", run.id)
+    return outcome
 
 
 async def _record_build_terminal(
@@ -2003,7 +1985,6 @@ async def _record_build_terminal(
     *,
     status: RunStatus,
     push_results_list: list[RepoPushStatus] | None,
-    disposition: str | None = None,
     envelope_verdict: str | None = None,
     completed_at: str | None = None,
     exit_code: int | None = None,
@@ -2026,9 +2007,8 @@ async def _record_build_terminal(
     ):
         logger.error(
             "INVARIANT VIOLATION: zero-commit build run about to be recorded"
-            " succeeded run_id=%s disposition=%s envelope_verdict=%s",
+            " succeeded run_id=%s envelope_verdict=%s",
             run_id,
-            disposition,
             envelope_verdict,
         )
         status = RunStatus.failed
@@ -2086,11 +2066,12 @@ async def _nudge_item_to_review(
     The worker — not the agent — materializes the item transition that follows
     from a build terminal.  The mapping, stated once:
 
-    * ``done``               -> ``review``  (this function)
-    * no artifact (unasserted success) -> ``review``  (this function)
-    * ``already_satisfied``  -> ``review``, via :func:`_route_already_satisfied_item`
-    * ``blocked`` / ``failed`` -> NOT moved; those runs exit on the failure path
-      and must never present themselves as ready for review.
+    * a SUCCESSFUL build run (commits pushed, gate green or absent) -> ``review``
+      (this function)
+    * a talos ``already_satisfied`` run -> ``review``, via
+      :func:`_route_already_satisfied_item`
+    * every FAILED run -> NOT moved; those runs exit on the failure path and must
+      never present themselves as ready for review.
 
     Reading the item first is the guard: never regress one a human already moved
     on.  A read failure leaves the item untouched, and a PATCH failure never
@@ -2124,20 +2105,12 @@ async def _route_already_satisfied_item(
     *,
     callback_token: str | None,
     attribution: str | None,
-    detail: str = "",
-    provenance: str = "asserted",
 ) -> None:
     """Route an ``already_satisfied`` BUILD terminal to GTD: item -> review + comment.
 
-    SHARED by both already_satisfied paths — the claude-code artifact-disposition
-    path (48617eb) and the talos exit-30 (AlreadySatisfied) path — so the two
-    engines can never diverge in how a no-op terminal reaches GTD (kb-03296: the
-    manage-relaunch bug existed because the same decision was made in two callers
-    and only one carried the guard).
+    TALOS-ONLY. This used to be shared with a claude-code path that reached the same terminal from an agent-written file claiming the work was already done; that path is gone, because a claim about a run cannot be evidence about a run. Talos keeps the terminal because talos exit 30 is emitted only AFTER talos has run the project's checks itself — the no-op is verified, not asserted.
 
-    Status-set is deliberately tolerant: a PATCH failure does NOT flip the run
-    status away from ``already_satisfied`` — mirrors every other status-set in
-    this module.
+    Status-set is deliberately tolerant: a PATCH failure does NOT flip the run status away from ``already_satisfied`` — mirrors every other status-set in this module.
     """
     await _best_effort_set_item_status(
         item_id,
@@ -2146,33 +2119,12 @@ async def _route_already_satisfied_item(
         callback_token=callback_token,
         terminal="already_satisfied",
     )
-    # The SAME routing for every tier; only the attribution sentence differs.
-    # An inferred or derived no-op must never read as the agent's own word.
-    if provenance == "asserted":
-        _lede = (
-            f"Build run `{run_id}` made no changes: the agent reported the "
-            f"acceptance criteria are already satisfied."
-        )
-    elif provenance == "inferred":
-        _lede = (
-            f"Build run `{run_id}` made no changes. The agent wrote no"
-            " completion artifact, so `already_satisfied` was **inferred**"
-            " from the transcript and the diff by"
-            f" `{config.DISPOSITION_CLASSIFIER_MODEL}` — it is NOT the agent's"
-            " own word."
-        )
-    else:
-        _lede = (
-            f"Build run `{run_id}` made no changes. The agent wrote no"
-            " completion artifact and no classification was available, so"
-            " `already_satisfied` was **derived** mechanically from the absence"
-            " of commits and a passing quality gate — it is NOT the agent's own"
-            " word."
-        )
-    body = f"{_lede}\n\nReason: {reason}\n\n"
-    if detail:
-        body += f"{detail} "
-    body += "The item is moved to review for a human — it was NOT completed."
+    body = (
+        f"Build run `{run_id}` made no changes: the build engine reported the"
+        " acceptance criteria are already satisfied, and its own checks passed"
+        f" on the unchanged tree.\n\nReason: {reason}\n\n"
+        "The item is moved to review for a human — it was NOT completed."
+    )
     try:
         await gtd_client.post_comment(
             item_id,
@@ -3569,41 +3521,27 @@ async def _dispatch_worker(
             _rescued_repos: list[RepoPushStatus] = []
             _gate_cmd: str = ""
             _gate_result: dispatch.GateResult | None = None
-            _stashed_names: list[str] = []
             _envelope: completion.ResultEnvelope | None = None
             _verdict = "no_result_envelope"
-            _artifact: completion.CompletionArtifact | None = None
-            _artifact_reason = "absent"
-            # Tier 2/3 outcome, filled in after the post-run gate when (and only
-            # when) the agent's own artifact was missing or unusable.
-            _resolution: disposition_mod.DispositionResult | None = None
             _evidence_dir = str(retention.evidence_dir(run.id))
             if _verify_repos is not None:
-                # Leg 1 — the CLI's own result envelope, from the merged-stream
-                # transcript.  Leg 2 — the agent's completion artifact.  Both are
-                # read BEFORE any terminal so every build path can persist them.
+                # The CLI's own result envelope, from the merged-stream
+                # transcript.  Read BEFORE any terminal so every build path can
+                # persist it.
                 if workspace is not None:
                     _envelope = completion.parse_result_envelope(
                         workspace / "transcript.txt"
-                    )
-                    _artifact, _artifact_reason = completion.read_completion_artifact(
-                        workspace
-                    )
-                    completion.log_artifact_rejection(
-                        run.id, workspace, _artifact_reason
                     )
                 _verdict = completion.envelope_verdict(_envelope)
 
                 def _build_completion(
                     outcome: str,
                     gate_decision: str | None = None,
-                    *,
-                    unasserted: bool = False,
                 ) -> str:
                     """Log the one structured decision line and return the blob.
 
                     Called immediately before every BUILD terminal write so the
-                    branch taken and the three leg inputs that drove it are both
+                    branch taken and the evidence that drove it are both
                     greppable in the journal and durable on the run row.
                     """
                     _results = push_results_list or []
@@ -3614,21 +3552,15 @@ async def _dispatch_worker(
                     blob = build_completion_blob(
                         envelope=_envelope,
                         envelope_verdict=_verdict,
-                        artifact=_artifact,
-                        artifact_reject_reason=_artifact_reason,
                         zero_commits=_zero,
                         gate_decision=gate_decision,
                         evidence_dir=_evidence_dir,
-                        unasserted=unasserted,
-                        resolution=_resolution,
                     )
                     logger.info(
                         "build completion: run_id=%s outcome=%s envelope_verdict=%s"
                         " envelope_subtype=%s is_error=%s num_turns=%s"
                         " stop_reason=%s session_id=%s total_cost_usd=%s"
-                        " artifact=%s artifact_reject_reason=%s disposition=%s"
-                        " zero_commits=%s pushed_repos=%d gate_decision=%s engine=%s"
-                        " unasserted=%s",
+                        " zero_commits=%s pushed_repos=%d gate_decision=%s engine=%s",
                         run.id,
                         outcome,
                         _verdict,
@@ -3638,14 +3570,10 @@ async def _dispatch_worker(
                         _envelope.stop_reason if _envelope else None,
                         _envelope.session_id if _envelope else None,
                         _envelope.total_cost_usd if _envelope else None,
-                        completion.artifact_state(_artifact, _artifact_reason),
-                        None if _artifact_reason == "ok" else _artifact_reason,
-                        _artifact.disposition if _artifact else None,
                         _zero,
                         _pushed,
                         gate_decision,
                         engine_used.name,
-                        unasserted,
                     )
                     return blob
 
@@ -3780,70 +3708,54 @@ async def _dispatch_worker(
                     return  # exit early — do not mark succeeded
 
                 # --- BUILD terminal classification -------------------------
-                # Precedence is fixed: envelope verdict, then the presence of the
-                # agent's completion artifact, then what that artifact asserts.
-                # There is NO escape hatch on `done` — a zero-commit build run is
-                # never a success.
+                # MECHANICAL EVIDENCE ONLY. Every input to this decision is
+                # something the WORKER observed: the CLI's own result envelope,
+                # the commits that reached origin, and the project gate's exit
+                # code. Nothing the agent originated is read here.
                 #
-                # One exception, and only one: an ABSENT (or unparseable —
-                # "unparseable == absent") artifact on a run that DID push
-                # commits is not fatal by itself.  Writing the artifact is a
-                # cooperative act and some engines intermittently skip it; when
-                # legs 2 and 3 (commits pushed, project gate green) are
-                # mechanically satisfied, failing the run is a false negative
-                # that halts healthy rollout waves.  Such a run falls through to
-                # the post-run gate via `_unasserted_path` and the gate decides.
-                # Zero commits keeps the old behaviour: nothing asserted AND
-                # nothing pushed leaves no evidence to fall back on.
+                # NO CODE IN THIS REGION MAY BRANCH ON WHETHER THE AGENT SAID
+                # ANYTHING — not on a comment, not on a file it wrote, not on an
+                # MCP call it made. That exact mistake has now been made twice at
+                # two different addresses. First it was `len(comments) >= 2`,
+                # counting GTD comments as proof of work. The completion artifact
+                # was introduced to fix it and reproduced it one layer down: a
+                # JSON file the agent wrote, believed on its own say-so, with a
+                # three-tier cascade bolted on to guess what the agent meant when
+                # the file was missing. The file was in fact unreadable on every
+                # host from the day it shipped (`cat` was never in the sudoers
+                # NOPASSWD list), so the cascade ran on every single run and the
+                # "agents are 0% compliant" signal that justified building it was
+                # an artefact of a permissions bug.
+                #
+                # The rule that replaces all of it: an agent-originated signal is
+                # a REQUEST, never a guarantee. It may inform a human. It may not
+                # move a run's status.
                 _zero_commits = dispatch.is_zero_commits_run(push_results_list)
-                _disposition = _artifact.disposition if _artifact else None
-                _already_satisfied_path = False
-                _unasserted_path = False
                 _failure_prefix: str | None = None
 
                 if _verdict != "ok":
-                    # Strict precedence: the envelope is the CLI's own statement
-                    # about how the process ended, and the new leniency applies
-                    # only to the agent-authored artifact.
+                    # The envelope is the CLI's own statement about how the
+                    # process ended — harness-emitted, not agent-authored.
                     _failure_prefix = _verdict
-                elif _artifact is None:
-                    # TIER 1 produced nothing.  Nothing is decided HERE: tiers 2
-                    # and 3 both take the post-run gate decision as evidence, so
-                    # the disposition is resolved after the gate has run — the
-                    # zero-commit case included, which is exactly where an
-                    # unwritten `already_satisfied` would otherwise be lost.
-                    _unasserted_path = True
-                elif _disposition in {"blocked", "failed"}:
-                    _failure_prefix = f"agent_reported_{_disposition}"
-                elif _disposition == "done" and _zero_commits:
-                    _failure_prefix = "done_claim_zero_commits"
-                elif _disposition == "already_satisfied" and _zero_commits:
-                    _already_satisfied_path = True
-
-                # Why the artifact was unusable, when it was there but rejected.
-                # Shared by the failure paths and the unasserted-success path —
-                # a rejected artifact must reach the operator either way.
-                _reject_detail = (
-                    f"Completion artifact rejected: {_artifact_reason}."
-                    if _artifact is None and _artifact_reason not in {"ok", "absent"}
-                    else ""
-                )
+                elif _zero_commits:
+                    # Zero commits across every repo is terminal, decided HERE,
+                    # before the gate runs.
+                    #
+                    # Running the gate on a commit-less tree is worse than
+                    # useless: the tree IS the base commit, so a green result
+                    # says the base is green and says nothing whatever about the
+                    # run. Treating that green as evidence of a completed no-op
+                    # is precisely how four agents' worth of real work was
+                    # discarded as "already satisfied" in a single night. It also
+                    # costs ~6 minutes of gate time per run to learn nothing.
+                    _failure_prefix = "zero_commits"
 
                 if _failure_prefix is not None:
-                    _detail_parts: list[str] = []
-                    if _artifact is not None and _artifact.summary.strip():
-                        _detail_parts.append(_artifact.summary.strip())
-                    if _artifact is not None and _artifact.decision_needed.strip():
-                        _detail_parts.append(
-                            f"Decision needed: {_artifact.decision_needed.strip()}"
-                        )
-                    if _reject_detail:
-                        _detail_parts.append(_reject_detail)
-                    _detail = "\n\n".join(_detail_parts)
                     error_str = f"{_failure_prefix}: " + (
-                        _detail.replace("\n", " ")
-                        if _detail
-                        else "build run did not assert a usable completion"
+                        "the agent ended its run without producing any commits"
+                        " on any repo"
+                        if _failure_prefix == "zero_commits"
+                        else "build run did not reach a usable conclusion"
                     )
                     _push_results_json = json.dumps(
                         [r.model_dump(mode="json") for r in push_results_list]
@@ -3862,7 +3774,7 @@ async def _dispatch_worker(
                         try:
                             await gtd_client.post_comment(
                                 run.item_id,
-                                build_failure_comment(_failure_prefix, run.id, _detail),
+                                build_failure_comment(_failure_prefix, run.id),
                                 created_by=attribution or "agent-gtd-dispatch",
                                 token=run.callback_token,
                             )
@@ -3888,14 +3800,13 @@ async def _dispatch_worker(
                 _gate_timed_out: bool | None = None
                 _gate_duration: float | None = None
 
-                # The zero-pushed-repo short-circuit is conditional: on the
-                # already_satisfied path the gate MUST run even though nothing was
-                # pushed — a no-op claim on a RED repo is a failure, never a skip.
-                # The unasserted path is in the same position for the same reason:
-                # the gate result is the evidence both remaining tiers reason
-                # from, and it is what tells a zero-commit run with no artifact
-                # apart from a genuine no-op.
-                if _n_pushed == 0 and not (_already_satisfied_path or _unasserted_path):
+                # Reaching here means commits were pushed — the zero-commit case
+                # already returned above without running the gate. The
+                # `_n_pushed == 0` branch survives only for the case where every
+                # repo reports `no_changes` yet `is_zero_commits_run` did not
+                # fire (an empty repo list), and it short-circuits rather than
+                # gating a tree nothing touched.
+                if _n_pushed == 0:
                     decision = "skipped_no_pushed_repo"
                 elif not _gate_cmd:
                     decision = "skipped_no_gate_command"
@@ -3911,10 +3822,6 @@ async def _dispatch_worker(
                     _gate_timeout = max(
                         int(_gate_remaining), config.POST_RUN_GATE_MIN_SECONDS
                     )
-                    _stashed_names = [r.repo_name for r in push_results_list if r.dirty]
-                    _dirty_paths = [
-                        p for n, p, _b in _verify_repos if n in _stashed_names
-                    ]
                     logger.info(
                         "run %s: post-run gate starting (timeout %ds)",
                         run.id,
@@ -3928,7 +3835,6 @@ async def _dispatch_worker(
                         _gate_timeout,
                         engine_used,
                         _register_subprocess,
-                        _dirty_paths or None,
                     )
                     assert _gate_result is not None  # noqa: S101
                     completed = datetime.now(UTC).isoformat()
@@ -3963,220 +3869,6 @@ async def _dispatch_worker(
                     (f"{_gate_duration:.1f}" if _gate_duration is not None else None),
                 )
 
-                _unasserted_ok = False
-                if _unasserted_path:
-                    # TIERS 2 AND 3.  The agent asserted nothing, so the WORKER
-                    # — which cannot skip the step the way a volunteered file
-                    # write can be skipped — resolves the disposition itself:
-                    # a bounded-evidence classification call first, mechanical
-                    # derivation only if that is unavailable.
-                    _evidence = disposition_mod.build_evidence(
-                        run_id=run.id,
-                        engine=engine_used.name,
-                        branch=run.branch_name,
-                        transcript_tail=(
-                            disposition_mod.read_transcript_tail(
-                                workspace / "transcript.txt"
-                            )
-                            if workspace is not None
-                            else ""
-                        ),
-                        repo_lines=[
-                            f"{r.repo_name}: {r.status.value}"
-                            f" ({r.commits_ahead} commit(s))"
-                            for r in push_results_list
-                        ],
-                        total_commits=sum(r.commits_ahead for r in push_results_list),
-                        pushed_repos=_n_pushed,
-                        gate_decision=decision,
-                        gate_output=(
-                            _gate_result.output if _gate_result is not None else None
-                        ),
-                        item=item,
-                        artifact_reject_reason=_artifact_reason,
-                    )
-                    _resolution = await disposition_mod.resolve(
-                        _evidence,
-                        has_commits=not _zero_commits,
-                        gate_decision=decision,
-                    )
-                    _disposition = _resolution.disposition
-
-                    # The resolved verdict now routes through the SAME flags the
-                    # asserted path sets — no parallel routing path (kb-03296).
-                    # The pre-existing unasserted guard survives on top of it:
-                    # with nobody asserting anything, a green gate is the only
-                    # corroboration that exists, so a non-passing gate fails the
-                    # run whatever the tier concluded.
-                    # The pre-existing rule was `decision == "passed"`, which
-                    # made an ungated project a place where an ASSERTED `done`
-                    # succeeds (there is no gate result to fail) and an
-                    # otherwise identical unasserted run fails. Same project,
-                    # same absent gate, opposite verdicts based only on whether
-                    # the agent happened to write a file. `skipped_no_gate_command`
-                    # is INCONCLUSIVE, not negative, so it is admitted here and
-                    # the tiers decide on the remaining evidence — which for
-                    # zero commits is still nothing, and still fails.
-                    # Every OTHER non-passing decision (`failed`, `timed_out`,
-                    # `launch_error`, `skipped_no_pushed_repo`) keeps failing
-                    # the run outright: those are gate verdicts ABOUT the tree.
-                    # `already_satisfied` can only arrive here from TIER 2: the
-                    # classifier reads the transcript and can see a stated
-                    # reason, so it is entitled to that verdict. The derived
-                    # tier is not and never returns it (see `derive`), so a
-                    # zero-commit run with no classification lands `failed`.
-                    _unasserted_ok = (
-                        decision in {"passed", "skipped_no_gate_command"}
-                        and _disposition in {"done", "already_satisfied"}
-                        and not (_disposition == "done" and _zero_commits)
-                    )
-                    if (
-                        _unasserted_ok
-                        and _disposition == "already_satisfied"
-                        and _zero_commits
-                    ):
-                        _already_satisfied_path = True
-
-                    # One greppable WARNING per non-asserted run.  This is the
-                    # data that says how often each tier fires, per engine, and
-                    # whether the prompt fixes are working — so it carries the
-                    # engine, the tier, the verdict and the classifier latency.
-                    logger.warning(
-                        "unasserted build run: run_id=%s engine=%s"
-                        " artifact_reject_reason=%s pushed_repos=%d"
-                        " gate_decision=%s tier=%s disposition=%s"
-                        " classifier_model=%s classifier_failure=%s"
-                        " classifier_latency_s=%s outcome=%s",
-                        run.id,
-                        engine_used.name,
-                        None if _artifact_reason == "ok" else _artifact_reason,
-                        _n_pushed,
-                        decision,
-                        _resolution.provenance,
-                        _disposition,
-                        _resolution.model,
-                        _resolution.classifier_failure,
-                        (
-                            f"{_resolution.latency_seconds:.2f}"
-                            if _resolution.latency_seconds is not None
-                            else None
-                        ),
-                        (
-                            "already_satisfied"
-                            if _already_satisfied_path
-                            else ("succeeded" if _unasserted_ok else "failed")
-                        ),
-                    )
-
-                if _unasserted_path and not _unasserted_ok:
-                    # Nothing asserted and no route to a success terminal.
-                    # Reuses the existing triage class — the dispatch boundary
-                    # gains no new failure prefix — and the class is the honest
-                    # one: whatever tier 2 or 3 concluded, the AGENT still never
-                    # said how its run ended, so `agent_reported_*` would put
-                    # words in its mouth.
-                    assert _resolution is not None  # noqa: S101
-                    error_str = (
-                        "stopped_without_assertion: no completion artifact;"
-                        f" {_resolution.provenance} disposition="
-                        f"{_resolution.disposition}"
-                        f" (gate decision={decision})"
-                    )
-                    if _resolution.reason.strip():
-                        error_str += f" — {_resolution.reason.strip()}"
-                    if _reject_detail:
-                        error_str += f" {_reject_detail}"
-                    _push_results_json = json.dumps(
-                        [r.model_dump(mode="json") for r in push_results_list]
-                    )
-                    await db.update_run(
-                        run.id,
-                        status=RunStatus.failed,
-                        completed_at=completed,
-                        exit_code=result.returncode,
-                        error=error_str[:ERROR_TEXT_MAX_CHARS],
-                        push_results=_push_results_json,
-                        completion=_build_completion(
-                            "failed", decision, unasserted=True
-                        ),
-                    )
-                    _publish_run_event(run.id, "failed", completed)
-                    if run.item_id is not None:
-                        _unasserted_detail = (
-                            disposition_mod.provenance_sentence(_resolution)
-                            + f"\n\n{_resolution.provenance.capitalize()}"
-                            f" disposition: `{_resolution.disposition}`."
-                        )
-                        if _resolution.reason.strip():
-                            _unasserted_detail += f" {_resolution.reason.strip()}"
-                        if _zero_commits and _resolution.provenance == "derived":
-                            # Nothing asserted, nothing classified, nothing
-                            # pushed. Say ONLY what is known — a green gate on
-                            # an unchanged tree is the base commit passing, so
-                            # it is not evidence the work already existed. This
-                            # is the wording that replaced a derived
-                            # `already_satisfied`, which told a lead that a run
-                            # producing nothing was work already done.
-                            _unasserted_detail += (
-                                f"\n\nBranch `{run.branch_name}` carries no"
-                                " commits and the run wrote no completion"
-                                " artifact, so what the agent did — or whether"
-                                " it did anything at all — could not be"
-                                " established. An unchanged tree passes a"
-                                " quality gate trivially (gate decision:"
-                                f" `{decision}`), so the gate cannot tell a"
-                                " genuine no-op apart from a run that produced"
-                                " nothing. The outcome is UNKNOWN: this item"
-                                " needs a human or a re-dispatch."
-                            )
-                        elif decision == "skipped_no_gate_command":
-                            # The gate did NOT run — do not imply it returned a
-                            # verdict. No gate configured is inconclusive, not
-                            # negative; what fails the run here is the absence
-                            # of the other evidence, not the absent gate.
-                            _unasserted_detail += (
-                                f"\n\nBranch `{run.branch_name}` carries"
-                                f" {_n_pushed} pushed repo(s). No quality gate"
-                                " is configured for this project, so the gate"
-                                " did not run and the verdict rests on the"
-                                " pushed commits alone — which do not support a"
-                                " successful outcome here. Setting a project"
-                                " `gate_command` would make an outcome like this"
-                                " verifiable."
-                            )
-                        else:
-                            _unasserted_detail += (
-                                f"\n\nBranch `{run.branch_name}` carries"
-                                f" {_n_pushed} pushed repo(s) and the post-run"
-                                f" gate decision was `{decision}`, so the run is"
-                                " recorded failed."
-                            )
-                        if _reject_detail:
-                            _unasserted_detail += f"\n\n{_reject_detail}"
-                        if _gate_result is not None and _gate_result.output:
-                            _unasserted_detail += (
-                                "\n\nGate output (tail):\n\n````\n"
-                                + _gate_result.output.rstrip("\n")
-                                + "\n````"
-                            )
-                        try:
-                            await gtd_client.post_comment(
-                                run.item_id,
-                                build_failure_comment(
-                                    "stopped_without_assertion",
-                                    run.id,
-                                    _unasserted_detail,
-                                ),
-                                created_by=attribution or "agent-gtd-dispatch",
-                                token=run.callback_token,
-                            )
-                        except Exception:
-                            logger.warning(
-                                "Failed to post unasserted-failure comment for run %s",
-                                run.id,
-                            )
-                    return  # exit early — do not mark succeeded
-
                 if _gate_result is not None and not _gate_result.passed:
                     if decision == "timed_out":
                         error_str = f"post-run gate timed out after {_gate_timeout}s"
@@ -4191,9 +3883,6 @@ async def _dispatch_worker(
                         )
                     else:  # launch_error
                         error_str = "post-run gate failed: launch error"
-
-                    if _already_satisfied_path:
-                        error_str = f"already_satisfied_gate_failed: {error_str}"
 
                     _push_results_json = json.dumps(
                         [r.model_dump(mode="json") for r in push_results_list]
@@ -4250,27 +3939,12 @@ async def _dispatch_worker(
                                 f" `{run.branch_name}` was pushed but was not"
                                 " gate-verified."
                             )
-                        if _already_satisfied_path:
-                            _gate_first_line = (
-                                "Build run failed (already_satisfied_gate_failed)"
-                                f" — run `{run.id}`. The agent claimed the work was"
-                                " already satisfied, but the project quality gate"
-                                " did not pass on the untouched tree.\n\n"
-                                + _gate_first_line
-                            )
                         _gate_comment = (
                             _gate_first_line
                             + "\n\nGate output (tail):\n\n````\n"
                             + (_gate_result.output or "(no output)").rstrip("\n")
                             + "\n````"
                         )
-                        if decision != "launch_error" and _stashed_names:
-                            _gate_comment += (
-                                "\n\nUncommitted changes in"
-                                f" {', '.join(_stashed_names)} were stashed"
-                                " before the gate ran, so the gate checked"
-                                " only the committed work."
-                            )
                         try:
                             await gtd_client.post_comment(
                                 run.item_id,
@@ -4291,43 +3965,12 @@ async def _dispatch_worker(
                     [r.model_dump(mode="json") for r in push_results_list]
                 )
 
-            if _verify_repos is not None and _already_satisfied_path:
-                # The agent asserted the work was already done, produced zero
-                # commits, and the project gate is green or absent.  Terminal is
-                # `already_satisfied` — never `succeeded` (the invariant) and
-                # never `failed` (that would recreate a re-dispatch loop).
-                # Reason text, whichever tier supplied the verdict: the agent's
-                # own `reason` when it asserted, otherwise the classifier's or
-                # the derivation's.  `already_satisfied` without a reason is the
-                # one thing this terminal must never be.
-                if _artifact is not None:
-                    _as_reason = _artifact.reason.strip()
-                    _as_provenance = "asserted"
-                else:
-                    assert _resolution is not None  # noqa: S101
-                    _as_reason = _resolution.reason.strip()
-                    _as_provenance = _resolution.provenance
-                await db.update_run(
-                    run.id,
-                    status=RunStatus.already_satisfied,
-                    completed_at=completed,
-                    exit_code=result.returncode,
-                    error=f"already_satisfied: {_as_reason}"[:500],
-                    push_results=_push_results_json,
-                    completion=_build_completion("already_satisfied", decision),
-                )
-                _publish_run_event(run.id, "already_satisfied", completed)
-                if run.item_id is not None:
-                    await _route_already_satisfied_item(
-                        run.item_id,
-                        run.id,
-                        _as_reason,
-                        callback_token=run.callback_token,
-                        attribution=attribution,
-                        detail=f"Quality gate: {decision}.",
-                        provenance=_as_provenance,
-                    )
-                return
+            # NOTE: there is no `already_satisfied` branch here. That terminal is
+            # reachable from talos exit 30 ONLY (see `_run_talos`), where talos
+            # ran its own checks before emitting the verdict. A claude-code build
+            # cannot produce it: the only evidence that ever distinguished a
+            # deliberate no-op from a silent failure was the agent's own claim,
+            # and a claim is not evidence. Zero commits now fails above.
 
             # All pushed (or no BUILD verification needed) — mark succeeded
             if _verify_repos is not None:
@@ -4335,14 +3978,11 @@ async def _dispatch_worker(
                     run.id,
                     status=RunStatus.succeeded,
                     push_results_list=push_results_list,
-                    disposition=_disposition,
                     envelope_verdict=_verdict,
                     completed_at=completed,
                     exit_code=result.returncode,
                     push_results=_push_results_json,
-                    completion_blob=_build_completion(
-                        "succeeded", decision, unasserted=_unasserted_path
-                    ),
+                    completion_blob=_build_completion("succeeded", decision),
                 )
                 _publish_run_event(run.id, _final_status.value, completed)
                 if _final_status is not RunStatus.succeeded:
@@ -4403,12 +4043,6 @@ async def _dispatch_worker(
                     f"Post-run gate passed (run `{run.id}`): `{_gate_cmd}`"
                     f" exited 0 in {int(_gate_result.duration_seconds)}s."
                 )
-                if _stashed_names:
-                    _gate_pass_comment += (
-                        "\n\nUncommitted changes in"
-                        f" {', '.join(_stashed_names)} were stashed before the"
-                        " gate ran, so the gate checked only the committed work."
-                    )
                 try:
                     await gtd_client.post_comment(
                         run.item_id,
@@ -4421,84 +4055,12 @@ async def _dispatch_worker(
                         "Failed to post post-run gate pass comment for run %s",
                         run.id,
                     )
-            if (
-                _verify_repos is not None
-                and _unasserted_path
-                and run.item_id is not None
-            ):
-                # Say plainly that nobody asserted anything, and name the tier
-                # that stood in for the agent. The reviewer — not the agent —
-                # is the one confirming the change matches scope, and an
-                # inferred verdict must never read as the agent's own word.
-                assert _resolution is not None  # noqa: S101
-                # NEVER say the gate passed when it did not run. On an ungated
-                # project the gate is skipped, and describing that as a pass
-                # sends a reviewer looking for a test result that never existed.
-                if decision == "skipped_no_gate_command":
-                    _gate_clause = (
-                        "no quality gate is configured for this project"
-                        f" (decision=`{decision}`), so the gate did not run and"
-                        " the verdict rests on the pushed commits alone"
-                    )
-                else:
-                    _gate_clause = (
-                        f"the project quality gate passed (decision=`{decision}`)"
-                    )
-                if _resolution.provenance == "inferred":
-                    _unasserted_body = (
-                        f"Build run `{run.id}` is recorded **successful on an"
-                        " inferred disposition**. The agent pushed commits to"
-                        f" `{run.branch_name}` and {_gate_clause}, but it never"
-                        " wrote a completion artifact, so it never asserted how"
-                        " its run ended."
-                    )
-                else:
-                    _unasserted_body = (
-                        f"Build run `{run.id}` is recorded **successful on"
-                        " mechanical evidence alone**. The agent pushed commits"
-                        f" to `{run.branch_name}` and {_gate_clause}, but it"
-                        " never wrote a completion artifact, so it never"
-                        " asserted how its run ended."
-                    )
-                if decision == "skipped_no_gate_command":
-                    _unasserted_body += (
-                        " Setting a project `gate_command` is what would make"
-                        " an outcome like this verifiable rather than merely"
-                        " plausible."
-                    )
-                _unasserted_body += (
-                    f"\n\n{disposition_mod.provenance_sentence(_resolution)}"
-                    f"\n\n{_resolution.provenance.capitalize()} disposition:"
-                    f" `{_resolution.disposition}`."
-                )
-                if _resolution.reason.strip():
-                    _unasserted_body += f" {_resolution.reason.strip()}"
-                if _reject_detail:
-                    _unasserted_body += f"\n\n{_reject_detail}"
-                _unasserted_body += (
-                    "\n\nNothing here says the agent believes it finished the"
-                    " item — please confirm the change actually matches the"
-                    " item's scope before accepting it."
-                )
-                try:
-                    await gtd_client.post_comment(
-                        run.item_id,
-                        _unasserted_body,
-                        created_by=attribution or "agent-gtd-dispatch",
-                        token=run.callback_token,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Failed to post unasserted-success comment for run %s",
-                        run.id,
-                    )
             if _verify_repos is not None and run.item_id is not None:
-                # ALWAYS: the worker's own account of a successful build run.
-                # The agent's prompt no longer asks it to report the mechanical
-                # half (branch, commits, push, gate) or to set the item status —
-                # both are materialized here, from what the worker already
-                # holds, and enriched with the artifact when there is one.  A
-                # run that wrote no artifact still leaves the reviewer facts.
+                # ALWAYS: the worker's own account of a successful build run,
+                # composed entirely from what the worker observed — branch,
+                # per-repo commit counts, push outcomes, gate decision. The agent
+                # does not report the mechanical half and does not set the item
+                # status; both are materialized here.
                 try:
                     await gtd_client.post_comment(
                         run.item_id,
@@ -4507,8 +4069,6 @@ async def _dispatch_worker(
                             run.branch_name,
                             push_results_list,
                             decision,
-                            _artifact,
-                            _resolution,
                         ),
                         created_by=attribution or "agent-gtd-dispatch",
                         token=run.callback_token,
@@ -4518,10 +4078,8 @@ async def _dispatch_worker(
                         "Failed to post build completion comment for run %s",
                         run.id,
                     )
-                # Disposition -> item status, materialized by the worker (the
-                # agent no longer sets it).  `done` and the unasserted
-                # no-artifact success both land on `review`; `already_satisfied`
-                # routed itself above; `blocked`/`failed` never reach here.
+                # A successful build run moves its item to `review`. There is no
+                # other outcome that reaches here: failures returned early above.
                 await _nudge_item_to_review(
                     run.item_id,
                     run.id,
@@ -4664,6 +4222,19 @@ async def _dispatch_worker(
             retention.capture_evidence(run.id, workspace, _evidence_repos)
         except Exception:
             logger.exception("evidence capture raised for run %s — continuing", run.id)
+
+        # Rescue: commit and push anything the agent left behind, BEFORE the
+        # clone is deleted. Teardown is irreversible, so this is the last moment
+        # the work exists anywhere. Runs regardless of the recorded terminal —
+        # a failed run is exactly the case where unpushed work is most likely.
+        _rescued = await _rescue_before_teardown(
+            run, _evidence_repos, attribution=attribution
+        )
+        if _rescued is not None and not _rescued.ok:
+            # Rescue could not get the work to origin. The workspace is the only
+            # copy left, so keep it and say so where an operator will see it.
+            should_cleanup = False
+
         if workspace is not None and should_cleanup:
             dispatch.cleanup_workspace(workspace)
         if run.mode == DispatchMode.MANAGE and run.rollout_id and not _human_cancelled:

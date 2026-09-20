@@ -27,7 +27,7 @@ WORKSPACE_ROOT: Path = Path.home() / "workspace"
 AGENT_SUBPROCESS_USER: str = ""
 
 # Retention — the decay-rate split.
-# Evidence (transcript, completion artifact, patch) is small and stays useful for
+# Evidence (transcript and patch) is small and stays useful for
 # months; the workspace TREE is hundreds of MB to GB (full clones plus target/,
 # node_modules/, .venv) and its value decays in a day or two.
 EVIDENCE_ROOT: Path = Path.home() / "run-evidence"
@@ -175,65 +175,6 @@ OLLAMA_CLOUD_API_KEY: str = ""
 OLLAMA_CLOUD_BASE_URL: str = "https://ollama.com"
 OLLAMA_CLOUD_MODEL: str = "glm-5.3:cloud"
 
-# --- Run-disposition classifier (tier 2 of disposition.py) -------------------
-#
-# Why every knob here is CONFIG and not a literal in disposition.py: the model
-# is an open-weights one, and open-weights models move fast — GLM 5.4 or 6 will
-# land well before this code is next touched.  Model, base URL, credential
-# source, timeout and the master switch are all env-overridable so moving the
-# classifier to a newer model (or to a different provider entirely) is an env
-# change on the hosts, with no code edit and no redeploy of logic.  This
-# indirection exists for MODEL CHURN; provider OUTAGE is covered by the derived
-# tier, which needs no configuration at all.
-#
-# DISPOSITION_CLASSIFIER_API_KEY_ENV names the env var that holds the
-# credential rather than the credential itself, so switching providers does not
-# require the secret to be re-plumbed through this module.
-#
-# ---------------------------------------------------------------------------
-# TRANSPORT/MODEL COMPATIBILITY — read this before changing the model
-# ---------------------------------------------------------------------------
-# The classifier speaks the ANTHROPIC-COMPATIBLE wire (`POST /v1/messages`,
-# driven by the `anthropic` SDK in disposition.py).  Ollama Cloud exposes TWO
-# wires and they do NOT serve the same set of models:
-#
-#   * native   `POST /api/chat`   — serves `glm-5.3-flash:cloud` (verified 200)
-#   * anthropic `POST /v1/messages` — does NOT serve flash; serves `glm-5.3:cloud`
-#
-# Measured against the live service with a valid host credential:
-#
-#   | endpoint       | model                | result |
-#   |----------------|----------------------|--------|
-#   | /v1/messages   | glm-5.3-flash:cloud  | 401    |
-#   | /v1/messages   | glm-5.3-flash        | 401    |
-#   | /v1/messages   | glm-5.3:cloud        | 200    |
-#   | /api/chat      | glm-5.3-flash:cloud  | 200    |
-#
-# THE TRAP: Ollama Cloud answers **401, not 404**, for a model it will not
-# serve on that endpoint.  A model-availability problem is therefore
-# INDISTINGUISHABLE from an auth problem unless you test both — and the first
-# shipped default (`glm-5.3-flash` on /v1/messages) read as a credential fault
-# and never once returned 200 in production.  That cost the feature silently:
-# every run fell through to the derived tier for a week.
-#
-# So: a model named here must have been observed returning 200 ON THIS
-# ENDPOINT.  Do not infer availability from the native `ollama run` wire, from
-# the talos engine pins (talos uses /api/chat, which is why flash works there),
-# or from the model list on ollama.com.  Issue a real /v1/messages request.
-# The one-shot reachability probe in disposition.py exists so that a wrong
-# pairing announces itself at WARNING on startup instead of being discovered
-# from false-negative run dispositions days later.
-DISPOSITION_CLASSIFIER_ENABLED: bool = True
-DISPOSITION_CLASSIFIER_MODEL: str = "glm-5.3:cloud"
-DISPOSITION_CLASSIFIER_BASE_URL: str = "https://ollama.com"
-DISPOSITION_CLASSIFIER_API_KEY_ENV: str = "OLLAMA_CLOUD_API_KEY"
-# Hard per-attempt timeout. The classifier runs inside the worker's TERMINAL
-# path, so a hung call delays the run's completion (and, in a rollout, the wave
-# behind it). 45 s x at most 2 attempts = ~90 s worst case, well under
-# POST_RUN_GATE_MIN_SECONDS (600 s) — the smallest slice of run budget the
-# worker ever reserves for post-agent work.
-DISPOSITION_CLASSIFIER_TIMEOUT_SECONDS: int = 45
-
 # talos binary discovery: default 'talos', PATH-resolved by the subprocess machinery
 # (mirrors how the 'claude' binary is resolved for claude-code engines). Override via
 # TALOS_BIN env var when the binary lives at a non-default path on the host.
@@ -246,7 +187,7 @@ TALOS_GATE_TIMEOUT_SECS: int = 900
 # uvicorn's own loggers and leaves the root logger alone, so before 2026-09-19
 # every `logger.info(...)` in this package went nowhere: the journal carried
 # uvicorn access lines and nothing else.  That made the gate-install decisions,
-# the post-run gate, the manage-recovery ladder and the unasserted-run WARNING
+# the post-run gate, the manage-recovery ladder and the rescue WARNING
 # invisible in production — all of them precisely the things you need when a
 # dispatch misbehaves.  See `main.configure_logging`.
 LOG_LEVEL: str = "INFO"
@@ -290,9 +231,6 @@ def load() -> None:
     global GATE_INSTALL_TIMEOUT_SECONDS, POST_RUN_GATE_MIN_SECONDS
     global OLLAMA_CLOUD_API_KEY, OLLAMA_CLOUD_BASE_URL, OLLAMA_CLOUD_MODEL
     global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS
-    global DISPOSITION_CLASSIFIER_ENABLED, DISPOSITION_CLASSIFIER_MODEL
-    global DISPOSITION_CLASSIFIER_BASE_URL, DISPOSITION_CLASSIFIER_API_KEY_ENV
-    global DISPOSITION_CLASSIFIER_TIMEOUT_SECONDS
     global AGENT_SUBPROCESS_USER
     global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
     global MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS, MAX_MANAGE_FREE_RELAUNCHES
@@ -358,27 +296,6 @@ def load() -> None:
         "OLLAMA_CLOUD_BASE_URL", "https://ollama.com"
     )
     OLLAMA_CLOUD_MODEL = os.environ.get("OLLAMA_CLOUD_MODEL", "glm-5.3:cloud")
-    DISPOSITION_CLASSIFIER_ENABLED = os.environ.get(
-        "DISPATCH_DISPOSITION_CLASSIFIER_ENABLED", "1"
-    ).strip().lower() not in {"0", "false", "no", "off", ""}
-    # Default model: see the TRANSPORT/MODEL COMPATIBILITY note above. Only a
-    # model verified to return 200 on the Anthropic-compatible /v1/messages
-    # endpoint belongs here; flash is served ONLY by the native /api/chat wire.
-    DISPOSITION_CLASSIFIER_MODEL = (
-        os.environ.get("DISPATCH_DISPOSITION_CLASSIFIER_MODEL", "").strip()
-        or "glm-5.3:cloud"
-    )
-    DISPOSITION_CLASSIFIER_BASE_URL = (
-        os.environ.get("DISPATCH_DISPOSITION_CLASSIFIER_BASE_URL", "").strip()
-        or "https://ollama.com"
-    )
-    DISPOSITION_CLASSIFIER_API_KEY_ENV = (
-        os.environ.get("DISPATCH_DISPOSITION_CLASSIFIER_API_KEY_ENV", "").strip()
-        or "OLLAMA_CLOUD_API_KEY"
-    )
-    DISPOSITION_CLASSIFIER_TIMEOUT_SECONDS = int(
-        os.environ.get("DISPATCH_DISPOSITION_CLASSIFIER_TIMEOUT_SECONDS", "45")
-    )
     TALOS_BIN = os.environ.get("TALOS_BIN", "talos")
     TALOS_GATE_TIMEOUT_SECS = int(os.environ.get("TALOS_GATE_TIMEOUT_SECS", "900"))
     OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "qwen3.6:35b")

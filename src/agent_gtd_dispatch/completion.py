@@ -1,30 +1,29 @@
-"""Agent completion evidence: the result envelope and the completion artifact.
+"""The agent CLI's own result envelope — the completion evidence the worker can trust.
 
-Two independent legs of the build-completion contract live here.
+The envelope is the CLI's ``--output-format json`` terminal object, extracted from
+the merged stdout+stderr transcript that ``dispatch.run_agent`` streams to
+``transcript.txt``.  It is MECHANICAL evidence: the harness emits it, not the agent,
+so it cannot be skipped, forgotten or embellished by the model running inside it.
 
-Leg 1 — the CLI's own ``--output-format json`` result envelope, extracted from the
-merged stdout+stderr transcript that ``dispatch.run_agent`` streams to
-``transcript.txt``.
+There used to be a second leg here — an agent-authored ``completion.json`` stating
+what the agent believed it did.  It is gone, and deliberately so.  Anything the agent
+originates (a file, a comment, an MCP call) is a REQUEST, not a guarantee: it is
+produced by the same process whose reliability is in question, so a run's status must
+never turn on whether it appeared.  A run's terminal is now built from this envelope,
+the commits that reached origin, and the project gate result — three things the worker
+observes for itself.
 
-Leg 2 — the agent-authored completion artifact at
-``<workspace>/.dispatch/completion.json``, which states what the agent believes it
-did.
-
-This module only READS.  It never posts to GTD, never touches the database and
-never decides a run's status — callers combine the two legs with the push results
-to reach a terminal.
+This module only READS.  It never posts to GTD, never touches the database and never
+decides a run's status.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import subprocess
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict
-
-from .dispatch import _sudo_wrap
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -34,16 +33,6 @@ logger = logging.getLogger(__name__)
 # Only the tail of the transcript is scanned: the envelope is the last thing the
 # CLI writes, and a long build can leave a multi-hundred-MB transcript behind.
 MAX_TRANSCRIPT_TAIL_BYTES: int = 1048576
-
-# An artifact larger than this is refused outright — an agent that writes a
-# multi-GB completion.json must not be able to block teardown.
-MAX_ARTIFACT_BYTES: int = 65536
-
-KNOWN_SCHEMA_VERSIONS: frozenset[int] = frozenset({1})
-
-VALID_DISPOSITIONS: frozenset[str] = frozenset(
-    {"done", "already_satisfied", "blocked", "failed"}
-)
 
 
 class ResultEnvelope(BaseModel):
@@ -64,18 +53,6 @@ class ResultEnvelope(BaseModel):
     result: str | None = None
     session_id: str | None = None
     total_cost_usd: float | None = None
-
-
-class CompletionArtifact(BaseModel):
-    """The agent-authored assertion about how its run ended."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    schema_version: int = 1
-    disposition: str
-    summary: str = ""
-    reason: str = ""
-    decision_needed: str = ""
 
 
 def _iter_json_objects(text: str) -> list[Any]:
@@ -170,146 +147,3 @@ def envelope_verdict(env: ResultEnvelope | None) -> str:
         )
         return "result_is_error"
     return "ok"
-
-
-def artifact_read_argv(path: Path) -> list[str]:
-    """Return the argv used to read an agent-created file.
-
-    The artifact is written by the AGENT process, which runs as
-    ``config.AGENT_SUBPROCESS_USER`` while the worker runs as the service user, so
-    every read goes through ``dispatch._sudo_wrap`` exactly as ``verify_pushes``
-    and ``cleanup_workspace`` do.
-    """
-    return _sudo_wrap(["cat", str(path)])
-
-
-def _read_artifact_bytes(path: Path) -> bytes | None:
-    """Read an agent-created file cross-user; None when it cannot be read."""
-    try:
-        result = subprocess.run(  # noqa: S603
-            artifact_read_argv(path),
-            capture_output=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout
-
-
-def locate_completion_artifact(workspace: Path) -> tuple[Path | None, str]:
-    """Find the completion artifact under ``workspace``.
-
-    The contract path is ``<workspace>/.dispatch/completion.json``.  Belt and
-    braces for an agent that wrote a relative path after ``cd``-ing into a repo
-    directory: exactly one ``*/.dispatch/completion.json`` hit is accepted, two or
-    more is ``ambiguous_location``.
-    """
-    primary = workspace / ".dispatch" / "completion.json"
-    if primary.exists():
-        return primary, "ok"
-    try:
-        hits = sorted(workspace.glob("*/.dispatch/completion.json"))
-    except OSError:
-        hits = []
-    if len(hits) == 1:
-        return hits[0], "ok"
-    if len(hits) > 1:
-        return None, "ambiguous_location"
-    return None, "absent"
-
-
-def read_completion_artifact(
-    workspace: Path,
-) -> tuple[CompletionArtifact | None, str]:
-    """Read and validate the agent's completion artifact.
-
-    Returns ``(artifact, "ok")`` or ``(None, reason)`` where reason is one of
-    ``absent``, ``not_json``, ``not_object``, ``unknown_schema_version``,
-    ``unknown_disposition``, ``missing_reason``, ``missing_decision_needed``,
-    ``oversize``, ``ambiguous_location``.
-
-    A MISSING ``schema_version`` defaults to 1 and is accepted — version skew
-    between the worker and a build agent must degrade gracefully.
-    """
-    path, located = locate_completion_artifact(workspace)
-    if path is None:
-        return None, located
-
-    try:
-        size = path.stat().st_size
-    except OSError:
-        size = None
-    if size is not None and size > MAX_ARTIFACT_BYTES:
-        return None, "oversize"
-
-    raw = _read_artifact_bytes(path)
-    if raw is None:
-        return None, "absent"
-    if len(raw) > MAX_ARTIFACT_BYTES:
-        return None, "oversize"
-
-    text = raw.decode("utf-8", errors="replace")
-    try:
-        data: Any = json.loads(text)
-    except ValueError:
-        return None, "not_json"
-    if not isinstance(data, dict):
-        return None, "not_object"
-
-    if "schema_version" in data and data["schema_version"] not in KNOWN_SCHEMA_VERSIONS:
-        return None, "unknown_schema_version"
-
-    disposition = data.get("disposition")
-    if disposition not in VALID_DISPOSITIONS:
-        return None, "unknown_disposition"
-
-    reason = data.get("reason")
-    if disposition == "already_satisfied" and not str(reason or "").strip():
-        return None, "missing_reason"
-
-    decision_needed = data.get("decision_needed")
-    if disposition == "blocked" and not str(decision_needed or "").strip():
-        return None, "missing_decision_needed"
-
-    payload = dict(data)
-    payload.setdefault("schema_version", 1)
-    for key in ("summary", "reason", "decision_needed"):
-        if payload.get(key) is None:
-            payload[key] = ""
-    try:
-        artifact = CompletionArtifact.model_validate(payload)
-    except ValueError:
-        return None, "not_object"
-    return artifact, "ok"
-
-
-def artifact_state(artifact: CompletionArtifact | None, reason: str) -> str:
-    """Map a ``read_completion_artifact`` outcome to present|absent|malformed."""
-    if artifact is not None:
-        return "present"
-    if reason in {"absent", "ambiguous_location"}:
-        return "absent"
-    return "malformed"
-
-
-def log_artifact_rejection(run_id: str, workspace: Path, reason: str) -> None:
-    """Log a rejected artifact at WARNING with a short raw head for triage.
-
-    Telemetry distinguishes malformed from absent; the terminal stays binary.
-    """
-    if reason == "ok":
-        return
-    head = b""
-    path, located = locate_completion_artifact(workspace)
-    if path is not None and located == "ok":
-        raw = _read_artifact_bytes(path)
-        if raw:
-            head = raw[:200]
-    logger.warning(
-        "completion artifact rejected: run_id=%s reason=%s raw_head=%r",
-        run_id,
-        reason,
-        head,
-    )

@@ -1,10 +1,13 @@
 """Shared helpers for seeding the build-completion evidence a BUILD run requires.
 
-Every BUILD-mode terminal now reads two things out of the workspace: the CLI's
-``--output-format json`` result envelope at the tail of ``transcript.txt`` (leg 1)
-and the agent-authored artifact at ``.dispatch/completion.json`` (leg 2).  Worker
-tests that only care about push verification or the post-run gate seed a clean,
-green pair with these helpers so the assertion under test stays isolated.
+A BUILD-mode terminal reads ONE thing out of the workspace: the CLI's
+``--output-format json`` result envelope at the tail of ``transcript.txt``.  Worker
+tests that only care about push verification or the post-run gate seed a clean, green
+envelope with these helpers so the assertion under test stays isolated.
+
+There used to be a second helper here for the agent-authored completion artifact.
+It is gone with the contract — no code reads an agent-written file any more, so a test
+that seeded one would be seeding something the worker cannot see.
 """
 
 from __future__ import annotations
@@ -40,21 +43,7 @@ def write_envelope(workspace: Path, **overrides: Any) -> None:
     (workspace / "transcript.txt").write_text(json.dumps(envelope) + "\n")
 
 
-def write_artifact(workspace: Path, disposition: str = "done", **fields: Any) -> None:
-    """Write a completion artifact at the contract path under ``workspace``."""
-    payload: dict[str, Any] = {
-        "schema_version": 1,
-        "disposition": disposition,
-        "summary": "seeded by test",
-    }
-    payload.update(fields)
-    target = workspace / ".dispatch"
-    target.mkdir(parents=True, exist_ok=True)
-    (target / "completion.json").write_text(json.dumps(payload))
-
-
-def seed_build_evidence(workspace: Path, disposition: str = "done") -> None:
-    """Seed a green envelope plus a ``done`` artifact into ``workspace``."""
+def seed_build_evidence(workspace: Path) -> None:
+    """Seed a green result envelope into ``workspace``."""
     workspace.mkdir(parents=True, exist_ok=True)
     write_envelope(workspace)
-    write_artifact(workspace, disposition)

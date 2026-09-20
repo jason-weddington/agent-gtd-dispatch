@@ -45,10 +45,6 @@ GATE_ENV_KEYS: frozenset[str] = COMMON_ENV_KEYS - {
     "KB_DATABASE_URL",
 }
 
-# git stash message used to park uncommitted changes in a dirty repo before
-# running the post-run gate, so the gate only ever checks committed work.
-GATE_STASH_MESSAGE: str = "agent-gtd-post-run-gate"
-
 # Shim run via `/bin/bash -c` (the binary the sudoers NOPASSWD list already
 # authorizes): GNU `timeout` bounds the gate and signals its whole process
 # group, then `/bin/sh -c` runs the gate_command string itself.
@@ -428,15 +424,11 @@ def verify_pushes(
 def is_zero_commits_run(push_results: list[RepoPushStatus]) -> bool:
     """Return True when all repos have no_changes status (zero commits across the run).
 
-    A zero-commits run may be a silent failure (the agent died mid-implementation)
-    or a deliberate no-op (the agent determined the work was already done).  The
-    caller distinguishes the two by the completion artifact's ``disposition``
-    written by the agent itself — never by counting activity on the GTD item.
+    The invariant this function exists to serve: a zero-commit build run is never success.
 
-    The invariant this function exists to serve: a zero-commit build run is never
-    success.  The only non-failure zero-commit outcome is ``already_satisfied``,
-    which requires a parseable artifact carrying a reason and a green-or-absent
-    quality gate, and which does not complete the item.
+    There is no longer any attempt to tell a "deliberate no-op" apart from a silent failure for a claude-code build, because nothing the worker can observe distinguishes them. An unchanged tree passes a quality gate trivially — the gate is judging the base commit — so a green gate on zero commits is evidence about the base, not about the run. The worker used to accept an agent-written file claiming "already done" as the tiebreaker; that file is gone, and with it the only input that ever separated the two cases. Zero commits is now simply a failure.
+
+    ``already_satisfied`` survives as a terminal for ONE engine only: talos exit code 30, where talos ran its own checks before emitting the verdict. See :func:`main._run_talos`.
     """
     return bool(push_results) and all(
         r.status == PushStatus.no_changes for r in push_results
@@ -499,7 +491,6 @@ def run_gate_command(
     timeout_seconds: int,
     engine: Engine,
     popen_callback: Callable[[subprocess.Popen[bytes]], None] | None = None,
-    dirty_repo_paths: list[Path] | None = None,
 ) -> GateResult:
     """Run the project's post-run quality gate and capture its outcome.
 
@@ -512,49 +503,9 @@ def run_gate_command(
     caught and folded into the returned :class:`GateResult` so a gate failure
     or a launch error can never be misclassified by the caller as an agent
     timeout.
-    """
-    for path in dirty_repo_paths or []:
-        try:
-            stash_proc = subprocess.run(
-                _sudo_wrap(
-                    [
-                        "git",
-                        "-c",
-                        "user.name=agent-gtd-dispatch",
-                        "-c",
-                        "user.email=agent-gtd-dispatch@localhost",
-                        "stash",
-                        "push",
-                        "--message",
-                        GATE_STASH_MESSAGE,
-                    ]
-                ),
-                cwd=path,
-                capture_output=True,
-                check=False,
-            )
-        except OSError as exc:
-            return GateResult(
-                returncode=None,
-                timed_out=False,
-                output=(
-                    "gate launch failed: could not stash uncommitted changes"
-                    f" in {path.name}: {exc}"
-                ),
-                duration_seconds=0.0,
-            )
-        if stash_proc.returncode != 0:
-            stderr_tail = stash_proc.stderr.decode("utf-8", errors="replace")[-500:]
-            return GateResult(
-                returncode=None,
-                timed_out=False,
-                output=(
-                    "gate launch failed: could not stash uncommitted changes"
-                    f" in {path.name}: {stderr_tail}"
-                ),
-                duration_seconds=0.0,
-            )
 
+    The gate runs against the working tree EXACTLY as the agent left it. This function used to ``git stash push`` any uncommitted changes first, on the theory that a gate should only judge committed work. That theory destroyed four runs' worth of real work in one night: agents that had implemented an item but not yet committed it had their entire tree stashed away, at which point the gate passed trivially against the pristine base commit and the worker concluded the work was already done. Stashing is a MUTATION performed on evidence during the act of judging it, and there is no version of that which is safe. A dirty tree is now handled where it belongs — by the rescue path at teardown, which commits and pushes it to the run's own branch rather than hiding it.
+    """
     argv = _sudo_wrap(
         [
             "/bin/bash",
@@ -799,6 +750,157 @@ def prepare_manage_workspace_multi(repo_urls: list[str], run_id: str) -> Path:
             raise RuntimeError(f"workspace checkout failed for {url}: {stderr_tail}")
 
     return root
+
+
+@dataclass(frozen=True, slots=True)
+class RescueResult:
+    """What the pre-teardown rescue did to one repo."""
+
+    repo_name: str
+    #: True when this repo had unpushed commits or a dirty tree to rescue.
+    attempted: bool
+    #: True when the rescued branch reached origin.
+    pushed: bool
+    #: True when uncommitted working-tree changes were committed by the rescue.
+    committed: bool
+    #: Operator-facing failure text; empty when nothing went wrong.
+    error: str = ""
+
+
+def _repo_has_unrescued_work(repo_path: Path, branch_name: str) -> tuple[bool, bool]:
+    """Return ``(has_work, tree_is_dirty)`` for one repo on ``branch_name``.
+
+    ``has_work`` is true when the repo holds anything that would be destroyed by teardown: uncommitted changes in the working tree (tracked, modified OR untracked — the sweep-style ``--untracked-files=no`` used for push verification is deliberately NOT used here, because a run whose entire output is new files would look clean), or commits on the branch that are not on the remote.
+
+    The remote comparison is against the LIVE remote ref via ``git ls-remote``, never against the clone's own ``origin/main``. A dispatch clone's remote-tracking refs are frozen at clone time, so comparing against them reports work as unpushed forever — a permanent false positive that would make every teardown rescue-push something already safely on origin.
+    """
+    porcelain = subprocess.run(
+        _sudo_wrap(["git", "status", "--porcelain"]),
+        cwd=repo_path,
+        check=False,
+        capture_output=True,
+    )
+    dirty = bool(
+        porcelain.returncode == 0
+        and porcelain.stdout.decode("utf-8", errors="replace").strip()
+    )
+
+    head = subprocess.run(
+        _sudo_wrap(["git", "rev-parse", "HEAD"]),
+        cwd=repo_path,
+        check=False,
+        capture_output=True,
+    )
+    if head.returncode != 0:
+        return dirty, dirty
+    local_sha = head.stdout.decode("utf-8", errors="replace").strip()
+
+    remote = subprocess.run(
+        _sudo_wrap(["git", "ls-remote", "origin", f"refs/heads/{branch_name}"]),
+        cwd=repo_path,
+        check=False,
+        capture_output=True,
+    )
+    if remote.returncode != 0:
+        # Cannot establish what origin has. Fail LOUD, not quiet: assume there
+        # is work to rescue. A redundant push is refused harmlessly by git; a
+        # skipped one deletes the work.
+        return True, dirty
+    remote_line = remote.stdout.decode("utf-8", errors="replace").strip()
+    remote_sha = remote_line.split("\t")[0] if remote_line else ""
+    return (dirty or remote_sha != local_sha), dirty
+
+
+def rescue_abandoned_work(
+    repo_name: str, repo_path: Path, branch_name: str, run_id: str
+) -> RescueResult:
+    """Commit and push work an agent left behind, immediately before teardown.
+
+    This is the LAST line of defence and it exists because teardown is irreversible. A dispatch clone is deleted at run exit, so anything the agent finished but did not push — commits it made and never pushed, or work still sitting in the working tree — is destroyed at that moment, whatever the run's recorded status says. One night of runs lost roughly 560 agent-turns of completed, gate-green work this way.
+
+    Three properties make this safe to run unattended:
+
+    Hooks are SKIPPED (``--no-verify``) on both the commit and the push. This is the deliberate opposite of :func:`main._commit_with_retry`, which must run hooks so fixer hooks can fix, and the two paths must NOT be merged. The difference is what is being committed: the normal path commits work an agent declared finished, where a hook rejection is a real signal worth acting on. This path commits work that is by definition INCOMPLETE and will usually fail a hook — and a blocked commit here does not produce a cleaner tree, it produces no tree at all. Preserving the evidence beats enforcing a standard on something nobody is going to merge as-is.
+
+    It only ever writes to the run's OWN ``feat/*`` branch — the same branch the dispatch worker already pushes to on its success path — so it is a retry of an access that already exists, not a new one. It must never push to a default branch, and never force-push.
+
+    A redundant rescue costs nothing: if the worker already pushed, git refuses the ref update and the result simply records it.
+    """
+    result = RescueResult(repo_name, attempted=False, pushed=False, committed=False)
+    try:
+        has_work, dirty = _repo_has_unrescued_work(repo_path, branch_name)
+    except OSError as exc:
+        return RescueResult(
+            repo_name,
+            attempted=True,
+            pushed=False,
+            committed=False,
+            error=f"could not inspect {repo_name}: {exc}",
+        )
+    if not has_work:
+        return result
+
+    committed = False
+    if dirty:
+        add = subprocess.run(
+            _sudo_wrap(["git", "add", "-A"]),
+            cwd=repo_path,
+            check=False,
+            capture_output=True,
+        )
+        if add.returncode != 0:
+            return RescueResult(
+                repo_name,
+                attempted=True,
+                pushed=False,
+                committed=False,
+                error=f"git add failed in {repo_name}: {git_output_excerpt(add)}",
+            )
+        commit = subprocess.run(
+            _sudo_wrap(
+                [
+                    "git",
+                    "-c",
+                    "user.name=agent-gtd-dispatch",
+                    "-c",
+                    "user.email=agent-gtd-dispatch@localhost",
+                    "commit",
+                    "--no-verify",
+                    "-m",
+                    (
+                        "chore(rescue): partial work recovered from abandoned run"
+                        f" {run_id}\n\n"
+                        "Committed by the dispatch worker at teardown, NOT by the"
+                        " agent. This is unreviewed, incomplete work that was"
+                        " about to be deleted with the workspace. Hooks were"
+                        " skipped; it has not passed any quality gate."
+                    ),
+                ]
+            ),
+            cwd=repo_path,
+            check=False,
+            capture_output=True,
+        )
+        # A non-zero commit with a now-clean tree means there was nothing to
+        # commit after all (a race, or an ignored-only diff). Not an error —
+        # fall through to the push, which is the part that matters.
+        committed = commit.returncode == 0
+
+    push = subprocess.run(
+        _sudo_wrap(["git", "push", "--no-verify", "-u", "origin", branch_name]),
+        cwd=repo_path,
+        check=False,
+        capture_output=True,
+    )
+    if push.returncode != 0:
+        return RescueResult(
+            repo_name,
+            attempted=True,
+            pushed=False,
+            committed=committed,
+            error=f"git push failed in {repo_name}: {git_output_excerpt(push)}",
+        )
+    return RescueResult(repo_name, attempted=True, pushed=True, committed=committed)
 
 
 def cleanup_workspace(workspace: Path) -> None:
@@ -1438,32 +1540,42 @@ back to `feat`."""
     return _indent_prompt_block(body)
 
 
-def _manage_turn_discipline_block() -> str:
-    """Turn-discipline section shared by both manage prompt variants.
+_TURN_DISCIPLINE_BODY: str = """\
+## Turn Discipline — Never End Your Turn With Something Still Running
 
-    Mirrors the build prompt's foreground-push rule: the manage engine runs as
-    ``claude --print`` (one-shot, non-interactive), so ending the turn kills the
-    process and every background shell it started.
-    """
-    return _indent_prompt_block(
-        """\
-## Turn Discipline — Never Background a Run Wait
+This is an INVARIANT about your process, not a list of commands to avoid:
 
-Wait for dispatched build runs **in the foreground**. NEVER invoke a run wait
-with `run_in_background: true`, and never use any other async or background
-execution mechanism for it — no trailing `&`, no `nohup`, no detached poller
-script, no waiting on a `<task-notification>` hand-off. **Do NOT end your turn
-or session while any dispatched build run is still in flight.**
+**Never end your turn while anything you started is still running.** Whatever
+you launch — a command, a wait, a build, a check — you stay in the foreground
+until it exits and you have read its result.
 
-State the consequence to yourself plainly, because you cannot recover from it:
-your manage process is launched with `claude --print`, which is one-shot and
-non-interactive. When you end your turn the process exits, every background
-shell you started dies with it, and no notification will ever be delivered to
-wake you. The wave is orphaned — the builds keep running with nobody left to
-review, gate or merge them — and replacing you consumes the relaunch budget.
-Waiting in the foreground is the only shape that works here.
+Why it is absolute, stated plainly because you cannot recover from it: you are
+launched with `claude --print`, which is one-shot and non-interactive. Your
+process IS your turn. When the turn ends the process exits, every child process
+and background shell you started is killed with it, and no notification, hook or
+callback can ever wake you to collect a result. There is no "come back to it
+later" — later does not exist for you.
+
+So: no `run_in_background: true`, no trailing `&`, no `nohup`, no `disown`, no
+detached poller script, no waiting on a hand-off that arrives after your turn.
+If a command is slow, wait for it anyway. A long foreground wait is always
+correct; a backgrounded command is always fatal.
+
+`git push` and the project's quality gate are the two that most often tempt an
+agent to background them, because both can take minutes while pre-push hooks or
+a full test suite run. They are ILLUSTRATIONS, not the rule. The rule covers
+EVERY command you run. An agent that had a perfect rule about `git push` still
+lost its entire run by backgrounding a gate command — because a rule that names
+specific commands reads as a whitelist of everything it does not name.
 """
-    )
+
+
+def _turn_discipline_block() -> str:
+    """Turn-discipline section shared by the build prompt and BOTH manage prompt variants.
+
+    One block, one wording, every prompt. It used to render into the manage prompts only, with the build prompt carrying two bullets scoped to ``git push`` instead — and an agent that had followed that narrower rule perfectly still died backgrounding the project gate, because naming two commands implicitly permits every command not named. The rule here is therefore written as an invariant about the process (``claude --print`` dies with the turn, so nothing can wake you) with specific commands demoted to examples.
+    """
+    return _indent_prompt_block(_TURN_DISCIPLINE_BODY)
 
 
 def _manage_warmup_skip_block(rollout_id: str) -> str:
@@ -1590,7 +1702,7 @@ def _build_manage_workspace_main_prompt(
         )
 
     step3 = _manage_step3_block(rollout_id, gate_exception)
-    turn_discipline = _manage_turn_discipline_block()
+    turn_discipline = _turn_discipline_block()
     warmup_skip = _manage_warmup_skip_block(rollout_id)
     merge_bar = _manage_merge_bar_block(_gate, "3", workspace=True)
     recent_notes = _manage_recent_merge_notes_block(merge_notes)
@@ -1841,12 +1953,12 @@ def _build_manage_workspace_main_prompt(
            check WHY — call `mcp__agent-gtd__get_run_status(<run_id>)` for that item's
            child build run and read its `status` field.
 
-           If `status` is exactly `already_satisfied`, the build agent asserted the
-           work was already done. For a claude-code build this means the dispatch
-           worker verified the quality gate on the tree as it stood; for a talos build
-           (talos exit code 30, AlreadySatisfied) talos's own checks already ran and
-           were green before it emitted that disposition — same guarantee, different
-           enforcement point. Either engine, treat `already_satisfied` identically.
+           If `status` is exactly `already_satisfied`, the work was already done.
+           Only a talos build can reach this status (talos exit code 30,
+           AlreadySatisfied), and talos's own checks ran green before it emitted
+           that verdict. A claude-code build can NEVER report this — a commit-less
+           claude-code run is recorded `failed`, so if you see zero commits on one,
+           it is a halt candidate, not a skip.
            Skip the merge and advance:
            ```
            mcp__agent-gtd__complete_item_in_rollout(
@@ -2126,7 +2238,7 @@ def _build_manage_prompt(
         )
 
     step3 = _manage_step3_block(rollout_id, gate_exception)
-    turn_discipline = _manage_turn_discipline_block()
+    turn_discipline = _turn_discipline_block()
     warmup_skip = _manage_warmup_skip_block(rollout_id)
     merge_bar = _manage_merge_bar_block(_gate, "2", workspace=False)
     recent_notes = _manage_recent_merge_notes_block(merge_notes)
@@ -2342,12 +2454,12 @@ def _build_manage_prompt(
         WHY — call `mcp__agent-gtd__get_run_status(<run_id>)` for that item's child
         build run and read its `status` field.
 
-        If `status` is exactly `already_satisfied`, the build agent asserted the work
-        was already done. For a claude-code build this means the dispatch worker
-        verified the quality gate on the tree as it stood; for a talos build (talos
-        exit code 30, AlreadySatisfied) talos's own checks already ran and were
-        green before it emitted that disposition — same guarantee, different
-        enforcement point. Either engine, treat `already_satisfied` identically.
+        If `status` is exactly `already_satisfied`, the work was already done. Only a
+        talos build can reach this status (talos exit code 30, AlreadySatisfied), and
+        talos's own checks ran green before it emitted that verdict. A claude-code
+        build can NEVER report this — a commit-less claude-code run is recorded
+        `failed`, so if you see zero commits on one, it is a halt candidate, not a
+        skip.
         Skip the merge and advance:
         ```
         mcp__agent-gtd__complete_item_in_rollout(
@@ -2526,9 +2638,16 @@ def _build_manage_prompt(
 REVIEW_VERDICTS: frozenset[str] = frozenset({"merge", "re-dispatch", "skip", "halt"})
 
 # Where the reviewer writes its verdict, relative to the rollout workspace
-# root. Mirrors the build contract's ``.dispatch/completion.json``: a file at a
-# fixed path is the only channel that survives a subprocess whose stdout is a
-# transcript.
+# root. A file at a fixed path is the only channel that survives a subprocess
+# whose stdout is a transcript.
+#
+# This is the one artifact contract the worker still branches on, and the
+# asymmetry is deliberate. A BUILD agent's claim about its own run is
+# unfalsifiable and was deleted for that reason; a REVIEWER's verdict is an
+# instruction to the worker about what to do next, which has no mechanical
+# substitute — there is nothing to observe instead. The safety property is
+# different too: an unusable build claim used to be read charitably, whereas an
+# unusable verdict HALTS (see :func:`read_review_verdict`).
 VERDICT_ARTIFACT_RELPATH: str = ".dispatch/verdict.json"
 
 # Where the per-rollout default-branch record is cached inside the reused
@@ -2569,18 +2688,13 @@ def rollout_workspace_path(rollout_id: str) -> Path:
 
 
 def _read_default_branches(root: Path) -> dict[str, str]:
-    """Read the cached default-branch record, or {} when absent/unreadable."""
+    """Read the cached default-branch record, or {} when absent/unreadable.
+
+    A plain read — see :func:`read_review_verdict` for why no sudo escalation is needed or wanted here.
+    """
     path = root / DEFAULT_BRANCHES_RELPATH
     try:
-        raw = subprocess.run(
-            _sudo_wrap(["cat", str(path)]),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if raw.returncode != 0:
-            return {}
-        data = json.loads(raw.stdout)
+        data = json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
     if not isinstance(data, dict):
@@ -2589,19 +2703,20 @@ def _read_default_branches(root: Path) -> dict[str, str]:
 
 
 def _write_default_branches(root: Path, branches: dict[str, str]) -> None:
-    """Persist the default-branch record inside the reused workspace."""
+    """Persist the default-branch record inside the reused workspace.
+
+    The directory is still created via sudo as the AGENT user, because the reviewer agent writes its verdict into that same ``.dispatch/`` directory and must own it. With the agent's 0002 umask that directory is group-writable and group-owned by the agent's group, of which the service user is a member — so this write needs no escalation of its own. The ``tee`` it replaced was never authorised in sudoers anyway.
+    """
     payload = json.dumps(branches, indent=2, sort_keys=True)
     subprocess.run(
         _sudo_wrap(["mkdir", "-p", str(root / ".dispatch")]),
         check=False,
         capture_output=True,
     )
-    subprocess.run(
-        _sudo_wrap(["tee", str(root / DEFAULT_BRANCHES_RELPATH)]),
-        input=payload.encode(),
-        check=False,
-        capture_output=True,
-    )
+    try:
+        (root / DEFAULT_BRANCHES_RELPATH).write_text(payload)
+    except OSError:
+        logger.warning("could not write default-branch record under %s", root)
 
 
 def prepare_rollout_workspace(
@@ -2787,26 +2902,23 @@ def read_review_verdict(workspace_root: Path) -> tuple[dict[str, Any] | None, st
     Returns ``(verdict, reason)``.  ``verdict`` is None whenever the artifact
     could not be used, and ``reason`` is one of the literals ``ok``, ``absent``,
     ``not_json``, ``not_object``, ``unknown_schema_version``,
-    ``unknown_verdict``, ``missing_rationale`` — the same
-    named-failure-literal shape the build completion artifact uses, so
-    telemetry can distinguish a malformed verdict from a missing one while the
-    worker's decision stays binary.
+    ``unknown_verdict``, ``missing_rationale`` — so telemetry can distinguish a
+    malformed verdict from a missing one while the worker's decision stays
+    binary.
 
     A reviewer that returns no usable verdict does NOT get the benefit of the
     doubt: the caller halts.  Merging on a guess is the one outcome that cannot
     be undone.
+
+    The read is PLAIN, not sudo-escalated, and that matters more here than anywhere else in this module: ``cat`` is not in the sudoers NOPASSWD list, so the escalated read this replaced was denied every single time. An unreadable verdict halts a rollout, so on the shipped sudoers EVERY reviewer verdict would have halted its wave. The workspace is mode 2775 owned by the agent user with the service user in that group, and the agent's umask is 0002, so a plain read reaches the file.
     """
     path = workspace_root / VERDICT_ARTIFACT_RELPATH
-    result = subprocess.run(
-        _sudo_wrap(["cat", str(path)]),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
+    try:
+        raw = path.read_text()
+    except OSError:
         return None, "absent"
     try:
-        data = json.loads(result.stdout)
+        data = json.loads(raw)
     except ValueError:
         return None, "not_json"
     if not isinstance(data, dict):
@@ -3313,13 +3425,12 @@ def _build_build_prompt(
 ) -> str:
     """System prompt for build mode — implement and push a branch.
 
-    ``workspace`` is interpolated as an ABSOLUTE path into the completion-artifact
-    instructions.  It must be absolute: the build steps tell the agent to ``cd``
-    into a repo directory, so a relative ``.dispatch/completion.json`` would land
-    inside a repo clone in workspace mode and the worker would never find it.
+    The prompt asks the agent for NOTHING that its run's outcome depends on. It used to end with a "completion artifact" contract — a JSON file the agent wrote to declare how its run ended — and the worker branched on what that file said. That is gone: an agent-originated signal is a request, not a guarantee, and a run's status must be derivable from what the worker can observe for itself (commits on origin, the gate result, the CLI's own result envelope). What the agent is still asked for — terse progress comments — is for HUMANS to read, and no code anywhere reads it.
+
+    ``workspace`` is retained in the signature for the workspace-layout section and for callers that pass it positionally.
     """
     item_id = item["id"]
-    artifact_path = workspace / ".dispatch" / "completion.json"
+    turn_discipline = _turn_discipline_block()
 
     files_section = _build_supporting_files_section(attachments, run_id)
 
@@ -3361,44 +3472,56 @@ def _build_build_prompt(
     prompt += textwrap.dedent(
         f"""\
 
+        {turn_discipline}
+
         ## Rules
 
         1. **Fetch the item first.** Call `get_item` with item_id="{item_id}" as your first action.
         2. **Branch.** You are already on branch `{branch_name}`. Stay on it. Never commit to main.
         3. **Test.** Run the project's test suite before committing. Fix failures.
         4. **Commit.** Use conventional commit messages. Small, focused commits.
-        5. **Push.** When done, run `git push` to push `{branch_name}` to origin, **in the
-           foreground**. NEVER invoke `git push` with `run_in_background` or any other
-           async/background execution mechanism. Pre-push hooks may run the full test
-           suite and take several minutes — that is expected; wait for the command to
-           exit. Do not end your turn or session while a `git push` you started is
-           still running. You do not need to verify the push landed — the dispatch
-           worker verifies every repo's remote ref itself and fails the run if any
-           commit did not reach origin.
+           **Commit as you go** — do not leave finished work uncommitted while you
+           move on to the next thing. Work that is only in the working tree when
+           your turn ends is work nobody can review.
+        5. **Push.** When done, run `git push` to push `{branch_name}` to origin, in the
+           foreground (see **Turn Discipline** above). You do not need to verify the
+           push landed — the dispatch worker verifies every repo's remote ref itself
+           and fails the run if any commit did not reach origin.
         6. **Stop if stuck.** If the task is too ambiguous, you lack information, or
-           you cannot complete it cleanly — STOP. Do not guess or produce low-quality work.
+           you cannot complete it cleanly — STOP. Commit and push whatever is
+           finished, say what stopped you in a comment, and end. Do not guess or
+           produce low-quality work.
+
+        ## How your run is judged
+
+        Your outcome is decided from three things the dispatch worker observes for
+        itself: the commits that reached origin on `{branch_name}`, the project's
+        quality gate, and the agent CLI's own result envelope. Nothing you write
+        decides it. In particular:
+
+        - **A run that ends with zero commits on origin fails.** There is no
+          declaration, file or comment that makes a commit-less run succeed. If the
+          acceptance criteria turn out to be already satisfied by existing code, say
+          so in a comment naming what already exists and where — a human will read
+          it — but understand the run itself is still recorded as having produced
+          nothing.
+        - You do NOT set the item's status. The worker moves the item itself.
 
         ## Reporting
 
-        Post progress comments to the GTD item as you work. Use `add_comment`
-        with item_id="{item_id}". Keep comments terse — one line is fine. Only post
-        what a reader could not get from the run itself — a decision you made, a
-        surprise you hit. Do not narrate the phases of your work.
+        Post progress comments to the GTD item as you work. Use `add_comment` with
+        item_id="{item_id}". Humans and lead agents read these in the UI, and they are
+        the only place a decision you made is visible to them.
 
-        **On success:**
-        1. Post a final comment with: what you did, the branch name (`{branch_name}`), notes for the reviewer
-        2. Write the completion artifact described in the **Completion Artifact**
-           section — the last section of this prompt. Reporting does not end here: it
-           hands off to that section, and the artifact is what actually ends the run.
+        Keep them terse — one line is fine. Post only what a reader could NOT get from
+        the run itself: a judgement call you had to make, a surprise in the code, an
+        acceptance criterion you read differently than it was probably meant. Do not
+        narrate the phases of your work, and do not restate the branch name, the
+        commit count or the test result — the worker already reports all of that.
 
-        Do NOT set the item's status. The dispatch worker moves the item itself,
-        derived from the disposition you report in the artifact — that disposition is
-        the only statement you make about how the run ended.
-
-        **On failure/blocked**, your comment should include:
-        - Why you stopped
-        - What information or clarification you need
-        - Any partial progress (if you pushed commits)
+        On success, a final one-line comment with anything the reviewer should know
+        before reading the diff. If you stopped early or got blocked, say what stopped
+        you and what information would unblock you.
 
         ## Important
 
@@ -3406,70 +3529,6 @@ def _build_build_prompt(
         - Never force-push, never push to main, never delete branches you didn't create.
         - Never modify CI/CD configs, deployment scripts, or secrets.
         - Focus only on this task. Don't fix unrelated issues you notice.
-
-        ## Completion Artifact
-
-        This is the last section of this prompt: nothing comes after it, and nothing you
-        do comes after the action it describes. On EVERY path — success, no-op, blocked,
-        or failure — writing this file is the final action of the run, performed after
-        the final comment, with no further work behind it.
-        Write the completion artifact to this ABSOLUTE path:
-
-        ```
-        {artifact_path}
-        ```
-
-        Write it at that absolute path regardless of which directory you are currently
-        in (the build steps above may have left you inside a repo subdirectory).
-        Create the parent directory first if needed.
-
-        The file is a single JSON object:
-
-        ```json
-        {{
-          "schema_version": 1,
-          "disposition": "done",
-          "summary": "one line on what happened",
-          "reason": "",
-          "decision_needed": ""
-        }}
-        ```
-
-        `disposition` is exactly one of `done`, `already_satisfied`, `blocked`, `failed`.
-        - `done` — you implemented the item and pushed commits.
-        - `already_satisfied` — the acceptance criteria were already met; `reason` is
-          REQUIRED and must say what already exists and where.
-        - `blocked` — you cannot proceed; `decision_needed` is REQUIRED and must state
-          the decision or information a human must supply.
-        - `failed` — you tried and could not finish.
-
-        The worker materializes that pick — you do not. `done` and
-        `already_satisfied` move the item to `review` for a human; `blocked` and
-        `failed` leave the item where it is and record the run failed, so a blocked
-        run never presents itself as ready for review.
-
-        `summary` is optional.
-
-        What happens if you skip it, stated accurately so you can weigh it yourself: a
-        run that pushed commits and whose post-run gate passes is still recorded
-        successful, but flagged `unasserted` — only a run with no commits, or a failing
-        gate, is failed outright for a missing artifact. So this is not a trap; it is the
-        only channel you have. The artifact is the ONLY way to report `already_satisfied`,
-        `blocked` or `failed` instead of having your outcome guessed from what you
-        happened to push, and the ONLY carrier of the no-op `reason` and the
-        `decision_needed` text a human reads to unblock you. Without it your run is
-        judged on mechanical evidence alone and everything you concluded is lost.
-
-        ### No-Op Case — Work Already Done
-
-        Before writing any code, check whether the acceptance criteria are **already satisfied**
-        by existing code. If no source changes are needed:
-        - Write the completion artifact with `"disposition": "already_satisfied"` and a
-          non-empty `reason` naming what already exists (e.g. "<feature> already
-          implemented at <file>:<line>").
-        - Do NOT push any commits.
-        - STOP. The dispatch worker verifies the quality gate and moves the item on;
-          you do not need to do anything else.
     """
     )
 

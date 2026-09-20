@@ -1,4 +1,8 @@
-"""Tests for completion.py — result-envelope parsing and the completion artifact."""
+"""Tests for completion.py — result-envelope parsing.
+
+The agent-authored completion artifact this module used to also parse is gone; its
+tests went with it. A run's status is built only from evidence the worker observes.
+"""
 
 from __future__ import annotations
 
@@ -11,11 +15,9 @@ import pytest
 
 from agent_gtd_dispatch import completion, config
 from agent_gtd_dispatch.completion import (
-    KNOWN_SCHEMA_VERSIONS,
     ResultEnvelope,
     envelope_verdict,
     parse_result_envelope,
-    read_completion_artifact,
 )
 
 
@@ -196,152 +198,3 @@ class TestEnvelopeVerdict:
             {"type": "result", "subtype": "success", "brand_new_field": 3}
         )
         assert env.model_dump()["brand_new_field"] == 3
-
-
-# ---------------------------------------------------------------------------
-# read_completion_artifact
-# ---------------------------------------------------------------------------
-
-
-def _write_artifact(workspace, payload, *, subdir=None) -> None:
-    base = workspace if subdir is None else workspace / subdir
-    target = base / ".dispatch"
-    target.mkdir(parents=True, exist_ok=True)
-    (target / "completion.json").write_text(
-        payload if isinstance(payload, str) else json.dumps(payload)
-    )
-
-
-class TestReadCompletionArtifact:
-    def test_absent(self, tmp_path) -> None:
-        assert read_completion_artifact(tmp_path) == (None, "absent")
-
-    def test_oversize(self, tmp_path) -> None:
-        _write_artifact(tmp_path, {"disposition": "done", "summary": "x" * 70000})
-        artifact, reason = read_completion_artifact(tmp_path)
-        assert artifact is None
-        assert reason == "oversize"
-
-    def test_not_json(self, tmp_path) -> None:
-        _write_artifact(tmp_path, "{not json")
-        assert read_completion_artifact(tmp_path) == (None, "not_json")
-
-    def test_not_object(self, tmp_path) -> None:
-        _write_artifact(tmp_path, "[1, 2, 3]")
-        assert read_completion_artifact(tmp_path) == (None, "not_object")
-
-    def test_unknown_schema_version(self, tmp_path) -> None:
-        _write_artifact(tmp_path, {"schema_version": 99, "disposition": "done"})
-        assert read_completion_artifact(tmp_path) == (None, "unknown_schema_version")
-
-    def test_missing_schema_version_defaults_to_one(self, tmp_path) -> None:
-        assert 1 in KNOWN_SCHEMA_VERSIONS
-        _write_artifact(tmp_path, {"disposition": "done"})
-        artifact, reason = read_completion_artifact(tmp_path)
-        assert reason == "ok"
-        assert artifact is not None
-        assert artifact.schema_version == 1
-
-    def test_unknown_disposition(self, tmp_path) -> None:
-        _write_artifact(tmp_path, {"disposition": "vibes"})
-        assert read_completion_artifact(tmp_path) == (None, "unknown_disposition")
-
-    def test_missing_disposition_is_unknown_disposition(self, tmp_path) -> None:
-        _write_artifact(tmp_path, {"summary": "no disposition here"})
-        assert read_completion_artifact(tmp_path) == (None, "unknown_disposition")
-
-    @pytest.mark.parametrize("reason_value", [None, "", "   "])
-    def test_missing_reason(self, tmp_path, reason_value) -> None:
-        payload = {"disposition": "already_satisfied"}
-        if reason_value is not None:
-            payload["reason"] = reason_value
-        _write_artifact(tmp_path, payload)
-        assert read_completion_artifact(tmp_path) == (None, "missing_reason")
-
-    @pytest.mark.parametrize("decision_value", [None, "", "   "])
-    def test_missing_decision_needed(self, tmp_path, decision_value) -> None:
-        payload = {"disposition": "blocked"}
-        if decision_value is not None:
-            payload["decision_needed"] = decision_value
-        _write_artifact(tmp_path, payload)
-        assert read_completion_artifact(tmp_path) == (
-            None,
-            "missing_decision_needed",
-        )
-
-    def test_ambiguous_location(self, tmp_path) -> None:
-        _write_artifact(tmp_path, {"disposition": "done"}, subdir="repo_a")
-        _write_artifact(tmp_path, {"disposition": "done"}, subdir="repo_b")
-        assert read_completion_artifact(tmp_path) == (None, "ambiguous_location")
-
-    def test_misplaced_artifact_in_single_repo_subdir_is_found(self, tmp_path) -> None:
-        _write_artifact(tmp_path, {"disposition": "done"}, subdir="repo_a")
-        artifact, reason = read_completion_artifact(tmp_path)
-        assert reason == "ok"
-        assert artifact is not None
-        assert artifact.disposition == "done"
-
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            {"disposition": "done"},
-            {"disposition": "already_satisfied", "reason": "already there"},
-            {"disposition": "blocked", "decision_needed": "which API?"},
-            {"disposition": "failed"},
-        ],
-    )
-    def test_valid_dispositions(self, tmp_path, payload) -> None:
-        _write_artifact(tmp_path, payload)
-        artifact, reason = read_completion_artifact(tmp_path)
-        assert reason == "ok"
-        assert artifact is not None
-        assert artifact.disposition == payload["disposition"]
-
-    def test_extra_keys_ignored(self, tmp_path) -> None:
-        _write_artifact(
-            tmp_path, {"disposition": "done", "invented_by_the_agent": True}
-        )
-        artifact, reason = read_completion_artifact(tmp_path)
-        assert reason == "ok"
-        assert artifact is not None
-        assert not hasattr(artifact, "invented_by_the_agent")
-
-    def test_missing_summary_defaults_to_empty(self, tmp_path) -> None:
-        _write_artifact(tmp_path, {"disposition": "done"})
-        artifact, reason = read_completion_artifact(tmp_path)
-        assert reason == "ok"
-        assert artifact is not None
-        assert artifact.summary == ""
-
-    def test_rejection_is_logged_with_raw_head(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        _write_artifact(tmp_path, "{not json")
-        with caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.completion"):
-            completion.log_artifact_rejection("run-1", tmp_path, "not_json")
-        assert "completion artifact rejected" in caplog.text
-        assert "not_json" in caplog.text
-        assert "not json" in caplog.text
-
-    def test_artifact_state_mapping(self) -> None:
-        artifact, _ = None, None
-        assert completion.artifact_state(artifact, "absent") == "absent"
-        assert completion.artifact_state(artifact, "ambiguous_location") == "absent"
-        assert completion.artifact_state(artifact, "not_json") == "malformed"
-
-
-# ---------------------------------------------------------------------------
-# cross-user reads
-# ---------------------------------------------------------------------------
-
-
-class TestArtifactReadArgv:
-    def test_sudo_prefix_when_agent_user_set(self, tmp_path, monkeypatch) -> None:
-        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
-        argv = completion.artifact_read_argv(tmp_path / "completion.json")
-        assert argv[:4] == ["sudo", "-u", "dispatch", "-H"]
-
-    def test_no_sudo_prefix_when_unset(self, tmp_path, monkeypatch) -> None:
-        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
-        argv = completion.artifact_read_argv(tmp_path / "completion.json")
-        assert argv[0] != "sudo"

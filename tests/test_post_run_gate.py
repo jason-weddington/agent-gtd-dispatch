@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
@@ -13,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent_gtd_dispatch import config, db, dispatch, disposition
+from agent_gtd_dispatch import config, db, dispatch
 from agent_gtd_dispatch.dispatch import GateResult
 from agent_gtd_dispatch.engines import CLAUDE
 from agent_gtd_dispatch.models import (
@@ -23,11 +22,9 @@ from agent_gtd_dispatch.models import (
     Run,
 )
 from tests.completion_fixtures import (
-    MAX_TURNS_ENVELOPE,
     seed_build_evidence,
-    write_artifact,
-    write_envelope,
 )
+from tests.worker_mocks import stub_rescue
 
 
 @pytest.fixture(autouse=True)
@@ -222,22 +219,6 @@ class TestRunGateCommandMocked:
             )
         callback.assert_called_once()
 
-    def test_stash_failure_short_circuits_before_popen(self, tmp_path) -> None:
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=1, stdout=b"", stderr=b"boom"
-        )
-        with (
-            patch("agent_gtd_dispatch.dispatch.subprocess.run", return_value=completed),
-            patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen,
-        ):
-            result = dispatch.run_gate_command(
-                tmp_path, "echo hi", 30, CLAUDE, None, [tmp_path]
-            )
-        assert result.output.startswith(
-            "gate launch failed: could not stash uncommitted changes in"
-        )
-        mock_popen.assert_not_called()
-
 
 # ---------------------------------------------------------------------------
 # run_gate_command — real shell (skipped when timeout(1)/git(1) unavailable)
@@ -281,7 +262,15 @@ class TestRunGateCommandRealShell:
         assert "done" in result.output
         assert result.duration_seconds < 5
 
-    def test_dirty_tree_stashed_before_gate_runs(self, tmp_path) -> None:
+    def test_gate_sees_the_dirty_tree_and_nothing_is_stashed(self, tmp_path) -> None:
+        """The gate judges the tree AS THE AGENT LEFT IT.
+
+        The inverse of the behaviour this replaced. ``run_gate_command`` used to
+        ``git stash push`` a dirty repo first, so the gate ran against the pristine
+        base commit — which is how four agents' uncommitted work was judged
+        "already done" and deleted: the gate passed trivially because there was
+        nothing left in the tree to fail it.
+        """
         repo = tmp_path / "repo"
         repo.mkdir()
         subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -306,10 +295,10 @@ class TestRunGateCommandRealShell:
         )
         (repo / "a.txt").write_text("two\n")
 
-        result = dispatch.run_gate_command(
-            repo, "git diff --quiet", 30, CLAUDE, None, [repo]
-        )
-        assert result.returncode == 0
+        # `git diff --quiet` exits 1 on a dirty tree. Under the old stashing
+        # behaviour this returned 0.
+        result = dispatch.run_gate_command(repo, "git diff --quiet", 30, CLAUDE)
+        assert result.returncode == 1
 
         stash_list = subprocess.run(
             ["git", "stash", "list"],
@@ -318,7 +307,8 @@ class TestRunGateCommandRealShell:
             text=True,
             check=True,
         )
-        assert "agent-gtd-post-run-gate" in stash_list.stdout
+        assert stash_list.stdout.strip() == ""
+        assert (repo / "a.txt").read_text() == "two\n"
 
 
 # ---------------------------------------------------------------------------
@@ -500,9 +490,9 @@ def _install_common_mocks(
     item_id,
     project,
     fake_workspace,
-    disposition="done",
 ):
-    seed_build_evidence(fake_workspace, disposition)
+    seed_build_evidence(fake_workspace)
+    stub_rescue(mock_dispatch)
     mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
     mock_gtd.get_item = AsyncMock(
         return_value={"id": item_id, "title": "T", "project_id": "proj1"}
@@ -583,7 +573,8 @@ class TestWorkerPostRunGate:
         assert isinstance(call.args[2], int)
         assert call.args[3] is CLAUDE
         assert callable(call.args[4])
-        assert call.args[5] is None
+        # No 6th argument: the dirty-repo stash list is gone with the stashing.
+        assert len(call.args) == 5
 
         comment_texts = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
         assert any("Post-run gate passed" in t for t in comment_texts)
@@ -928,27 +919,36 @@ class TestWorkerPostRunGate:
         assert updated.error.startswith("push verification failed")
         mock_dispatch.run_gate_command.assert_not_called()
 
-    async def _run_already_satisfied(
-        self,
-        tmp_path,
-        caplog,
-        *,
-        gate_result,
-        project,
-        item_id,
-    ):
+    @pytest.mark.asyncio
+    async def test_zero_commits_fails_without_ever_running_the_gate(
+        self, tmp_path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A commit-less claude-code build fails, and the gate is NOT run.
+
+        This is the central behaviour change. What used to happen: the worker
+        stashed the agent's uncommitted work, ran the gate against the resulting
+        pristine base commit, got a trivially green result, read that as
+        corroboration of a no-op, recorded `already_satisfied`, moved the item to
+        review and deleted the clone. Roughly 560 agent-turns of real work, gone,
+        reported as success.
+
+        Two assertions carry the fix. The terminal is `failed` — there is no
+        longer any route from zero commits to a non-failure status for this
+        engine. And the gate is never invoked: an unchanged tree passes trivially,
+        so gating one costs ~6 minutes to learn a fact about the base commit.
+        """
         from agent_gtd_dispatch.main import _dispatch_worker
 
         await db.init_db()
         run = Run(
-            item_id=item_id,
+            item_id="item-f",
             project_name="TestProject",
             branch_name="feat/f",
             mode=DispatchMode.BUILD,
         )
         await db.insert_run(run)
 
-        fake_workspace = tmp_path / f"repos-testproj-{item_id}"
+        fake_workspace = tmp_path / "repos-testproj-f"
         fake_workspace.mkdir()
 
         with (
@@ -959,117 +959,74 @@ class TestWorkerPostRunGate:
             _install_common_mocks(
                 mock_gtd,
                 mock_dispatch,
-                item_id=item_id,
-                project=project,
+                item_id="item-f",
+                project=_default_project(),
                 fake_workspace=fake_workspace,
             )
-            write_artifact(
-                fake_workspace,
-                "already_satisfied",
-                reason="ALREADY THERE at foo.py:12",
-            )
             mock_gtd.set_item_status = AsyncMock()
-            mock_gtd.complete_item = AsyncMock()
             mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
             mock_dispatch.verify_pushes = MagicMock(
                 return_value=[_no_changes(branch="feat/f")]
             )
-            mock_dispatch.run_gate_command = MagicMock(return_value=gate_result)
+            mock_dispatch.run_gate_command = MagicMock()
 
             await _dispatch_worker(run, 50, CLAUDE, 600)
 
         updated = await db.get_run(run.id)
         assert updated is not None
-        return updated, mock_gtd, mock_dispatch
-
-    @pytest.mark.asyncio
-    async def test_already_satisfied_runs_gate_and_lands_already_satisfied(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        gate_result = GateResult(
-            returncode=0, timed_out=False, output="ok", duration_seconds=2.0
-        )
-        updated, mock_gtd, mock_dispatch = await self._run_already_satisfied(
-            tmp_path,
-            caplog,
-            gate_result=gate_result,
-            project=_default_project(),
-            item_id="item-f",
-        )
-        # The gate RUNS even though zero repos were pushed.
-        mock_dispatch.run_gate_command.assert_called_once()
-        assert "decision=skipped_no_pushed_repo" not in caplog.text
-        assert updated.status.value == "already_satisfied"
-        assert updated.error is not None
-        assert updated.error.startswith("already_satisfied: ")
-        assert "ALREADY THERE at foo.py:12" in updated.error
-        assert updated.push_results is not None
-        assert "outcome=already_satisfied" in caplog.text
-        assert "gate_decision=passed" in caplog.text
-        mock_gtd.set_item_status.assert_awaited_once()
-        assert mock_gtd.set_item_status.await_args.args[:2] == ("item-f", "review")
-        mock_gtd.complete_item.assert_not_called()
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any("already satisfied" in b for b in bodies)
-        assert any("ALREADY THERE at foo.py:12" in b for b in bodies)
-
-    @pytest.mark.asyncio
-    async def test_already_satisfied_red_gate_fails_run(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        gate_result = GateResult(
-            returncode=1, timed_out=False, output="boom", duration_seconds=2.0
-        )
-        updated, mock_gtd, _ = await self._run_already_satisfied(
-            tmp_path,
-            caplog,
-            gate_result=gate_result,
-            project=_default_project(),
-            item_id="item-g",
-        )
         assert updated.status.value == "failed"
         assert updated.error is not None
-        assert updated.error.startswith("already_satisfied_gate_failed: ")
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any(
-            "Build run failed (already_satisfied_gate_failed)" in b for b in bodies
-        )
-
-    @pytest.mark.asyncio
-    async def test_already_satisfied_gate_timeout_fails_run(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        gate_result = GateResult(
-            returncode=124, timed_out=True, output="slow", duration_seconds=600.0
-        )
-        updated, _mock_gtd, _ = await self._run_already_satisfied(
-            tmp_path,
-            caplog,
-            gate_result=gate_result,
-            project=_default_project(),
-            item_id="item-h",
-        )
-        assert updated.status.value == "failed"
-        assert updated.error is not None
-        assert updated.error.startswith("already_satisfied_gate_failed: ")
-        assert "timed out" in updated.error
-
-    @pytest.mark.asyncio
-    async def test_already_satisfied_without_gate_command_still_terminal(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        updated, mock_gtd, mock_dispatch = await self._run_already_satisfied(
-            tmp_path,
-            caplog,
-            gate_result=None,
-            project=_default_project(gate_command=""),
-            item_id="item-i",
-        )
+        assert updated.error.startswith("zero_commits: ")
         mock_dispatch.run_gate_command.assert_not_called()
-        assert updated.status.value == "already_satisfied"
-        assert "gate_decision=skipped_no_gate_command" in caplog.text
+        # The item must NOT be nudged to review — there is nothing to review.
+        mock_gtd.set_item_status.assert_not_called()
         bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any("skipped_no_gate_command" in b for b in bodies)
+        assert any("Build run failed (zero_commits)" in b for b in bodies)
+
+    @pytest.mark.asyncio
+    async def test_zero_commits_fails_even_on_an_ungated_project(
+        self, tmp_path
+    ) -> None:
+        """No gate_command changes nothing: zero commits is decided before the gate."""
+        from agent_gtd_dispatch.main import _dispatch_worker
+
+        await db.init_db()
+        run = Run(
+            item_id="item-i",
+            project_name="TestProject",
+            branch_name="feat/i",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        fake_workspace = tmp_path / "repos-testproj-i"
+        fake_workspace.mkdir()
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            _install_common_mocks(
+                mock_gtd,
+                mock_dispatch,
+                item_id="item-i",
+                project=_default_project(gate_command=""),
+                fake_workspace=fake_workspace,
+            )
+            mock_gtd.set_item_status = AsyncMock()
+            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
+            mock_dispatch.verify_pushes = MagicMock(
+                return_value=[_no_changes(branch="feat/i")]
+            )
+            mock_dispatch.run_gate_command = MagicMock()
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "failed"
+        assert updated.error.startswith("zero_commits: ")
+        mock_dispatch.run_gate_command.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_plan_mode_skips_gate(self, tmp_path) -> None:
@@ -1223,7 +1180,14 @@ class TestWorkerPostRunGate:
         assert mock_dispatch.run_gate_command.call_args.args[2] in range(590, 601)
 
     @pytest.mark.asyncio
-    async def test_dirty_repo_stashed_and_noted_in_pass_comment(self, tmp_path) -> None:
+    async def test_dirty_repo_is_gated_as_is_and_never_stashed(self, tmp_path) -> None:
+        """A dirty working tree is handed to the gate untouched.
+
+        The worker no longer parks uncommitted changes before gating, so it also
+        no longer tells the reviewer that it did. What happens to that dirty tree
+        now is the rescue path at teardown, which commits and pushes it to the
+        run's own branch instead of hiding it.
+        """
         from agent_gtd_dispatch.main import _dispatch_worker
 
         await db.init_db()
@@ -1261,12 +1225,12 @@ class TestWorkerPostRunGate:
             await _dispatch_worker(run, 50, CLAUDE, 600)
 
         call = mock_dispatch.run_gate_command.call_args
-        assert call.args[5] == [fake_workspace]
+        assert len(call.args) == 5
 
         comment_texts = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
         pass_comments = [t for t in comment_texts if "Post-run gate passed" in t]
         assert len(pass_comments) == 1
-        assert "Uncommitted changes in repos-testproj" in pass_comments[0]
+        assert "stashed" not in pass_comments[0]
 
     @pytest.mark.asyncio
     async def test_timeout_expired_linger_success_skips_gate(self, tmp_path) -> None:
@@ -1357,6 +1321,7 @@ class TestWorkerPostRunGate:
             mock_dispatch.build_system_prompt = MagicMock(return_value="prompt text")
             mock_dispatch.cleanup_workspace = MagicMock()
             mock_dispatch._executor = None
+            stub_rescue(mock_dispatch)
             mock_dispatch.is_zero_commits_run = dispatch.is_zero_commits_run
             seed_build_evidence(fake_ws_root)
             mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
@@ -1369,749 +1334,6 @@ class TestWorkerPostRunGate:
 
         call = mock_dispatch.run_gate_command.call_args
         assert call.args[0] == fake_ws_root
-
-
-# ---------------------------------------------------------------------------
-# The unasserted path: absent/unusable completion artifact + pushed commits
-# ---------------------------------------------------------------------------
-
-
-def _drop_artifact(workspace: Path) -> None:
-    """Remove the completion artifact a seeded workspace wrote (reason=absent)."""
-    (workspace / ".dispatch" / "completion.json").unlink()
-
-
-def _malform_artifact(workspace: Path) -> None:
-    """Leave an artifact that read_completion_artifact rejects (reason=not_json)."""
-    (workspace / ".dispatch" / "completion.json").write_text("{ not json at all")
-
-
-async def _run_build_worker(
-    tmp_path,
-    caplog,
-    *,
-    item_id,
-    artifact="absent",
-    pushed=True,
-    gate_result=None,
-    project=None,
-    envelope=None,
-    item_status=None,
-    rollout_id=None,
-):
-    from agent_gtd_dispatch.main import _dispatch_worker
-
-    await db.init_db()
-    run = Run(
-        item_id=item_id,
-        project_name="TestProject",
-        branch_name="feat/unasserted",
-        mode=DispatchMode.BUILD,
-        rollout_id=rollout_id,
-    )
-    await db.insert_run(run)
-
-    fake_workspace = tmp_path / f"repos-testproj-{item_id}"
-    fake_workspace.mkdir()
-
-    with (
-        patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
-        patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
-        caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
-    ):
-        _install_common_mocks(
-            mock_gtd,
-            mock_dispatch,
-            item_id=item_id,
-            project=project if project is not None else _default_project(),
-            fake_workspace=fake_workspace,
-            disposition="done" if artifact in {"absent", "malformed"} else artifact,
-        )
-        if artifact == "absent":
-            _drop_artifact(fake_workspace)
-        elif artifact == "malformed":
-            _malform_artifact(fake_workspace)
-        elif artifact == "already_satisfied":
-            write_artifact(
-                fake_workspace,
-                "already_satisfied",
-                reason="ALREADY THERE at foo.py:12",
-            )
-        elif artifact == "blocked":
-            write_artifact(fake_workspace, "blocked", decision_needed="which schema?")
-        if envelope is not None:
-            write_envelope(fake_workspace, **envelope)
-        _item: dict[str, object] = {
-            "id": item_id,
-            "title": "T",
-            "project_id": "proj1",
-        }
-        if item_status is not None:
-            _item["status"] = item_status
-        mock_gtd.get_item = AsyncMock(return_value=_item)
-        mock_gtd.set_item_status = AsyncMock()
-        mock_gtd.complete_item = AsyncMock()
-        mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
-        mock_dispatch.verify_pushes = MagicMock(
-            return_value=[
-                (_pushed if pushed else _no_changes)(branch="feat/unasserted")
-            ]
-        )
-        mock_dispatch.run_gate_command = MagicMock(return_value=gate_result)
-
-        await _dispatch_worker(run, 50, CLAUDE, 600)
-
-    updated = await db.get_run(run.id)
-    assert updated is not None
-    return updated, mock_gtd, mock_dispatch
-
-
-class TestUnassertedCompletionPath:
-    """A pushed, gate-green build run is a success even with no artifact.
-
-    Writing `.dispatch/completion.json` is a cooperative act; some engines skip
-    it intermittently. When the mechanical legs (commits pushed + project gate
-    green) are satisfied, failing the run is a false negative that halts healthy
-    rollout waves — so the gate decides instead.
-    """
-
-    async def _run(self, tmp_path, caplog, **kwargs):
-        return await _run_build_worker(tmp_path, caplog, **kwargs)
-
-    # --- the new semantics ------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_absent_artifact_pushed_gate_passed_is_success(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        updated, mock_gtd, mock_dispatch = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua1",
-            gate_result=GateResult(
-                returncode=0, timed_out=False, output="ok", duration_seconds=3.0
-            ),
-        )
-        assert updated.status.value == "succeeded"
-        assert updated.error is None
-        # The gate RAN — it is what decides this terminal.
-        mock_dispatch.run_gate_command.assert_called_once()
-        # Recorded for later per-engine aggregation.
-        assert updated.completion is not None
-        blob = json.loads(updated.completion)
-        assert blob["unasserted"] is True
-        assert blob["gate_decision"] == "passed"
-        assert blob["artifact"] == "absent"
-        # Item nudged to review, because an agent that skipped the artifact
-        # write plausibly skipped its own status update too.
-        mock_gtd.set_item_status.assert_awaited_once()
-        assert mock_gtd.set_item_status.await_args.args[:2] == ("item-ua1", "review")
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        unasserted = [b for b in bodies if "mechanical evidence alone" in b]
-        assert len(unasserted) == 1
-        assert "feat/unasserted" in unasserted[0]
-        assert "decision=`passed`" in unasserted[0]
-        assert any(
-            r.levelname == "WARNING" and "unasserted build run:" in r.getMessage()
-            for r in caplog.records
-        )
-
-    @pytest.mark.asyncio
-    async def test_warning_log_carries_engine_and_counts(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua1b",
-            gate_result=GateResult(
-                returncode=0, timed_out=False, output="ok", duration_seconds=3.0
-            ),
-        )
-        line = next(
-            r.getMessage()
-            for r in caplog.records
-            if "unasserted build run:" in r.getMessage()
-        )
-        for fragment in (
-            "engine=claude-code",
-            "artifact_reject_reason=absent",
-            "pushed_repos=1",
-            "gate_decision=passed",
-            "outcome=succeeded",
-        ):
-            assert fragment in line
-
-    @pytest.mark.asyncio
-    async def test_absent_artifact_pushed_gate_failed_is_failure(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        updated, mock_gtd, _ = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua2",
-            gate_result=GateResult(
-                returncode=1, timed_out=False, output="boom", duration_seconds=3.0
-            ),
-        )
-        assert updated.status.value == "failed"
-        assert updated.error is not None
-        assert updated.error.startswith("stopped_without_assertion: ")
-        assert "decision=failed" in updated.error
-        blob = json.loads(updated.completion or "{}")
-        assert blob["unasserted"] is True
-        mock_gtd.set_item_status.assert_not_awaited()
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any("stopped_without_assertion" in b for b in bodies)
-        assert any("boom" in b for b in bodies)
-
-    @pytest.mark.asyncio
-    async def test_absent_artifact_pushed_no_gate_command_succeeds(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """An ungated project must not fail an unasserted run that pushed work.
-
-        This inverts the original behaviour, and deliberately: on the ASSERTED
-        path a `done` artifact on a project with no `gate_command` succeeds
-        (there is no gate result to fail), so the same project, the same absent
-        gate and the same pushed commits used to produce opposite verdicts
-        based only on whether the agent happened to write a file. Four
-        consecutive false negatives on complete, correct branches came from
-        exactly this. `skipped_no_gate_command` is INCONCLUSIVE, not negative.
-        """
-        updated, mock_gtd, mock_dispatch = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua3",
-            project=_default_project(gate_command=""),
-        )
-        mock_dispatch.run_gate_command.assert_not_called()
-        assert updated.status.value == "succeeded"
-        assert updated.error is None
-        blob = json.loads(updated.completion or "{}")
-        assert blob["unasserted"] is True
-        assert blob["disposition"] == "done"
-        assert blob["disposition_provenance"] == "derived"
-        assert blob["gate_decision"] == "skipped_no_gate_command"
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        # The operator is told what would make such a run VERIFIABLE...
-        assert any("gate_command" in b for b in bodies)
-        # ...and is never told a gate passed, or failed, when none ran.
-        assert not any("quality gate passed" in b for b in bodies)
-        assert not any("gate did not pass" in b for b in bodies)
-        assert any("no quality gate is configured" in b for b in bodies)
-
-    @pytest.mark.asyncio
-    async def test_asserted_and_unasserted_agree_on_an_ungated_project(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """End-to-end: same project, same absent gate, same commits, same verdict."""
-        ungated = _default_project(gate_command="")
-        (tmp_path / "asserted").mkdir()
-        (tmp_path / "unasserted").mkdir()
-        asserted, _gtd_a, _d_a = await self._run(
-            tmp_path / "asserted",
-            caplog,
-            item_id="item-agree-asserted",
-            artifact="done",
-            project=ungated,
-        )
-        unasserted, _gtd_u, _d_u = await self._run(
-            tmp_path / "unasserted",
-            caplog,
-            item_id="item-agree-unasserted",
-            project=ungated,
-        )
-        assert asserted.status.value == unasserted.status.value == "succeeded"
-        assert json.loads(asserted.completion or "{}")["disposition"] == "done"
-        assert json.loads(unasserted.completion or "{}")["disposition"] == "done"
-
-    @pytest.mark.asyncio
-    async def test_a_gate_that_ran_and_failed_still_fails_the_run(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """No-regression: relaxing the SKIPPED case must not relax the RAN case."""
-        updated, _mock_gtd, _ = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua3b",
-            gate_result=GateResult(
-                returncode=1, timed_out=False, output="boom", duration_seconds=2.0
-            ),
-        )
-        assert updated.status.value == "failed"
-
-    @pytest.mark.asyncio
-    async def test_absent_artifact_zero_commits_no_gate_command_is_failure(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The case the contract exists for — must not be weakened.
-
-        Nothing asserted, nothing pushed and no gate to corroborate anything:
-        the derived tier maps a gate that did not run to `failed`, exactly as
-        before the tiers existed.
-        """
-        updated, mock_gtd, mock_dispatch = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua4",
-            pushed=False,
-            project=_default_project(gate_command=""),
-        )
-        assert updated.status.value == "failed"
-        assert updated.error is not None
-        assert updated.error.startswith("stopped_without_assertion: ")
-        assert "derived disposition=failed" in updated.error
-        blob = json.loads(updated.completion or "{}")
-        assert blob["unasserted"] is True
-        assert blob["disposition"] == "failed"
-        assert blob["disposition_provenance"] == "derived"
-        mock_dispatch.run_gate_command.assert_not_called()
-        mock_gtd.set_item_status.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_absent_artifact_zero_commits_gate_passed_is_a_failure(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """THE regression (run c2a8072e2e25): a do-nothing run read as a no-op.
-
-        This case used to derive `already_satisfied` — which routed the item to
-        `review`, recorded a rollout child as skipped so the wave ADVANCED past
-        it, and told a human the work already existed.  It did not: the agent
-        produced nothing.  An unchanged tree passes a test-suite gate trivially,
-        so a green gate cannot tell a genuine no-op apart from a run that did
-        nothing, and the derived tier must not pretend otherwise.
-
-        The gate still RUNS despite zero pushed repos — its verdict is still
-        evidence, it just is not evidence of THIS.
-        """
-        updated, mock_gtd, mock_dispatch = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua4b",
-            pushed=False,
-            gate_result=GateResult(
-                returncode=0, timed_out=False, output="ok", duration_seconds=3.0
-            ),
-        )
-        mock_dispatch.run_gate_command.assert_called_once()
-        assert updated.status.value == "failed"
-        assert updated.error is not None
-        assert updated.error.startswith("stopped_without_assertion: ")
-        assert "derived disposition=failed" in updated.error
-        blob = json.loads(updated.completion or "{}")
-        assert blob["disposition"] == "failed"
-        assert blob["disposition_provenance"] == "derived"
-        # NEVER routed to review, and never recorded as a no-op.
-        mock_gtd.set_item_status.assert_not_awaited()
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert not any("made no changes" in b for b in bodies)
-        assert not any("already satisfied" in b for b in bodies)
-        # The honest report: what happened is UNKNOWN, and a human must look.
-        unknown = [b for b in bodies if "could not be established" in b]
-        assert len(unknown) == 1
-        assert "no commits" in unknown[0]
-        assert "passes a quality gate trivially" in unknown[0]
-        assert "needs a human or a re-dispatch" in unknown[0]
-
-    @pytest.mark.asyncio
-    async def test_malformed_artifact_pushed_gate_passed_surfaces_reason(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Unparseable == absent, but the reject reason still reaches the operator."""
-        updated, mock_gtd, _ = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua5",
-            artifact="malformed",
-            gate_result=GateResult(
-                returncode=0, timed_out=False, output="ok", duration_seconds=3.0
-            ),
-        )
-        assert updated.status.value == "succeeded"
-        blob = json.loads(updated.completion or "{}")
-        assert blob["unasserted"] is True
-        assert blob["artifact_reject_reason"] == "not_json"
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any("Completion artifact rejected: not_json." in b for b in bodies)
-
-    @pytest.mark.asyncio
-    async def test_malformed_artifact_gate_failed_surfaces_reason(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        updated, mock_gtd, _ = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua5b",
-            artifact="malformed",
-            gate_result=GateResult(
-                returncode=1, timed_out=False, output="boom", duration_seconds=3.0
-            ),
-        )
-        assert updated.status.value == "failed"
-        assert updated.error is not None
-        assert "Completion artifact rejected: not_json." in updated.error
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any("Completion artifact rejected: not_json." in b for b in bodies)
-
-    @pytest.mark.asyncio
-    async def test_bad_envelope_keeps_strict_precedence(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The CLI envelope outranks the new leniency, even with commits + green gate."""
-        updated, _mock_gtd, mock_dispatch = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua6",
-            envelope=MAX_TURNS_ENVELOPE,
-            gate_result=GateResult(
-                returncode=0, timed_out=False, output="ok", duration_seconds=3.0
-            ),
-        )
-        assert updated.status.value == "failed"
-        assert updated.error is not None
-        assert updated.error.startswith("max_turns_exhausted: ")
-        mock_dispatch.run_gate_command.assert_not_called()
-
-    # --- guards -----------------------------------------------------------
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("current_status", ["review", "done"])
-    async def test_item_already_reviewed_or_done_is_not_patched(
-        self, tmp_path, caplog: pytest.LogCaptureFixture, current_status
-    ) -> None:
-        updated, mock_gtd, _ = await self._run(
-            tmp_path,
-            caplog,
-            item_id=f"item-ua7-{current_status}",
-            item_status=current_status,
-            gate_result=GateResult(
-                returncode=0, timed_out=False, output="ok", duration_seconds=3.0
-            ),
-        )
-        assert updated.status.value == "succeeded"
-        mock_gtd.set_item_status.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_comment_failure_does_not_flip_the_terminal(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        from agent_gtd_dispatch.main import _dispatch_worker
-
-        await db.init_db()
-        run = Run(
-            item_id="item-ua8",
-            project_name="TestProject",
-            branch_name="feat/unasserted",
-            mode=DispatchMode.BUILD,
-        )
-        await db.insert_run(run)
-        fake_workspace = tmp_path / "repos-testproj-ua8"
-        fake_workspace.mkdir()
-
-        async def _boom(item_id, content, **kwargs):
-            if "mechanical evidence alone" in content:
-                raise RuntimeError("comment post failed")
-            return None
-
-        with (
-            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
-            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
-            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
-        ):
-            _install_common_mocks(
-                mock_gtd,
-                mock_dispatch,
-                item_id="item-ua8",
-                project=_default_project(),
-                fake_workspace=fake_workspace,
-            )
-            _drop_artifact(fake_workspace)
-            mock_gtd.post_comment = AsyncMock(side_effect=_boom)
-            mock_gtd.set_item_status = AsyncMock(side_effect=RuntimeError("nope"))
-            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
-            mock_dispatch.verify_pushes = MagicMock(
-                return_value=[_pushed(branch="feat/unasserted")]
-            )
-            mock_dispatch.run_gate_command = MagicMock(
-                return_value=GateResult(
-                    returncode=0, timed_out=False, output="ok", duration_seconds=1.0
-                )
-            )
-
-            await _dispatch_worker(run, 50, CLAUDE, 600)
-
-        updated = await db.get_run(run.id)
-        assert updated is not None
-        assert updated.status.value == "succeeded"
-
-    @pytest.mark.asyncio
-    async def test_rollout_child_reports_success(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Rollouts need no change: the manage-prompt halt rule never sees this run.
-
-        The zero-commit halt rule keys on a FAILED child run; an unasserted child
-        that pushed work and passed the gate reports `succeeded`, so the wave
-        proceeds exactly as it would for an artifact-present run.
-        """
-        updated, _mock_gtd, _ = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua9",
-            rollout_id="rollout-1",
-            gate_result=GateResult(
-                returncode=0, timed_out=False, output="ok", duration_seconds=3.0
-            ),
-        )
-        assert updated.rollout_id == "rollout-1"
-        assert updated.status.value == "succeeded"
-        assert updated.push_results is not None
-        assert not dispatch.is_zero_commits_run(updated.push_results)
-
-    # --- no-regression: every artifact-PRESENT outcome is untouched -------
-
-    @pytest.mark.asyncio
-    async def test_present_done_artifact_unchanged(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        updated, mock_gtd, _ = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua10",
-            artifact="done",
-            gate_result=GateResult(
-                returncode=0, timed_out=False, output="ok", duration_seconds=3.0
-            ),
-        )
-        assert updated.status.value == "succeeded"
-        blob = json.loads(updated.completion or "{}")
-        assert blob["unasserted"] is False
-        assert blob["disposition"] == "done"
-        # `done` -> `review`, materialized by the worker (the agent's prompt no
-        # longer asks it to set the status).
-        mock_gtd.set_item_status.assert_awaited_once()
-        assert mock_gtd.set_item_status.await_args.args[:2] == ("item-ua10", "review")
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert not any("mechanical evidence alone" in b for b in bodies)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("disposition", ["blocked", "failed"])
-    async def test_present_blocked_or_failed_artifact_unchanged(
-        self, tmp_path, caplog: pytest.LogCaptureFixture, disposition
-    ) -> None:
-        updated, _mock_gtd, mock_dispatch = await self._run(
-            tmp_path,
-            caplog,
-            item_id=f"item-ua11-{disposition}",
-            artifact=disposition,
-            gate_result=GateResult(
-                returncode=0, timed_out=False, output="ok", duration_seconds=3.0
-            ),
-        )
-        assert updated.status.value == "failed"
-        assert updated.error is not None
-        assert updated.error.startswith(f"agent_reported_{disposition}: ")
-        blob = json.loads(updated.completion or "{}")
-        assert blob["unasserted"] is False
-        mock_dispatch.run_gate_command.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_present_done_artifact_zero_commits_unchanged(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        updated, _mock_gtd, _ = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua12",
-            artifact="done",
-            pushed=False,
-        )
-        assert updated.status.value == "failed"
-        assert updated.error is not None
-        assert updated.error.startswith("done_claim_zero_commits: ")
-
-    @pytest.mark.asyncio
-    async def test_present_already_satisfied_artifact_unchanged(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        updated, mock_gtd, _ = await self._run(
-            tmp_path,
-            caplog,
-            item_id="item-ua13",
-            artifact="already_satisfied",
-            pushed=False,
-            gate_result=GateResult(
-                returncode=0, timed_out=False, output="ok", duration_seconds=3.0
-            ),
-        )
-        assert updated.status.value == "already_satisfied"
-        blob = json.loads(updated.completion or "{}")
-        assert blob["unasserted"] is False
-        mock_gtd.set_item_status.assert_awaited_once()
-
-
-# ---------------------------------------------------------------------------
-# Disposition -> item status, and the always-posted completion comment
-# ---------------------------------------------------------------------------
-
-
-class TestDispositionToItemStatus:
-    """The worker — not the agent — materializes the item transition.
-
-    Mapping under test: `done` -> `review`; no artifact -> `review`;
-    `blocked`/`failed` -> item untouched (the two-signals-one-meaning bug: a
-    blocked run must never present itself as ready for review).
-    """
-
-    _GREEN = GateResult(
-        returncode=0, timed_out=False, output="ok", duration_seconds=1.0
-    )
-
-    @pytest.mark.asyncio
-    async def test_done_moves_item_to_review(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        updated, mock_gtd, _ = await _run_build_worker(
-            tmp_path,
-            caplog,
-            item_id="item-map-done",
-            artifact="done",
-            gate_result=self._GREEN,
-        )
-        assert updated.status.value == "succeeded"
-        mock_gtd.set_item_status.assert_awaited_once()
-        assert mock_gtd.set_item_status.await_args.args[:2] == (
-            "item-map-done",
-            "review",
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("disposition", ["blocked", "failed"])
-    async def test_blocked_or_failed_never_moves_item_to_review(
-        self, tmp_path, caplog: pytest.LogCaptureFixture, disposition
-    ) -> None:
-        updated, mock_gtd, _ = await _run_build_worker(
-            tmp_path,
-            caplog,
-            item_id=f"item-map-{disposition}",
-            artifact=disposition,
-            gate_result=self._GREEN,
-        )
-        assert updated.status.value == "failed"
-        mock_gtd.set_item_status.assert_not_awaited()
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert not any("review" in b.lower() for b in bodies)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("current_status", ["review", "done"])
-    async def test_done_artifact_does_not_regress_a_finished_item(
-        self, tmp_path, caplog: pytest.LogCaptureFixture, current_status
-    ) -> None:
-        updated, mock_gtd, _ = await _run_build_worker(
-            tmp_path,
-            caplog,
-            item_id=f"item-map-keep-{current_status}",
-            artifact="done",
-            item_status=current_status,
-            gate_result=self._GREEN,
-        )
-        assert updated.status.value == "succeeded"
-        mock_gtd.set_item_status.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_status_set_failure_does_not_flip_the_terminal(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        from agent_gtd_dispatch.main import _dispatch_worker
-
-        await db.init_db()
-        run = Run(
-            item_id="item-map-boom",
-            project_name="TestProject",
-            branch_name="feat/unasserted",
-            mode=DispatchMode.BUILD,
-        )
-        await db.insert_run(run)
-        fake_workspace = tmp_path / "repos-testproj-map-boom"
-        fake_workspace.mkdir()
-
-        with (
-            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
-            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
-            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
-        ):
-            _install_common_mocks(
-                mock_gtd,
-                mock_dispatch,
-                item_id="item-map-boom",
-                project=_default_project(),
-                fake_workspace=fake_workspace,
-            )
-            mock_gtd.set_item_status = AsyncMock(side_effect=RuntimeError("nope"))
-            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
-            mock_dispatch.verify_pushes = MagicMock(
-                return_value=[_pushed(branch="feat/unasserted")]
-            )
-            mock_dispatch.run_gate_command = MagicMock(return_value=self._GREEN)
-
-            await _dispatch_worker(run, 50, CLAUDE, 600)
-
-        updated = await db.get_run(run.id)
-        assert updated is not None
-        assert updated.status.value == "succeeded"
-
-    @pytest.mark.asyncio
-    async def test_item_read_failure_leaves_item_untouched(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        from agent_gtd_dispatch.main import _dispatch_worker
-
-        await db.init_db()
-        run = Run(
-            item_id="item-map-readfail",
-            project_name="TestProject",
-            branch_name="feat/unasserted",
-            mode=DispatchMode.BUILD,
-        )
-        await db.insert_run(run)
-        fake_workspace = tmp_path / "repos-testproj-map-readfail"
-        fake_workspace.mkdir()
-
-        calls: list[str] = []
-
-        async def _get_item(item_id, **kwargs):
-            calls.append(item_id)
-            if len(calls) > 1:  # the terminal-path read, not the dispatch-time one
-                raise RuntimeError("gtd down")
-            return {"id": item_id, "title": "T", "project_id": "proj1"}
-
-        with (
-            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
-            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
-            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
-        ):
-            _install_common_mocks(
-                mock_gtd,
-                mock_dispatch,
-                item_id="item-map-readfail",
-                project=_default_project(),
-                fake_workspace=fake_workspace,
-            )
-            mock_gtd.get_item = AsyncMock(side_effect=_get_item)
-            mock_gtd.set_item_status = AsyncMock()
-            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
-            mock_dispatch.verify_pushes = MagicMock(
-                return_value=[_pushed(branch="feat/unasserted")]
-            )
-            mock_dispatch.run_gate_command = MagicMock(return_value=self._GREEN)
-
-            await _dispatch_worker(run, 50, CLAUDE, 600)
-
-        updated = await db.get_run(run.id)
-        assert updated is not None
-        assert updated.status.value == "succeeded"
-        mock_gtd.set_item_status.assert_not_awaited()
 
 
 class TestAlwaysPostCompletionComment:
@@ -2130,39 +1352,57 @@ class TestAlwaysPostCompletionComment:
         ]
 
     @pytest.mark.asyncio
-    async def test_posted_without_an_artifact_and_names_branch_and_commits(
+    async def test_posted_from_worker_observation_alone(
         self, tmp_path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        _updated, mock_gtd, _ = await _run_build_worker(
-            tmp_path,
-            caplog,
+        """Branch, commit counts, push outcomes and gate decision — nothing else.
+
+        The body no longer varies with anything the agent did or did not produce:
+        there is exactly one shape, composed from what the worker measured.
+        """
+        from agent_gtd_dispatch.main import _dispatch_worker
+
+        await db.init_db()
+        run = Run(
             item_id="item-cc1",
-            artifact="absent",
-            gate_result=self._GREEN,
+            project_name="TestProject",
+            branch_name="feat/cc1",
+            mode=DispatchMode.BUILD,
         )
+        await db.insert_run(run)
+        fake_workspace = tmp_path / "repos-testproj-cc1"
+        fake_workspace.mkdir()
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            _install_common_mocks(
+                mock_gtd,
+                mock_dispatch,
+                item_id="item-cc1",
+                project=_default_project(),
+                fake_workspace=fake_workspace,
+            )
+            mock_gtd.set_item_status = AsyncMock()
+            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
+            mock_dispatch.verify_pushes = MagicMock(
+                return_value=[_pushed(branch="feat/cc1")]
+            )
+            mock_dispatch.run_gate_command = MagicMock(return_value=self._GREEN)
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
         bodies = self._completion_bodies(mock_gtd)
         assert len(bodies) == 1
-        assert "feat/unasserted" in bodies[0]
+        assert "feat/cc1" in bodies[0]
         assert "1 commit(s) across 1 repo(s)" in bodies[0]
         assert "repos-testproj: pushed" in bodies[0]
         assert "Quality gate: `passed`." in bodies[0]
-        assert "wrote no completion artifact" in bodies[0]
-
-    @pytest.mark.asyncio
-    async def test_enriched_with_artifact_fields_when_present(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        _updated, mock_gtd, _ = await _run_build_worker(
-            tmp_path,
-            caplog,
-            item_id="item-cc2",
-            artifact="done",
-            gate_result=self._GREEN,
-        )
-        bodies = self._completion_bodies(mock_gtd)
-        assert len(bodies) == 1
-        assert "Agent disposition: `done`." in bodies[0]
-        assert "wrote no completion artifact" not in bodies[0]
+        # No vocabulary from the deleted artifact contract may survive here.
+        assert "artifact" not in bodies[0].lower()
+        assert "disposition" not in bodies[0].lower()
 
     @pytest.mark.asyncio
     async def test_comment_failure_does_not_flip_the_terminal(
@@ -2174,7 +1414,7 @@ class TestAlwaysPostCompletionComment:
         run = Run(
             item_id="item-cc3",
             project_name="TestProject",
-            branch_name="feat/unasserted",
+            branch_name="feat/cc3",
             mode=DispatchMode.BUILD,
         )
         await db.insert_run(run)
@@ -2202,7 +1442,7 @@ class TestAlwaysPostCompletionComment:
             mock_gtd.set_item_status = AsyncMock()
             mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
             mock_dispatch.verify_pushes = MagicMock(
-                return_value=[_pushed(branch="feat/unasserted")]
+                return_value=[_pushed(branch="feat/cc3")]
             )
             mock_dispatch.run_gate_command = MagicMock(return_value=self._GREEN)
 
@@ -2216,18 +1456,12 @@ class TestAlwaysPostCompletionComment:
 
 
 class TestBuildCompletionCommentComposition:
-    """Unit-level: what the worker can say without the agent's help."""
-
-    @staticmethod
-    def _artifact(**kwargs):
-        from agent_gtd_dispatch.completion import CompletionArtifact
-
-        return CompletionArtifact(**{"disposition": "done", **kwargs})
+    """Unit-level: the comment is composed only from observed facts."""
 
     def test_no_push_results_still_names_the_branch(self) -> None:
         from agent_gtd_dispatch.main import build_completion_comment
 
-        body = build_completion_comment("run-1", "feat/x", None, None, None)
+        body = build_completion_comment("run-1", "feat/x", None, None)
         assert "feat/x" in body
         assert "0 commit(s) across 0 repo(s)" in body
         assert "Quality gate" not in body
@@ -2235,7 +1469,7 @@ class TestBuildCompletionCommentComposition:
     def test_unknown_branch_is_labelled(self) -> None:
         from agent_gtd_dispatch.main import build_completion_comment
 
-        body = build_completion_comment("run-1", None, [], "passed", None)
+        body = build_completion_comment("run-1", None, [], "passed")
         assert "`(unknown)`" in body
 
     def test_per_repo_lines_carry_status_counts_and_dirty_flag(self) -> None:
@@ -2246,490 +1480,538 @@ class TestBuildCompletionCommentComposition:
             "feat/x",
             [_pushed(repo_name="repo_a", dirty=True), _no_changes(repo_name="repo_b")],
             "passed",
-            None,
         )
         assert "1 commit(s) across 2 repo(s)" in body
         assert "- repo_a: pushed (1 commit(s), aaa1111)" in body
         assert "[dirty working tree]" in body
         assert "- repo_b: no_changes (0 commit(s), aaa1111)" in body
 
-    def test_artifact_fields_enrich_the_body(self) -> None:
-        from agent_gtd_dispatch.main import build_completion_comment
 
-        body = build_completion_comment(
-            "run-1",
-            "feat/x",
-            [_pushed()],
-            "passed",
-            self._artifact(
-                summary="did the thing",
-                reason="it was already there",
-                decision_needed="which schema?",
-            ),
-        )
-        assert "Agent disposition: `done`." in body
-        assert "Summary: did the thing" in body
-        assert "Reason: it was already there" in body
-        assert "Decision needed: which schema?" in body
-
-    def test_blank_artifact_fields_are_omitted(self) -> None:
-        from agent_gtd_dispatch.main import build_completion_comment
-
-        body = build_completion_comment(
-            "run-1", "feat/x", [_pushed()], "passed", self._artifact(summary="   ")
-        )
-        assert "Summary:" not in body
-        assert "Reason:" not in body
-        assert "Decision needed:" not in body
-
-
-# ---------------------------------------------------------------------------
-# Three-tier disposition: asserted -> inferred -> derived, wired into the worker
-# ---------------------------------------------------------------------------
-
-
-class TestThreeTierDispositionRouting:
-    """Tier 1 wins outright; tiers 2 and 3 route through the EXISTING paths.
-
-    The whole point of the tiering is that a run never ends with a silent gap,
-    and that a verdict the agent did not give is never presented as though it
-    had. Both halves are asserted here.
-    """
+class TestRescueBeforeTeardown:
+    """Worker wiring: the rescue runs before teardown and gates the teardown."""
 
     _GREEN = GateResult(
         returncode=0, timed_out=False, output="ok", duration_seconds=1.0
     )
 
-    @staticmethod
-    def _spy(**kwargs):
-        return patch.object(disposition, "classify", new=AsyncMock(**kwargs))
+    async def _run(self, tmp_path, *, item_id, branch, rescue, push_results):
+        from agent_gtd_dispatch.main import _dispatch_worker
 
-    @staticmethod
-    def _inferred(value: str, reason: str = "from the transcript"):
-        return disposition.DispositionResult(
-            disposition=value,
-            reason=reason,
-            provenance="inferred",
-            model="glm-5.3-flash",
-            latency_seconds=1.25,
+        await db.init_db()
+        run = Run(
+            item_id=item_id,
+            project_name="TestProject",
+            branch_name=branch,
+            mode=DispatchMode.BUILD,
         )
+        await db.insert_run(run)
+        fake_workspace = tmp_path / f"repos-testproj-{item_id}"
+        fake_workspace.mkdir()
 
-    # --- tier 1 wins: no classifier call at all --------------------------
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("artifact", "pushed"),
-        [
-            ("done", True),
-            ("already_satisfied", False),
-            ("blocked", True),
-            ("failed", True),
-        ],
-    )
-    async def test_artifact_present_never_calls_the_classifier(
-        self, tmp_path, caplog: pytest.LogCaptureFixture, artifact, pushed
-    ) -> None:
-        """An asserted disposition costs no money and no latency."""
-        with self._spy() as spy:
-            updated, _mock_gtd, _ = await _run_build_worker(
-                tmp_path,
-                caplog,
-                item_id=f"item-t1-{artifact}",
-                artifact=artifact,
-                pushed=pushed,
-                gate_result=self._GREEN,
-            )
-        spy.assert_not_awaited()
-        blob = json.loads(updated.completion or "{}")
-        assert blob["disposition"] == artifact
-        assert blob["disposition_provenance"] == "asserted"
-        assert blob["unasserted"] is False
-
-    @pytest.mark.asyncio
-    async def test_artifact_present_run_is_unchanged_end_to_end(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """No-regression: a `done` artifact behaves exactly as it does today."""
-        with self._spy() as spy:
-            updated, mock_gtd, mock_dispatch = await _run_build_worker(
-                tmp_path,
-                caplog,
-                item_id="item-t1-noregress",
-                artifact="done",
-                gate_result=self._GREEN,
-            )
-        spy.assert_not_awaited()
-        assert updated.status.value == "succeeded"
-        assert updated.error is None
-        mock_dispatch.run_gate_command.assert_called_once()
-        mock_gtd.set_item_status.assert_awaited_once()
-        assert mock_gtd.set_item_status.await_args.args[:2] == (
-            "item-t1-noregress",
-            "review",
-        )
-        blob = json.loads(updated.completion or "{}")
-        assert blob["unasserted"] is False
-        assert blob["disposition"] == "done"
-        assert blob["disposition_provenance"] == "asserted"
-        assert blob["classifier_model"] is None
-        assert blob["classifier_failure"] is None
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any("Agent disposition: `done`." in b for b in bodies)
-        assert not any("inferred" in b for b in bodies)
-        assert not any("derived" in b for b in bodies)
-        assert not any("mechanical evidence alone" in b for b in bodies)
-        assert not any(
-            "unasserted build run:" in r.getMessage() for r in caplog.records
-        )
-
-    # --- tier 2 routes exactly as an asserted verdict of the same value ---
-
-    @pytest.mark.asyncio
-    async def test_inferred_done_takes_the_success_path(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        with self._spy(return_value=self._inferred("done", "implemented and pushed")):
-            updated, mock_gtd, _ = await _run_build_worker(
-                tmp_path,
-                caplog,
-                item_id="item-t2-done",
-                artifact="absent",
-                gate_result=self._GREEN,
-            )
-        assert updated.status.value == "succeeded"
-        blob = json.loads(updated.completion or "{}")
-        assert blob["disposition"] == "done"
-        assert blob["disposition_provenance"] == "inferred"
-        assert blob["classifier_model"] == "glm-5.3-flash"
-        assert blob["classifier_latency_s"] == 1.25
-        assert blob["unasserted"] is True
-        # The item-status transition shipped in 5cb3125, unchanged.
-        mock_gtd.set_item_status.assert_awaited_once()
-        assert mock_gtd.set_item_status.await_args.args[:2] == (
-            "item-t2-done",
-            "review",
-        )
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any("**inferred**" in b and "glm-5.3-flash" in b for b in bodies)
-        assert any("NOT the agent's own word" in b for b in bodies)
-        assert not any("mechanical evidence alone" in b for b in bodies)
-
-    @pytest.mark.asyncio
-    async def test_inferred_already_satisfied_takes_the_existing_noop_path(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        with self._spy(
-            return_value=self._inferred(
-                "already_satisfied", "the guard already exists at foo.py:12"
-            )
-        ):
-            updated, mock_gtd, _ = await _run_build_worker(
-                tmp_path,
-                caplog,
-                item_id="item-t2-as",
-                artifact="absent",
-                pushed=False,
-                gate_result=self._GREEN,
-            )
-        assert updated.status.value == "already_satisfied"
-        assert updated.error is not None
-        assert updated.error.startswith("already_satisfied: ")
-        blob = json.loads(updated.completion or "{}")
-        assert blob["disposition"] == "already_satisfied"
-        assert blob["disposition_provenance"] == "inferred"
-        # Same route as an asserted already_satisfied: item -> review.
-        mock_gtd.set_item_status.assert_awaited_once()
-        assert mock_gtd.set_item_status.await_args.args[:2] == ("item-t2-as", "review")
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        noop = [b for b in bodies if "made no changes" in b]
-        assert len(noop) == 1
-        assert "**inferred**" in noop[0]
-        assert "the agent reported the" not in noop[0]
-        assert "the guard already exists at foo.py:12" in noop[0]
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("value", ["blocked", "failed"])
-    async def test_inferred_blocked_or_failed_fails_the_run(
-        self, tmp_path, caplog: pytest.LogCaptureFixture, value
-    ) -> None:
-        with self._spy(return_value=self._inferred(value, "needs a schema decision")):
-            updated, mock_gtd, _ = await _run_build_worker(
-                tmp_path,
-                caplog,
-                item_id=f"item-t2-{value}",
-                artifact="absent",
-                gate_result=self._GREEN,
-            )
-        assert updated.status.value == "failed"
-        assert updated.error is not None
-        # An existing triage prefix — no new BUILD_FAILURE_PREFIXES member — and
-        # never `agent_reported_*`, which would put words in the agent's mouth.
-        assert updated.error.startswith("stopped_without_assertion: ")
-        assert f"inferred disposition={value}" in updated.error
-        blob = json.loads(updated.completion or "{}")
-        assert blob["disposition"] == value
-        assert blob["disposition_provenance"] == "inferred"
-        # blocked/failed never present themselves as ready for review.
-        mock_gtd.set_item_status.assert_not_awaited()
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any("needs a schema decision" in b for b in bodies)
-        assert any("NOT the agent's own word" in b for b in bodies)
-
-    @pytest.mark.asyncio
-    async def test_inferred_done_with_zero_commits_still_fails(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The zero-commit invariant outranks any tier's `done`."""
-        with self._spy(return_value=self._inferred("done")):
-            updated, mock_gtd, _ = await _run_build_worker(
-                tmp_path,
-                caplog,
-                item_id="item-t2-done-zero",
-                artifact="absent",
-                pushed=False,
-                gate_result=self._GREEN,
-            )
-        assert updated.status.value == "failed"
-        mock_gtd.set_item_status.assert_not_awaited()
-
-    # --- tier 3 fallbacks -------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_classifier_timeout_falls_back_to_derived(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        with patch.object(
-            disposition,
-            "classify",
-            new=AsyncMock(
-                return_value=disposition.ClassificationFailure(
-                    reason="timeout", latency_seconds=45.0
-                )
-            ),
-        ):
-            updated, mock_gtd, _ = await _run_build_worker(
-                tmp_path,
-                caplog,
-                item_id="item-t3-timeout",
-                artifact="absent",
-                gate_result=self._GREEN,
-            )
-        assert updated.status.value == "succeeded"
-        blob = json.loads(updated.completion or "{}")
-        assert blob["disposition"] == "done"
-        assert blob["disposition_provenance"] == "derived"
-        assert blob["classifier_failure"] == "timeout"
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any("**derived** mechanically" in b for b in bodies)
-
-    @pytest.mark.asyncio
-    async def test_unrecognized_response_falls_back_to_derived(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A fifth value is not a disposition — it is a classification failure."""
         with (
-            patch.object(
-                disposition,
-                "_call_model",
-                new=AsyncMock(return_value='{"disposition": "mostly_done"}'),
-            ),
-            patch.object(config, "DISPOSITION_CLASSIFIER_ENABLED", True),
-            patch.dict(os.environ, {"OLLAMA_CLOUD_API_KEY": "k"}),
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
         ):
-            updated, _mock_gtd, _ = await _run_build_worker(
-                tmp_path,
-                caplog,
-                item_id="item-t3-nonsense",
-                artifact="absent",
-                gate_result=self._GREEN,
+            _install_common_mocks(
+                mock_gtd,
+                mock_dispatch,
+                item_id=item_id,
+                project=_default_project(),
+                fake_workspace=fake_workspace,
             )
-        assert updated.status.value == "succeeded"
-        blob = json.loads(updated.completion or "{}")
-        assert blob["disposition"] == "done"
-        assert blob["disposition_provenance"] == "derived"
-        assert blob["classifier_failure_class"] == "parse"
-        assert "unrecognized_response" in blob["classifier_failure"]
-        # Recorded even on FAILURE: this field was `null` on the run that
-        # exposed a tier 2 which had never once worked.
-        assert blob["classifier_model"] == "glm-5.3:cloud"
+            mock_gtd.set_item_status = AsyncMock()
+            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
+            mock_dispatch.verify_pushes = MagicMock(return_value=push_results)
+            mock_dispatch.run_gate_command = MagicMock(return_value=self._GREEN)
+            mock_dispatch.rescue_abandoned_work = MagicMock(return_value=rescue)
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        return updated, mock_gtd, mock_dispatch
 
     @pytest.mark.asyncio
-    async def test_disabled_by_config_makes_no_network_call(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
+    async def test_successful_rescue_comments_and_still_tears_down(
+        self, tmp_path
     ) -> None:
-        call = AsyncMock()
-        with (
-            patch.object(config, "DISPOSITION_CLASSIFIER_ENABLED", False),
-            patch.object(disposition, "_call_model", new=call),
-        ):
-            updated, _mock_gtd, _ = await _run_build_worker(
-                tmp_path,
-                caplog,
-                item_id="item-t3-disabled",
-                artifact="absent",
-                gate_result=self._GREEN,
-            )
-        call.assert_not_awaited()
-        blob = json.loads(updated.completion or "{}")
-        assert blob["disposition_provenance"] == "derived"
-        assert blob["classifier_failure"] == "disabled"
-
-    @pytest.mark.asyncio
-    async def test_malformed_artifact_also_reaches_the_tiers(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Unparseable == absent for tiering, and the reject reason still shows."""
-        with self._spy(return_value=self._inferred("done")):
-            updated, mock_gtd, _ = await _run_build_worker(
-                tmp_path,
-                caplog,
-                item_id="item-t3-malformed",
-                artifact="malformed",
-                gate_result=self._GREEN,
-            )
-        blob = json.loads(updated.completion or "{}")
-        assert blob["artifact_reject_reason"] == "not_json"
-        assert blob["disposition_provenance"] == "inferred"
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any("Completion artifact rejected: not_json." in b for b in bodies)
-
-    # --- the telemetry line ----------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_warning_line_carries_tier_disposition_and_latency(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        with self._spy(return_value=self._inferred("done")):
-            await _run_build_worker(
-                tmp_path,
-                caplog,
-                item_id="item-t4-warn",
-                artifact="absent",
-                gate_result=self._GREEN,
-            )
-        record = next(
-            r for r in caplog.records if "unasserted build run:" in r.getMessage()
+        rescue = dispatch.RescueResult(
+            "repos-testproj", attempted=True, pushed=True, committed=True
         )
-        assert record.levelname == "WARNING"
-        line = record.getMessage()
-        for fragment in (
-            "engine=claude-code",
-            "tier=inferred",
-            "disposition=done",
-            "classifier_model=glm-5.3-flash",
-            "classifier_latency_s=1.25",
-            "gate_decision=passed",
-            "outcome=succeeded",
-        ):
-            assert fragment in line
-
-
-# ---------------------------------------------------------------------------
-# already_satisfied survives — only its mechanical DERIVATION is gone
-# ---------------------------------------------------------------------------
-
-
-class TestAlreadySatisfiedIsStillAssertableAndInferable:
-    """No-regression for the two tiers that ARE entitled to the disposition.
-
-    Removing the derived tier's ability to INFER `already_satisfied` must not
-    remove the disposition itself. An agent that ASSERTS it with a reason, and
-    a classifier that READS one out of the transcript and the diff, both still
-    land the `already_satisfied` terminal, still move the item to `review`, and
-    still let a rollout wave skip and advance past the item.
-    """
-
-    _GREEN = GateResult(
-        returncode=0, timed_out=False, output="ok", duration_seconds=1.0
-    )
-
-    @pytest.mark.asyncio
-    async def test_asserted_already_satisfied_is_untouched(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        updated, mock_gtd, mock_dispatch = await _run_build_worker(
+        _updated, mock_gtd, mock_dispatch = await self._run(
             tmp_path,
-            caplog,
-            item_id="item-as-asserted",
-            artifact="already_satisfied",
-            pushed=False,
-            gate_result=self._GREEN,
+            item_id="item-r1",
+            branch="feat/r1",
+            rescue=rescue,
+            push_results=[_pushed(branch="feat/r1")],
         )
-        # Zero commits, green gate, an artifact carrying a reason.
-        mock_dispatch.run_gate_command.assert_called_once()
-        assert updated.status.value == "already_satisfied"
-        assert updated.error is not None
-        assert updated.error.startswith("already_satisfied: ")
-        blob = json.loads(updated.completion or "{}")
-        assert blob["disposition"] == "already_satisfied"
-        assert blob["disposition_provenance"] == "asserted"
-        assert blob["unasserted"] is False
-        # Item -> review, via the unchanged `_route_already_satisfied_item`.
-        mock_gtd.set_item_status.assert_awaited_once()
-        assert mock_gtd.set_item_status.await_args.args[:2] == (
-            "item-as-asserted",
-            "review",
-        )
+        mock_dispatch.cleanup_workspace.assert_called_once()
         bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        noop = [b for b in bodies if "made no changes" in b]
-        assert len(noop) == 1
-        # The agent's own word, said as such.
-        assert "the agent reported the" in noop[0]
-        assert "**derived** mechanically" not in noop[0]
+        rescue_comments = [b for b in bodies if "Unreviewed partial work" in b]
+        assert len(rescue_comments) == 1
+        assert "feat/r1" in rescue_comments[0]
+        # The comment must not let a reader mistake this for reviewed work.
+        assert "hooks were skipped" in rescue_comments[0]
+        assert "passed no quality gate" in rescue_comments[0]
 
     @pytest.mark.asyncio
-    async def test_inferred_already_satisfied_is_untouched(
-        self, tmp_path, caplog: pytest.LogCaptureFixture
+    async def test_failed_rescue_retains_the_workspace_and_says_so(
+        self, tmp_path
     ) -> None:
-        """The classifier sees a STATED reason, so it is entitled to the verdict.
-
-        Same mechanical evidence as the derived case that now fails — zero
-        commits and a passing gate — but here the transcript was read and a
-        reason came back with the verdict. That is the difference, and it is
-        why this tier keeps the disposition the derived tier loses.
-        """
-        inferred = disposition.DispositionResult(
-            disposition="already_satisfied",
-            reason="the guard already exists at foo.py:12",
-            provenance="inferred",
-            model="glm-5.3-flash",
-            latency_seconds=0.9,
+        """A rescue that could not push means the clone is the only copy left."""
+        rescue = dispatch.RescueResult(
+            "repos-testproj",
+            attempted=True,
+            pushed=False,
+            committed=True,
+            error="git push failed in repos-testproj: no route to host",
         )
-        with patch.object(
-            disposition, "classify", new=AsyncMock(return_value=inferred)
-        ):
-            updated, mock_gtd, _ = await _run_build_worker(
-                tmp_path,
-                caplog,
-                item_id="item-as-inferred",
-                artifact="absent",
-                pushed=False,
-                gate_result=self._GREEN,
-            )
-        assert updated.status.value == "already_satisfied"
-        blob = json.loads(updated.completion or "{}")
-        assert blob["disposition"] == "already_satisfied"
-        assert blob["disposition_provenance"] == "inferred"
-        mock_gtd.set_item_status.assert_awaited_once()
-        assert mock_gtd.set_item_status.await_args.args[:2] == (
-            "item-as-inferred",
-            "review",
+        updated, mock_gtd, mock_dispatch = await self._run(
+            tmp_path,
+            item_id="item-r2",
+            branch="feat/r2",
+            rescue=rescue,
+            push_results=[_pushed(branch="feat/r2")],
         )
+        mock_dispatch.cleanup_workspace.assert_not_called()
+        assert updated.error is not None
+        assert "rescue_push_failed" in updated.error
+        assert "RETAINED" in updated.error
+        assert "no route to host" in updated.error
         bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        noop = [b for b in bodies if "made no changes" in b]
-        assert len(noop) == 1
-        # Labelled as the model's verdict — never the agent's own word.
-        assert "**inferred**" in noop[0]
-        assert "the guard already exists at foo.py:12" in noop[0]
-        assert "the agent reported the" not in noop[0]
+        assert any("could NOT rescue" in b for b in bodies)
 
     @pytest.mark.asyncio
-    async def test_the_classifier_keeps_the_full_closed_set(self) -> None:
-        """The closed set tier 2 picks from is unchanged by this item."""
-        assert disposition.VALID_DISPOSITIONS == (
-            "done",
-            "already_satisfied",
-            "blocked",
-            "failed",
+    async def test_nothing_to_rescue_posts_nothing(self, tmp_path) -> None:
+        rescue = dispatch.RescueResult(
+            "repos-testproj", attempted=False, pushed=False, committed=False
         )
-        assert "already_satisfied" in disposition._SYSTEM_PROMPT
+        _updated, mock_gtd, mock_dispatch = await self._run(
+            tmp_path,
+            item_id="item-r3",
+            branch="feat/r3",
+            rescue=rescue,
+            push_results=[_pushed(branch="feat/r3")],
+        )
+        mock_dispatch.cleanup_workspace.assert_called_once()
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert not any("Unreviewed partial work" in b for b in bodies)
+
+    @pytest.mark.asyncio
+    async def test_rescue_runs_on_a_failed_run_too(self, tmp_path) -> None:
+        """The failure path is exactly where unpushed work is most likely.
+
+        A zero-commit run returns early from the terminal classification; the
+        rescue lives in the teardown ``finally``, so it still runs — and that run
+        is the one whose working tree most often holds everything the agent did.
+        """
+        rescue = dispatch.RescueResult(
+            "repos-testproj", attempted=True, pushed=True, committed=True
+        )
+        updated, mock_gtd, mock_dispatch = await self._run(
+            tmp_path,
+            item_id="item-r4",
+            branch="feat/r4",
+            rescue=rescue,
+            push_results=[_no_changes(branch="feat/r4")],
+        )
+        assert updated.status.value == "failed"
+        assert (updated.error or "").startswith("zero_commits: ")
+        mock_dispatch.rescue_abandoned_work.assert_called_once()
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any("Unreviewed partial work" in b for b in bodies)
+
+    @pytest.mark.asyncio
+    async def test_rescue_never_touches_a_non_feature_branch(self, tmp_path) -> None:
+        """Blast-radius guard: this pushes with hooks off, so `feat/*` only."""
+        rescue = dispatch.RescueResult(
+            "repos-testproj", attempted=True, pushed=True, committed=True
+        )
+        _updated, _mock_gtd, mock_dispatch = await self._run(
+            tmp_path,
+            item_id="item-r5",
+            branch="main",
+            rescue=rescue,
+            push_results=[_pushed(branch="main")],
+        )
+        mock_dispatch.rescue_abandoned_work.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_raising_rescue_does_not_abort_teardown(self, tmp_path) -> None:
+        """The rescue runs inside the teardown ``finally``.
+
+        An exception escaping it would skip ``cleanup_workspace`` and leak the
+        clone on every run, so each repo's rescue is individually contained.
+        """
+        from agent_gtd_dispatch.main import _dispatch_worker
+
+        await db.init_db()
+        run = Run(
+            item_id="item-r6",
+            project_name="TestProject",
+            branch_name="feat/r6",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+        fake_workspace = tmp_path / "repos-testproj-r6"
+        fake_workspace.mkdir()
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            _install_common_mocks(
+                mock_gtd,
+                mock_dispatch,
+                item_id="item-r6",
+                project=_default_project(),
+                fake_workspace=fake_workspace,
+            )
+            mock_gtd.set_item_status = AsyncMock()
+            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
+            mock_dispatch.verify_pushes = MagicMock(
+                return_value=[_pushed(branch="feat/r6")]
+            )
+            mock_dispatch.run_gate_command = MagicMock(return_value=self._GREEN)
+            mock_dispatch.rescue_abandoned_work = MagicMock(
+                side_effect=OSError("git vanished")
+            )
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "succeeded"
+        mock_dispatch.cleanup_workspace.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_rescue_comment_failure_is_isolated(self, tmp_path) -> None:
+        """A GTD outage must not stop the workspace being torn down."""
+        from agent_gtd_dispatch.main import _dispatch_worker
+
+        await db.init_db()
+        run = Run(
+            item_id="item-r7",
+            project_name="TestProject",
+            branch_name="feat/r7",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+        fake_workspace = tmp_path / "repos-testproj-r7"
+        fake_workspace.mkdir()
+
+        async def _boom(item_id, content, **kwargs):
+            if "Unreviewed partial work" in content:
+                raise RuntimeError("gtd down")
+            return None
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            _install_common_mocks(
+                mock_gtd,
+                mock_dispatch,
+                item_id="item-r7",
+                project=_default_project(),
+                fake_workspace=fake_workspace,
+            )
+            mock_gtd.post_comment = AsyncMock(side_effect=_boom)
+            mock_gtd.set_item_status = AsyncMock()
+            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
+            mock_dispatch.verify_pushes = MagicMock(
+                return_value=[_pushed(branch="feat/r7")]
+            )
+            mock_dispatch.run_gate_command = MagicMock(return_value=self._GREEN)
+            mock_dispatch.rescue_abandoned_work = MagicMock(
+                return_value=dispatch.RescueResult(
+                    "repos-testproj", attempted=True, pushed=True, committed=True
+                )
+            )
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "succeeded"
+        mock_dispatch.cleanup_workspace.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_rescue_failure_error_text_appends_to_an_existing_error(
+        self, tmp_path
+    ) -> None:
+        """A failed run already has an error; the rescue note must not clobber it."""
+        rescue = dispatch.RescueResult(
+            "repos-testproj",
+            attempted=True,
+            pushed=False,
+            committed=True,
+            error="git push failed in repos-testproj: remote hung up",
+        )
+        updated, _mock_gtd, mock_dispatch = await self._run(
+            tmp_path,
+            item_id="item-r8",
+            branch="feat/r8",
+            rescue=rescue,
+            push_results=[_no_changes(branch="feat/r8")],
+        )
+        assert updated.status.value == "failed"
+        assert updated.error is not None
+        assert updated.error.startswith("zero_commits: ")
+        assert "rescue_push_failed" in updated.error
+        mock_dispatch.cleanup_workspace.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_plan_mode_has_no_repos_so_no_rescue(self, tmp_path) -> None:
+        """Only BUILD runs record repos; there is nothing to inspect otherwise."""
+        from agent_gtd_dispatch.main import _dispatch_worker
+
+        await db.init_db()
+        run = Run(
+            item_id="item-r9",
+            project_name="TestProject",
+            branch_name="feat/r9",
+            mode=DispatchMode.PLAN,
+        )
+        await db.insert_run(run)
+        fake_workspace = tmp_path / "repos-testproj-r9"
+        fake_workspace.mkdir()
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            _install_common_mocks(
+                mock_gtd,
+                mock_dispatch,
+                item_id="item-r9",
+                project=_default_project(),
+                fake_workspace=fake_workspace,
+            )
+            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        mock_dispatch.rescue_abandoned_work.assert_not_called()
+
+
+class TestWorkerItemRoutingTolerance:
+    """Every GTD call the worker makes after a terminal is best-effort.
+
+    The run row is the source of truth about what happened. A flaky GTD API must
+    never flip an already-recorded terminal, and must never leave the worker
+    raising inside a teardown path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unreadable_item_status_leaves_the_item_untouched(self) -> None:
+        from agent_gtd_dispatch.main import _nudge_item_to_review
+
+        with patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd:
+            mock_gtd.get_item = AsyncMock(side_effect=RuntimeError("gtd down"))
+            mock_gtd.set_item_status = AsyncMock()
+            await _nudge_item_to_review(
+                "item-x", "run-x", callback_token=None, terminal="succeeded"
+            )
+        # Never guess: a read failure must not become a blind PATCH.
+        mock_gtd.set_item_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("current", ["review", "done"])
+    async def test_an_item_already_moved_on_is_not_regressed(self, current) -> None:
+        from agent_gtd_dispatch.main import _nudge_item_to_review
+
+        with patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd:
+            mock_gtd.get_item = AsyncMock(return_value={"status": current})
+            mock_gtd.set_item_status = AsyncMock()
+            await _nudge_item_to_review(
+                "item-x", "run-x", callback_token=None, terminal="succeeded"
+            )
+        mock_gtd.set_item_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failing_status_patch_is_swallowed(self) -> None:
+        from agent_gtd_dispatch.main import _best_effort_set_item_status
+
+        with patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd:
+            mock_gtd.set_item_status = AsyncMock(side_effect=RuntimeError("gtd down"))
+            # Must not raise.
+            await _best_effort_set_item_status(
+                "item-x", "review", "run-x", callback_token=None, terminal="succeeded"
+            )
+
+    @pytest.mark.asyncio
+    async def test_already_satisfied_comment_failure_is_swallowed(self) -> None:
+        from agent_gtd_dispatch.main import _route_already_satisfied_item
+
+        with patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd:
+            mock_gtd.set_item_status = AsyncMock()
+            mock_gtd.post_comment = AsyncMock(side_effect=RuntimeError("gtd down"))
+            await _route_already_satisfied_item(
+                "item-x",
+                "run-x",
+                "already there at foo.py:12",
+                callback_token=None,
+                attribution=None,
+            )
+        # The status set still happened — the comment is the part that failed.
+        mock_gtd.set_item_status.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_already_satisfied_comment_names_the_reason_and_not_the_agent(
+        self,
+    ) -> None:
+        """Talos VERIFIED the no-op; the wording must not read as an agent claim."""
+        from agent_gtd_dispatch.main import _route_already_satisfied_item
+
+        with patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd:
+            mock_gtd.set_item_status = AsyncMock()
+            mock_gtd.post_comment = AsyncMock()
+            await _route_already_satisfied_item(
+                "item-x",
+                "run-x",
+                "already there at foo.py:12",
+                callback_token=None,
+                attribution=None,
+            )
+        body = str(mock_gtd.post_comment.await_args.args[1])
+        assert "already there at foo.py:12" in body
+        assert "its own checks passed" in body
+        assert "was NOT completed" in body
+
+    @pytest.mark.asyncio
+    async def test_rollout_skip_failure_does_not_raise(self) -> None:
+        from agent_gtd_dispatch.main import _complete_rollout_item_skipped
+
+        with patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd:
+            mock_gtd.complete_item_in_rollout = AsyncMock(
+                side_effect=RuntimeError("gtd down")
+            )
+            mock_gtd.post_comment = AsyncMock()
+            await _complete_rollout_item_skipped(
+                "ro-1", "item-x", "run-x", callback_token=None, attribution=None
+            )
+        mock_gtd.post_comment.assert_not_awaited()
+
+
+class TestRescueHelperDirectly:
+    """Unit-level coverage of ``_rescue_before_teardown``'s own failure handling."""
+
+    @staticmethod
+    def _run(branch="feat/z", item_id="item-z"):
+        return Run(
+            id="run-z",
+            item_id=item_id,
+            project_name="TestProject",
+            branch_name=branch,
+            mode=DispatchMode.BUILD,
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_repos_returns_none(self, tmp_path) -> None:
+        from agent_gtd_dispatch.main import _rescue_before_teardown
+
+        assert await _rescue_before_teardown(self._run(), [], attribution=None) is None
+
+    @pytest.mark.asyncio
+    async def test_a_failing_db_write_does_not_raise_into_teardown(
+        self, tmp_path
+    ) -> None:
+        """The error text is best-effort; losing it must not abort cleanup."""
+        from agent_gtd_dispatch.main import _rescue_before_teardown
+
+        failed = dispatch.RescueResult(
+            "repo-a", attempted=True, pushed=False, committed=True, error="push refused"
+        )
+        with (
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.db") as mock_db,
+        ):
+            mock_dispatch._executor = None
+            mock_dispatch.RescueResult = dispatch.RescueResult
+            mock_dispatch.rescue_abandoned_work = MagicMock(return_value=failed)
+            mock_gtd.post_comment = AsyncMock()
+            mock_db.get_run = AsyncMock(side_effect=RuntimeError("db gone"))
+
+            outcome = await _rescue_before_teardown(
+                self._run(), [("repo-a", tmp_path, None)], attribution=None
+            )
+
+        assert outcome is not None
+        assert outcome.ok is False
+        # The operator still hears about it via the GTD comment.
+        assert mock_gtd.post_comment.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_run_with_no_item_still_rescues(self, tmp_path) -> None:
+        """Pushing the work matters more than being able to announce it."""
+        from agent_gtd_dispatch.main import _rescue_before_teardown
+
+        pushed = dispatch.RescueResult(
+            "repo-a", attempted=True, pushed=True, committed=True
+        )
+        run = self._run()
+        run.item_id = None
+        with (
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+        ):
+            mock_dispatch._executor = None
+            mock_dispatch.RescueResult = dispatch.RescueResult
+            mock_dispatch.rescue_abandoned_work = MagicMock(return_value=pushed)
+            mock_gtd.post_comment = AsyncMock()
+
+            outcome = await _rescue_before_teardown(
+                run, [("repo-a", tmp_path, None)], attribution=None
+            )
+
+        assert outcome is not None
+        assert outcome.ok is True
+        mock_dispatch.rescue_abandoned_work.assert_called_once()
+        mock_gtd.post_comment.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_partial_multi_repo_rescue_is_not_ok(self, tmp_path) -> None:
+        """One repo left behind is enough to retain the workspace.
+
+        A workspace run has many clones; ``ok`` must mean every repo that had work
+        got it to origin, not that some did.
+        """
+        from agent_gtd_dispatch.main import _rescue_before_teardown
+
+        results = {
+            "repo-a": dispatch.RescueResult(
+                "repo-a", attempted=True, pushed=True, committed=True
+            ),
+            "repo-b": dispatch.RescueResult(
+                "repo-b",
+                attempted=True,
+                pushed=False,
+                committed=True,
+                error="no route",
+            ),
+        }
+        with (
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.db") as mock_db,
+        ):
+            mock_dispatch._executor = None
+            mock_dispatch.RescueResult = dispatch.RescueResult
+            mock_dispatch.rescue_abandoned_work = MagicMock(
+                side_effect=lambda name, *_a: results[name]
+            )
+            mock_gtd.post_comment = AsyncMock()
+            mock_db.get_run = AsyncMock(return_value=None)
+            mock_db.update_run = AsyncMock()
+
+            outcome = await _rescue_before_teardown(
+                self._run(),
+                [("repo-a", tmp_path, None), ("repo-b", tmp_path, None)],
+                attribution=None,
+            )
+
+        assert outcome is not None
+        assert outcome.ok is False
+        assert len(outcome.attempted) == 2

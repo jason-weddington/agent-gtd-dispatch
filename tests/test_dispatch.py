@@ -7,6 +7,7 @@ import logging
 import os
 import pwd
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import ClassVar
@@ -47,9 +48,9 @@ from agent_gtd_dispatch.models import DispatchRequest, PushStatus, RepoPushStatu
 from tests.completion_fixtures import (
     MAX_TURNS_ENVELOPE,
     seed_build_evidence,
-    write_artifact,
     write_envelope,
 )
+from tests.worker_mocks import stub_rescue
 
 
 def _dispatch_sudo_available() -> bool:
@@ -407,6 +408,76 @@ class TestBuildEnv:
         assert "KB_TEST_DATABASE_URL" in env_keep_keys
         assert "KB_REQUIRE_POSTGRES_TESTS" in env_keep_keys
 
+    def test_every_sudo_wrapped_command_is_in_sudoers_nopasswd(self) -> None:
+        """Flywheel guard: every command the worker sudo-wraps must be NOPASSWD-authorised.
+
+        The COMMAND counterpart to the env_keep guards above, and it exists because
+        this bug class is invisible everywhere it would normally be caught. In dev and
+        in CI ``AGENT_SUBPROCESS_USER`` is empty, which makes ``_sudo_wrap`` the
+        IDENTITY function — so an unauthorised command runs perfectly in every test and
+        is denied only on a provisioned host, where the denial surfaces as an empty read
+        rather than as an error.
+
+        That is not hypothetical. ``cat`` was sudo-wrapped for the completion artifact
+        and the reviewer verdict but was never added to the NOPASSWD list: 163 denials
+        across three hosts, every one of them read by the caller as "the file is absent",
+        and the resulting fake "agents never write the artifact" signal is what motivated
+        an entire three-tier disposition cascade to guess what agents had meant.
+
+        Parsed with ``ast`` rather than a regex so that a call spanning several lines —
+        which every interesting one does — is not missed.
+        """
+        import ast
+
+        tmpl = Path(__file__).parent.parent / "templates" / "sudoers-dispatch-svc.tmpl"
+        nopasswd_line = next(
+            line
+            for line in tmpl.read_text().splitlines()
+            if "NOPASSWD:" in line and not line.lstrip().startswith("#")
+        )
+        authorised = {
+            Path(cmd.strip()).name
+            for cmd in nopasswd_line.split("NOPASSWD:", 1)[1].split(",")
+            if cmd.strip()
+        }
+        assert authorised, "no NOPASSWD commands parsed from the sudoers template"
+
+        src_dir = Path(__file__).parent.parent / "src"
+        found: list[tuple[str, int, str]] = []
+        for py in sorted(src_dir.rglob("*.py")):
+            tree = ast.parse(py.read_text(), filename=str(py))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not node.args:
+                    continue
+                func = node.func
+                name = (
+                    func.attr
+                    if isinstance(func, ast.Attribute)
+                    else func.id
+                    if isinstance(func, ast.Name)
+                    else ""
+                )
+                if name != "_sudo_wrap":
+                    continue
+                argv = node.args[0]
+                # Only a literal list with a literal first element can be checked
+                # statically; a dynamically-built argv (engine.build_command, the
+                # talos argv) is verified by its own tests instead.
+                if not isinstance(argv, ast.List) or not argv.elts:
+                    continue
+                first = argv.elts[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    found.append((py.name, node.lineno, first.value))
+
+        assert found, "no literal _sudo_wrap argv found — did the helper get renamed?"
+        unauthorised = [
+            (f, ln, cmd) for f, ln, cmd in found if Path(cmd).name not in authorised
+        ]
+        assert not unauthorised, (
+            "sudo-wrapped commands missing from the sudoers NOPASSWD list "
+            f"(authorised: {sorted(authorised)}): {unauthorised}"
+        )
+
     def test_callback_token_not_baked_into_mcp_registration(self) -> None:
         """No-leak guard: mcp-servers.sh must NOT bake a literal AGENT_GTD_API_KEY
         into the agent-gtd MCP block (that would pin every agent to the static key
@@ -608,7 +679,8 @@ class TestBuildSystemPrompt:
         assert "verify the remote ref advanced" not in prompt
         assert "git rev-parse HEAD" not in prompt
         # ...and it is told WHY it does not have to.
-        assert "You do not need to verify the push landed" in prompt
+        assert "You do not need to verify the" in prompt
+        assert "push landed" in prompt
 
     def test_no_op_guidance_present(self) -> None:
         prompt = self._prompt()
@@ -3662,9 +3734,8 @@ class TestZeroCommitsGuard:
     and so was permanently open.
 
     Covers:
-    1. zero commits + a ``done`` claim → failure (``done_claim_zero_commits``)
-    2. zero commits + two post-start comments, no artifact → failure
-       (``stopped_without_assertion``) — comments are irrelevant
+    1. zero commits + a green result envelope → failure (``zero_commits``)
+    2. zero commits + two post-start comments → failure — comments are irrelevant
     3. normal commit+push → success (regression, happy path)
     4. unpushed commits → failure (regression, existing verify_pushes behaviour)
     """
@@ -3787,7 +3858,7 @@ class TestZeroCommitsGuard:
         assert updated is not None
         assert updated.status.value == "failed"
         assert updated.error is not None
-        assert updated.error.startswith("done_claim_zero_commits: ")
+        assert updated.error.startswith("zero_commits: ")
 
         # The deleted guard's comment lookup must be gone.
         mock_gtd.list_comments.assert_not_called()
@@ -3879,7 +3950,7 @@ class TestZeroCommitsGuard:
         assert updated is not None
         assert updated.status.value == "failed"
         assert updated.error is not None
-        assert updated.error.startswith("stopped_without_assertion: ")
+        assert updated.error.startswith("zero_commits: ")
         mock_gtd.list_comments.assert_not_called()
 
     async def test_normal_commit_push_succeeds_regression(self, tmp_path) -> None:
@@ -4205,7 +4276,14 @@ class TestSetupGitExclude:
 # ---------------------------------------------------------------------------
 
 
-class TestBuildPromptCompletionArtifact:
+class TestBuildPromptHasNoArtifactContract:
+    """The artifact contract is gone from the build prompt, and must stay gone.
+
+    No behavioural test can catch a prompt-text regression, so the removed contract
+    is pinned ABSENT by vocabulary. Re-introducing it would re-introduce the thing
+    the refactor deleted: a run status that turns on a file the agent chose to write.
+    """
+
     def _prompt(self, workspace=Path("/srv/agent/workspace/ws-abc")):
         return dispatch._build_build_prompt(
             {"id": "item-1"},
@@ -4215,80 +4293,32 @@ class TestBuildPromptCompletionArtifact:
             workspace=workspace,
         )
 
-    def test_contains_absolute_artifact_path_and_schema(self) -> None:
+    def test_no_artifact_contract_anywhere_in_the_prompt(self) -> None:
         prompt = self._prompt()
-        assert ".dispatch/completion.json" in prompt
-        assert "/srv/agent/workspace/ws-abc" in prompt
-        assert "schema_version" in prompt
-        for literal in ("done", "already_satisfied", "blocked", "failed"):
-            assert literal in prompt
+        assert "completion.json" not in prompt
+        assert "Completion Artifact" not in prompt
+        assert "completion artifact" not in prompt
+        assert "schema_version" not in prompt
+        assert "decision_needed" not in prompt
+        assert "already_satisfied" not in prompt
 
-    def test_no_op_block_rewritten(self) -> None:
+    def test_agent_is_not_asked_to_declare_a_disposition(self) -> None:
         prompt = self._prompt()
-        assert "stays `active`" not in prompt
-        assert "Post a comment describing what already exists" not in prompt
-        assert "already_satisfied" in prompt
+        assert "disposition" not in prompt.lower()
 
-    def test_artifact_section_comes_after_reporting(self) -> None:
+    def test_prompt_states_zero_commits_cannot_succeed(self) -> None:
+        """The agent is told the real rule, so it can act on it while it still can."""
         prompt = self._prompt()
-        artifact_at = prompt.index("## Completion Artifact")
-        reporting_at = prompt.index("## Reporting")
-        important_at = prompt.index("## Important")
-        assert reporting_at < artifact_at
-        assert important_at < artifact_at
+        assert "zero commits on origin fails" in prompt
+        assert "commit as you go" in prompt.lower()
 
-    def test_artifact_section_is_the_last_section(self) -> None:
+    def test_prompt_names_the_three_mechanical_inputs(self) -> None:
         prompt = self._prompt()
-        headings = [
-            line.strip()
-            for line in prompt.splitlines()
-            if line.strip().startswith("## ")
-        ]
-        assert headings, "prompt rendered without any '##' sections"
-        assert headings[-1] == "## Completion Artifact"
-
-    def test_no_op_case_not_orphaned_before_artifact_section(self) -> None:
-        prompt = self._prompt()
-        assert prompt.index("## Completion Artifact") < prompt.index(
-            "No-Op Case — Work Already Done"
-        )
-
-    def test_reporting_on_success_hands_off_to_artifact(self) -> None:
-        prompt = self._prompt()
-        on_success = prompt[prompt.index("**On success:**") :]
-        on_success = on_success[: on_success.index("**On failure/blocked**")]
-        steps = [
-            line.strip()
-            for line in on_success.splitlines()
-            if line.strip()[:2] in {"1.", "2.", "3."}
-        ]
-        assert len(steps) == 2
-        assert steps[0].startswith("1. Post a final comment")
-        assert "completion artifact" in steps[1]
-        assert "**Completion Artifact**" in steps[1]
-
-    def test_opening_sentence_does_not_claim_a_contradicted_last_action(self) -> None:
-        prompt = self._prompt()
-        assert "Your LAST action on EVERY path" not in prompt
-        section = prompt[prompt.index("## Completion Artifact") :]
-        assert "nothing comes after it" in section
-        assert "final action of the run" in section
-
-    def test_stale_failure_consequence_sentence_is_gone(self) -> None:
-        prompt = self._prompt()
-        assert "recorded as a FAILURE regardless of what" not in prompt
-        assert "unasserted" in prompt
-        assert "only a run with no commits, or a failing" in prompt
-
-    def test_build_system_prompt_threads_workspace(self) -> None:
-        prompt = build_system_prompt(
-            {"id": "item-1"},
-            {"name": "P"},
-            "feat/x",
-            50,
-            workspace=Path("/ws/root-xyz"),
-        )
-        assert "/ws/root-xyz/.dispatch/completion.json" in prompt
+        section = prompt[prompt.index("## How your run is judged") :]
+        assert "commits that reached origin" in section
+        assert "quality gate" in section
+        assert "result envelope" in section
+        assert "Nothing you write\ndecides it." in section
 
 
 class TestManagePromptAlreadySatisfied:
@@ -4410,6 +4440,7 @@ async def _run_build_worker(
         mock_dispatch.run_gate_command = MagicMock(return_value=gate_result)
         mock_dispatch.cleanup_workspace = MagicMock()
         mock_dispatch._executor = None
+        stub_rescue(mock_dispatch)
 
         from agent_gtd_dispatch.engines import CLAUDE
 
@@ -4421,7 +4452,14 @@ async def _run_build_worker(
 
 
 class TestFieldScenarioA:
-    """Exit 0, comments on the item, zero commits, NO completion artifact."""
+    """Exit 0, comments on the item, ZERO commits.
+
+    The agent commented — repeatedly, in the 10-comment case — and the run still
+    fails. That is the whole point: activity on the item is not evidence of work.
+    Two generations of this bug read agent-originated signals as proof (first
+    ``len(comments) >= 2``, then a JSON file the agent wrote), and both let a run
+    that produced nothing be recorded as done.
+    """
 
     @pytest.fixture(autouse=True)
     def _workspace_root(self, tmp_path, monkeypatch):
@@ -4429,16 +4467,16 @@ class TestFieldScenarioA:
         monkeypatch.setattr(config, "EVIDENCE_ROOT", tmp_path / "evidence")
 
     @pytest.mark.parametrize("comment_count", [2, 10])
-    async def test_zero_commits_without_artifact_fails(
+    async def test_zero_commits_fails_however_much_the_agent_said(
         self, tmp_path, caplog, comment_count
     ) -> None:
         from unittest.mock import AsyncMock
 
         def _seed(ws):
-            write_envelope(ws)  # leg 1 GREEN — isolates leg 2
+            write_envelope(ws)  # envelope GREEN — isolates the commit count
 
         with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
-            updated, mock_gtd, _md, _ws = await _run_build_worker(
+            updated, mock_gtd, mock_dispatch, _ws = await _run_build_worker(
                 tmp_path,
                 item_id=f"item-a-{comment_count}",
                 workspace_name=f"repos-a-{comment_count}",
@@ -4448,14 +4486,19 @@ class TestFieldScenarioA:
             assert isinstance(mock_gtd.post_comment, AsyncMock)
 
         assert updated.status.value == "failed"
-        assert updated.status.value != "succeeded"
         assert updated.error is not None
-        assert updated.error.startswith("stopped_without_assertion: ")
+        assert updated.error.startswith("zero_commits: ")
+        # The gate is not even reached on this path.
+        mock_dispatch.run_gate_command.assert_not_called()
         assert "build completion:" in caplog.text
         assert "outcome=failed" in caplog.text
         assert "zero_commits=True" in caplog.text
         assert updated.completion is not None
-        assert json.loads(updated.completion)["artifact"] == "absent"
+        blob = json.loads(updated.completion)
+        assert blob["gate_decision"] is None
+        # No trace of the deleted artifact contract on the run record.
+        assert "artifact" not in blob
+        assert "disposition" not in blob
 
     async def test_empty_transcript_is_no_result_envelope(
         self, tmp_path, caplog
@@ -4473,35 +4516,40 @@ class TestFieldScenarioA:
             )
 
         # Exit 0 never excuses a missing envelope, and the envelope verdict is
-        # checked BEFORE the artifact.
+        # checked BEFORE the commit count.
         assert updated.status.value == "failed"
         assert updated.error is not None
         assert updated.error.startswith("no_result_envelope: ")
         assert "outcome=failed" in caplog.text
         assert "zero_commits=True" in caplog.text
-        assert json.loads(updated.completion or "{}")["artifact"] == "absent"
 
 
 class TestFieldScenarioB:
-    """Exit 0, green envelope, already_satisfied artifact, green gate."""
+    """Exit 0, green envelope, zero commits, green gate — still a failure.
+
+    The run that motivated the whole refactor. The agent had done real work but
+    left it uncommitted; the worker stashed the tree, gated the resulting pristine
+    base commit, got a green result, and read that green as corroboration of a
+    deliberate no-op. It recorded ``already_satisfied`` and deleted the clone.
+
+    A green gate on an unchanged tree is a fact about the BASE COMMIT. There is no
+    longer any path from zero commits to a non-failure terminal for a claude-code
+    build, and the gate that produced the misleading green is not run at all.
+    """
 
     @pytest.fixture(autouse=True)
     def _workspace_root(self, tmp_path, monkeypatch):
         monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
         monkeypatch.setattr(config, "EVIDENCE_ROOT", tmp_path / "evidence")
 
-    async def test_already_satisfied_terminal(self, tmp_path, caplog) -> None:
+    async def test_zero_commits_never_lands_already_satisfied(
+        self, tmp_path, caplog
+    ) -> None:
         def _seed(ws):
             write_envelope(ws)
-            write_artifact(
-                ws,
-                "already_satisfied",
-                reason="guard already present at main.py:1806",
-            )
 
-        gate_result = dispatch_module_gate_result()
         with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
-            updated, mock_gtd, _md, _ws = await _run_build_worker(
+            updated, mock_gtd, mock_dispatch, _ws = await _run_build_worker(
                 tmp_path,
                 item_id="item-b",
                 workspace_name="repos-b",
@@ -4513,24 +4561,17 @@ class TestFieldScenarioB:
                     "git_origin": "git@host:repos/testproj",
                     "gate_command": "make gate",
                 },
-                gate_result=gate_result,
+                gate_result=dispatch_module_gate_result(),
             )
 
-        assert updated.status.value == "already_satisfied"
-        assert updated.error is not None
-        assert "guard already present at main.py:1806" in updated.error
-        mock_gtd.set_item_status.assert_awaited_once()
-        assert mock_gtd.set_item_status.await_args.args[:2] == ("item-b", "review")
+        assert updated.status.value == "failed"
+        assert updated.status.value != "already_satisfied"
+        assert (updated.error or "").startswith("zero_commits: ")
+        mock_dispatch.run_gate_command.assert_not_called()
+        # The item must not be advanced — there is nothing to review.
+        mock_gtd.set_item_status.assert_not_awaited()
         mock_gtd.complete_item.assert_not_called()
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any("guard already present at main.py:1806" in b for b in bodies)
-        assert "outcome=already_satisfied" in caplog.text
-        assert "disposition=already_satisfied" in caplog.text
-        assert "gate_decision=passed" in caplog.text
-        blob = json.loads(updated.completion or "{}")
-        assert blob["disposition"] == "already_satisfied"
-        assert blob["gate_decision"] == "passed"
-        assert blob["zero_commits"] is True
+        assert "outcome=failed" in caplog.text
 
 
 def dispatch_module_gate_result():
@@ -4577,40 +4618,9 @@ class TestBuildTerminalBranches:
         assert updated.status.value == "failed"
         assert (updated.error or "").startswith("result_is_error: ")
 
-    async def test_agent_reported_blocked(self, tmp_path) -> None:
-        def _seed(ws):
-            write_envelope(ws)
-            write_artifact(ws, "blocked", decision_needed="which API should I use?")
-
-        updated, mock_gtd, _md, _ws = await _run_build_worker(
-            tmp_path,
-            item_id="item-blocked",
-            workspace_name="repos-blocked",
-            seed=_seed,
-            push_results=[_repo_status(PushStatus.no_changes)],
-        )
-        assert updated.status.value == "failed"
-        assert (updated.error or "").startswith("agent_reported_blocked: ")
-        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
-        assert any("which API should I use?" in b for b in bodies)
-
-    async def test_agent_reported_failed(self, tmp_path) -> None:
-        def _seed(ws):
-            write_envelope(ws)
-            write_artifact(ws, "failed")
-
-        updated, _gtd, _md, _ws = await _run_build_worker(
-            tmp_path,
-            item_id="item-failed",
-            workspace_name="repos-failed",
-            seed=_seed,
-            push_results=[_repo_status(PushStatus.no_changes)],
-        )
-        assert updated.status.value == "failed"
-        assert (updated.error or "").startswith("agent_reported_failed: ")
-
-    async def test_done_claim_zero_commits(self, tmp_path) -> None:
-        updated, _gtd, _md, _ws = await _run_build_worker(
+    async def test_zero_commits_beats_a_green_envelope(self, tmp_path) -> None:
+        """A perfectly green envelope does not rescue a run that committed nothing."""
+        updated, mock_gtd, mock_dispatch, _ws = await _run_build_worker(
             tmp_path,
             item_id="item-done0",
             workspace_name="repos-done0",
@@ -4618,7 +4628,34 @@ class TestBuildTerminalBranches:
             push_results=[_repo_status(PushStatus.no_changes)],
         )
         assert updated.status.value == "failed"
-        assert (updated.error or "").startswith("done_claim_zero_commits: ")
+        assert (updated.error or "").startswith("zero_commits: ")
+        mock_dispatch.run_gate_command.assert_not_called()
+        bodies = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        assert any("Build run failed (zero_commits)" in b for b in bodies)
+        assert any("without producing a single commit" in b for b in bodies)
+
+    async def test_envelope_verdict_is_checked_before_the_commit_count(
+        self, tmp_path
+    ) -> None:
+        """A bad envelope wins over zero commits — both fail, the prefix differs.
+
+        Precedence matters for triage: ``max_turns_exhausted`` on a commit-less run
+        tells an operator to split the item, whereas ``zero_commits`` tells them the
+        agent stopped without producing anything.
+        """
+
+        def _seed(ws):
+            write_envelope(ws, **MAX_TURNS_ENVELOPE)
+
+        updated, _gtd, _md, _ws = await _run_build_worker(
+            tmp_path,
+            item_id="item-mt0",
+            workspace_name="repos-mt0",
+            seed=_seed,
+            push_results=[_repo_status(PushStatus.no_changes)],
+        )
+        assert updated.status.value == "failed"
+        assert (updated.error or "").startswith("max_turns_exhausted: ")
 
     async def test_done_with_commits_succeeds(self, tmp_path) -> None:
         updated, _gtd, _md, _ws = await _run_build_worker(
@@ -4631,7 +4668,6 @@ class TestBuildTerminalBranches:
         assert updated.status.value == "succeeded"
         blob = json.loads(updated.completion or "{}")
         assert blob["envelope_verdict"] == "ok"
-        assert blob["disposition"] == "done"
         assert blob["zero_commits"] is False
         assert blob["session_id"] == "s-1"
         assert blob["num_turns"] == 12
@@ -4648,7 +4684,6 @@ class TestBuildTerminalBranches:
         mock_dispatch.cleanup_workspace.assert_called_once()
         evidence = config.EVIDENCE_ROOT / updated.id
         assert (evidence / "transcript.txt").exists()
-        assert (evidence / "completion.json").exists()
 
     async def test_evidence_captured_on_agent_nonzero_exit(self, tmp_path) -> None:
         def _seed(ws):
@@ -4711,7 +4746,6 @@ class TestInvariantTripwire:
                 run.id,
                 status=RunStatus.succeeded,
                 push_results_list=[_repo_status(PushStatus.no_changes)],
-                disposition="done",
                 envelope_verdict="ok",
             )
 
@@ -4961,14 +4995,20 @@ class TestManagePromptForegroundWait:
         assert "keep" in region and "until the command exits 0, 2 or 1" in region
 
     def test_turn_discipline_sentence_present(self, workspace_repo_dirs) -> None:
+        """The manage prompts render the SHARED turn-discipline block.
+
+        Same block, same words, as the build prompt — the two used to differ, and
+        the build prompt's narrower version is what failed.
+        """
         prompt = _manage_prompt(workspace_repo_dirs)
         assert "Turn Discipline" in prompt
-        assert "NEVER invoke a run wait\nwith `run_in_background: true`" in prompt
         assert (
-            "Do NOT end your turn\nor session while any dispatched build run is "
-            "still in flight.**" in prompt
+            "**Never end your turn while anything you started is still running.**"
+            in prompt
         )
+        assert "no `run_in_background: true`" in prompt
         assert "`claude --print`" in prompt
+        assert "Your\nprocess IS your turn." in prompt
 
     def test_time_budget_line_no_longer_says_on_timeout(
         self, workspace_repo_dirs
@@ -5091,8 +5131,8 @@ class TestBuildPromptTerminalActionCollapse:
 
     def test_prompt_says_the_worker_owns_the_transition(self) -> None:
         prompt = self._prompt()
-        assert "Do NOT set the item's status" in prompt
-        assert "derived from the disposition you report" in prompt
+        assert "You do NOT set the item's status" in prompt
+        assert "The worker moves the item itself." in prompt
 
     def test_no_remote_ref_verification(self) -> None:
         prompt = self._prompt()
@@ -5100,12 +5140,22 @@ class TestBuildPromptTerminalActionCollapse:
         assert "git rev-parse HEAD" not in prompt
         assert "Compare the returned SHA" not in prompt
 
-    def test_foreground_push_rule_survives(self) -> None:
-        """Turn discipline, not verification — it must not be collateral damage."""
+    def test_turn_discipline_is_an_invariant_not_a_command_whitelist(self) -> None:
+        """The rule must cover EVERY command, with git push only as an example.
+
+        The build prompt used to carry two bullets scoped to ``git push``. An agent
+        that followed them perfectly still lost its run by backgrounding the project
+        gate — a rule that enumerates commands reads as permission for the rest.
+        """
         prompt = self._prompt()
-        assert "**in the\n   foreground**" in prompt
-        assert "NEVER invoke `git push` with `run_in_background`" in prompt
-        assert "Do not end your turn or session while a `git push`" in prompt
+        assert "Turn Discipline" in prompt
+        assert (
+            "Never end your turn while anything you started is still running" in prompt
+        )
+        assert "The rule covers\nEVERY command you run." in prompt
+        assert "ILLUSTRATIONS, not the rule" in prompt
+        assert "whitelist of everything it does not name" in prompt
+        assert "`claude --print`" in prompt
 
     def test_scripted_milestone_comments_are_gone(self) -> None:
         prompt = self._prompt()
@@ -5134,16 +5184,18 @@ class TestBuildPromptTerminalActionCollapse:
         assert "git add" not in prompt.lower()
         assert "Ignore the `run-xyz-attachments/` directory" not in prompt
 
-    def test_disposition_to_item_status_mapping_is_stated(self) -> None:
-        prompt = self._prompt()
-        section = prompt[prompt.index("## Completion Artifact") :]
-        assert "The worker materializes that pick" in section
-        assert "move the item to `review`" in section
-        assert "never presents itself as ready for review" in section
+    def test_terse_progress_comments_are_requested_for_humans(self) -> None:
+        """Comments are re-asked for — and framed as being for READERS, not for code.
 
-    def test_final_summary_comment_survives(self) -> None:
+        They were worth keeping (a lead reads them in the UI) and are safe to keep
+        precisely because no code branches on them.
+        """
         prompt = self._prompt()
-        assert "Post a final comment with: what you did" in prompt
+        section = prompt[prompt.index("## Reporting") :]
+        assert "Humans and lead agents read these in the UI" in section
+        assert "Keep them terse" in section
+        assert "could NOT get from" in section
+        assert "final one-line comment" in section
 
 
 class TestCommitsAheadOfBase:
@@ -5649,3 +5701,352 @@ class TestRolloutWorkspaceReuse:
         assert any("git fetch origin --prune" in f for f in flat)
         assert any("git reset --hard origin/main" in f for f in flat)
         assert any("git clean -fd" in f for f in flat)
+
+
+_GIT_UNAVAILABLE = shutil.which("git") is None
+
+
+@pytest.mark.skipif(_GIT_UNAVAILABLE, reason="requires git(1)")
+class TestRescueAbandonedWork:
+    """The last line of defence before an irreversible teardown.
+
+    Driven against REAL git repos with a real local origin, because every failure
+    this guards against is a git-semantics failure — a frozen remote-tracking ref,
+    a hook that rejects an incomplete commit, an untracked-only change that reads
+    as a clean tree. A mocked subprocess would agree with whatever the code did.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_sudo(self, monkeypatch):
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+
+    @staticmethod
+    def _git(repo, *args, **kwargs):
+        return subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                *args,
+            ],
+            cwd=repo,
+            capture_output=True,
+            check=kwargs.pop("check", True),
+        )
+
+    def _repo_with_origin(self, tmp_path, branch="feat/x"):
+        """A clone on ``branch`` whose origin is a real bare repo."""
+        origin = tmp_path / "origin.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-b", "main", str(origin)],
+            check=True,
+            capture_output=True,
+        )
+        seed = tmp_path / "seed"
+        seed.mkdir()
+        self._git(seed, "init", "-b", "main")
+        (seed / "base.txt").write_text("base\n")
+        self._git(seed, "add", "-A")
+        self._git(seed, "commit", "-m", "base")
+        self._git(seed, "remote", "add", "origin", str(origin))
+        self._git(seed, "push", "-u", "origin", "main")
+
+        repo = tmp_path / "clone"
+        subprocess.run(
+            ["git", "clone", str(origin), str(repo)], check=True, capture_output=True
+        )
+        self._git(repo, "checkout", "-b", branch)
+        return repo, origin
+
+    @staticmethod
+    def _remote_sha(origin, branch):
+        out = subprocess.run(
+            ["git", "ls-remote", str(origin), f"refs/heads/{branch}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        return out.split("\t")[0] if out else ""
+
+    def test_uncommitted_work_is_committed_and_pushed(self, tmp_path) -> None:
+        """The exact shape that lost ~560 agent-turns: finished work, never committed."""
+        repo, origin = self._repo_with_origin(tmp_path)
+        (repo / "feature.py").write_text("def feature():\n    return 42\n")
+        (repo / "base.txt").write_text("modified\n")
+
+        result = dispatch.rescue_abandoned_work("repo-a", repo, "feat/x", "run-1")
+
+        assert result.attempted is True
+        assert result.committed is True
+        assert result.pushed is True
+        assert result.error == ""
+        assert self._remote_sha(origin, "feat/x") != ""
+
+        # Both the untracked NEW file and the modified tracked file survived.
+        files = subprocess.run(
+            ["git", "show", "--name-only", "--format=", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert "feature.py" in files
+        assert "base.txt" in files
+
+    def test_untracked_only_change_is_not_mistaken_for_a_clean_tree(
+        self, tmp_path
+    ) -> None:
+        """A run whose entire output is NEW files must still be rescued.
+
+        ``git status --porcelain --untracked-files=no`` — the variant used for push
+        verification — reports this tree as clean, which would silently delete the
+        whole run's output.
+        """
+        repo, origin = self._repo_with_origin(tmp_path)
+        (repo / "brand_new.py").write_text("x = 1\n")
+
+        result = dispatch.rescue_abandoned_work("repo-a", repo, "feat/x", "run-1")
+
+        assert result.pushed is True
+        assert self._remote_sha(origin, "feat/x") != ""
+
+    def test_committed_but_unpushed_work_is_pushed_without_a_new_commit(
+        self, tmp_path
+    ) -> None:
+        repo, origin = self._repo_with_origin(tmp_path)
+        (repo / "done.py").write_text("y = 2\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "feat: real work")
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        result = dispatch.rescue_abandoned_work("repo-a", repo, "feat/x", "run-1")
+
+        assert result.attempted is True
+        assert result.committed is False  # nothing dirty — no rescue commit made
+        assert result.pushed is True
+        assert self._remote_sha(origin, "feat/x") == head
+
+    def test_a_rejecting_pre_commit_hook_does_not_lose_the_work(self, tmp_path) -> None:
+        """``--no-verify`` is load-bearing here, and deliberately unlike the normal path.
+
+        Incomplete work usually FAILS a hook. ``main._commit_with_retry`` must run
+        hooks so fixer hooks can fix; this path must skip them, because a blocked
+        commit here does not yield a cleaner tree — it yields no tree at all.
+        """
+        repo, origin = self._repo_with_origin(tmp_path)
+        hook = repo / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\necho 'lint failed'\nexit 1\n")
+        hook.chmod(0o755)
+        (repo / "half_done.py").write_text("def broken(:\n")
+
+        result = dispatch.rescue_abandoned_work("repo-a", repo, "feat/x", "run-1")
+
+        assert result.committed is True
+        assert result.pushed is True
+        assert self._remote_sha(origin, "feat/x") != ""
+
+    def test_nothing_to_rescue_is_a_no_op(self, tmp_path) -> None:
+        """A clean, fully-pushed repo is not touched and reports attempted=False."""
+        repo, origin = self._repo_with_origin(tmp_path)
+        (repo / "done.py").write_text("y = 2\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "feat: real work")
+        self._git(repo, "push", "-u", "origin", "feat/x")
+        before = self._remote_sha(origin, "feat/x")
+
+        result = dispatch.rescue_abandoned_work("repo-a", repo, "feat/x", "run-1")
+
+        assert result.attempted is False
+        assert result.pushed is False
+        assert self._remote_sha(origin, "feat/x") == before
+
+    def test_frozen_remote_tracking_ref_does_not_cause_a_false_positive(
+        self, tmp_path
+    ) -> None:
+        """Detection compares against the LIVE remote, never the clone's origin/main.
+
+        A dispatch clone's remote-tracking refs are frozen at clone time. Comparing
+        against them reports already-pushed work as unpushed on every teardown — a
+        watchdog that looks perfect and cries wolf forever.
+        """
+        repo, origin = self._repo_with_origin(tmp_path)
+        (repo / "done.py").write_text("y = 2\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "feat: real work")
+        self._git(repo, "push", "-u", "origin", "feat/x")
+
+        # Move origin/main forward behind the clone's back, so the clone's own
+        # origin/main is now stale — exactly the dispatch-clone situation.
+        other = tmp_path / "other"
+        subprocess.run(
+            ["git", "clone", str(origin), str(other)], check=True, capture_output=True
+        )
+        (other / "someone_else.txt").write_text("elsewhere\n")
+        self._git(other, "add", "-A")
+        self._git(other, "commit", "-m", "chore: unrelated")
+        self._git(other, "push", "origin", "main")
+
+        has_work, _dirty = dispatch._repo_has_unrescued_work(repo, "feat/x")
+        assert has_work is False
+
+    def test_push_failure_is_reported_not_swallowed(self, tmp_path) -> None:
+        repo, _origin = self._repo_with_origin(tmp_path)
+        (repo / "work.py").write_text("z = 3\n")
+        self._git(repo, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+
+        result = dispatch.rescue_abandoned_work("repo-a", repo, "feat/x", "run-1")
+
+        assert result.attempted is True
+        assert result.committed is True  # the work IS committed locally
+        assert result.pushed is False
+        assert "git push failed in repo-a" in result.error
+
+    def test_head_that_cannot_be_read_falls_back_to_the_dirty_flag(
+        self, tmp_path
+    ) -> None:
+        """A branch with no commits yet has no HEAD to resolve.
+
+        ``git rev-parse HEAD`` fails on an unborn branch. The dirty flag is then the
+        only signal, and it must still be honoured — a first-commit run that died
+        before committing is exactly the work worth rescuing.
+        """
+        repo = tmp_path / "empty"
+        repo.mkdir()
+        self._git(repo, "init", "-b", "feat/x")
+        (repo / "first.py").write_text("a = 1\n")
+
+        has_work, dirty = dispatch._repo_has_unrescued_work(repo, "feat/x")
+        assert dirty is True
+        assert has_work is True
+
+    def test_unreachable_remote_is_assumed_to_have_work(self, tmp_path) -> None:
+        """When origin cannot be reached, fail LOUD rather than quiet.
+
+        A redundant push is refused harmlessly by git; a skipped one deletes the
+        work. This check must never fail in the silent direction.
+        """
+        repo, _origin = self._repo_with_origin(tmp_path)
+        (repo / "done.py").write_text("y = 2\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "feat: real work")
+        self._git(repo, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+
+        has_work, dirty = dispatch._repo_has_unrescued_work(repo, "feat/x")
+        assert dirty is False
+        assert has_work is True
+
+    def test_inspection_oserror_is_reported_not_swallowed(self, tmp_path) -> None:
+        repo, _origin = self._repo_with_origin(tmp_path)
+        with patch(
+            "agent_gtd_dispatch.dispatch._repo_has_unrescued_work",
+            side_effect=OSError("no such executable"),
+        ):
+            result = dispatch.rescue_abandoned_work("repo-a", repo, "feat/x", "run-1")
+        assert result.attempted is True
+        assert result.pushed is False
+        assert "could not inspect repo-a" in result.error
+
+    def test_git_add_failure_is_reported_not_swallowed(self, tmp_path) -> None:
+        repo, _origin = self._repo_with_origin(tmp_path)
+        (repo / "work.py").write_text("z = 3\n")
+        failed_add = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout=b"", stderr=b"index locked"
+        )
+        real_run = subprocess.run
+
+        def _fake(argv, **kwargs):
+            if "add" in argv:
+                return failed_add
+            return real_run(argv, **kwargs)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run", side_effect=_fake):
+            result = dispatch.rescue_abandoned_work("repo-a", repo, "feat/x", "run-1")
+        assert result.attempted is True
+        assert result.committed is False
+        assert result.pushed is False
+        assert "git add failed in repo-a" in result.error
+
+    def test_a_dirty_tree_with_nothing_committable_still_pushes(self, tmp_path) -> None:
+        """A commit that finds nothing staged is not an error — the push still runs.
+
+        ``committed`` reports False and the unpushed commits still reach origin.
+        """
+        repo, origin = self._repo_with_origin(tmp_path)
+        (repo / "done.py").write_text("y = 2\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "feat: real work")
+        # Ignored-only dirt: `git status --porcelain` is clean, but force one
+        # through by making the commit itself a no-op.
+        (repo / ".gitignore").write_text("scratch/\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "chore: ignore scratch")
+        (repo / "scratch").mkdir()
+        (repo / "scratch" / "tmp.log").write_text("noise\n")
+
+        result = dispatch.rescue_abandoned_work("repo-a", repo, "feat/x", "run-1")
+
+        assert result.pushed is True
+        assert self._remote_sha(origin, "feat/x") != ""
+
+
+class TestCrossUserReadsArePlain:
+    """The reads that used to escalate via ``sudo cat`` and were denied every time.
+
+    ``cat`` was never in the sudoers NOPASSWD list, so every one of these reads was
+    refused on every provisioned host. For the reviewer verdict that was the worst
+    case of all: an unreadable verdict HALTS a rollout, so on the shipped sudoers
+    every reviewer verdict would have halted its wave.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_sudo(self, monkeypatch):
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+
+    def test_default_branches_round_trip(self, tmp_path) -> None:
+        dispatch._write_default_branches(
+            tmp_path, {"repo_a": "main", "repo_b": "trunk"}
+        )
+        assert dispatch._read_default_branches(tmp_path) == {
+            "repo_a": "main",
+            "repo_b": "trunk",
+        }
+
+    def test_absent_default_branches_is_an_empty_dict(self, tmp_path) -> None:
+        assert dispatch._read_default_branches(tmp_path) == {}
+
+    def test_malformed_default_branches_is_an_empty_dict(self, tmp_path) -> None:
+        (tmp_path / ".dispatch").mkdir()
+        (tmp_path / dispatch.DEFAULT_BRANCHES_RELPATH).write_text("{not json")
+        assert dispatch._read_default_branches(tmp_path) == {}
+
+    def test_non_object_default_branches_is_an_empty_dict(self, tmp_path) -> None:
+        (tmp_path / ".dispatch").mkdir()
+        (tmp_path / dispatch.DEFAULT_BRANCHES_RELPATH).write_text("[1, 2]")
+        assert dispatch._read_default_branches(tmp_path) == {}
+
+    def test_unwritable_default_branches_does_not_raise(self, tmp_path) -> None:
+        """Called on the wave-loop path — a failed cache write must not kill it."""
+        dispatch._write_default_branches(tmp_path / "nonexistent", {"a": "main"})
+
+    def test_a_valid_verdict_is_read_without_escalation(self, tmp_path) -> None:
+        (tmp_path / ".dispatch").mkdir()
+        (tmp_path / dispatch.VERDICT_ARTIFACT_RELPATH).write_text(
+            json.dumps(
+                {"schema_version": 1, "verdict": "merge", "rationale": "looks right"}
+            )
+        )
+        verdict, reason = dispatch.read_review_verdict(tmp_path)
+        assert reason == "ok"
+        assert verdict is not None
+        assert verdict["verdict"] == "merge"
+
+    def test_an_absent_verdict_reads_as_absent_not_as_a_merge(self, tmp_path) -> None:
+        assert dispatch.read_review_verdict(tmp_path) == (None, "absent")

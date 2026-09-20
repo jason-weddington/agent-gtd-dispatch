@@ -12,6 +12,7 @@ from agent_gtd_dispatch import config, dispatch
 from agent_gtd_dispatch.dispatch import verify_pushes
 from agent_gtd_dispatch.models import PushStatus, RepoPushStatus
 from tests.completion_fixtures import seed_build_evidence
+from tests.worker_mocks import stub_rescue
 
 
 @pytest.fixture(autouse=True)
@@ -1015,6 +1016,7 @@ class TestPushBackstop:
                 return_value=_make_completed(0)
             )
             mock_dispatch._executor = None
+            stub_rescue(mock_dispatch)
             mock_dispatch.cleanup_workspace = MagicMock()
 
             from agent_gtd_dispatch.engines import CLAUDE
@@ -1125,6 +1127,7 @@ class TestPushBackstop:
                 return_value=_make_completed(1, stderr="rejected")
             )
             mock_dispatch._executor = None
+            stub_rescue(mock_dispatch)
             mock_dispatch.cleanup_workspace = MagicMock()
 
             from agent_gtd_dispatch.engines import CLAUDE
@@ -1225,6 +1228,7 @@ class TestPushBackstop:
                 return_value=_make_completed(0)
             )
             mock_dispatch._executor = None
+            stub_rescue(mock_dispatch)
             mock_dispatch.cleanup_workspace = MagicMock()
 
             from agent_gtd_dispatch.engines import CLAUDE
@@ -1314,6 +1318,7 @@ class TestPushBackstop:
                 return_value=_make_completed(0)
             )
             mock_dispatch._executor = None
+            stub_rescue(mock_dispatch)
             mock_dispatch.cleanup_workspace = MagicMock()
 
             from agent_gtd_dispatch.engines import CLAUDE

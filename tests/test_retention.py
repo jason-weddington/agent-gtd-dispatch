@@ -136,6 +136,10 @@ class TestCaptureEvidence:
         workspace = config.WORKSPACE_ROOT / "ws-run1"
         workspace.mkdir(parents=True)
         (workspace / "transcript.txt").write_text("hello transcript")
+        # An agent may still volunteer a `.dispatch/completion.json`; nothing asks
+        # for one and evidence capture deliberately ignores it. Written here so the
+        # assertion below pins that it is NOT copied — the completion-artifact
+        # contract was deleted, and a capture path left behind is how it grows back.
         (workspace / ".dispatch").mkdir()
         (workspace / ".dispatch" / "completion.json").write_text(
             json.dumps({"disposition": "done"})
@@ -148,9 +152,7 @@ class TestCaptureEvidence:
         )
 
         assert (target / "transcript.txt").read_text() == "hello transcript"
-        assert json.loads((target / "completion.json").read_text()) == {
-            "disposition": "done"
-        }
+        assert not (target / "completion.json").exists()
         patch_text = (target / "patch.diff").read_text()
         assert "# repo: repo_a" in patch_text
         assert "# repo: repo_b" in patch_text

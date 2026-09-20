@@ -245,43 +245,51 @@ Returns an empty list if `list_agents.sh` is missing, not executable, times out,
 
 ## Build completion contract
 
-A BUILD run's terminal is derived from three independent legs, never from activity on the GTD item.
+A BUILD run's terminal is derived from MECHANICAL EVIDENCE ONLY — three things the worker observes for itself. Nothing the agent originates (a comment, a file it writes, an MCP call it makes) is read, because a signal produced by the process whose reliability is in question is a request, not a guarantee.
 
-**Leg 1 — the CLI result envelope.** Every claude-code engine is launched with `--output-format json`, so the agent's transcript ends with a `{"type":"result",...}` object. The worker parses the last such object out of the transcript tail. No parseable envelope means the run failed, regardless of the subprocess exit code.
+**Leg 1 — the CLI result envelope.** Every claude-code engine is launched with `--output-format json`, so the agent's transcript ends with a `{"type":"result",...}` object. The harness emits it, not the agent. The worker parses the last such object out of the transcript tail. No parseable envelope means the run failed, regardless of the subprocess exit code.
 
-**Leg 2 — the completion artifact.** The agent's last action on every path is to write `<workspace>/.dispatch/completion.json`: `{"schema_version": 1, "disposition": "done"|"already_satisfied"|"blocked"|"failed", "summary": "...", "reason": "...", "decision_needed": "..."}`. `reason` is required for `already_satisfied`; `decision_needed` is required for `blocked`; `summary` is optional. A missing `schema_version` defaults to 1 and is accepted, so worker/agent version skew degrades gracefully. A run without this file is recorded as a failure regardless of what it pushed.
+**Leg 2 — commits on origin.** Per-repo push verification compares local HEAD against the live remote ref.
 
-**Leg 3 — the zero-commit invariant.** A build run that produced zero commits across every repo is NEVER recorded as a success. There is no escape hatch on `done`, and a runtime choke point immediately before every terminal write coerces a violating status to `failed` with an `invariant_zero_commit_success:` error and an `INVARIANT VIOLATION` log line.
+**Leg 3 — the project quality gate,** re-run by the worker after push verification so a hook bypass cannot slip a gate-failing tree past dispatch.
+
+Underneath them, the invariant: a build run that produced zero commits across every repo is NEVER recorded as a success. A runtime choke point immediately before every terminal write coerces a violating status to `failed` with an `invariant_zero_commit_success:` error and an `INVARIANT VIOLATION` log line.
 
 ### Terminal precedence
 
 1. Push verification already failing — unchanged behaviour.
 2. `envelope_verdict != ok` → failed, error prefixed with the verdict (`no_result_envelope`, `result_is_error`, `max_turns_exhausted`).
-3. No parseable artifact → failed, error prefixed `stopped_without_assertion:`.
-4. `disposition` in `{blocked, failed}` → failed, error prefixed `agent_reported_<disposition>:`.
-5. `disposition == done` with zero commits → failed, error prefixed `done_claim_zero_commits:`.
-6. `disposition == already_satisfied` with zero commits → the already_satisfied terminal below.
-7. Otherwise the existing pushed/gate path.
+3. **Zero commits across every repo → failed, prefixed `zero_commits:`. The gate is NOT run.**
+4. Commits pushed + gate `passed` or `skipped_no_gate_command` → succeeded.
+5. Commits pushed + any other gate decision → failed.
+
+Step 3 returns before the gate deliberately. An unchanged tree passes a quality gate trivially — the tree is the base commit, so a green result is a fact about the base and says nothing about the run. Gating it costs minutes and produces a misleading green; the previous design read exactly that green as proof of a deliberate no-op and discarded four runs' worth of real, uncommitted work as "already satisfied".
+
+The gate runs against the working tree exactly as the agent left it. The worker does not stash uncommitted changes before gating — stashing mutates the evidence while judging it. A dirty tree is handled by the rescue path below.
 
 ### The `already_satisfied` terminal
 
-`already_satisfied` is a new `RunStatus` member. It is reached only when the artifact is present and parseable, carries `disposition: already_satisfied` with a non-empty `reason`, the run produced zero commits, and the project quality gate did not fail.
+`already_satisfied` is a `RunStatus` member reachable from **talos exit 30 only**, where talos has run the project's checks itself before emitting the verdict — the no-op is verified rather than asserted. The worker sets the item to `review` (best-effort) and posts a comment carrying the reason; the item is never completed on this path.
 
-On this path the gate RUNS even though nothing was pushed — a no-op claim on a red repo is a failure, never a skip. A red, timed-out or unlaunchable gate fails the run with the error prefixed `already_satisfied_gate_failed:`. When the project has NO `gate_command` the gate decision is the literal `skipped_no_gate_command` and the run IS `already_satisfied`; both the human-facing comment and the telemetry record that so the reviewer knows the no-op was unverified.
+A claude-code build can never reach it. For that engine nothing the worker can observe distinguishes "the work was already done" from "the agent produced nothing", so a commit-less claude-code run is simply `failed` — loud and re-dispatchable, rather than a silent hole in a wave that looks like progress.
 
-The worker sets the item to `review` (best-effort — a failure there does not change the run status) and posts a comment carrying the verbatim reason and the gate decision. The item is never completed on this path.
+### Rescuing abandoned work
+
+A dispatch clone is deleted at run exit, so work the agent finished but never pushed dies with it. Before teardown — on every terminal path, failures included — the worker checks each repo for unpushed commits or a dirty working tree and, if it finds any, commits and pushes them to the run's own `feat/*` branch with hooks skipped, then posts one comment saying plainly that this is unreviewed partial work. **If the rescue push fails the workspace is retained** and the run's `error` says so.
+
+Hooks are skipped here (and only here) because this work is incomplete by definition and will usually fail a hook — a blocked commit would not yield a cleaner tree, it would yield no tree at all. The normal commit path keeps hooks enabled so fixer hooks can fix.
 
 ### Triage `error` prefixes
 
-The triage distinctions are `error`-string prefixes, not extra protocol statuses: `no_result_envelope`, `result_is_error`, `max_turns_exhausted`, `stopped_without_assertion`, `agent_reported_blocked`, `agent_reported_failed`, `done_claim_zero_commits`, `already_satisfied_gate_failed`, `invariant_zero_commit_success`. The GTD comment on a failed build starts with `Build run failed (<prefix>)` so the class is legible without opening the transcript.
+The triage distinctions are `error`-string prefixes, not extra protocol statuses: `no_result_envelope`, `result_is_error`, `max_turns_exhausted`, `zero_commits`, `invariant_zero_commit_success`. The GTD comment on a failed build starts with `Build run failed (<prefix>)` so the class is legible without opening the transcript.
 
 ### The `completion` run column
 
-Every build terminal writes a JSON blob into the runs table's nullable `completion` column: `envelope_verdict`, `envelope_subtype`, `is_error`, `num_turns`, `stop_reason`, `session_id`, `total_cost_usd`, `artifact` (`present|absent|malformed`), `artifact_reject_reason`, `disposition`, `zero_commits`, `gate_decision`, `evidence_dir`. This is the only durable carrier of the envelope on a succeeded run (where `error` is NULL) and the only way `session_id` / `num_turns` / `total_cost_usd` survive teardown. The same values are logged as one `build completion:` key=value line, greppable in `journalctl --user -u agent-gtd-dispatch`.
+Every build terminal writes a JSON blob into the runs table's nullable `completion` column: `envelope_verdict`, `envelope_subtype`, `is_error`, `num_turns`, `stop_reason`, `session_id`, `total_cost_usd`, `zero_commits`, `gate_decision`, `evidence_dir`. Every field is something the worker measured. This is the only durable carrier of the envelope on a succeeded run (where `error` is NULL) and the only way `session_id` / `num_turns` / `total_cost_usd` survive teardown. The same values are logged as one `build completion:` key=value line, greppable in `journalctl --user -u agent-gtd-dispatch`.
 
 ### Retention and evidence
 
-Every terminal run's evidence is captured into `<DISPATCH_EVIDENCE_ROOT>/<run_id>/` BEFORE the workspace is torn down: `transcript.txt`, `completion.json` (when present) and `patch.diff` (a per-repo `git diff <base>..HEAD`). Capture is verdict-free and best-effort — it never raises into a teardown path.
+Every terminal run's evidence is captured into `<DISPATCH_EVIDENCE_ROOT>/<run_id>/` BEFORE the workspace is torn down: `transcript.txt` and `patch.diff` (a per-repo `git diff <base>..HEAD`). Capture is verdict-free and best-effort — it never raises into a teardown path.
 
 Pruning is age-based only, never free-space-based and never outcome-based. Workspace trees older than `DISPATCH_WORKSPACE_RETENTION_HOURS` and evidence directories older than `DISPATCH_EVIDENCE_RETENTION_DAYS` are deleted, except those belonging to a live run.
 

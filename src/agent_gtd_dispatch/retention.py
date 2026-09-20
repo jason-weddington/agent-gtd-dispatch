@@ -7,8 +7,8 @@ are exactly the ones whose outcome was recorded wrongly.
 
 Two decay rates, two roots:
 
-Evidence (``EVIDENCE_ROOT``) is small — a transcript, a JSON artifact and a diff —
-and stays useful for months.
+Evidence (``EVIDENCE_ROOT``) is small — a transcript and a diff — and stays useful
+for months.
 
 The workspace TREE (``WORKSPACE_ROOT``) is hundreds of megabytes to gigabytes of
 clones plus build output, and its value decays within a day or two.
@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 TRANSCRIPT_NAME: str = "transcript.txt"
-ARTIFACT_NAME: str = "completion.json"
 PATCH_NAME: str = "patch.diff"
 
 
@@ -42,33 +41,20 @@ def evidence_dir(run_id: str) -> Path:
     return config.EVIDENCE_ROOT / run_id
 
 
-def _locate_artifact(workspace: Path) -> Path | None:
-    """Find the agent's completion artifact under a workspace, if any."""
-    primary = workspace / ".dispatch" / ARTIFACT_NAME
-    if primary.exists():
-        return primary
-    try:
-        hits = sorted(workspace.glob(f"*/.dispatch/{ARTIFACT_NAME}"))
-    except OSError:
-        return None
-    if len(hits) == 1:
-        return hits[0]
-    return None
-
-
 def _read_cross_user(path: Path) -> bytes | None:
-    """Read a file that may be owned by the agent user."""
+    """Read a file that may be owned by the agent user.
+
+    A plain read, NOT a sudo escalation.  The workspace root is mode 2775 owned by
+    the agent user, the service user is a member of that group, and the agent's
+    umask is 0002 — so every file it creates under the workspace is group-readable
+    by the service user.  The escalation this replaced never worked at all: ``cat``
+    is not in the sudoers NOPASSWD list, so every cross-user read was denied from
+    the day it shipped, and each denial read to the caller as "the file was absent".
+    """
     try:
-        result = subprocess.run(  # noqa: S603
-            _sudo_wrap(["cat", str(path)]),
-            capture_output=True,
-            check=False,
-        )
+        return path.read_bytes()
     except OSError:
         return None
-    if result.returncode != 0:
-        return None
-    return result.stdout
 
 
 def _throwaway_index_path(repo_path: Path) -> Path:
@@ -202,16 +188,6 @@ def capture_evidence(
                 written.append(TRANSCRIPT_NAME)
         except Exception:
             logger.warning("evidence capture: transcript copy failed run_id=%s", run_id)
-
-        try:
-            artifact = _locate_artifact(workspace)
-            if artifact is not None:
-                raw = _read_cross_user(artifact)
-                if raw is not None:
-                    (target / ARTIFACT_NAME).write_bytes(raw)
-                    written.append(ARTIFACT_NAME)
-        except Exception:
-            logger.warning("evidence capture: artifact copy failed run_id=%s", run_id)
 
     try:
         chunks: list[str] = [_patch_header(run_id, agent_gtd_run_id)]
