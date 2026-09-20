@@ -984,6 +984,68 @@ class TestWorkerPostRunGate:
         assert any("Build run failed (zero_commits)" in b for b in bodies)
 
     @pytest.mark.asyncio
+    async def test_zero_commits_splits_abandoned_work_from_wrote_nothing(
+        self, tmp_path
+    ) -> None:
+        """A dirty tree gets its own terminal, because it needs the opposite response.
+
+        Zero commits covers two opposite situations. A DIRTY tree means the agent
+        was part-way through real work and stopped — usually by ending its turn
+        while something it started was still running — and the rescue path has put
+        those changes on a branch to review. A CLEAN tree means it wrote nothing,
+        which is exactly what a correct refusal looks like when an agent checks its
+        acceptance criteria, finds the spec no longer matches the repo, and declines
+        to guess rather than inventing work.
+
+        Flattening the two makes a fleet look less reliable than it is while hiding
+        the real defect, which in the refusal case is a stale spec and not the agent.
+        The split is mechanical — `dirty` is observed on the push result, never
+        inferred — and neither terminal claims to know WHY the tree was clean.
+        """
+        from agent_gtd_dispatch.main import _dispatch_worker
+
+        await db.init_db()
+        run = Run(
+            item_id="item-dirty",
+            project_name="TestProject",
+            branch_name="feat/dirty",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+
+        fake_workspace = tmp_path / "repos-testproj-dirty"
+        fake_workspace.mkdir()
+
+        dirty_result = _no_changes(branch="feat/dirty")
+        dirty_result.dirty = True
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            _install_common_mocks(
+                mock_gtd,
+                mock_dispatch,
+                item_id="item-dirty",
+                project=_default_project(),
+                fake_workspace=fake_workspace,
+            )
+            mock_gtd.set_item_status = AsyncMock()
+            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
+            mock_dispatch.verify_pushes = MagicMock(return_value=[dirty_result])
+            mock_dispatch.run_gate_command = MagicMock()
+
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        updated = await db.get_run(run.id)
+        assert updated is not None
+        assert updated.status.value == "failed"
+        assert updated.error is not None
+        assert updated.error.startswith("zero_commits_work_abandoned: ")
+        # Still no gate: there are no commits to judge either way.
+        mock_dispatch.run_gate_command.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_zero_commits_fails_even_on_an_ungated_project(
         self, tmp_path
     ) -> None:

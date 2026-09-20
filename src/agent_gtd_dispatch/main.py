@@ -1761,6 +1761,7 @@ BUILD_FAILURE_PREFIXES: frozenset[str] = frozenset(
         "result_is_error",
         "max_turns_exhausted",
         "zero_commits",
+        "zero_commits_work_abandoned",
         "invariant_zero_commit_success",
     }
 )
@@ -1776,10 +1777,23 @@ _FAILURE_PREFIX_DETAIL: dict[str, str] = {
         " recorded — review before re-dispatching."
     ),
     "zero_commits": (
-        "The agent ended its run without producing a single commit on any repo,"
-        " so there is nothing to review. The project gate was NOT run: an"
-        " unchanged tree passes trivially, which would say the base commit is"
-        " green and nothing at all about this run."
+        "The agent ended its run without producing a single commit, and left the"
+        " working tree CLEAN — it wrote nothing at all. The project gate was NOT"
+        " run: an unchanged tree passes trivially, which would say the base commit"
+        " is green and nothing about this run. Read the agent's comments on the"
+        " item before re-dispatching. This is what a deliberate refusal looks like"
+        " — an agent that checked its acceptance criteria, found the spec no longer"
+        " matched the repo, and correctly declined to guess — and it is also what a"
+        " confused run looks like. Only the agent's own account distinguishes them,"
+        " which is why this terminal does not try to."
+    ),
+    "zero_commits_work_abandoned": (
+        "The agent ended its run without committing, but left changes in the"
+        " working tree — it was part-way through real work. Those changes have been"
+        " committed and pushed to the run's own branch by the rescue path, so they"
+        " are reviewable rather than lost. This is NOT a refusal: it usually means"
+        " the agent ended its turn while something it started was still running,"
+        " which kills the process under `claude --print`."
     ),
     "invariant_zero_commit_success": (
         "A zero-commit build run was about to be recorded as a success — the"
@@ -3775,12 +3789,36 @@ async def _dispatch_worker(
                     # is precisely how four agents' worth of real work was
                     # discarded as "already satisfied" in a single night. It also
                     # costs ~6 minutes of gate time per run to learn nothing.
-                    _failure_prefix = "zero_commits"
+                    #
+                    # Split by TREE STATE, because zero-commits covers two
+                    # opposite situations and they need opposite responses from
+                    # the lead. A DIRTY tree means the agent was part-way through
+                    # real work and stopped — the rescue path has its changes on a
+                    # branch, go and look. A CLEAN tree means it wrote nothing,
+                    # which is what a correct refusal looks like when an agent
+                    # checks its acceptance criteria, finds the spec no longer
+                    # matches the repo and declines to guess. Counting those
+                    # together makes the fleet look less reliable than it is while
+                    # hiding the real defect, which is a stale spec.
+                    #
+                    # This is a MECHANICAL split — `dirty` is observed, not
+                    # inferred. Nothing here decides WHY the tree was clean; only
+                    # the agent's own comments can say that, and the terminal text
+                    # sends the reader to them rather than guessing.
+                    _failure_prefix = (
+                        "zero_commits_work_abandoned"
+                        if any(r.dirty for r in push_results_list)
+                        else "zero_commits"
+                    )
 
                 if _failure_prefix is not None:
                     error_str = f"{_failure_prefix}: " + (
-                        "the agent ended its run without producing any commits"
-                        " on any repo"
+                        "the agent ended its run without committing, leaving"
+                        " changes in the working tree; the rescue path pushed them"
+                        " to the run's branch"
+                        if _failure_prefix == "zero_commits_work_abandoned"
+                        else "the agent ended its run having produced no commits"
+                        " and no working-tree changes — read its comments"
                         if _failure_prefix == "zero_commits"
                         else "build run did not reach a usable conclusion"
                     )
