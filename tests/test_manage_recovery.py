@@ -1709,6 +1709,10 @@ def _loop_patch_stack():
         mock_gtd.complete_in_rollout = AsyncMock(return_value={"newly_ready": []})
         mock_db.insert_run = AsyncMock()
         mock_db.update_run = AsyncMock()
+        # Default: this host HAS a local run row for whatever rollout is under
+        # test, i.e. it is resuming its own work. The sweep's ownership check
+        # reads this; tests for the not-ours case override it with [].
+        mock_db.list_runs_by_rollout = AsyncMock(return_value=[_make_run()])
         yield SimpleNamespace(
             gtd=mock_gtd,
             db=mock_db,
@@ -2167,6 +2171,32 @@ class TestReadoptionSweep:
             await _readopt_running_rollouts()
 
         mock_loop.assert_not_called()
+
+    async def test_sweep_does_not_adopt_another_hosts_rollout(self) -> None:
+        """A rollout this host has no local run row for belongs to someone else.
+
+        ``list_running_rollouts`` is fleet-wide, and the in-process
+        ``_rollout_to_run`` guard is empty at process start — which is exactly
+        when this sweep runs. Without an ownership check every host adopts every
+        running rollout on every restart, and a manager owns the squash-merge and
+        the push, so that is two processes merging one wave. Caught in production
+        when a newly provisioned fourth host came up and immediately started
+        driving another project's in-flight rollout.
+        """
+        from agent_gtd_dispatch.main import _readopt_running_rollouts
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._start_rollout_loop") as mock_loop,
+        ):
+            ctx.db.list_runs_by_rollout = AsyncMock(return_value=[])
+            ctx.gtd.list_running_rollouts = AsyncMock(
+                return_value=[{"id": "someone-elses-rollout", "project_name": "p"}]
+            )
+            await _readopt_running_rollouts()
+
+        mock_loop.assert_not_called()
+        ctx.db.insert_run.assert_not_called()
 
     async def test_resumed_loop_does_not_double_dispatch_an_in_flight_item(
         self,

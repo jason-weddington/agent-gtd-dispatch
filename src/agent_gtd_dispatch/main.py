@@ -2967,6 +2967,26 @@ async def _readopt_running_rollouts() -> None:
     build is already in flight (status ``dispatched``) cannot be dispatched
     again — and such items are reported by ``advance_rollout`` as
     ``in_progress``, not ``next_ready``, so the resumed loop does not even try.
+
+    THIS HOST'S ROLLOUTS ONLY.  ``list_running_rollouts`` is a FLEET-WIDE query:
+    it returns every running rollout the lead can see, on any host.  The only
+    thing that ever stopped this loop adopting another host's rollout was
+    ``_rollout_to_run``, which is in-process memory and therefore empty in
+    exactly the situation this sweep runs in — process start.  So any host
+    coming up would adopt every running rollout in the fleet, and since a
+    manager owns the squash-merge and the ``git push origin main``, two managers
+    on one rollout is two processes merging the same wave.  A routine
+    ``deploy.sh`` restarts every host at once, so this fired fleet-wide on every
+    deploy; it was caught when a brand-new fourth host came up and immediately
+    adopted another project's in-flight rollout.
+
+    The local ``runs`` table is the ownership record: it is SQLite on this
+    host's disk, it survives a restart, and a row exists for a rollout only if
+    THIS host was told to drive it (``dispatch_rollout`` writes one) or already
+    was.  That is precisely the resume-after-my-own-restart case this sweep
+    exists for, and it cannot express "steal someone else's".  A host whose
+    database is wiped declines to resume rather than guessing, which is the
+    correct direction to fail.
     """
     try:
         rollouts = await gtd_client.list_running_rollouts()
@@ -2974,9 +2994,16 @@ async def _readopt_running_rollouts() -> None:
         logger.exception("re-adoption sweep: failed to list running rollouts")
         return
 
-    logger.info("re-adoption sweep: %d running rollout(s)", len(rollouts))
+    logger.info("re-adoption sweep: %d running rollout(s) fleet-wide", len(rollouts))
     for rollout in rollouts:
         rollout_id = str(rollout.get("id") or "")
+        if rollout_id and not await db.list_runs_by_rollout(rollout_id):
+            logger.info(
+                "re-adoption sweep: skipping rollout_id=%s — no local run row,"
+                " so this host never drove it",
+                rollout_id,
+            )
+            continue
         if not rollout_id or rollout_id in _rollout_to_run:
             continue
         run = Run(
