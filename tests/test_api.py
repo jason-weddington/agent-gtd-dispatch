@@ -258,16 +258,18 @@ class TestDispatch:
         _run, _max_turns, _engine, timeout_seconds = mock_worker.call_args.args
         assert timeout_seconds == 7200
 
+    @patch("agent_gtd_dispatch.main._start_rollout_loop")
     @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.dispatch")
     @patch("agent_gtd_dispatch.main.gtd_client")
-    def test_manage_mode_uses_manage_timeout_seconds(
-        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+    def test_manage_mode_drives_the_worker_wave_loop(
+        self, mock_client, mock_dispatch, mock_worker, mock_loop, client, auth_headers
     ):
+        """A manage dispatch starts the worker-driven loop, not a resident agent."""
         from agent_gtd_dispatch import config
 
         config.MANAGE_TIMEOUT_SECONDS = 14400
-        config.TIMEOUT_SECONDS = 1800  # should NOT be used for manage mode
+        config.TIMEOUT_SECONDS = 1800
 
         mock_client.get_rollout = AsyncMock(
             return_value={
@@ -295,8 +297,11 @@ class TestDispatch:
             headers=auth_headers,
         )
         assert resp.status_code == 200
-        _run, _max_turns, _engine, timeout_seconds = mock_worker.call_args.args
-        assert timeout_seconds == 14400
+        mock_worker.assert_not_called()
+        mock_loop.assert_called_once()
+        started_run = mock_loop.call_args.args[0]
+        assert started_run.mode == "manage"
+        assert started_run.rollout_id == "wr-abc"
 
     @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.dispatch")
@@ -1338,11 +1343,12 @@ class TestWorkspaceDispatch:
         assert resp.status_code == 400
         assert "workspace_repos" in resp.json()["detail"]
 
+    @patch("agent_gtd_dispatch.main._start_rollout_loop")
     @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.dispatch")
     @patch("agent_gtd_dispatch.main.gtd_client")
     def test_manage_workspace_project_accepted(
-        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+        self, mock_client, mock_dispatch, mock_worker, mock_loop, client, auth_headers
     ) -> None:
         """Manage dispatch targeting a workspace project with workspace_repos returns 200."""
         mock_client.get_rollout = AsyncMock(
@@ -1375,8 +1381,10 @@ class TestWorkspaceDispatch:
         data = resp.json()
         assert data["status"] == "pending"
         assert data["mode"] == "manage"
-        # Worker must have been invoked (proves the guard was removed)
-        mock_worker.assert_called_once()
+        # The worker-driven wave loop must have been started (proves the guard
+        # was removed). A manage dispatch no longer spawns a resident agent.
+        mock_loop.assert_called_once()
+        mock_worker.assert_not_called()
 
     @patch("agent_gtd_dispatch.main.gtd_client")
     def test_manage_workspace_project_empty_repos_returns_400(
@@ -1965,3 +1973,16 @@ class TestConfigureLogging:
 
         assert "quiet" not in out
         assert "loud" in out
+
+
+class TestReviewModeIsNotExternallyDispatchable:
+    """Reviewers are worker-internal — the wave loop supplies their envelope."""
+
+    def test_review_mode_dispatch_is_rejected(self, client, auth_headers) -> None:
+        resp = client.post(
+            "/dispatch",
+            json={"item_id": "item-1", "max_turns": 40, "mode": "review"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+        assert "not externally dispatchable" in resp.json()["detail"]

@@ -1409,8 +1409,15 @@ class TestCountedNotPollingWithBuildsInFlight:
         assert "run-a" in bodies["item-a"]
         assert "run-b" in bodies["item-b"]
 
-    async def test_resume_context_forwarded_to_relaunched_worker(self) -> None:
-        """The in-flight list reaches the replacement worker as resume_context."""
+    async def test_ladder_relaunch_resumes_the_worker_wave_loop(self) -> None:
+        """The ladder's relaunch now RESUMES the worker-driven loop.
+
+        The loop reads its frontier from `advance_rollout` plus the in-flight
+        query on every tick, so it needs no `resume_context` handed to it — the
+        thing the old resident manager could only be TOLD, the loop simply
+        re-reads. The ladder itself (tallies, caps, backoff) is untouched; only
+        what it relaunches into changed.
+        """
         from agent_gtd_dispatch.main import _do_manage_recovery
 
         run = _make_run()
@@ -1420,6 +1427,7 @@ class TestCountedNotPollingWithBuildsInFlight:
         with (
             _full_patch_stack() as ctx,
             patch("agent_gtd_dispatch.main._dispatch_worker") as mock_worker,
+            patch("agent_gtd_dispatch.main._start_rollout_loop") as mock_loop,
         ):
             ctx.gtd.relaunch_manage_rollout = AsyncMock(
                 return_value=_rollout("running", retry_count=1)
@@ -1439,9 +1447,11 @@ class TestCountedNotPollingWithBuildsInFlight:
                 resume_context=in_flight,
             )
 
-        kwargs = mock_worker.call_args.kwargs
-        assert kwargs["resume_context"] == in_flight
-        assert kwargs["is_recovery"] is True
+        mock_worker.assert_not_called()
+        mock_loop.assert_called_once()
+        relaunched = mock_loop.call_args.args[0]
+        assert relaunched.rollout_id == "rollout-abc"
+        assert relaunched.mode == "manage"
 
 
 # ---------------------------------------------------------------------------
@@ -1667,3 +1677,894 @@ class TestCapExceededHaltDeferredWhileBuildsInFlight:
             ctx.db.insert_run.assert_not_called()
             ctx.create_task.assert_not_called()
             ctx.sleep.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Worker-driven rollout wave loop
+#
+# The worker owns the loop; a short-lived REVIEW-mode agent reviews and merges
+# one completed build at a time. These tests pin the two failure modes that
+# would be silent: the advance/in-flight combination (either source alone is a
+# hang), and a reviewer exit reaching the manage relaunch ladder.
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _loop_patch_stack():
+    """Isolate every module-level dict + collaborator the wave loop touches."""
+    with (
+        patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+        patch("agent_gtd_dispatch.main.db") as mock_db,
+        patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()) as mock_sleep,
+        patch("agent_gtd_dispatch.main._active_processes", {}) as active,
+        patch("agent_gtd_dispatch.main._rollout_to_run", {}) as rollout_to_run,
+        patch("agent_gtd_dispatch.main._rollout_redispatches", {}) as redispatches,
+    ):
+        mock_gtd.update_rollout_state = AsyncMock()
+        mock_gtd.post_comment = AsyncMock()
+        mock_gtd.halt_rollout = AsyncMock()
+        mock_gtd.dispatch_item = AsyncMock(return_value={"id": "child-run"})
+        mock_gtd.reset_rollout_item = AsyncMock(return_value={})
+        mock_gtd.complete_in_rollout = AsyncMock(return_value={"newly_ready": []})
+        mock_db.insert_run = AsyncMock()
+        mock_db.update_run = AsyncMock()
+        yield SimpleNamespace(
+            gtd=mock_gtd,
+            db=mock_db,
+            dispatch=mock_dispatch,
+            sleep=mock_sleep,
+            active=active,
+            rollout_to_run=rollout_to_run,
+            redispatches=redispatches,
+        )
+
+
+def _fake_workspace():
+    from pathlib import Path
+
+    return SimpleNamespace(
+        root=Path("/tmp/rollout-ws"),  # noqa: S108 — never touched, dispatch is mocked
+        repo_paths={"repo-a": Path("/tmp/rollout-ws/repo-a")},  # noqa: S108
+        default_branches={"repo-a": "main"},
+        created=False,
+        workspace_mode=True,
+    )
+
+
+async def _tick(ctx, **overrides):
+    """Run one wave-loop tick with sensible defaults."""
+    from agent_gtd_dispatch.main import _rollout_wave_tick
+
+    kwargs = {
+        "project": {"name": "p", "workspace_repos": ["git@h:o/repo-a"]},
+        "workspace_ref": [_fake_workspace()],
+        "reviewer_engine": MagicMock(name="claude-code-sonnet"),
+        "dispatch_attempts": {},
+        "token": None,
+        "attribution": None,
+    }
+    kwargs.update(overrides)
+    return await _rollout_wave_tick("rollout-abc", **kwargs)
+
+
+class TestAdvanceInFlightCombination:
+    """`advance_rollout` alone reports finished items as in-flight forever."""
+
+    def test_terminal_run_is_a_completed_build(self) -> None:
+        from agent_gtd_dispatch.main import _completed_build_item_ids
+
+        advance = {"in_progress": ["item-a", "item-b"], "next_ready": []}
+        in_flight = [{"runId": "r-b", "itemId": "item-b", "status": "running"}]
+        assert _completed_build_item_ids(advance, in_flight) == ["item-a"]
+
+    def test_all_in_flight_yields_nothing_to_review(self) -> None:
+        from agent_gtd_dispatch.main import _completed_build_item_ids
+
+        advance = {"in_progress": ["item-a"]}
+        in_flight = [{"runId": "r-a", "itemId": "item-a", "status": "pending"}]
+        assert _completed_build_item_ids(advance, in_flight) == []
+
+    async def test_loop_advances_when_a_dispatched_run_goes_terminal(self) -> None:
+        """A dispatched item whose run has gone terminal gets REVIEWED, not waited on.
+
+        This is the whole trap: `in_progress` still names the item (its
+        rollout_items row is `dispatched` and only the worker can change that),
+        while `inFlightBuildRuns` — the JOIN against claude_runs.status — no
+        longer does. Driven by `advance_rollout` alone the loop would poll
+        forever.
+        """
+        from agent_gtd_dispatch.main import _TICK_CONTINUE, ReviewVerdict
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._launch_reviewer",
+                new=AsyncMock(return_value=ReviewVerdict("skip", "nothing", "", "")),
+            ) as mock_reviewer,
+        ):
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": [],
+                    "in_progress": ["item-a"],
+                    "blocked": [],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            directive = await _tick(ctx)
+
+        assert directive == _TICK_CONTINUE
+        mock_reviewer.assert_awaited_once()
+        ctx.sleep.assert_not_awaited()
+
+    async def test_loop_waits_while_the_run_is_still_in_flight(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_WAIT
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._launch_reviewer") as mock_reviewer,
+        ):
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": [],
+                    "in_progress": ["item-a"],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={
+                    "status": "running",
+                    "inFlightBuildRuns": [
+                        {"runId": "r-a", "itemId": "item-a", "status": "running"}
+                    ],
+                }
+            )
+            directive = await _tick(ctx)
+
+        assert directive == _TICK_WAIT
+        mock_reviewer.assert_not_called()
+
+    async def test_graph_complete_is_read_not_computed(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_DONE
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": [],
+                    "in_progress": [],
+                    "graph_complete": True,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            assert await _tick(ctx) == _TICK_DONE
+
+    async def test_ready_items_are_dispatched(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": ["item-a"],
+                    "in_progress": [],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            assert await _tick(ctx) == _TICK_CONTINUE
+
+        ctx.gtd.dispatch_item.assert_awaited_once_with(
+            "item-a", rollout_id="rollout-abc", token=None
+        )
+
+    async def test_nothing_ready_nothing_in_flight_halts(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": [],
+                    "in_progress": [],
+                    "blocked": ["item-z"],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            assert await _tick(ctx) == _TICK_HALTED
+
+        ctx.gtd.halt_rollout.assert_awaited_once()
+        assert "stalled" in ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+
+
+class TestVerdictHandling:
+    """The reviewer decides; the WORKER acts — including any re-dispatch."""
+
+    async def _act(self, ctx, verdict, *, rationale="because", merge_note="note"):
+        from agent_gtd_dispatch.main import ReviewVerdict, _act_on_verdict
+
+        return await _act_on_verdict(
+            "rollout-abc",
+            "item-a",
+            ReviewVerdict(verdict, rationale, merge_note, ""),
+            token=None,
+            attribution=None,
+        )
+
+    async def test_merge_records_the_item_complete(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.complete_in_rollout = AsyncMock(
+                return_value={"newly_ready": ["item-b"]}
+            )
+            assert await self._act(ctx, "merge") == _TICK_CONTINUE
+
+        call = ctx.gtd.complete_in_rollout.await_args
+        assert call.args == ("rollout-abc", "item-a")
+        assert call.kwargs["outcome"] == "completed"
+        assert call.kwargs["merge_note"] == "note"
+        ctx.gtd.halt_rollout.assert_not_awaited()
+
+    async def test_skip_advances_the_wave(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        with _loop_patch_stack() as ctx:
+            assert await self._act(ctx, "skip") == _TICK_CONTINUE
+
+        assert ctx.gtd.complete_in_rollout.await_args.kwargs["outcome"] == "skipped"
+        ctx.gtd.halt_rollout.assert_not_awaited()
+
+    async def test_halt_halts_the_rollout(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with _loop_patch_stack() as ctx:
+            assert await self._act(ctx, "halt", rationale="auth code") == _TICK_HALTED
+
+        ctx.gtd.halt_rollout.assert_awaited_once()
+        assert "auth code" in ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+        ctx.gtd.complete_in_rollout.assert_not_awaited()
+
+    async def test_redispatch_once_then_halts_at_the_cap(self) -> None:
+        from agent_gtd_dispatch.main import (
+            _TICK_CONTINUE,
+            _TICK_HALTED,
+            MAX_ITEM_REDISPATCHES,
+        )
+
+        assert MAX_ITEM_REDISPATCHES == 1
+
+        with _loop_patch_stack() as ctx:
+            assert await self._act(ctx, "re-dispatch") == _TICK_CONTINUE
+            # The reset is what makes the re-dispatch land: dispatch_item's
+            # wave linkage is guarded by `AND status = 'ready'`.
+            ctx.gtd.reset_rollout_item.assert_awaited_once_with(
+                "rollout-abc", "item-a", token=None
+            )
+            ctx.gtd.dispatch_item.assert_awaited_once()
+
+            # Second `re-dispatch` verdict for the SAME item hits the cap.
+            assert await self._act(ctx, "re-dispatch") == _TICK_HALTED
+            assert ctx.gtd.dispatch_item.await_count == 1
+
+        ctx.gtd.halt_rollout.assert_awaited_once()
+        assert "cap reached" in ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+
+
+class TestWorkerPublishesRolloutState:
+    """The manager_* columns lose their only writer — the worker takes over."""
+
+    async def test_polling_phase_published_while_builds_are_in_flight(self) -> None:
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": [],
+                    "in_progress": ["item-a"],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={
+                    "status": "running",
+                    "inFlightBuildRuns": [
+                        {"runId": "r-a", "itemId": "item-a", "status": "running"}
+                    ],
+                }
+            )
+            await _tick(ctx)
+
+        phases = [c.args[1] for c in ctx.gtd.update_rollout_state.await_args_list]
+        assert "polling" in phases
+
+    async def test_dispatching_phase_names_the_item(self) -> None:
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": ["item-a"],
+                    "in_progress": [],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            await _tick(ctx)
+
+        call = ctx.gtd.update_rollout_state.await_args
+        assert call.args[1] == "dispatching"
+        assert call.kwargs["current_item_id"] == "item-a"
+
+    async def test_halt_publishes_the_halted_phase(self) -> None:
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": [],
+                    "in_progress": [],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            await _tick(ctx)
+
+        phases = [c.args[1] for c in ctx.gtd.update_rollout_state.await_args_list]
+        assert "halted" in phases
+
+    async def test_reviewing_phase_published_before_the_reviewer_launches(
+        self,
+    ) -> None:
+        from agent_gtd_dispatch.main import ReviewVerdict
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._launch_reviewer",
+                new=AsyncMock(return_value=ReviewVerdict("skip", "x", "", "")),
+            ),
+        ):
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": [],
+                    "in_progress": ["item-a"],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            await _tick(ctx)
+
+        phases = [c.args[1] for c in ctx.gtd.update_rollout_state.await_args_list]
+        assert "reviewing" in phases
+
+
+class TestReviewerExitAndTheLadder:
+    """A reviewer exiting is normal completion, not a crashed resident manager."""
+
+    def test_reviewer_run_is_not_manage_mode(self) -> None:
+        """The chosen mechanism: a DISTINCT dispatch mode.
+
+        The ladder fires on `run.mode == MANAGE and run.rollout_id`. A reviewer
+        run carries `mode=REVIEW`, so it is structurally ineligible — without
+        disabling the ladder for anything else.
+        """
+        from agent_gtd_dispatch.models import DispatchMode, Run
+
+        reviewer = Run(
+            item_id="item-a",
+            project_name="p",
+            mode=DispatchMode.REVIEW,
+            rollout_id="rollout-abc",
+        )
+        assert reviewer.mode != DispatchMode.MANAGE
+        assert reviewer.mode == "review"
+
+    async def test_reviewer_exit_does_not_trigger_the_relaunch_ladder(self) -> None:
+        """Feed a reviewer's Run to the ladder's own entry point: nothing fires."""
+        from agent_gtd_dispatch.main import _maybe_relaunch_manage
+        from agent_gtd_dispatch.models import DispatchMode, Run
+
+        reviewer = Run(
+            item_id="item-a",
+            project_name="p",
+            mode=DispatchMode.REVIEW,
+            rollout_id="rollout-abc",
+            engine="claude-code-sonnet",
+        )
+        # The ladder is only ever CALLED for manage-mode runs; assert the guard
+        # that makes that true still holds for a reviewer run.
+        assert not (
+            reviewer.mode == DispatchMode.MANAGE and reviewer.rollout_id is not None
+        )
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._start_rollout_loop") as mock_loop,
+        ):
+            ctx.gtd.get_rollout = AsyncMock(return_value=_rollout("completed"))
+            await _maybe_relaunch_manage(
+                reviewer,
+                100,
+                MagicMock(),
+                3600,
+                None,
+                manager_uptime_seconds=60.0,
+                run_timed_out=False,
+            )
+
+        ctx.gtd.relaunch_manage_rollout.assert_not_called()
+        mock_loop.assert_not_called()
+
+
+class TestReviewerEnvWithholdsDispatchKeys:
+    """A reviewer returns a verdict; it never dispatches. So: no dispatch keys."""
+
+    def test_review_env_contains_neither_dispatch_key(self) -> None:
+        import os
+
+        from agent_gtd_dispatch.engines import CLAUDE_SONNET, build_env
+        from agent_gtd_dispatch.models import DispatchMode
+
+        with patch.dict(
+            os.environ,
+            {
+                "DISPATCH_LOCAL_URL": "http://localhost:8100",
+                "DISPATCH_API_KEY": "super-secret",
+                "ANTHROPIC_API_KEY": "sk-ant-nope",
+            },
+        ):
+            env = build_env(CLAUDE_SONNET, mode=DispatchMode.REVIEW)
+            manage_env = build_env(CLAUDE_SONNET, mode=DispatchMode.MANAGE)
+
+        assert "DISPATCH_LOCAL_URL" not in env
+        assert "DISPATCH_API_KEY" not in env
+        # kb-01512: unconditional, for every claude-code subprocess.
+        assert "ANTHROPIC_API_KEY" not in env
+        # The manage grant is untouched — this is a withholding, not a removal.
+        assert "DISPATCH_LOCAL_URL" in manage_env
+        assert "DISPATCH_API_KEY" in manage_env
+
+
+class TestReadoptionSweep:
+    """A deploy restart must not silently stop every running rollout."""
+
+    async def test_sweep_resumes_a_running_rollout(self) -> None:
+        from agent_gtd_dispatch.main import _readopt_running_rollouts
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._start_rollout_loop") as mock_loop,
+        ):
+            ctx.gtd.list_running_rollouts = AsyncMock(
+                return_value=[{"id": "rollout-abc", "project_name": "p"}]
+            )
+            await _readopt_running_rollouts()
+
+        mock_loop.assert_called_once()
+        resumed = mock_loop.call_args.args[0]
+        assert resumed.rollout_id == "rollout-abc"
+        assert resumed.mode == "manage"
+
+    async def test_sweep_skips_a_rollout_a_live_loop_already_owns(self) -> None:
+        from agent_gtd_dispatch.main import _readopt_running_rollouts
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._start_rollout_loop") as mock_loop,
+        ):
+            ctx.rollout_to_run["rollout-abc"] = _make_run()
+            ctx.gtd.list_running_rollouts = AsyncMock(
+                return_value=[{"id": "rollout-abc", "project_name": "p"}]
+            )
+            await _readopt_running_rollouts()
+
+        mock_loop.assert_not_called()
+
+    async def test_resumed_loop_does_not_double_dispatch_an_in_flight_item(
+        self,
+    ) -> None:
+        """The frontier is re-READ, so an item already building is never re-dispatched.
+
+        `advance_rollout` reports a `dispatched` item as `in_progress`, never
+        as `next_ready`, and the GTD-side wave linkage is additionally guarded
+        by `AND status = 'ready'`. Between them a resumed loop cannot
+        double-dispatch.
+        """
+        from agent_gtd_dispatch.main import _TICK_WAIT
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": [],
+                    "in_progress": ["item-a"],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={
+                    "status": "running",
+                    "inFlightBuildRuns": [
+                        {"runId": "r-a", "itemId": "item-a", "status": "running"}
+                    ],
+                }
+            )
+            assert await _tick(ctx) == _TICK_WAIT
+
+        ctx.gtd.dispatch_item.assert_not_awaited()
+
+
+class TestLaunchReviewer:
+    """One reviewer, one build, one bounded verdict."""
+
+    @staticmethod
+    def _item() -> dict:
+        return {"id": "item-a", "title": "Do it", "acceptance_criteria": ["works"]}
+
+    async def _launch(self, ctx, *, verdict_blob, reason, exit_code=0, raises=None):
+        from agent_gtd_dispatch.main import _launch_reviewer
+
+        ctx.gtd.get_item = AsyncMock(return_value=self._item())
+        ctx.gtd.list_runs_for_item = AsyncMock(
+            return_value=[
+                {
+                    "id": "run-a",
+                    "rollout_id": "rollout-abc",
+                    "feature_branch": "feat/item-a",
+                    "status": "success",
+                    "error_msg": "",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+        )
+        ctx.gtd.get_rollout_merge_notes = AsyncMock(return_value=[])
+        ctx.dispatch.MERGE_NOTE_CONTEXT_LIMIT = 10
+        ctx.dispatch.REVIEW_RATIONALE_MAX_CHARS = 2000
+        ctx.dispatch.build_review_prompt = MagicMock(return_value="PROMPT")
+        ctx.dispatch.clear_review_verdict = MagicMock()
+        ctx.dispatch.read_review_verdict = MagicMock(
+            return_value=(verdict_blob, reason)
+        )
+        if raises is not None:
+            ctx.dispatch.run_agent = AsyncMock(side_effect=raises)
+        else:
+            ctx.dispatch.run_agent = AsyncMock(
+                return_value=SimpleNamespace(returncode=exit_code)
+            )
+        return await _launch_reviewer(
+            "rollout-abc",
+            "item-a",
+            project={"name": "P"},
+            workspace=_fake_workspace(),
+            reviewer_engine=SimpleNamespace(name="claude-code-sonnet"),
+            token=None,
+            attribution=None,
+        )
+
+    async def test_valid_verdict_is_returned_and_the_run_succeeds(self) -> None:
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "merge",
+                    "rationale": "ACs satisfied",
+                    "merge_note": "no signature changes",
+                    "repo_states": {"repo-a": "merged"},
+                },
+                reason="ok",
+            )
+
+        assert outcome.verdict == "merge"
+        assert outcome.merge_note == "no signature changes"
+        assert "repo-a=merged" in outcome.detail
+        # The reviewer run is REVIEW mode, so the ladder can never see it.
+        inserted = ctx.db.insert_run.await_args.args[0]
+        assert inserted.mode == "review"
+        assert inserted.rollout_id == "rollout-abc"
+        # A stale verdict from the previous item is cleared before launch.
+        ctx.dispatch.clear_review_verdict.assert_called_once()
+
+    async def test_no_verdict_artifact_is_treated_as_halt(self) -> None:
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(ctx, verdict_blob=None, reason="absent")
+
+        assert outcome.verdict == "halt"
+        assert "absent" in outcome.detail
+        assert ctx.db.update_run.await_args.kwargs["status"].value == "failed"
+
+    async def test_subprocess_failure_is_treated_as_halt(self) -> None:
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx,
+                verdict_blob=None,
+                reason="absent",
+                raises=RuntimeError("boom"),
+            )
+
+        assert outcome.verdict == "halt"
+        assert "RuntimeError" in outcome.detail
+
+    async def test_reviewer_runs_in_review_mode_with_the_review_budget(self) -> None:
+        from agent_gtd_dispatch import config as cfg
+        from agent_gtd_dispatch.models import DispatchMode
+
+        with _loop_patch_stack() as ctx:
+            await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "skip",
+                    "rationale": "empty branch",
+                },
+                reason="ok",
+            )
+
+        kwargs = ctx.dispatch.run_agent.await_args.kwargs
+        assert kwargs["mode"] == DispatchMode.REVIEW
+        assert kwargs["timeout_seconds"] == cfg.REVIEW_TIMEOUT_SECONDS
+        assert ctx.dispatch.run_agent.await_args.args[4] == cfg.REVIEW_MAX_TURNS
+
+
+class TestGateResultSummary:
+    def test_empty_error_msg_reads_as_no_recorded_failure(self) -> None:
+        from agent_gtd_dispatch.main import _gate_result_summary
+
+        assert "no failure recorded" in _gate_result_summary({"error_msg": ""})
+
+    def test_gate_failure_is_quoted(self) -> None:
+        from agent_gtd_dispatch.main import _gate_result_summary
+
+        summary = _gate_result_summary({"error_msg": "post-run gate failed: ruff"})
+        assert "post-run gate failed: ruff" in summary
+
+
+class TestLatestRunForItem:
+    async def test_picks_the_newest_run_for_this_rollout(self) -> None:
+        from agent_gtd_dispatch.main import _latest_run_for_item
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.list_runs_for_item = AsyncMock(
+                return_value=[
+                    {"id": "old", "rollout_id": "rollout-abc", "created_at": "1"},
+                    {"id": "other", "rollout_id": "rollout-zzz", "created_at": "9"},
+                    {"id": "new", "rollout_id": "rollout-abc", "created_at": "2"},
+                ]
+            )
+            row = await _latest_run_for_item("item-a", "rollout-abc", token=None)
+        assert row["id"] == "new"
+
+    async def test_no_matching_run_returns_empty(self) -> None:
+        from agent_gtd_dispatch.main import _latest_run_for_item
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.list_runs_for_item = AsyncMock(return_value=[])
+            assert await _latest_run_for_item("item-a", "r", token=None) == {}
+
+    async def test_lookup_failure_is_not_fatal(self) -> None:
+        from agent_gtd_dispatch.main import _latest_run_for_item
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.list_runs_for_item = AsyncMock(side_effect=RuntimeError("x"))
+            assert await _latest_run_for_item("item-a", "r", token=None) == {}
+
+
+class TestDriveRollout:
+    """End-to-end over the loop driver, with the tick stubbed."""
+
+    @staticmethod
+    def _run() -> Run:
+        return Run(
+            project_name="p",
+            mode="manage",
+            rollout_id="rollout-abc",
+            engine="claude-code",
+        )
+
+    async def _drive(self, ctx, directives, *, rollout=None):
+        from agent_gtd_dispatch.main import _drive_rollout
+
+        ctx.gtd.get_rollout = AsyncMock(
+            return_value=rollout or {"project_id": "proj-1"}
+        )
+        ctx.gtd.get_project = AsyncMock(
+            return_value={"name": "P", "workspace_repos": []}
+        )
+        with patch(
+            "agent_gtd_dispatch.main._rollout_wave_tick",
+            new=AsyncMock(side_effect=directives),
+        ) as tick:
+            result = await _drive_rollout(self._run())
+        return result, tick
+
+    async def test_waits_then_completes(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_DONE, _TICK_WAIT
+
+        with _loop_patch_stack() as ctx:
+            result, tick = await self._drive(ctx, [_TICK_WAIT, _TICK_DONE])
+
+        assert result == _TICK_DONE
+        assert tick.await_count == 2
+        ctx.sleep.assert_awaited_once()
+
+    async def test_halted_stops_the_loop(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with _loop_patch_stack() as ctx:
+            result, tick = await self._drive(ctx, [_TICK_HALTED])
+
+        assert result == _TICK_HALTED
+        assert tick.await_count == 1
+
+    async def test_reviewer_engine_comes_off_the_rollout_row(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_DONE
+
+        with _loop_patch_stack() as ctx:
+            await self._drive(
+                ctx,
+                [_TICK_DONE],
+                rollout={
+                    "project_id": "proj-1",
+                    "reviewer_engine": "claude-code-haiku",
+                },
+            )
+            _, tick = await self._drive(
+                ctx,
+                [_TICK_DONE],
+                rollout={
+                    "project_id": "proj-1",
+                    "reviewer_engine": "claude-code-haiku",
+                },
+            )
+        assert tick.await_args.kwargs["reviewer_engine"].name == "claude-code-haiku"
+
+    async def test_unknown_reviewer_engine_falls_back_to_the_default(self) -> None:
+        from agent_gtd_dispatch import config as cfg
+        from agent_gtd_dispatch.main import _TICK_DONE
+
+        with _loop_patch_stack() as ctx:
+            _, tick = await self._drive(
+                ctx,
+                [_TICK_DONE],
+                rollout={"project_id": "proj-1", "reviewer_engine": "nope-9000"},
+            )
+        assert tick.await_args.kwargs["reviewer_engine"].name == cfg.REVIEWER_ENGINE
+
+
+class TestRolloutLoopWorker:
+    @staticmethod
+    def _run() -> Run:
+        return Run(
+            project_name="p",
+            mode="manage",
+            rollout_id="rollout-abc",
+            engine="claude-code",
+        )
+
+    async def test_done_records_the_run_succeeded_and_frees_the_slot(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_DONE, _rollout_loop_worker
+
+        run = self._run()
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._drive_rollout",
+                new=AsyncMock(return_value=_TICK_DONE),
+            ),
+        ):
+            ctx.active[run.id] = MagicMock()
+            await _rollout_loop_worker(run)
+
+        statuses = [c.kwargs.get("status") for c in ctx.db.update_run.await_args_list]
+        assert statuses[-1].value == "succeeded"
+        assert run.id not in ctx.active
+        assert "rollout-abc" not in ctx.rollout_to_run
+
+    async def test_halted_records_the_run_failed(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED, _rollout_loop_worker
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._drive_rollout",
+                new=AsyncMock(return_value=_TICK_HALTED),
+            ),
+        ):
+            await _rollout_loop_worker(self._run())
+
+        assert ctx.db.update_run.await_args.kwargs["status"].value == "failed"
+
+    async def test_a_crashing_loop_is_recorded_not_swallowed(self) -> None:
+        from agent_gtd_dispatch.main import _rollout_loop_worker
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._drive_rollout",
+                new=AsyncMock(side_effect=RuntimeError("boom")),
+            ),
+        ):
+            await _rollout_loop_worker(self._run())
+
+        kwargs = ctx.db.update_run.await_args.kwargs
+        assert kwargs["status"].value == "failed"
+        assert "rollout_loop_error" in kwargs["error"]
+
+    async def test_cancellation_records_cancelled_and_re_raises(self) -> None:
+        from agent_gtd_dispatch.main import _rollout_loop_worker
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._drive_rollout",
+                new=AsyncMock(side_effect=asyncio.CancelledError()),
+            ),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await _rollout_loop_worker(self._run())
+
+        assert ctx.db.update_run.await_args.kwargs["status"].value == "cancelled"
+
+
+class TestPublishRolloutPhase:
+    async def test_a_publish_failure_never_stops_the_wave(self) -> None:
+        from agent_gtd_dispatch.main import _publish_rollout_phase
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.update_rollout_state = AsyncMock(side_effect=RuntimeError("down"))
+            await _publish_rollout_phase("rollout-abc", "polling")  # must not raise
+
+
+class TestDispatchAttemptGuard:
+    async def test_an_item_that_never_leaves_ready_halts_rather_than_looping(
+        self,
+    ) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE, _TICK_HALTED
+
+        attempts: dict[str, int] = {}
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": ["item-a"],
+                    "in_progress": [],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            assert await _tick(ctx, dispatch_attempts=attempts) == _TICK_CONTINUE
+            assert await _tick(ctx, dispatch_attempts=attempts) == _TICK_CONTINUE
+            assert await _tick(ctx, dispatch_attempts=attempts) == _TICK_HALTED
+
+        assert "never" in ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+
+
+class TestRolloutLeftRunning:
+    async def test_a_halted_rollout_stops_the_loop(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={"next_ready": [], "in_progress": []}
+            )
+            ctx.gtd.get_rollout = AsyncMock(return_value={"status": "halted"})
+            assert await _tick(ctx) == _TICK_HALTED
+        ctx.gtd.halt_rollout.assert_not_awaited()
+
+    async def test_a_completed_rollout_stops_the_loop(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_DONE
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={"next_ready": [], "in_progress": []}
+            )
+            ctx.gtd.get_rollout = AsyncMock(return_value={"status": "completed"})
+            assert await _tick(ctx) == _TICK_DONE

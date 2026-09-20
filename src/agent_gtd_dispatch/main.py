@@ -24,6 +24,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
 
+from agent_gtd_dispatch_protocol.branches import make_branch_name
+
 from . import (
     completion,
     config,
@@ -280,6 +282,7 @@ async def _probe_disposition_classifier() -> None:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Initialize config and DB on startup, cancel tasks on shutdown."""
     global _watchdog_task, _retention_task, _classifier_probe_task
+    global _readoption_task
     config.load()
     # Before config.load() there is no LOG_LEVEL to honour, and after this line
     # every logger.info in the package reaches the journal.
@@ -296,6 +299,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         logger.info("No orphaned runs found on startup")
     _watchdog_task = asyncio.create_task(_manage_watchdog())
     _retention_task = asyncio.create_task(_retention_loop())
+    # Re-adoption sweep: the wave loop lives inside THIS service, so a routine
+    # deploy restart would otherwise silently stop every running rollout from
+    # advancing. Backgrounded so startup never blocks on the GTD API.
+    _readoption_task = asyncio.create_task(_readopt_running_rollouts())
     # One probe of the disposition classifier, in the BACKGROUND and never
     # fatal: a misconfigured classifier degrades silently by design (every
     # failure falls through to the derived tier), so without this it is
@@ -312,6 +319,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         _retention_task.cancel()
     if _classifier_probe_task is not None:
         _classifier_probe_task.cancel()
+    if _readoption_task is not None:
+        _readoption_task.cancel()
     for task in _active_processes.values():
         task.cancel()
 
@@ -630,19 +639,12 @@ async def _do_manage_recovery(
         count_toward_cap,
         retry_count,
     )
-    task = asyncio.create_task(
-        _dispatch_worker(
-            new_run,
-            max_turns,
-            engine,
-            timeout_seconds,
-            attribution=attribution,
-            manage_retry_count=retry_count,
-            is_recovery=True,
-            resume_context=resume_context,
-        )
-    )
-    _active_processes[new_run.id] = task
+    # The ladder's "relaunch" is now a loop RESUMPTION: the replacement drives
+    # the same worker-owned wave loop, which reads its frontier from
+    # `advance_rollout` plus the in-flight query and therefore needs no
+    # resume_context of its own. The ladder, its tallies and its caps are
+    # untouched — this is only what they relaunch INTO.
+    _start_rollout_loop(new_run, attribution=attribution)
 
 
 async def _maybe_relaunch_manage(
@@ -1047,6 +1049,9 @@ def _try_start_pending() -> None:
     """
     while _pending_queue and len(_active_processes) < config.MAX_CONCURRENT_RUNS:
         pending = _pending_queue.pop(0)
+        if pending.run.mode == DispatchMode.MANAGE and pending.run.rollout_id:
+            _start_rollout_loop(pending.run, attribution=pending.attribution)
+            continue
         task = asyncio.create_task(
             _dispatch_worker(
                 pending.run,
@@ -2239,6 +2244,812 @@ async def _complete_rollout_item_skipped(
         logger.warning(
             "Failed to post rollout skip-and-advance comment for run %s", run_id
         )
+
+
+# ---------------------------------------------------------------------------
+# Worker-driven rollout wave loop
+# ---------------------------------------------------------------------------
+#
+# The worker owns the loop: determine what is ready, dispatch it, wait for
+# completion, launch a short-lived REVIEWER for each completed build, act on
+# that reviewer's verdict, advance, repeat.  No long-lived agent process is
+# involved in any of it.
+#
+# Of roughly twenty steps in the old resident-manager prompt, exactly four were
+# irreducibly model work — AC reconciliation, the unrelated-manifest scope
+# judgment, the inline-fix small-or-not decision, and sensitive-area discretion
+# — and all four sit inside the review-and-merge window for a SINGLE completed
+# build.  Everything else was deterministic, and one step (the
+# ``already_satisfied`` skip-and-advance) had already been ported to worker code
+# precisely to stop relying on the LLM for it.  This generalises that precedent.
+#
+# The relaunch ladder, ``_do_manage_recovery``, the watchdog and the in-memory
+# tallies above are deliberately left in place: they are torn down by a
+# follow-up item once this loop is proven.
+
+# Re-exported for tests (and so the cap has one name, not a literal).
+MAX_ITEM_REDISPATCHES: int = config.MAX_ITEM_REDISPATCHES
+
+# rollout_id -> item_id -> number of `re-dispatch` verdicts already honoured.
+# In-memory like the manage tallies above: a dispatch-service restart resets
+# the count, which errs toward giving an item one more chance rather than
+# halting a rollout that a restart happened to interrupt.
+_rollout_redispatches: dict[str, dict[str, int]] = {}
+
+# Handle for the startup re-adoption sweep, held only so shutdown can cancel it.
+_readoption_task: asyncio.Task[None] | None = None
+
+# Loop tick directives.
+_TICK_CONTINUE = "continue"  # state changed — re-read immediately
+_TICK_WAIT = "wait"  # builds in flight — sleep, then re-read
+_TICK_DONE = "done"  # graph_complete, or the rollout left `running`
+_TICK_HALTED = "halted"  # the loop halted the rollout (or it was halted)
+
+# Guard against a dispatch that reports success but does not move the item out
+# of `next_ready` (the wave linkage is guarded by `AND status = 'ready'`, so a
+# `pending` item would be dispatched forever).  Two attempts, then halt loudly.
+_MAX_DISPATCH_ATTEMPTS_PER_ITEM = 2
+
+
+class ReviewVerdict(NamedTuple):
+    """A reviewer's bounded answer about ONE completed build."""
+
+    verdict: str  # one of dispatch.REVIEW_VERDICTS
+    rationale: str
+    merge_note: str
+    detail: str  # structured failure detail, or the rejection reason
+
+
+def _completed_build_item_ids(
+    advance: dict[str, Any], in_flight: list[Any]
+) -> list[str]:
+    """Items whose build has FINISHED — the advance/in-flight combination.
+
+    THIS IS THE TRAP THE WHOLE LOOP TURNS ON.  ``advance_rollout``'s
+    ``in_progress`` is "rollout_items rows in ``dispatched`` status" and is NOT
+    joined to ``claude_runs.status``.  An item stays ``dispatched`` until
+    something completes it in the rollout — which, in this design, is the
+    worker acting on a reviewer's verdict.  So ``in_progress`` reports finished
+    items as in-flight FOREVER, and a loop driven by ``advance_rollout`` alone
+    never advances: it waits for a transition that only it can cause.
+
+    The rollout's ``inFlightBuildRuns`` is the missing half — a JOIN against
+    ``claude_runs.status`` filtered to non-terminal runs.  Subtracting it from
+    ``in_progress`` yields exactly the items whose build run has gone terminal
+    and which therefore need reviewing.  Using either source alone is a hang.
+
+    Args:
+        advance: The ``advance_rollout`` response.
+        in_flight: The rollout's ``inFlightBuildRuns`` list.
+
+    Returns:
+        Item ids, in ``in_progress`` order, whose build run is no longer
+        in flight.
+    """
+    in_flight_items = {
+        str(entry.get("itemId"))
+        for entry in in_flight or []
+        if isinstance(entry, dict) and entry.get("itemId")
+    }
+    return [
+        str(item_id)
+        for item_id in (advance.get("in_progress") or [])
+        if str(item_id) not in in_flight_items
+    ]
+
+
+async def _publish_rollout_phase(
+    rollout_id: str,
+    phase: str,
+    *,
+    item_id: str | None = None,
+    step: str | None = None,
+    token: str | None = None,
+) -> None:
+    """Write the rollout's manager_* state fields. Best effort, never fatal.
+
+    ``manager_phase`` / ``manager_current_item_id`` / ``manager_current_step`` /
+    ``manager_state_updated_at`` feed the Rollout Detail banner over SSE and
+    have no other writer once the resident manager is gone.  Nothing branches
+    on them for control flow — they are pure observability — so a failure to
+    publish must never stop the wave.
+
+    The stage -> ``ManagerPhase`` mapping is 1:1 with the existing enum, which
+    is why no UI change is needed: ``warm_up`` (adopting the rollout and
+    preparing the shared workspace), ``dispatching``, ``polling`` (waiting on
+    in-flight builds), ``reviewing`` and ``merging`` (published by the reviewer
+    itself, which is the agent actually in those phases), ``reconciling_ac``
+    (also the reviewer's), and ``halted``.
+    """
+    try:
+        await gtd_client.update_rollout_state(
+            rollout_id, phase, current_item_id=item_id, current_step=step, token=token
+        )
+    except Exception:
+        logger.warning(
+            "rollout-loop: failed to publish phase=%s for rollout %s",
+            phase,
+            rollout_id,
+        )
+
+
+async def _latest_run_for_item(
+    item_id: str, rollout_id: str, *, token: str | None
+) -> dict[str, Any]:
+    """Return the most recent child build run for *item_id* in *rollout_id*.
+
+    Resolved by QUERY, never from memory: the startup re-adoption sweep picks
+    up rollouts this process never dispatched, so an in-memory item->run map
+    would be empty exactly when it is needed most.
+    """
+    try:
+        runs = await gtd_client.list_runs_for_item(item_id, token=token)
+    except Exception:
+        logger.warning("rollout-loop: failed to list runs for item %s", item_id)
+        return {}
+    matching = [r for r in runs if str(r.get("rollout_id") or "") == rollout_id]
+    if not matching:
+        return {}
+    return max(matching, key=lambda r: str(r.get("created_at") or ""))
+
+
+def _gate_result_summary(run_row: dict[str, Any]) -> str:
+    """Render the post-run gate outcome for the reviewer's envelope.
+
+    The GTD-side run row has no gate column; the gate's verdict reaches it as
+    the ``post-run gate ...`` prefix on ``error_msg`` (and, when it passed, as
+    silence).  Say which of those we are looking at rather than handing the
+    reviewer a bare string.
+    """
+    error_msg = str(run_row.get("error_msg") or "").strip()
+    if not error_msg:
+        return (
+            "no failure recorded on the run — the post-run gate did not fail "
+            "(it may have passed or been skipped for a project with no "
+            "`gate_command`). Run the merge bar yourself regardless."
+        )
+    return f"the run recorded a failure: `{error_msg[:1000]}`"
+
+
+async def _launch_reviewer(
+    rollout_id: str,
+    item_id: str,
+    *,
+    project: dict[str, Any],
+    workspace: dispatch.RolloutWorkspace,
+    reviewer_engine: Engine,
+    token: str | None,
+    attribution: str | None,
+) -> ReviewVerdict:
+    """Run ONE short-lived reviewer for ONE completed build and read its verdict.
+
+    The reviewer run carries ``mode=DispatchMode.REVIEW``.  That is the chosen
+    mechanism for keeping a reviewer's exit away from the manage relaunch
+    ladder: the ladder fires on ``run.mode == MANAGE and run.rollout_id`` and
+    exists to resurrect a RESIDENT manager, whereas a reviewer exiting is normal
+    completion.  A distinct mode makes a reviewer structurally ineligible
+    without disabling the ladder for anything else — the resident-manager path
+    still exists until the follow-up item removes it — and it simultaneously
+    buys the env withholding (``_MANAGE_EXECUTOR_ENV_KEYS`` is granted only for
+    MANAGE) and the reviewer's own turn budget.  An explicit marker on a
+    manage-mode run would have bought none of those and would have left the
+    ladder one ``if`` away from firing on a reviewer.
+
+    Returns a :class:`ReviewVerdict`.  Every failure path — launch error,
+    non-zero exit, missing or malformed verdict artifact — returns
+    ``verdict="halt"``: a reviewer that did not answer does not get the benefit
+    of the doubt, because merging on a guess is the one outcome that cannot be
+    undone.
+    """
+    item = await gtd_client.get_item(item_id, token=token)
+    run_row = await _latest_run_for_item(item_id, rollout_id, token=token)
+    branch_name = str(run_row.get("feature_branch") or "")
+    if not branch_name:
+        branch_name = make_branch_name(item_id, str(item.get("title") or ""))
+
+    try:
+        merge_notes = await gtd_client.get_rollout_merge_notes(
+            rollout_id, limit=dispatch.MERGE_NOTE_CONTEXT_LIMIT, token=token
+        )
+    except Exception:
+        logger.warning(
+            "rollout-loop: failed to fetch merge notes for rollout %s", rollout_id
+        )
+        merge_notes = []
+
+    used = _rollout_redispatches.get(rollout_id, {}).get(item_id, 0)
+    repo_dirs = list(workspace.repo_paths)
+    prompt = dispatch.build_review_prompt(
+        item,
+        project,
+        rollout_id,
+        branch_name,
+        config.REVIEW_MAX_TURNS,
+        workspace.root,
+        repo_dirs=repo_dirs,
+        default_branches=workspace.default_branches,
+        workspace_mode=workspace.workspace_mode,
+        run_status=str(run_row.get("status") or "unknown"),
+        gate_result=_gate_result_summary(run_row),
+        merge_notes=merge_notes,
+        redispatches_used=used,
+        redispatch_cap=MAX_ITEM_REDISPATCHES,
+    )
+
+    reviewer_run = Run(
+        item_id=item_id,
+        project_name=str(project.get("name") or ""),
+        branch_name=branch_name,
+        engine=reviewer_engine.name,
+        engine_actual=reviewer_engine.name,
+        mode=DispatchMode.REVIEW,
+        rollout_id=rollout_id,
+        workspace_path=str(workspace.root),
+        callback_token=token,
+        status=RunStatus.running,
+        started_at=datetime.now(UTC),
+    )
+    await db.insert_run(reviewer_run)
+    logger.info(
+        "rollout-loop: reviewer spawn rollout_id=%s item_id=%s run_id=%s engine=%s "
+        "branch=%s max_turns=%d",
+        rollout_id,
+        item_id,
+        reviewer_run.id,
+        reviewer_engine.name,
+        branch_name,
+        config.REVIEW_MAX_TURNS,
+    )
+
+    # Clear any prior verdict so a reviewer that dies before writing one can
+    # never be credited with the PREVIOUS item's answer.
+    dispatch.clear_review_verdict(workspace.root)
+
+    exit_code: int | None = None
+    failure: str = ""
+    try:
+        result = await dispatch.run_agent(
+            reviewer_engine,
+            workspace.root,
+            prompt,
+            f"Review and merge `{branch_name}` for item {item_id}",
+            config.REVIEW_MAX_TURNS,
+            timeout_seconds=config.REVIEW_TIMEOUT_SECONDS,
+            mode=DispatchMode.REVIEW,
+            attribution=attribution,
+            callback_token=token,
+            run_id=reviewer_run.id,
+        )
+        exit_code = result.returncode
+    except Exception as exc:
+        failure = f"reviewer subprocess failed: {type(exc).__name__}: {exc}"
+        logger.exception(
+            "rollout-loop: reviewer run %s raised for item %s",
+            reviewer_run.id,
+            item_id,
+        )
+
+    verdict_blob, reason = dispatch.read_review_verdict(workspace.root)
+
+    if verdict_blob is None:
+        detail = failure or f"verdict artifact {reason} (reviewer exit={exit_code})"
+        await db.update_run(
+            reviewer_run.id,
+            status=RunStatus.failed,
+            completed_at=datetime.now(UTC).isoformat(),
+            error=f"review_no_verdict: {detail}"[:ERROR_TEXT_MAX_CHARS],
+        )
+        logger.warning(
+            "rollout-loop: reviewer run %s produced no usable verdict (%s) — "
+            "treating as halt",
+            reviewer_run.id,
+            reason,
+        )
+        return ReviewVerdict("halt", "reviewer returned no usable verdict", "", detail)
+
+    verdict = str(verdict_blob["verdict"])
+    rationale = str(verdict_blob.get("rationale") or "")[
+        : dispatch.REVIEW_RATIONALE_MAX_CHARS
+    ]
+    merge_note = str(verdict_blob.get("merge_note") or "")
+    fail = verdict_blob.get("failure")
+    detail = ""
+    if isinstance(fail, dict) and (fail.get("kind") or fail.get("detail")):
+        detail = f"{fail.get('kind') or 'unspecified'}: {fail.get('detail') or ''}"
+    repo_states = verdict_blob.get("repo_states")
+    if isinstance(repo_states, dict) and repo_states:
+        states = ", ".join(f"{k}={v}" for k, v in sorted(repo_states.items()))
+        detail = f"{detail} [repo states: {states}]" if detail else f"[{states}]"
+
+    await db.update_run(
+        reviewer_run.id,
+        status=RunStatus.succeeded,
+        completed_at=datetime.now(UTC).isoformat(),
+        completion=json.dumps(
+            {"verdict": verdict, "rationale": rationale, "detail": detail}
+        ),
+    )
+    logger.info(
+        "rollout-loop: reviewer verdict rollout_id=%s item_id=%s run_id=%s "
+        "verdict=%s exit_code=%s",
+        rollout_id,
+        item_id,
+        reviewer_run.id,
+        verdict,
+        exit_code,
+    )
+    return ReviewVerdict(verdict, rationale, merge_note, detail)
+
+
+async def _halt_rollout_from_loop(
+    rollout_id: str,
+    reason: str,
+    *,
+    item_id: str | None = None,
+    token: str | None = None,
+    attribution: str | None = None,
+) -> str:
+    """Halt the rollout, publish the halted phase, and comment. Returns _TICK_HALTED."""
+    await _publish_rollout_phase(
+        rollout_id, "halted", item_id=item_id, step=reason[:200], token=token
+    )
+    if item_id:
+        try:
+            await gtd_client.post_comment(
+                item_id,
+                f"Rollout `{rollout_id}` halted: {reason}",
+                created_by=attribution or "agent-gtd-dispatch",
+                token=token,
+            )
+        except Exception:
+            logger.warning("rollout-loop: failed to comment halt on item %s", item_id)
+    try:
+        await gtd_client.halt_rollout(rollout_id, reason=reason, token=token)
+    except Exception:
+        logger.exception("rollout-loop: failed to halt rollout %s", rollout_id)
+    logger.warning("rollout-loop: halted rollout_id=%s reason=%s", rollout_id, reason)
+    return _TICK_HALTED
+
+
+async def _act_on_verdict(
+    rollout_id: str,
+    item_id: str,
+    outcome: ReviewVerdict,
+    *,
+    token: str | None,
+    attribution: str | None,
+) -> str:
+    """Apply a reviewer's verdict. The WORKER acts; the reviewer only decided.
+
+    Including the re-dispatch: a reviewer is never handed the ability to
+    dispatch a child run, so ``re-dispatch`` is a request that this function
+    executes, capped at ``MAX_ITEM_REDISPATCHES`` per item.  Past the cap the
+    rollout halts — which is also the DEFAULT behaviour for a failed child, and
+    deliberately unchanged: absent an explicit ``re-dispatch`` verdict, a failed
+    child halts the rollout exactly as it does today.
+    """
+    if outcome.verdict == "halt":
+        reason = f"reviewer halted item {item_id}: {outcome.rationale}"
+        if outcome.detail:
+            reason = f"{reason} ({outcome.detail})"
+        return await _halt_rollout_from_loop(
+            rollout_id,
+            reason[:ERROR_TEXT_MAX_CHARS],
+            item_id=item_id,
+            token=token,
+            attribution=attribution,
+        )
+
+    if outcome.verdict in ("merge", "skip"):
+        recorded = "completed" if outcome.verdict == "merge" else "skipped"
+        try:
+            result = await gtd_client.complete_in_rollout(
+                rollout_id,
+                item_id,
+                outcome=recorded,
+                merge_actor="reviewer-autonomous",
+                decision_rule="agent-judgment",
+                merge_note=outcome.merge_note,
+                token=token,
+            )
+        except Exception as exc:
+            return await _halt_rollout_from_loop(
+                rollout_id,
+                f"failed to record item {item_id} as {recorded}: "
+                f"{type(exc).__name__}: {exc}",
+                item_id=item_id,
+                token=token,
+                attribution=attribution,
+            )
+        newly_ready = result.get("newly_ready") if isinstance(result, dict) else None
+        unblocked = (
+            f"Downstream items unblocked: {', '.join(str(x) for x in newly_ready)}."
+            if newly_ready
+            else "No downstream items unblocked."
+        )
+        try:
+            await gtd_client.post_comment(
+                item_id,
+                (
+                    f"Rollout `{rollout_id}`: reviewer verdict `{outcome.verdict}` — "
+                    f"item recorded as {recorded}. {outcome.rationale} {unblocked}"
+                ),
+                created_by=attribution or "agent-gtd-dispatch",
+                token=token,
+            )
+        except Exception:
+            logger.warning("rollout-loop: failed to comment verdict on %s", item_id)
+        return _TICK_CONTINUE
+
+    # re-dispatch
+    used = _rollout_redispatches.setdefault(rollout_id, {}).get(item_id, 0)
+    if used >= MAX_ITEM_REDISPATCHES:
+        return await _halt_rollout_from_loop(
+            rollout_id,
+            f"re-dispatch cap reached for item {item_id} "
+            f"({used}/{MAX_ITEM_REDISPATCHES}): {outcome.rationale}",
+            item_id=item_id,
+            token=token,
+            attribution=attribution,
+        )
+    _rollout_redispatches[rollout_id][item_id] = used + 1
+    try:
+        await gtd_client.reset_rollout_item(rollout_id, item_id, token=token)
+        await gtd_client.dispatch_item(item_id, rollout_id=rollout_id, token=token)
+    except Exception as exc:
+        return await _halt_rollout_from_loop(
+            rollout_id,
+            f"re-dispatch of item {item_id} failed: {type(exc).__name__}: {exc}",
+            item_id=item_id,
+            token=token,
+            attribution=attribution,
+        )
+    logger.info(
+        "rollout-loop: re-dispatched rollout_id=%s item_id=%s attempt=%d cap=%d",
+        rollout_id,
+        item_id,
+        used + 1,
+        MAX_ITEM_REDISPATCHES,
+    )
+    try:
+        await gtd_client.post_comment(
+            item_id,
+            (
+                f"Rollout `{rollout_id}`: reviewer verdict `re-dispatch` "
+                f"({used + 1}/{MAX_ITEM_REDISPATCHES}) — {outcome.rationale}"
+            ),
+            created_by=attribution or "agent-gtd-dispatch",
+            token=token,
+        )
+    except Exception:
+        logger.warning("rollout-loop: failed to comment re-dispatch on %s", item_id)
+    return _TICK_CONTINUE
+
+
+async def _rollout_wave_tick(
+    rollout_id: str,
+    *,
+    project: dict[str, Any],
+    workspace_ref: list[dispatch.RolloutWorkspace | None],
+    reviewer_engine: Engine,
+    dispatch_attempts: dict[str, int],
+    token: str | None,
+    attribution: str | None,
+) -> str:
+    """One pass of the wave loop. Returns a ``_TICK_*`` directive.
+
+    Order is load-bearing: completed builds are reviewed BEFORE newly-ready
+    items are dispatched, so a dependent item is never dispatched against a
+    base its predecessor has not yet been merged into.
+    """
+    advance = await gtd_client.advance_rollout(rollout_id, token=token)
+    rollout = await gtd_client.get_rollout(rollout_id, token=token)
+
+    status = str(rollout.get("status") or "")
+    if status != "running":
+        logger.info(
+            "rollout-loop: rollout_id=%s left running (status=%s) — loop exits",
+            rollout_id,
+            status,
+        )
+        return _TICK_HALTED if status == "halted" else _TICK_DONE
+
+    # Wave completion is READ, not computed. `complete_item_in_rollout` already
+    # closes the rollout and signals `graph_complete`, and `advance_rollout`
+    # computes the same thing independently. The worker consumes that field and
+    # does NOT invent a third notion of done.
+    if advance.get("graph_complete"):
+        logger.info(
+            "rollout-loop: rollout_id=%s graph_complete — loop exits", rollout_id
+        )
+        return _TICK_DONE
+
+    in_flight = _in_flight_build_runs(rollout)
+    completed = _completed_build_item_ids(advance, in_flight)
+
+    if completed:
+        item_id = completed[0]
+        if workspace_ref[0] is None:
+            await _publish_rollout_phase(
+                rollout_id,
+                "warm_up",
+                item_id=item_id,
+                step="Preparing the shared rollout workspace",
+                token=token,
+            )
+            workspace_ref[0] = await asyncio.get_running_loop().run_in_executor(
+                None,
+                functools.partial(
+                    dispatch.prepare_rollout_workspace,
+                    rollout_id,
+                    git_origin=str(project.get("git_origin") or ""),
+                    repo_urls=list(project.get("workspace_repos") or []),
+                ),
+            )
+        workspace = workspace_ref[0]
+        assert workspace is not None  # noqa: S101 — just assigned above
+        await asyncio.get_running_loop().run_in_executor(
+            None, dispatch.refresh_rollout_workspace, workspace
+        )
+        await _publish_rollout_phase(
+            rollout_id,
+            "reviewing",
+            item_id=item_id,
+            step=f"Reviewing the completed build for {item_id}",
+            token=token,
+        )
+        outcome = await _launch_reviewer(
+            rollout_id,
+            item_id,
+            project=project,
+            workspace=workspace,
+            reviewer_engine=reviewer_engine,
+            token=token,
+            attribution=attribution,
+        )
+        dispatch_attempts.pop(item_id, None)
+        return await _act_on_verdict(
+            rollout_id, item_id, outcome, token=token, attribution=attribution
+        )
+
+    next_ready = [str(i) for i in (advance.get("next_ready") or [])]
+    if next_ready:
+        for item_id in next_ready:
+            attempts = dispatch_attempts.get(item_id, 0)
+            if attempts >= _MAX_DISPATCH_ATTEMPTS_PER_ITEM:
+                return await _halt_rollout_from_loop(
+                    rollout_id,
+                    f"item {item_id} is still reported ready after {attempts} "
+                    "successful dispatch calls — the rollout item never "
+                    "transitioned to 'dispatched'",
+                    item_id=item_id,
+                    token=token,
+                    attribution=attribution,
+                )
+            await _publish_rollout_phase(
+                rollout_id,
+                "dispatching",
+                item_id=item_id,
+                step=f"Dispatching {item_id}",
+                token=token,
+            )
+            try:
+                child = await gtd_client.dispatch_item(
+                    item_id, rollout_id=rollout_id, token=token
+                )
+            except Exception as exc:
+                return await _halt_rollout_from_loop(
+                    rollout_id,
+                    f"dispatch of item {item_id} failed: {type(exc).__name__}: {exc}",
+                    item_id=item_id,
+                    token=token,
+                    attribution=attribution,
+                )
+            dispatch_attempts[item_id] = attempts + 1
+            logger.info(
+                "rollout-loop: dispatched rollout_id=%s item_id=%s run_id=%s",
+                rollout_id,
+                item_id,
+                (child or {}).get("id"),
+            )
+        return _TICK_CONTINUE
+
+    if in_flight:
+        await _publish_rollout_phase(
+            rollout_id,
+            "polling",
+            step=f"Waiting on {len(in_flight)} in-flight build run(s)",
+            token=token,
+        )
+        return _TICK_WAIT
+
+    return await _halt_rollout_from_loop(
+        rollout_id,
+        "rollout stalled: nothing ready, nothing in flight, graph not complete "
+        f"(blocked={list(advance.get('blocked') or [])})",
+        token=token,
+        attribution=attribution,
+    )
+
+
+async def _drive_rollout(
+    run: Run,
+    *,
+    attribution: str | None = None,
+) -> str:
+    """Drive one rollout's wave loop to completion. Returns the final directive.
+
+    This is the whole of AC1: determine what is ready, dispatch it, wait for
+    completion, review each completed build, act on the verdict, advance,
+    repeat until the rollout is complete or halted.
+    """
+    rollout_id = run.rollout_id
+    assert rollout_id is not None  # noqa: S101 — caller guarantees this
+    token = run.callback_token
+
+    rollout = await gtd_client.get_rollout(rollout_id, token=token)
+    project = await gtd_client.get_project(
+        str(rollout.get("project_id") or ""), token=token
+    )
+    run.project_name = str(project.get("name") or run.project_name)
+
+    reviewer_engine_name = (
+        str(rollout.get("reviewer_engine") or "").strip() or config.REVIEWER_ENGINE
+    )
+    try:
+        reviewer_engine = get_engine(reviewer_engine_name)
+    except ValueError:
+        logger.warning(
+            "rollout-loop: unknown reviewer engine %r for rollout %s — using %s",
+            reviewer_engine_name,
+            rollout_id,
+            config.REVIEWER_ENGINE,
+        )
+        reviewer_engine = get_engine(config.REVIEWER_ENGINE)
+
+    logger.info(
+        "rollout-loop: start rollout_id=%s run_id=%s project=%s reviewer_engine=%s",
+        rollout_id,
+        run.id,
+        project.get("name"),
+        reviewer_engine.name,
+    )
+    await _publish_rollout_phase(
+        rollout_id, "warm_up", step="Wave loop adopted the rollout", token=token
+    )
+
+    workspace_ref: list[dispatch.RolloutWorkspace | None] = [None]
+    dispatch_attempts: dict[str, int] = {}
+    directive = _TICK_CONTINUE
+    try:
+        while True:
+            directive = await _rollout_wave_tick(
+                rollout_id,
+                project=project,
+                workspace_ref=workspace_ref,
+                reviewer_engine=reviewer_engine,
+                dispatch_attempts=dispatch_attempts,
+                token=token,
+                attribution=attribution,
+            )
+            if directive in (_TICK_DONE, _TICK_HALTED):
+                return directive
+            if directive == _TICK_WAIT:
+                await asyncio.sleep(config.ROLLOUT_LOOP_POLL_SECONDS)
+    finally:
+        _rollout_redispatches.pop(rollout_id, None)
+        ws = workspace_ref[0]
+        # The shared workspace is torn down only when the loop itself ends. A
+        # halted rollout keeps it: the tree is the evidence a human needs.
+        if ws is not None and directive == _TICK_DONE:
+            with contextlib.suppress(Exception):
+                dispatch.cleanup_workspace(ws.root)
+
+
+async def _rollout_loop_worker(run: Run, *, attribution: str | None = None) -> None:
+    """Background task wrapper around :func:`_drive_rollout` with run bookkeeping.
+
+    Owns the same slot/queue accounting ``_dispatch_worker`` does, because it
+    occupies a run slot for as long as the rollout runs.
+    """
+    assert run.rollout_id is not None  # noqa: S101
+    started = datetime.now(UTC).isoformat()
+    await db.update_run(run.id, status=RunStatus.running, started_at=started)
+    _publish_run_event(run.id, "running", None)
+    _rollout_to_run[run.rollout_id] = run
+    try:
+        directive = await _drive_rollout(run, attribution=attribution)
+        finished = datetime.now(UTC).isoformat()
+        status = RunStatus.succeeded if directive == _TICK_DONE else RunStatus.failed
+        await db.update_run(
+            run.id,
+            status=status,
+            completed_at=finished,
+            error="" if directive == _TICK_DONE else f"rollout {directive}",
+        )
+        _publish_run_event(run.id, status.value, finished)
+    except asyncio.CancelledError:
+        cancelled = datetime.now(UTC).isoformat()
+        await db.update_run(run.id, status=RunStatus.cancelled, completed_at=cancelled)
+        _publish_run_event(run.id, "cancelled", cancelled)
+        raise
+    except Exception as exc:
+        logger.exception("rollout-loop: rollout %s loop crashed", run.rollout_id)
+        failed = datetime.now(UTC).isoformat()
+        await db.update_run(
+            run.id,
+            status=RunStatus.failed,
+            completed_at=failed,
+            error=f"rollout_loop_error: {type(exc).__name__}: {exc}"[
+                :ERROR_TEXT_MAX_CHARS
+            ],
+        )
+        _publish_run_event(run.id, "failed", failed)
+    finally:
+        _active_processes.pop(run.id, None)
+        _try_start_pending()
+        _run_event_queues.pop(run.id, None)
+        _rollout_to_run.pop(run.rollout_id, None)
+        logger.info(
+            "rollout-loop: exit rollout_id=%s run_id=%s", run.rollout_id, run.id
+        )
+
+
+def _start_rollout_loop(run: Run, *, attribution: str | None = None) -> None:
+    """Create and register the background task that drives one rollout."""
+    task = asyncio.create_task(_rollout_loop_worker(run, attribution=attribution))
+    _active_processes[run.id] = task
+
+
+async def _readopt_running_rollouts() -> None:
+    """Startup sweep: resume every running rollout from its persisted frontier.
+
+    REQUIRED, not a follow-up.  The wave loop now lives INSIDE the dispatch
+    service, whose own ``deploy.sh`` restarts it — so a routine deploy used to
+    mean "the monitor lies" and would now mean "the wave silently stops
+    advancing" without this.  Largely a relocation of the watchdog's existing
+    scan shape: list running rollouts, and for each one that no live loop owns,
+    start one.  The loop itself resumes from the persisted frontier, because
+    every tick re-reads ``advance_rollout`` plus the in-flight query rather than
+    trusting any in-process state.
+
+    Double-dispatch safety comes from the GTD side: the wave linkage in
+    ``dispatch_item`` is guarded by ``AND status = 'ready'``, so an item whose
+    build is already in flight (status ``dispatched``) cannot be dispatched
+    again — and such items are reported by ``advance_rollout`` as
+    ``in_progress``, not ``next_ready``, so the resumed loop does not even try.
+    """
+    try:
+        rollouts = await gtd_client.list_running_rollouts()
+    except Exception:
+        logger.exception("re-adoption sweep: failed to list running rollouts")
+        return
+
+    logger.info("re-adoption sweep: %d running rollout(s)", len(rollouts))
+    for rollout in rollouts:
+        rollout_id = str(rollout.get("id") or "")
+        if not rollout_id or rollout_id in _rollout_to_run:
+            continue
+        run = Run(
+            project_name=str(rollout.get("project_name") or ""),
+            mode=DispatchMode.MANAGE,
+            rollout_id=rollout_id,
+            engine=str(rollout.get("reviewer_engine") or config.REVIEWER_ENGINE),
+        )
+        try:
+            await db.insert_run(run)
+        except Exception:
+            logger.exception(
+                "re-adoption sweep: failed to record loop run for rollout %s",
+                rollout_id,
+            )
+            continue
+        logger.info(
+            "re-adoption sweep: resuming rollout_id=%s with run_id=%s",
+            rollout_id,
+            run.id,
+        )
+        _start_rollout_loop(run)
 
 
 async def _dispatch_worker(
@@ -3981,6 +4792,19 @@ async def dispatch_item(
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
     # Validate mode-specific requirements
+    if body.mode == DispatchMode.REVIEW:
+        # REVIEW runs are worker-internal: the wave loop launches one per
+        # completed build, with an envelope (branch, gate result, merge notes,
+        # re-dispatch tally) that no external caller can supply. Accepting one
+        # over HTTP would build a reviewer prompt with an empty envelope and
+        # let it merge on no evidence.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "mode=review is not externally dispatchable — reviewers are "
+                "launched by the dispatch worker's rollout wave loop"
+            ),
+        )
     if body.mode == DispatchMode.MANAGE and not body.rollout_id:
         raise HTTPException(
             status_code=400,
@@ -4270,12 +5094,20 @@ async def dispatch_item(
         )
 
     # Slot available — start the background task immediately.
-    task = asyncio.create_task(
-        _dispatch_worker(
-            run, max_turns, engine, timeout_seconds, attribution=body.attribution
+    if run.mode == DispatchMode.MANAGE and run.rollout_id:
+        # A manage dispatch no longer spawns a resident manager agent: the
+        # WORKER drives the wave loop and launches a short-lived reviewer per
+        # completed build. The resident-manager prompt, the relaunch ladder,
+        # `_do_manage_recovery` and the watchdog all remain in place — a
+        # follow-up item tears them down once this loop is proven.
+        _start_rollout_loop(run, attribution=body.attribution)
+    else:
+        task = asyncio.create_task(
+            _dispatch_worker(
+                run, max_turns, engine, timeout_seconds, attribution=body.attribution
+            )
         )
-    )
-    _active_processes[run.id] = task
+        _active_processes[run.id] = task
 
     return RunResponse(
         **run.model_dump(),

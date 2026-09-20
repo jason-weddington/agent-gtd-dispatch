@@ -71,6 +71,27 @@ class Engine:
 # the `claude-code` name literal.
 _MANAGE_EXECUTOR_ENV_KEYS: tuple[str, ...] = ("DISPATCH_LOCAL_URL", "DISPATCH_API_KEY")
 
+# Review-mode env exposure — the deliberate NEGATIVE of the grant above.
+#
+# A REVIEW-mode agent reviews one completed build and merges it.  It returns a
+# VERDICT; the WORKER acts on that verdict, including any re-dispatch.  So a
+# reviewer has no business dispatching child runs, and must never receive the
+# dispatch URL or key that would let it.
+#
+# The mode branch above already withholds them (it only fires for MANAGE), so
+# this subtraction is redundant TODAY.  It is kept explicit anyway: the keys are
+# withheld by INTENT, not by the accident of a condition that happens not to
+# match, and a future edit that widened the manage branch (to "any rollout-mode
+# run", say) would otherwise silently hand a reviewer the ability to dispatch.
+#
+# ANTHROPIC_API_KEY is absent from COMMON_ENV_KEYS and from every claude-family
+# engine's env_keys, so it never reaches ANY claude-code subprocess (kb-01512 —
+# its presence flips Claude Code onto API billing and off the Max
+# subscription).  That guard is unconditional and is asserted for reviewers too.
+_REVIEW_FORBIDDEN_ENV_KEYS: frozenset[str] = frozenset(
+    (*_MANAGE_EXECUTOR_ENV_KEYS, "ANTHROPIC_API_KEY")
+)
+
 
 def agent_local_bin_dirs() -> list[Path]:
     """Return the agent user's ``.local/bin`` and ``.cargo/bin`` directories.
@@ -123,6 +144,11 @@ def build_env(
 ) -> dict[str, str]:
     """Build a filtered env dict for the engine's subprocess.
 
+    ``mode`` gates two opposite env decisions: ``MANAGE`` ADDS the dispatch
+    URL + key so a resident manager can dispatch its children, and ``REVIEW``
+    explicitly SUBTRACTS them (plus ``ANTHROPIC_API_KEY``) because a reviewer
+    returns a verdict and never dispatches anything.
+
     ``callback_token`` is the run's per-run 72h JWT, minted by the dispatch
     worker and scoped to the DISPATCHING USER. When present it is set as
     ``AGENT_GTD_API_KEY`` in the subprocess env so the agent's OWN agent-gtd
@@ -145,6 +171,11 @@ def build_env(
     # its children. See Engine.is_claude_code_family.
     if engine.is_claude_code_family and mode == DispatchMode.MANAGE:
         allowed = allowed | frozenset(_MANAGE_EXECUTOR_ENV_KEYS)
+    # Review-mode: strip the dispatch keys (and re-assert the ANTHROPIC_API_KEY
+    # ban) unconditionally. See _REVIEW_FORBIDDEN_ENV_KEYS for why this is
+    # explicit rather than left to the branch above not matching.
+    if mode == DispatchMode.REVIEW:
+        allowed = allowed - _REVIEW_FORBIDDEN_ENV_KEYS
     env = {k: v for k, v in os.environ.items() if k in allowed}
     env["HOME"] = str(Path.home())
 

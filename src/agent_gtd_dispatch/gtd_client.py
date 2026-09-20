@@ -119,6 +119,7 @@ async def complete_in_rollout(
     outcome: str,
     merge_actor: str = "manager-allowlist",
     decision_rule: str = "",
+    merge_note: str = "",
     *,
     token: str | None = None,
 ) -> dict[str, Any]:
@@ -139,6 +140,7 @@ async def complete_in_rollout(
             "outcome": outcome,
             "merge_actor": merge_actor,
             "decision_rule": decision_rule,
+            "merge_note": merge_note,
         },
     )
     return result
@@ -255,3 +257,95 @@ async def list_running_rollouts(*, token: str | None = None) -> list[dict[str, A
         "GET", "/rollouts", token=token, params={"status": "running"}
     )
     return [r for r in result if r.get("status") == "running"]
+
+
+async def update_rollout_state(
+    rollout_id: str,
+    phase: str,
+    *,
+    current_item_id: str | None = None,
+    current_step: str | None = None,
+    token: str | None = None,
+) -> None:
+    """POST /api/rollouts/{rollout_id}/state.
+
+    Publishes the wave loop's current phase for the Rollout Detail banner (it
+    reaches the UI over SSE).  These four columns had exactly one writer — the
+    resident manage-mode agent — and nothing branches on them for control flow;
+    they are pure observability.  Retiring the resident manager therefore
+    removes their only writer, so the WORKER writes them now, and it knows its
+    phase far more precisely than the model ever did.
+
+    Each call REPLACES all four fields: pass ``current_item_id`` every time it
+    should survive a phase change.
+    """
+    await _request(
+        "POST",
+        f"/rollouts/{rollout_id}/state",
+        token=token,
+        json={
+            "phase": phase,
+            "current_item_id": current_item_id,
+            "current_step": current_step,
+        },
+    )
+
+
+async def reset_rollout_item(
+    rollout_id: str, item_id: str, *, token: str | None = None
+) -> dict[str, Any]:
+    """POST /api/rollouts/{rollout_id}/reset-item.
+
+    Returns a ``dispatched`` rollout item to ``ready`` so ``dispatch_item``'s
+    ``AND status = 'ready'`` wave-linkage guard matches again.  Without this a
+    re-dispatch is a silent no-op that leaves the previous (terminal) run linked.
+    """
+    result: dict[str, Any] = await _request(
+        "POST",
+        f"/rollouts/{rollout_id}/reset-item",
+        token=token,
+        json={"item_id": item_id},
+    )
+    return result
+
+
+async def dispatch_item(
+    item_id: str,
+    *,
+    rollout_id: str,
+    mode: str = "build",
+    token: str | None = None,
+) -> dict[str, Any]:
+    """POST /api/items/{item_id}/dispatch — create a child build run.
+
+    Used by the worker-driven wave loop.  The wave linkage on the GTD side is
+    guarded by ``AND status = 'ready'``, which is what makes this idempotent
+    and what makes the startup re-adoption sweep safe from double-dispatching
+    an item whose build is already in flight.
+    """
+    result: dict[str, Any] = await _request(
+        "POST",
+        f"/items/{item_id}/dispatch",
+        token=token,
+        json={"mode": mode, "rollout_id": rollout_id},
+    )
+    return result
+
+
+async def list_runs_for_item(
+    item_id: str, *, token: str | None = None
+) -> list[dict[str, Any]]:
+    """GET /api/runs?item_id={item_id} → the item's runs, newest last.
+
+    The wave loop needs the run record for an item whose build has gone
+    terminal — branch name, status and ``error_msg`` (which carries the
+    post-run gate verdict) all go into the reviewer's envelope.  Nothing on the
+    rollout carries it: ``advance_rollout`` returns item ids only, and
+    ``inFlightBuildRuns`` by definition excludes the terminal run we want.
+    Resolving it by query rather than from memory is also what makes the
+    startup re-adoption sweep work at all — a restarted worker has no memory.
+    """
+    result: list[dict[str, Any]] = await _request(
+        "GET", "/runs", token=token, params={"item_id": item_id}
+    )
+    return result

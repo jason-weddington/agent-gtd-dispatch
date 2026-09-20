@@ -360,6 +360,7 @@ class TestRolloutMethods:
                 "outcome": "completed",
                 "merge_actor": "manager-allowlist",
                 "decision_rule": "safe-docs",
+                "merge_note": "",
             },
         )
 

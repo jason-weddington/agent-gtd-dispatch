@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import re
 import subprocess
@@ -1056,6 +1057,13 @@ def build_system_prompt(
             run_id=run_id,
             workspace_repo_dirs=workspace_repo_dirs,
         )
+    if mode == DispatchMode.REVIEW:
+        # REVIEW prompts need the review envelope (branch, diff target, gate
+        # result, merge notes, re-dispatch tally) that this signature does not
+        # carry. The wave loop calls build_review_prompt directly; routing here
+        # would only be able to build a wrong prompt silently.
+        msg = "REVIEW mode builds its prompt via build_review_prompt()"
+        raise ValueError(msg)
     if mode == DispatchMode.MANAGE:
         return _build_manage_prompt(
             rollout_id or "",
@@ -2506,6 +2514,778 @@ def _build_manage_prompt(
     )
 
     return recovery_block + main_prompt
+
+
+# ---------------------------------------------------------------------------
+# REVIEW mode — the short-lived per-build merge reviewer
+# ---------------------------------------------------------------------------
+
+# The CLOSED set of verdicts a reviewer may return. Anything else is a
+# malformed verdict, which the worker treats as `halt` — an unrecognised
+# verdict must never be interpreted charitably as `merge`.
+REVIEW_VERDICTS: frozenset[str] = frozenset({"merge", "re-dispatch", "skip", "halt"})
+
+# Where the reviewer writes its verdict, relative to the rollout workspace
+# root. Mirrors the build contract's ``.dispatch/completion.json``: a file at a
+# fixed path is the only channel that survives a subprocess whose stdout is a
+# transcript.
+VERDICT_ARTIFACT_RELPATH: str = ".dispatch/verdict.json"
+
+# Where the per-rollout default-branch record is cached inside the reused
+# workspace, so a reviewer never re-derives (or guesses) a repo's base branch.
+DEFAULT_BRANCHES_RELPATH: str = ".dispatch/default-branches.json"
+
+# Cap on the reviewer's rationale text kept in logs/comments.
+REVIEW_RATIONALE_MAX_CHARS: int = 2000
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutWorkspace:
+    """A per-rollout workspace reused by every reviewer for that rollout."""
+
+    root: Path
+    #: repo directory name -> absolute path. For a monorepo project there is a
+    #: single entry whose path IS ``root``.
+    repo_paths: dict[str, Path]
+    #: repo directory name -> detected default branch, recorded ONCE at clone
+    #: time and reused by every subsequent reviewer.
+    default_branches: dict[str, str]
+    #: True when this call created the workspace, False when it was reused.
+    created: bool
+    #: True for a workspace (multi-repo) project, where each repo lives in its
+    #: own subdirectory under ``root``. False for a monorepo, where ``root`` IS
+    #: the single clone. Carried explicitly because a workspace project with
+    #: exactly one repo is still a workspace project.
+    workspace_mode: bool = False
+
+
+def rollout_workspace_path(rollout_id: str) -> Path:
+    """Return the stable workspace path for *rollout_id*.
+
+    Named ``rollout-<id>`` rather than ``repos-<run_id>`` precisely because it
+    is NOT per-run: it outlives every reviewer that uses it.
+    """
+    return config.WORKSPACE_ROOT / f"rollout-{rollout_id}"
+
+
+def _read_default_branches(root: Path) -> dict[str, str]:
+    """Read the cached default-branch record, or {} when absent/unreadable."""
+    path = root / DEFAULT_BRANCHES_RELPATH
+    try:
+        raw = subprocess.run(
+            _sudo_wrap(["cat", str(path)]),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if raw.returncode != 0:
+            return {}
+        data = json.loads(raw.stdout)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def _write_default_branches(root: Path, branches: dict[str, str]) -> None:
+    """Persist the default-branch record inside the reused workspace."""
+    payload = json.dumps(branches, indent=2, sort_keys=True)
+    subprocess.run(
+        _sudo_wrap(["mkdir", "-p", str(root / ".dispatch")]),
+        check=False,
+        capture_output=True,
+    )
+    subprocess.run(
+        _sudo_wrap(["tee", str(root / DEFAULT_BRANCHES_RELPATH)]),
+        input=payload.encode(),
+        check=False,
+        capture_output=True,
+    )
+
+
+def prepare_rollout_workspace(
+    rollout_id: str,
+    *,
+    git_origin: str = "",
+    repo_urls: list[str] | None = None,
+) -> RolloutWorkspace:
+    """Prepare (or REUSE) the persistent workspace shared by a rollout's reviewers.
+
+    Why reuse rather than clone per item: ``prepare_manage_workspace`` does a
+    ``--depth=50`` clone per manage run, and the workspace variant clones every
+    repo in the project.  Amortised once per rollout that is fine; paid once per
+    ITEM on a Raspberry Pi it is the dominant cost of reviewing a small diff.
+    A persistent workspace also preserves the recorded default branches for
+    free — the reviewer never has to re-derive a repo's base branch, which is
+    the input to the commit-count guard and to the merge itself.
+
+    Reuse is safe because the workspace is single-writer by construction: the
+    wave loop runs at most one reviewer per rollout at a time, and each reviewer
+    is handed a workspace that has just been HARD RESET to origin's default
+    branch in every repo (see :func:`refresh_rollout_workspace`).  Nothing from
+    a previous reviewer's tree survives that reset, so a reviewer cannot inherit
+    a half-applied inline fix from the item before it.
+
+    Idempotent: when the workspace already exists it is reused as-is and
+    ``created`` is False.  When it does not, every repo is cloned and its
+    default branch detected and recorded.
+
+    Args:
+        rollout_id: The rollout this workspace belongs to.
+        git_origin: Monorepo clone URL. Used when *repo_urls* is empty.
+        repo_urls: Workspace-project clone URLs, in project order.
+
+    Returns:
+        A :class:`RolloutWorkspace`.
+
+    Raises:
+        ValueError: If neither *git_origin* nor *repo_urls* is supplied, or if
+            two URLs map to the same directory name.
+        RuntimeError: On clone or checkout failure.
+    """
+    urls = list(repo_urls or [])
+    if not urls and not git_origin:
+        raise ValueError("prepare_rollout_workspace needs git_origin or repo_urls")
+
+    root = rollout_workspace_path(rollout_id)
+
+    if urls:
+        dir_names = [repo_dir_from_url(u) for u in urls]
+        seen: set[str] = set()
+        for name in dir_names:
+            if name in seen:
+                raise ValueError(f"Duplicate workspace repo directory: '{name}'")
+            seen.add(name)
+        repo_paths = {name: root / name for name in dir_names}
+    else:
+        dir_names = [repo_name_from_origin(git_origin)]
+        urls = [git_origin]
+        repo_paths = {dir_names[0]: root}
+
+    if root.exists():
+        cached = _read_default_branches(root)
+        if cached:
+            return RolloutWorkspace(
+                root=root,
+                repo_paths=repo_paths,
+                default_branches=cached,
+                created=False,
+                workspace_mode=bool(repo_urls),
+            )
+        # Directory exists but carries no record — treat it as reusable and
+        # re-derive rather than deleting someone else's tree.
+        branches = {
+            name: _detect_default_branch(path) for name, path in repo_paths.items()
+        }
+        _write_default_branches(root, branches)
+        return RolloutWorkspace(
+            root=root,
+            repo_paths=repo_paths,
+            default_branches=branches,
+            created=False,
+            workspace_mode=bool(repo_urls),
+        )
+
+    config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        _sudo_wrap(["mkdir", "-p", str(root)]),
+        check=True,
+        capture_output=True,
+    )
+
+    default_branches: dict[str, str] = {}
+    for url, name in zip(urls, dir_names, strict=True):
+        dest = repo_paths[name]
+        result = subprocess.run(
+            _sudo_wrap(["git", "clone", "--depth=50", url, str(dest)]),
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            stderr_tail = result.stderr.decode("utf-8", errors="replace")[-300:]
+            raise RuntimeError(
+                f"rollout workspace clone failed for {url}: {stderr_tail}"
+            )
+        branch = _detect_default_branch(dest)
+        checkout = subprocess.run(
+            _sudo_wrap(["git", "checkout", branch]),
+            cwd=dest,
+            check=False,
+            capture_output=True,
+        )
+        if checkout.returncode != 0:
+            stderr_tail = checkout.stderr.decode("utf-8", errors="replace")[-300:]
+            raise RuntimeError(
+                f"rollout workspace checkout failed for {url}: {stderr_tail}"
+            )
+        default_branches[name] = branch
+
+    _write_default_branches(root, default_branches)
+    return RolloutWorkspace(
+        root=root,
+        repo_paths=repo_paths,
+        default_branches=default_branches,
+        created=True,
+        workspace_mode=bool(repo_urls),
+    )
+
+
+def refresh_rollout_workspace(workspace: RolloutWorkspace) -> None:
+    """Return every repo in a reused workspace to a clean origin/<default> state.
+
+    Run immediately BEFORE each reviewer launch.  This is what makes reuse
+    safe: a previous reviewer may have left a feature branch checked out, an
+    inline fix in the tree, or a half-applied merge.  Fetch, hard-reset to
+    ``origin/<default>`` and clean untracked files, so every reviewer starts
+    from the same state a fresh clone would give it — minus the clone.
+
+    Best effort per repo: a repo that cannot be refreshed is logged and left
+    alone rather than failing the whole wave, because the reviewer's own
+    contract makes it verify the base before merging onto it.
+    """
+    for name, path in workspace.repo_paths.items():
+        branch = workspace.default_branches.get(name) or _DEFAULT_BRANCH_CANDIDATES[0]
+        for argv in (
+            ["git", "fetch", "origin", "--prune"],
+            ["git", "checkout", branch],
+            ["git", "reset", "--hard", f"origin/{branch}"],
+            ["git", "clean", "-fd"],
+        ):
+            result = subprocess.run(
+                _sudo_wrap(argv),
+                cwd=path,
+                check=False,
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "rollout workspace refresh: %s failed in %s: %s",
+                    " ".join(argv),
+                    path,
+                    result.stderr.decode("utf-8", errors="replace")[-300:],
+                )
+
+
+def clear_review_verdict(workspace_root: Path) -> None:
+    """Delete any verdict artifact left behind in a REUSED rollout workspace.
+
+    Load-bearing for workspace reuse: without it, a reviewer that dies before
+    writing its verdict would be credited with the PREVIOUS item's answer —
+    quite possibly a `merge`.
+    """
+    subprocess.run(
+        _sudo_wrap(["rm", "-f", str(workspace_root / VERDICT_ARTIFACT_RELPATH)]),
+        check=False,
+        capture_output=True,
+    )
+
+
+def read_review_verdict(workspace_root: Path) -> tuple[dict[str, Any] | None, str]:
+    """Read and validate the reviewer's verdict artifact.
+
+    Returns ``(verdict, reason)``.  ``verdict`` is None whenever the artifact
+    could not be used, and ``reason`` is one of the literals ``ok``, ``absent``,
+    ``not_json``, ``not_object``, ``unknown_schema_version``,
+    ``unknown_verdict``, ``missing_rationale`` — the same
+    named-failure-literal shape the build completion artifact uses, so
+    telemetry can distinguish a malformed verdict from a missing one while the
+    worker's decision stays binary.
+
+    A reviewer that returns no usable verdict does NOT get the benefit of the
+    doubt: the caller halts.  Merging on a guess is the one outcome that cannot
+    be undone.
+    """
+    path = workspace_root / VERDICT_ARTIFACT_RELPATH
+    result = subprocess.run(
+        _sudo_wrap(["cat", str(path)]),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None, "absent"
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None, "not_json"
+    if not isinstance(data, dict):
+        return None, "not_object"
+    if data.get("schema_version") != 1:
+        return None, "unknown_schema_version"
+    verdict = data.get("verdict")
+    if not isinstance(verdict, str) or verdict not in REVIEW_VERDICTS:
+        return None, "unknown_verdict"
+    rationale = data.get("rationale")
+    if not isinstance(rationale, str) or not rationale.strip():
+        return None, "missing_rationale"
+    return data, "ok"
+
+
+def _review_conflict_contract_block(*, workspace_mode: bool) -> str:
+    """The merge-conflict / non-fast-forward contract. Verbatim in the prompt.
+
+    Neither manage prompt mentioned either failure today: no ``git status``, no
+    ``--abort``, and nothing at all for the rejection you get when the default
+    branch moved between your fetch and your push — which is live, because
+    other sessions push to the same origin.
+    """
+    if workspace_mode:
+        partial = """\
+
+**Workspace mode — a conflict on repo 2 of 3.** Repos are merged in order and
+the earlier ones are already pushed. You may NOT roll them back, and you may
+NOT continue to repo 3. Do exactly this:
+
+1. `git merge --abort` in the failing repo. Leave it on its default branch
+   with a clean tree.
+2. Touch NOTHING in the repos that already merged, and nothing in the repos
+   that have not been reached. No revert, no force-push, no cleanup.
+3. Write the verdict artifact with `verdict: "halt"` and a `repo_states`
+   object naming every repo with exactly one of `merged`, `failed` or
+   `untouched`, plus `failure.kind` and `failure.detail`.
+
+The wave stops there and a human resolves the split state. That is the
+DETERMINISTIC outcome: a half-merged wave that is accurately described is
+recoverable; a half-merged wave that something tried to tidy up is not."""
+    else:
+        partial = """\
+
+**Single repo.** There is no partial state to describe: either the one merge
+landed or nothing did."""
+
+    body = f"""\
+## Merge Conflict and Non-Fast-Forward — the contract
+
+Two failures can happen during the merge itself, and you handle BOTH the same
+way: **attempt, detect, abort cleanly, report. Never improvise a resolution.**
+
+**1. Merge conflict.** `git merge --squash <branch>` exits non-zero and leaves
+conflict markers in the tree.
+
+```bash
+git merge --squash <branch> || {{
+    git merge --abort || git reset --hard HEAD
+    git status --porcelain   # MUST be empty before you go on
+}}
+```
+
+You do NOT resolve conflicts. Not "just the import block", not "obviously the
+branch's version wins". A conflict means two changes disagree about the same
+lines and nobody has decided which is right — that is a human's call, and a
+reviewer that picks one has silently discarded the other.
+
+**2. Non-fast-forward push.** `git push origin <default_branch>` is rejected
+because the default branch moved between your fetch and your push. Other
+sessions push to this same origin; this is expected, not exotic.
+
+```bash
+git push origin <default_branch> || {{
+    git reset --hard origin/<default_branch>   # after a fresh fetch
+    git status --porcelain                     # MUST be empty
+}}
+```
+
+**NEVER `git push --force` and NEVER `--force-with-lease`.** A rejected push
+means someone else's commit is on the branch. Discard YOUR merge commit (it is
+a squash of a branch that still exists on the remote — nothing is lost) and
+report the failure. Do not re-fetch, rebase and retry: the tree you gated is no
+longer the tree you would be pushing, so a retry would merge work that was
+never reviewed against a base that was never verified.
+
+**Leaving the workspace unmodified is part of the contract.** After either
+abort, `git status --porcelain` must be EMPTY and HEAD must be on the repo's
+default branch. Verify it; do not assume it.
+
+**Report it structurally.** Set `failure.kind` to exactly one of
+`merge_conflict` or `non_fast_forward` (or `gate_failed`, `commit_count_zero`,
+`push_failed` for the other merge-step failures), and put the git output tail
+in `failure.detail`.
+{partial}"""
+    return _indent_prompt_block(body)
+
+
+def _review_envelope_block(
+    item: dict[str, Any],
+    branch_name: str,
+    run_status: str,
+    gate_result: str,
+    merge_notes: list[dict[str, Any]] | None,
+) -> str:
+    """The evidence envelope handed to a reviewer: AC, branch, gate, notes."""
+    criteria = item.get("acceptance_criteria") or []
+    if isinstance(criteria, str):
+        try:
+            criteria = json.loads(criteria)
+        except ValueError:
+            criteria = [criteria]
+    ac_lines = "\n".join(f"{i}. {c}" for i, c in enumerate(criteria, start=1))
+    if not ac_lines:
+        ac_lines = "(this item declares no structured acceptance criteria)"
+
+    scope_out = item.get("scope_out") or []
+    if isinstance(scope_out, str):
+        try:
+            scope_out = json.loads(scope_out)
+        except ValueError:
+            scope_out = [scope_out]
+    scope_lines = "\n".join(f"- {c}" for c in scope_out) or "(none declared)"
+
+    notes = list(merge_notes or [])[:MERGE_NOTE_CONTEXT_LIMIT]
+    if notes:
+        note_rows = "\n".join(
+            f"- item `{n.get('item_id') or 'unknown'}`: "
+            f"{' '.join(str(n.get('note') or '').split())}"
+            for n in notes
+        )
+    else:
+        note_rows = (
+            "(no item in this rollout has been merged with a merge note yet — "
+            "you are the first)"
+        )
+
+    body = f"""\
+## The Build You Are Reviewing
+
+**Item:** {item.get("title", "(untitled)")} (`{item.get("id", "")}`)
+**Branch:** `{branch_name}`
+**Child build run terminal status:** `{run_status}`
+**Post-run gate result (from the dispatch worker):** {gate_result}
+
+### Item description
+
+{item.get("description", "(no description)")}
+
+### Acceptance criteria — the contract this diff must satisfy
+
+{ac_lines}
+
+### Declared out of scope
+
+{scope_lines}
+
+### Recent merge notes for this rollout (newest first)
+
+These are the persisted record of what already-merged items in this rollout
+changed that could invalidate a later item's spec. Read them as fact. They are
+what replaces a resident manager's accumulated context — you have none, and you
+are not supposed to.
+
+{note_rows}"""
+    return _indent_prompt_block(body)
+
+
+def build_review_prompt(
+    item: dict[str, Any],
+    project: dict[str, Any],
+    rollout_id: str,
+    branch_name: str,
+    max_turns: int,
+    workspace: Path,
+    *,
+    repo_dirs: list[str] | None = None,
+    default_branches: dict[str, str] | None = None,
+    workspace_mode: bool = False,
+    run_status: str = "unknown",
+    gate_result: str = "(not reported)",
+    merge_notes: list[dict[str, Any]] | None = None,
+    redispatches_used: int = 0,
+    redispatch_cap: int = 1,
+) -> str:
+    """System prompt for REVIEW mode — review ONE build, then merge or refuse.
+
+    The scope is deliberately one item.  A full map of both manage prompt
+    variants found that of roughly twenty steps, exactly FOUR are irreducibly
+    model work — acceptance-criteria reconciliation, the unrelated-manifest
+    scope judgment, the inline-fix small-or-not decision, and sensitive-area
+    discretion — and all four sit inside the review-and-merge window for a
+    SINGLE completed build.  Everything else in the old loop is deterministic
+    and now lives in the worker.
+    """
+    project_name = project.get("name", "")
+    dirs = list(repo_dirs or [])
+    branches = dict(default_branches or {})
+    gate_command = (project.get("gate_command") or "").strip()
+
+    if workspace_mode:
+        repo_bullets = "\n        ".join(
+            f"- `{d}/` (default branch `{branches.get(d, 'main')}`)" for d in dirs
+        )
+        layout = f"""\
+Your workspace is a **workspace root** containing one git clone per repo, each
+already checked out on its own default branch and hard-reset to origin:
+
+{repo_bullets}
+
+Merge order is that list order, pushed repos only."""
+        where = "the workspace root"
+    else:
+        only = dirs[0] if dirs else project_name
+        layout = (
+            f"Your workspace is a single git clone of `{only}`, checked out on "
+            f"`{branches.get(only, 'main')}` and hard-reset to origin."
+        )
+        where = "the repo root"
+
+    if gate_command:
+        gate_block = f"""\
+The merge bar is the project's stored `gate_command`. It is NOT something you
+infer, and it is the same command the dispatch worker already ran as the
+post-run gate. Run it verbatim from {where}:
+
+```bash
+{gate_command.replace(chr(10), chr(10) + "        ")}
+```
+
+Do not derive a different test/lint command from `CLAUDE.md` or `README.md` and
+merge against that instead. Two reviewers inferring two different bars for the
+same repo apply two different standards to consecutive items — that is a
+correctness problem, not a style one."""
+    else:
+        gate_block = f"""\
+This project has NO stored `gate_command`, so you are in FALLBACK mode: read
+`CLAUDE.md` / `README.md`, infer the test and lint commands, and run them from
+{where} before merging. A gate-less project is not a rollout with no quality
+bar. If a repo has no discoverable test or lint command at all, record `none`
+for it and continue — do NOT halt for that alone."""
+
+    envelope = _review_envelope_block(
+        item, branch_name, run_status, gate_result, merge_notes
+    )
+    conflict_contract = _review_conflict_contract_block(workspace_mode=workspace_mode)
+    commit_type = _manage_commit_type_block()
+    merge_note_rules = _manage_merge_note_block()
+
+    redispatch_line = (
+        f"This item has already been re-dispatched {redispatches_used} time(s); "
+        f"the cap is {redispatch_cap} per item. "
+        + (
+            "A further `re-dispatch` verdict will be converted to a HALT by the "
+            "worker, so choose it only if you believe one more build genuinely "
+            "fixes this."
+            if redispatches_used >= redispatch_cap
+            else "A `re-dispatch` verdict is still available."
+        )
+    )
+
+    return textwrap.dedent(
+        f"""\
+        You are a headless MERGE REVIEWER dispatched by the Agent GTD wave loop.
+        No human is available for questions — you must work autonomously.
+
+        **Mode: REVIEW** — You review ONE completed build and either merge it or
+        refuse it. You are short-lived by design: you were launched for this one
+        item and you exit when you have written your verdict.
+
+        **Project:** {project_name}
+        **Rollout ID:** {rollout_id}
+        **Turns remaining:** {max_turns}
+
+        {layout}
+
+        {envelope}
+
+        ## What You Decide, And What You Do Not
+
+        You return a VERDICT from a CLOSED set, and you perform the git merge
+        yourself when — and only when — that verdict is `merge`:
+
+        | verdict | meaning | who acts |
+        |---|---|---|
+        | `merge` | the work satisfies the ACs and passes the bar — YOU merged it | you merged; the worker records the item complete |
+        | `re-dispatch` | the work is wrong or incomplete but another build plausibly fixes it | the WORKER re-dispatches the item |
+        | `skip` | nothing to merge — the work was already done, or the branch is empty and legitimately so | the WORKER records the item skipped and advances |
+        | `halt` | anything you are not certain about | the WORKER halts the rollout for a human |
+
+        **YOU DO NOT DISPATCH.** You have no dispatch URL and no dispatch key,
+        deliberately: re-dispatching is the worker's decision to execute, not
+        yours. Do not try to call a dispatch tool, do not shell out to one, and
+        do not treat their absence as a misconfiguration. Returning
+        `re-dispatch` IS how you ask for another build.
+
+        {redispatch_line}
+
+        **When in doubt, `halt`.** A halted rollout recovers. A merged
+        regression does not. `halt` is never the wrong answer when you are
+        uncertain; `merge` frequently is.
+
+        ## Step 1 — Publish your phase
+
+        ```
+        mcp__agent-gtd__update_rollout_state(
+            rollout_id="{rollout_id}",
+            phase="reviewing",
+            current_item_id="{item.get("id", "")}",
+            current_step="Reviewing {branch_name}",
+        )
+        ```
+        Call it again with `phase="merging"` when you start the merge. Each call
+        REPLACES all four state fields — pass `current_item_id` every time.
+
+        ## Step 2 — Find which repos actually received the branch
+
+        In EVERY repo directory:
+        ```bash
+        git fetch origin
+        git ls-remote origin refs/heads/{branch_name}
+        ```
+        Non-empty output means that repo has the branch. `git ls-remote` is
+        AUTHORITATIVE. Cross-check against the build agent's final comment,
+        which is required to list exactly which repos it pushed to. Either
+        direction of disagreement is a `halt` — name both sources in your
+        rationale:
+        - the comment claims a repo the remote does not have: a push was
+          reported that did not land;
+        - the remote has a branch the comment did not list: unreported work.
+
+        If NO repo has the branch: read the child run's terminal status in the
+        envelope above. `already_satisfied` means the build agent asserted the
+        work was already done and the worker verified the quality gate on the
+        tree as it stood — return `skip`. Any other status with no branch is a
+        `halt` (or a `re-dispatch`, if the run failed for a reason another build
+        would plausibly not hit).
+
+        ## Step 3 — Reconcile the acceptance criteria against the diff
+
+        ```bash
+        git checkout {branch_name}
+        git diff origin/<default_branch>...{branch_name}
+        ```
+
+        This is the judgment you were launched for. Read the diff against the
+        acceptance criteria listed above, one at a time, and decide whether the
+        work actually satisfies them — not whether it looks plausible, and not
+        whether the tests pass (the gate answers that separately).
+
+        Three specific judgments are yours and cannot be reduced to a predicate:
+
+        1. **Unrelated manifest changes.** If the diff adds to
+           `package.json` / `package-lock.json` / `pyproject.toml` / `uv.lock`
+           things not tied to the item's stated scope, treat them as suspect:
+           revert those specific changes with `git checkout HEAD -- <file>` and
+           re-run the bar. A dependency added in passing is how supply chain
+           surface grows without anyone deciding to grow it.
+        2. **Is the fix small?** See Step 4.
+        3. **Sensitive areas.** If the diff touches auth code (`**/auth.py`,
+           `**/auth_routes.py`, route authentication), deploy/release scripts
+           (`deploy.sh`, `release.sh`, `start.sh`), CI or hooks (`.github/**`,
+           `.pre-commit-config.yaml`), infrastructure units (`*.service`,
+           `Dockerfile*`, `nginx*.conf`) or env/secrets (`.env*`, `.envrc*`),
+           prefer `halt` over `merge`. This is discretion, not a hard predicate:
+           a one-word typo fix in a Dockerfile comment is routine; a change to
+           how a route authenticates is not.
+
+        If the merged work will invalidate a LATER item's spec, say so in your
+        rationale — the worker persists it as this rollout's merge note and
+        every subsequent reviewer is handed it.
+
+        ## Step 4 — Run the merge bar in every pushed repo, BEFORE any merge
+
+        {gate_block}
+
+        **Inline-fix phase boundary.** While ZERO repos for this item have been
+        merged, a SMALL gate failure may be fixed inline — formatting, a single
+        missing import, a one-line change, a coverage ratchet bump, a stale test
+        assertion — then re-run the bar. "Small" is your judgment; if the fix is
+        non-trivial, or your first attempt does not make the bar green, stop and
+        return `re-dispatch` (the build agent has the item's full context and
+        you do not) or `halt`. Once the FIRST repo has been merged and pushed,
+        ANY subsequent failure is an immediate `halt` — no inline fixes, no
+        retries.
+
+        ALL pushed repos must pass the bar before ANY repo is merged.
+
+        ## Step 5 — Merge
+
+        Immediately before each repo's merge, run the commit-count guard using
+        THAT repo's recorded default branch:
+        ```bash
+        git fetch origin {branch_name}
+        commit_count=$(git rev-list origin/<default_branch>..{branch_name} --count)
+        ```
+        `commit_count == 0` with a child status of `already_satisfied` is a
+        `skip`. `commit_count == 0` with any other status is a `halt`.
+
+        {commit_type}
+
+        Squash merge, inside each repo's directory, against THAT repo's default
+        branch:
+        ```bash
+        git checkout <default_branch>
+        git merge --squash {branch_name}
+        git commit -F - <<'COMMITEOF'
+        <type>({item.get("id", "")[:8]}): {item.get("title", "")}
+
+        Rollout: {rollout_id}
+        Item: {item.get("id", "")}
+        COMMITEOF
+        git push origin <default_branch>
+        ```
+
+        Then delete the feature branch in each merged repo:
+        ```bash
+        git push origin --delete {branch_name}
+        git branch -D {branch_name}
+        ```
+
+        {conflict_contract}
+
+        {merge_note_rules}
+
+        ## Guardrails — Never Lower the Quality Bar
+
+        - NEVER lower `[tool.coverage.report] fail_under`. Coverage ratchets up
+          only. A `chore: lower coverage threshold` commit on the branch is a
+          guardrail violation: revert it before merging, or halt.
+        - Do not comment out test hooks, skip the suite, add blanket
+          `# type: ignore`, or push with `--no-verify`.
+        - Never force-push. Never roll back a repo that already merged.
+
+        ## Completion Artifact — this is how you return your verdict
+
+        Write this file as the LAST action of your run, on EVERY path. It is the
+        ONLY channel the worker reads; a run that ends without it is treated as
+        `halt`, and your reasoning is lost.
+
+        ```
+        {workspace}/{VERDICT_ARTIFACT_RELPATH}
+        ```
+
+        Create the parent directory first if needed. Write it at that ABSOLUTE
+        path regardless of which repo directory you are currently in.
+
+        ```json
+        {{
+          "schema_version": 1,
+          "verdict": "merge",
+          "rationale": "one or two sentences on why",
+          "merge_note": "signature/rename/config-key changes, or 'no signature, rename or config-key changes'",
+          "repo_states": {{"<repo_dir>": "merged"}},
+          "failure": {{"kind": "", "detail": ""}}
+        }}
+        ```
+
+        - `verdict` is exactly one of `merge`, `re-dispatch`, `skip`, `halt`.
+          Any other string is rejected and treated as `halt`.
+        - `rationale` is REQUIRED and must be non-empty.
+        - `merge_note` is REQUIRED when `verdict` is `merge`.
+        - `repo_states` maps each repo directory to exactly one of `merged`,
+          `failed`, `untouched`. Required whenever anything was merged or
+          attempted.
+        - `failure.kind` is one of `merge_conflict`, `non_fast_forward`,
+          `gate_failed`, `commit_count_zero`, `push_failed`,
+          `ac_not_satisfied`, `sensitive_area`, `` (empty when there was no
+          failure).
+
+        ## Rules
+
+        - You have max {max_turns} turns. Budget them wisely.
+        - Never touch rollouts or items outside `rollout_id={rollout_id}`.
+        - Do not dispatch anything. Do not halt the rollout yourself — return
+          the `halt` verdict and let the worker do it.
+        - Post at most one comment on the item, summarising your verdict.
+    """
+    )
 
 
 def _build_gate_section_build(gate_command: str, workspace_mode: bool) -> str:

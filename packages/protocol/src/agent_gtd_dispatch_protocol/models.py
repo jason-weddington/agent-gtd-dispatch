@@ -21,11 +21,23 @@ class RunStatus(StrEnum):
 
 
 class DispatchMode(StrEnum):
-    """Dispatch execution mode."""
+    """Dispatch execution mode.
+
+    ``REVIEW`` is the short-lived per-build merge reviewer the dispatch worker
+    launches from its own wave loop.  It is a DISTINCT mode rather than a flag
+    on a manage run on purpose: the manage relaunch ladder fires on
+    ``run.mode == MANAGE and run.rollout_id`` and exists to resurrect a RESIDENT
+    manager, so a reviewer exiting — which is normal completion, not a crash —
+    must not look like one.  A separate mode also keeps the reviewer out of the
+    manage-only env grant (``_MANAGE_EXECUTOR_ENV_KEYS``: a reviewer never
+    dispatches) and gives it its own turn budget, without touching either the
+    ladder or the manage path.
+    """
 
     BUILD = "build"
     PLAN = "plan"
     MANAGE = "manage"
+    REVIEW = "review"
 
 
 class DispatchRequest(BaseModel):

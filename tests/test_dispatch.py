@@ -5395,3 +5395,257 @@ class TestShowRunTranscriptDocstring:
         doc = show_run_transcript.__doc__ or ""
         assert "repos-{run_id}" in doc
         assert "wave-manager-abc123" not in doc
+
+
+# ---------------------------------------------------------------------------
+# REVIEW mode — the short-lived per-build merge reviewer
+# ---------------------------------------------------------------------------
+
+
+class TestReviewPromptContract:
+    """Text guards on the reviewer prompt.
+
+    No behavioural test can catch a prompt-text regression, and three of the
+    four judgments this agent exists to make live only in the prompt.
+    """
+
+    ITEM: ClassVar[dict] = {
+        "id": "abcdef01-2345-6789-abcd-ef0123456789",
+        "title": "Do the thing",
+        "description": "Make it work.",
+        "acceptance_criteria": ["The thing works", "Tests cover it"],
+        "scope_out": ["Do not touch auth"],
+    }
+    PROJECT: ClassVar[dict] = {"name": "P", "gate_command": "make gate"}
+
+    def _prompt(self, *, workspace_mode: bool = True) -> str:
+        dirs = ["repo-a", "repo-b"] if workspace_mode else ["repo-a"]
+        return dispatch.build_review_prompt(
+            self.ITEM,
+            self.PROJECT,
+            "rollout-abc",
+            "feat/abcdef01-do-the-thing",
+            40,
+            Path("/srv/agent/workspace/rollout-abc"),
+            repo_dirs=dirs,
+            default_branches=dict.fromkeys(dirs, "main"),
+            workspace_mode=workspace_mode,
+            run_status="success",
+            gate_result="no failure recorded",
+            merge_notes=[{"item_id": "item-0", "note": "renamed Foo to Bar"}],
+        )
+
+    def test_verdict_set_is_closed_and_enumerated(self) -> None:
+        prompt = self._prompt()
+        for verdict in sorted(dispatch.REVIEW_VERDICTS):
+            assert f"`{verdict}`" in prompt
+        assert "CLOSED set" in prompt
+
+    def test_reviewer_is_told_it_does_not_dispatch(self) -> None:
+        prompt = self._prompt()
+        assert "YOU DO NOT DISPATCH." in prompt
+        assert "no dispatch URL and no dispatch key" in prompt
+
+    def test_verdict_artifact_path_and_schema_are_absolute(self) -> None:
+        prompt = self._prompt()
+        assert "/srv/agent/workspace/rollout-abc/.dispatch/verdict.json" in prompt
+        assert "schema_version" in prompt
+        assert "ABSOLUTE" in prompt
+
+    def test_envelope_carries_branch_acs_gate_and_merge_notes(self) -> None:
+        prompt = self._prompt()
+        assert "feat/abcdef01-do-the-thing" in prompt
+        assert "The thing works" in prompt
+        assert "Tests cover it" in prompt
+        assert "Do not touch auth" in prompt
+        assert "no failure recorded" in prompt
+        assert "renamed Foo to Bar" in prompt
+
+    def test_merge_bar_is_the_stored_gate_command(self) -> None:
+        assert "make gate" in self._prompt()
+
+    def test_gateless_project_falls_back_to_inference(self) -> None:
+        prompt = dispatch.build_review_prompt(
+            self.ITEM,
+            {"name": "P"},
+            "rollout-abc",
+            "feat/x",
+            40,
+            Path("/ws"),
+            repo_dirs=["repo-a"],
+            default_branches={"repo-a": "main"},
+        )
+        assert "FALLBACK mode" in prompt
+        assert "not a rollout with no quality" in prompt
+
+    def test_conflict_contract_covers_abort_and_non_fast_forward(self) -> None:
+        prompt = self._prompt()
+        assert "git merge --abort" in prompt
+        assert "non_fast_forward" in prompt
+        assert "merge_conflict" in prompt
+        assert "NEVER `git push --force`" in prompt
+        assert "git status --porcelain" in prompt
+        assert "attempt, detect, abort cleanly, report" in prompt.lower()
+
+    def test_workspace_mode_states_the_partial_merge_behaviour(self) -> None:
+        prompt = self._prompt(workspace_mode=True)
+        assert "conflict on repo 2 of 3" in prompt
+        assert "repo_states" in prompt
+        assert "No revert, no force-push" in prompt
+
+    def test_monorepo_mode_says_there_is_no_partial_state(self) -> None:
+        prompt = self._prompt(workspace_mode=False)
+        assert "no partial state to describe" in prompt
+        assert "conflict on repo 2 of 3" not in prompt
+
+    def test_the_four_model_judgments_are_present(self) -> None:
+        prompt = self._prompt()
+        assert "Reconcile the acceptance criteria" in prompt
+        assert "Unrelated manifest changes" in prompt
+        assert "Is the fix small?" in prompt
+        assert "Sensitive areas" in prompt
+
+    def test_redispatch_cap_is_stated_and_exhaustion_is_explicit(self) -> None:
+        exhausted = dispatch.build_review_prompt(
+            self.ITEM,
+            self.PROJECT,
+            "rollout-abc",
+            "feat/x",
+            40,
+            Path("/ws"),
+            repo_dirs=["repo-a"],
+            default_branches={"repo-a": "main"},
+            redispatches_used=1,
+            redispatch_cap=1,
+        )
+        assert "the cap is 1 per item" in exhausted
+        assert "converted to a HALT" in exhausted
+
+    def test_build_system_prompt_refuses_review_mode(self) -> None:
+        from agent_gtd_dispatch.models import DispatchMode
+
+        with pytest.raises(ValueError, match="build_review_prompt"):
+            build_system_prompt({}, {"name": "P"}, None, 40, mode=DispatchMode.REVIEW)
+
+
+class TestReadReviewVerdict:
+    def _write(self, tmp_path: Path, payload: str) -> Path:
+        (tmp_path / ".dispatch").mkdir(parents=True, exist_ok=True)
+        (tmp_path / dispatch.VERDICT_ARTIFACT_RELPATH).write_text(payload)
+        return tmp_path
+
+    def test_absent_artifact(self, tmp_path: Path) -> None:
+        assert dispatch.read_review_verdict(tmp_path) == (None, "absent")
+
+    def test_not_json(self, tmp_path: Path) -> None:
+        self._write(tmp_path, "not json at all")
+        assert dispatch.read_review_verdict(tmp_path)[1] == "not_json"
+
+    def test_not_object(self, tmp_path: Path) -> None:
+        self._write(tmp_path, "[1, 2, 3]")
+        assert dispatch.read_review_verdict(tmp_path)[1] == "not_object"
+
+    def test_unknown_schema_version(self, tmp_path: Path) -> None:
+        self._write(tmp_path, json.dumps({"schema_version": 99, "verdict": "merge"}))
+        assert dispatch.read_review_verdict(tmp_path)[1] == "unknown_schema_version"
+
+    def test_verdict_outside_the_closed_set_is_rejected(self, tmp_path: Path) -> None:
+        self._write(
+            tmp_path,
+            json.dumps(
+                {"schema_version": 1, "verdict": "merge-anyway", "rationale": "x"}
+            ),
+        )
+        assert dispatch.read_review_verdict(tmp_path)[1] == "unknown_verdict"
+
+    def test_missing_rationale(self, tmp_path: Path) -> None:
+        self._write(tmp_path, json.dumps({"schema_version": 1, "verdict": "merge"}))
+        assert dispatch.read_review_verdict(tmp_path)[1] == "missing_rationale"
+
+    def test_valid_verdict(self, tmp_path: Path) -> None:
+        self._write(
+            tmp_path,
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "verdict": "merge",
+                    "rationale": "ACs satisfied",
+                    "merge_note": "no signature changes",
+                }
+            ),
+        )
+        blob, reason = dispatch.read_review_verdict(tmp_path)
+        assert reason == "ok"
+        assert blob is not None
+        assert blob["verdict"] == "merge"
+
+    def test_clear_removes_a_stale_verdict(self, tmp_path: Path) -> None:
+        self._write(
+            tmp_path,
+            json.dumps({"schema_version": 1, "verdict": "merge", "rationale": "x"}),
+        )
+        dispatch.clear_review_verdict(tmp_path)
+        assert dispatch.read_review_verdict(tmp_path) == (None, "absent")
+
+
+class TestRolloutWorkspaceReuse:
+    """One clone per ROLLOUT, not one per item."""
+
+    def test_path_is_keyed_on_the_rollout_not_a_run(self, tmp_path: Path) -> None:
+        with patch.object(config, "WORKSPACE_ROOT", tmp_path):
+            assert (
+                dispatch.rollout_workspace_path("roll-1") == tmp_path / "rollout-roll-1"
+            )
+
+    def test_second_call_reuses_and_does_not_clone(self, tmp_path: Path) -> None:
+        root = tmp_path / "rollout-roll-1"
+        (root / ".dispatch").mkdir(parents=True)
+        (root / dispatch.DEFAULT_BRANCHES_RELPATH).write_text(
+            json.dumps({"repo-a": "trunk"})
+        )
+        with (
+            patch.object(config, "WORKSPACE_ROOT", tmp_path),
+            patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps({"repo-a": "trunk"}), stderr=""
+            )
+            ws = dispatch.prepare_rollout_workspace(
+                "roll-1", repo_urls=["git@h:o/repo-a.git"]
+            )
+        assert ws.created is False
+        assert ws.default_branches == {"repo-a": "trunk"}
+        assert not any("clone" in str(c.args[0]) for c in mock_run.call_args_list)
+
+    def test_requires_an_origin_or_repo_urls(self, tmp_path: Path) -> None:
+        with (
+            patch.object(config, "WORKSPACE_ROOT", tmp_path),
+            pytest.raises(ValueError, match="git_origin or repo_urls"),
+        ):
+            dispatch.prepare_rollout_workspace("roll-1")
+
+    def test_duplicate_repo_dirs_rejected(self, tmp_path: Path) -> None:
+        with (
+            patch.object(config, "WORKSPACE_ROOT", tmp_path),
+            pytest.raises(ValueError, match="Duplicate"),
+        ):
+            dispatch.prepare_rollout_workspace(
+                "roll-1", repo_urls=["git@h:a/repo.git", "git@h:b/repo.git"]
+            )
+
+    def test_refresh_hard_resets_every_repo(self, tmp_path: Path) -> None:
+        ws = dispatch.RolloutWorkspace(
+            root=tmp_path,
+            repo_paths={"repo-a": tmp_path / "repo-a"},
+            default_branches={"repo-a": "main"},
+            created=False,
+            workspace_mode=True,
+        )
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess([], 0, b"", b"")
+            dispatch.refresh_rollout_workspace(ws)
+        argvs = [c.args[0] for c in mock_run.call_args_list]
+        flat = [" ".join(a) for a in argvs]
+        assert any("git fetch origin --prune" in f for f in flat)
+        assert any("git reset --hard origin/main" in f for f in flat)
+        assert any("git clean -fd" in f for f in flat)

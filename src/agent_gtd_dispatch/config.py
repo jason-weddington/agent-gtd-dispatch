@@ -93,6 +93,47 @@ MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS: int = 120
 # ever counting toward MAX_MANAGE_RETRIES.
 MAX_MANAGE_FREE_RELAUNCHES: int = 25
 
+# --- Worker-driven rollout wave loop + short-lived merge reviewer -----------
+#
+# The worker owns the wave loop; a REVIEW-mode agent is launched per completed
+# build, reviews it, and merges it. Everything below tunes that loop.
+
+# Default engine for a reviewer when the rollout row carries none. The
+# AUTHORITATIVE resolution lives on the GTD side
+# (``dispatch_worker.resolve_reviewer_engine``: rollout -> project ->
+# deployment default) and arrives on the rollout dict as ``reviewer_engine``.
+# This is only the floor for a rollout that predates that column.
+REVIEWER_ENGINE: str = "claude-code-sonnet"
+
+# Turn budget for one reviewer. Mirrors
+# ``agent_gtd.dispatch_worker.REVIEW_MAX_TURNS`` — a reviewer decides ONE build:
+# read the diff, reconcile the item's ACs, run the gate, merge a handful of
+# repos, write the verdict artifact. Keep the two numerically equal.
+REVIEW_MAX_TURNS: int = 40
+
+# Wall-clock ceiling for one reviewer. Generous enough for a cold gate run on
+# the Pi (the project gate command is the expensive part, not the model), far
+# below the 4-hour manage backstop it replaces: a reviewer that has not
+# finished one build in this long is wedged, not slow.
+REVIEW_TIMEOUT_SECONDS: int = 45 * 60
+
+# Seconds the wave loop sleeps between ticks while builds are in flight.
+# The loop is a poller by necessity — child build runs are executed by a
+# different process (possibly on a different host) and there is no push
+# notification to wait on.
+ROLLOUT_LOOP_POLL_SECONDS: int = 30
+
+# Per-ITEM cap on `re-dispatch` verdicts within one rollout.
+#
+# There is no retry concept for a failed child build anywhere today: one failed
+# child halts the whole rollout. A reviewer's `re-dispatch` verdict introduces
+# one, and a cap is what keeps it from becoming an unbounded build loop that
+# burns a token budget on an item that will never go green. 1 means: a given
+# item gets exactly one second chance per rollout; the next `re-dispatch`
+# verdict for that item halts instead. Default behaviour is unchanged — absent
+# an explicit `re-dispatch` verdict, a failed child still halts.
+MAX_ITEM_REDISPATCHES: int = 1
+
 # Planner (wave DAG)
 ANTHROPIC_API_KEY: str = ""
 PLANNER_MODEL: str = "claude-sonnet-4-6"
@@ -217,15 +258,17 @@ def timeout_seconds_for_mode(mode: str) -> int:
     the ``MANAGE_TIMEOUT_SECONDS`` comment above).
 
     Args:
-        mode: The dispatch mode — ``"build"``, ``"plan"`` or ``"manage"``.
-            ``DispatchMode`` is a ``StrEnum``, so members may be passed
-            directly.
+        mode: The dispatch mode — ``"build"``, ``"plan"``, ``"manage"`` or
+            ``"review"``. ``DispatchMode`` is a ``StrEnum``, so members may be
+            passed directly.
 
     Returns:
         Default timeout in seconds for that mode.
     """
     if mode == "manage":
         return MANAGE_TIMEOUT_SECONDS
+    if mode == "review":
+        return REVIEW_TIMEOUT_SECONDS
     return TIMEOUT_SECONDS
 
 
@@ -246,6 +289,8 @@ def load() -> None:
     global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
     global PLANNER_PROVIDER, PLANNER_BEDROCK_MODEL, AWS_REGION
     global MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS, MAX_MANAGE_FREE_RELAUNCHES
+    global REVIEWER_ENGINE, REVIEW_MAX_TURNS, REVIEW_TIMEOUT_SECONDS
+    global ROLLOUT_LOOP_POLL_SECONDS, MAX_ITEM_REDISPATCHES
     global EVIDENCE_ROOT, EVIDENCE_RETENTION_DAYS, WORKSPACE_RETENTION_HOURS
     global RETENTION_INTERVAL_SECONDS
     global LOG_LEVEL
@@ -370,3 +415,14 @@ def load() -> None:
     MAX_MANAGE_FREE_RELAUNCHES = int(
         os.environ.get("DISPATCH_MAX_MANAGE_FREE_RELAUNCHES", "25")
     )
+    REVIEWER_ENGINE = (
+        os.environ.get("DISPATCH_REVIEWER_ENGINE", "").strip() or "claude-code-sonnet"
+    )
+    REVIEW_MAX_TURNS = int(os.environ.get("DISPATCH_REVIEW_MAX_TURNS", "40"))
+    REVIEW_TIMEOUT_SECONDS = int(
+        os.environ.get("DISPATCH_REVIEW_TIMEOUT_SECONDS", "2700")
+    )
+    ROLLOUT_LOOP_POLL_SECONDS = int(
+        os.environ.get("DISPATCH_ROLLOUT_LOOP_POLL_SECONDS", "30")
+    )
+    MAX_ITEM_REDISPATCHES = int(os.environ.get("DISPATCH_MAX_ITEM_REDISPATCHES", "1"))
