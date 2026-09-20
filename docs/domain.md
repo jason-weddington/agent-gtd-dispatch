@@ -196,8 +196,9 @@ An **Engine** is a headless AI coding agent backend. Each engine has:
 
 **Note on `ANTHROPIC_API_KEY`**: It is deliberately **not** exposed to Claude Code
 subprocesses. If it leaked, Claude Code would prefer pay-as-you-go API billing over the
-user's Max subscription. The planner (`rollout_planner.py`) reads it in-process; the
-subprocess only receives `CLAUDE_CODE_OAUTH_TOKEN`.
+user's Max subscription. It is read in-process only as the talos Anthropic engines'
+credential (see `talos.talos_env_overlay`); the Claude Code subprocess only receives
+`CLAUDE_CODE_OAUTH_TOKEN`.
 
 ### Engine Availability
 
@@ -233,11 +234,12 @@ A **Rollout** is a wave-ordered execution plan for a set of related GTD items. I
 managed by the Agent GTD system but dispatched via this service.
 
 The rollout lifecycle is:
-1. A plan agent calls `POST /plan` with a list of item IDs.
-2. The dispatch service runs `rollout_planner.plan_rollout()` (an LLM call) to produce a
-   dependency DAG (`RolloutPlan` with `DagEdge` entries).
-3. The Agent GTD system creates a rollout record and dispatches a manage-mode run.
-4. The manage agent calls `advance_rollout`, dispatches build runs wave by wave, runs
+1. Agent GTD derives the dependency DAG itself, deterministically, from item blockers
+   plus `files_to_modify` overlap (`agent_gtd.services.rollout_dag.derive_edges`). No
+   LLM and no dispatch-service round-trip are involved — the `POST /plan` endpoint and
+   its LLM planner were deleted.
+2. The Agent GTD system creates a rollout record and dispatches a manage-mode run.
+3. The manage agent calls `advance_rollout`, dispatches build runs wave by wave, runs
    quality gates, squash-merges branches, and calls `complete_item_in_rollout`.
 
 See [docs/rollouts.md](rollouts.md) for the full rollout orchestration protocol.

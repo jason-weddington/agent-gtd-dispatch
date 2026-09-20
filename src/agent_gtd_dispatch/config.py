@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import urllib.parse
 from pathlib import Path
-from typing import Literal
 
 
 def _require(name: str) -> str:
@@ -134,12 +133,21 @@ ROLLOUT_LOOP_POLL_SECONDS: int = 30
 # an explicit `re-dispatch` verdict, a failed child still halts.
 MAX_ITEM_REDISPATCHES: int = 1
 
-# Planner (wave DAG)
+# Anthropic API key.
+#
+# This used to be a hard `_require` at startup, but ONLY because the LLM
+# rollout planner (rollout_planner.py / POST /plan) called the Anthropic API
+# in-process. That planner is gone: plan_rollout derives its DAG on the
+# agent_gtd side from item blockers plus file-overlap serialisation, with no
+# model in the loop. Do NOT re-add the `_require` on the assumption it is
+# load-bearing for planning — it is not.
+#
+# The key IS still read, but only as an OPTIONAL engine credential: talos.py
+# puts it in the per-engine env overlay for talos-haiku/sonnet/opus, and
+# engines.py gates those engines' availability on it (an unset key simply
+# means those lanes are not advertised via /info). It is deliberately never
+# exposed to claude-code subprocesses — see kb-01512.
 ANTHROPIC_API_KEY: str = ""
-PLANNER_MODEL: str = "claude-sonnet-4-6"
-PLANNER_PROVIDER: Literal["anthropic", "bedrock"] = "anthropic"
-PLANNER_BEDROCK_MODEL: str = "global.anthropic.claude-sonnet-4-6"
-AWS_REGION: str = ""
 
 # Ollama local inference backend.
 # OLLAMA_BASE_URL is the Ollama root URL, e.g. "http://10.0.0.5:11434".
@@ -276,7 +284,7 @@ def load() -> None:
     """Load configuration from environment. Call once at startup."""
     global DISPATCH_API_KEY, AGENT_GTD_URL, AGENT_GTD_API_KEY
     global WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS, MANAGE_TIMEOUT_SECONDS
-    global ANTHROPIC_API_KEY, PLANNER_MODEL, MAX_CONCURRENT_RUNS
+    global ANTHROPIC_API_KEY, MAX_CONCURRENT_RUNS
     global OLLAMA_BASE_URL, OLLAMA_API_KEY, OLLAMA_DEFAULT_MODEL
     global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS, PUSH_BACKSTOP_MIN_SECONDS
     global GATE_INSTALL_TIMEOUT_SECONDS, POST_RUN_GATE_MIN_SECONDS
@@ -287,7 +295,6 @@ def load() -> None:
     global DISPOSITION_CLASSIFIER_TIMEOUT_SECONDS
     global AGENT_SUBPROCESS_USER
     global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
-    global PLANNER_PROVIDER, PLANNER_BEDROCK_MODEL, AWS_REGION
     global MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS, MAX_MANAGE_FREE_RELAUNCHES
     global REVIEWER_ENGINE, REVIEW_MAX_TURNS, REVIEW_TIMEOUT_SECONDS
     global ROLLOUT_LOOP_POLL_SECONDS, MAX_ITEM_REDISPATCHES
@@ -301,19 +308,9 @@ def load() -> None:
     AGENT_GTD_URL = _require("AGENT_GTD_URL")
     AGENT_GTD_API_KEY = _require("AGENT_GTD_API_KEY")
 
-    _provider_raw = os.environ.get("DISPATCH_PLANNER_PROVIDER", "anthropic")
-    if _provider_raw not in {"anthropic", "bedrock"}:
-        msg = (
-            f"DISPATCH_PLANNER_PROVIDER={_provider_raw!r}: "
-            f"must be 'anthropic' or 'bedrock'"
-        )
-        raise RuntimeError(msg)
-    PLANNER_PROVIDER = _provider_raw  # type: ignore[assignment]
-
-    if PLANNER_PROVIDER == "anthropic":
-        ANTHROPIC_API_KEY = _require("ANTHROPIC_API_KEY")
-    else:
-        ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+    # Optional: gates the talos anthropic engines only (see the declaration
+    # above). Absent = those engines are simply not advertised.
+    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
     AGENT_SUBPROCESS_USER = os.environ.get("DISPATCH_AGENT_SUBPROCESS_USER", "")
     _workspace_env = os.environ.get("DISPATCH_WORKSPACE_ROOT", "")
@@ -342,11 +339,6 @@ def load() -> None:
     MANAGE_TIMEOUT_SECONDS = int(
         os.environ.get("DISPATCH_MANAGE_TIMEOUT_SECONDS", "14400")
     )
-    PLANNER_MODEL = os.environ.get("DISPATCH_PLANNER_MODEL", "claude-sonnet-4-6")
-    PLANNER_BEDROCK_MODEL = os.environ.get(
-        "DISPATCH_PLANNER_BEDROCK_MODEL", "global.anthropic.claude-sonnet-4-6"
-    )
-    AWS_REGION = os.environ.get("AWS_REGION", "")
     MAX_CONCURRENT_RUNS = int(os.environ.get("DISPATCH_MAX_CONCURRENT_RUNS", "32"))
     OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "")
     if OLLAMA_BASE_URL:

@@ -79,7 +79,6 @@ Coverage scope is controlled by `[tool.coverage.run] source` in `pyproject.toml`
 | `test_attachments_staging.py` | Attachment download, sanitization, and staging |
 | `test_branches.py` | Branch name generation (via protocol package) |
 | `test_protocol_exports.py` | Smoke test that protocol package re-exports are intact |
-| `test_rollout_planner.py` | Rollout planner LLM call and DAG output validation |
 
 ---
 

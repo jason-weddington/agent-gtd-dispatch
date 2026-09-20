@@ -67,7 +67,6 @@ the mode-mismatch guards.
 | `DISPATCH_API_KEY` | Bearer token that callers must supply to the REST API |
 | `AGENT_GTD_URL` | Agent GTD API base URL — replace with your own Agent GTD instance, e.g. `https://<your-agent-gtd-host>:8443` (the maintainer's deployment uses `https://r7-research:8443`) |
 | `AGENT_GTD_API_KEY` | Agent GTD API key (`agtd_…` prefix) |
-| `ANTHROPIC_API_KEY` | Anthropic API key — used by the rollout planner in-process; **not** exposed to Claude Code subprocesses |
 
 > **Where to obtain `CLAUDE_CODE_OAUTH_TOKEN` and `AGENT_GTD_API_KEY`**: see
 > [docs/install.md — Authentication & pairing](install.md#authentication--pairing) for
@@ -96,15 +95,6 @@ the mode-mismatch guards.
 |---|---|---|
 | `DISPATCH_MAX_CONCURRENT_RUNS` | `32` | Maximum simultaneous running dispatches; also sizes the ThreadPoolExecutor |
 
-### Optional — Planner
-
-| Variable | Default | Description |
-|---|---|---|
-| `DISPATCH_PLANNER_MODEL` | `claude-sonnet-4-6` | Anthropic model used by the rollout planner (`POST /plan`) |
-| `DISPATCH_PLANNER_PROVIDER` | `anthropic` | Planner LLM provider: `anthropic` (default, uses Anthropic API) or `bedrock` (routes through Amazon Bedrock for corporate/port environments where the Anthropic API is unreachable) |
-| `DISPATCH_PLANNER_BEDROCK_MODEL` | `global.anthropic.claude-sonnet-4-6` | Bedrock model ID (only used when `DISPATCH_PLANNER_PROVIDER=bedrock`). Use `us.anthropic.claude-sonnet-4-6` for the regional CRIS variant (+10% cost). Do NOT use the Anthropic model id format here. |
-| `AWS_REGION` | `""` (SDK falls back to `us-east-1`) | AWS region for Bedrock API calls. **Gotcha:** the anthropic SDK reads only `AWS_REGION` for the region — `AWS_PROFILE` alone does NOT supply it (the SDK does not read `~/.aws/config` for the region). Set this explicitly. |
-
 ### Optional — Ollama Backend
 
 | Variable | Default | Description |
@@ -116,9 +106,15 @@ the mode-mismatch guards.
 
 ### Notes on `ANTHROPIC_API_KEY`
 
-The service reads this key **in-process** for the rollout planner only. It is deliberately
-**not** forwarded to Claude Code subprocesses. If Claude Code received `ANTHROPIC_API_KEY`,
-it would prefer pay-as-you-go API billing over the user's Max subscription — see kb-01512.
+**Optional.** It used to be required at startup for the LLM rollout planner; that
+planner is gone and the service starts fine without the key. It is now read only as
+an engine credential: `talos.py` puts it in the per-engine env overlay for
+`talos-haiku` / `talos-sonnet` / `talos-opus`, and those engines are simply not
+advertised via `/info` when it is unset.
+
+It is deliberately **not** forwarded to Claude Code subprocesses. If Claude Code
+received `ANTHROPIC_API_KEY`, it would prefer pay-as-you-go API billing over the
+user's Max subscription — see kb-01512.
 
 Claude Code subprocesses receive `CLAUDE_CODE_OAUTH_TOKEN` only (from the environment of
 the service account or the subprocess user).

@@ -37,24 +37,3 @@ class TestProtocolExports:
             created_at=datetime.now(UTC),
         )
         assert resp.id == "x"
-
-    def test_plan_request(self) -> None:
-        from agent_gtd_dispatch_protocol import PlanRequest
-
-        req = PlanRequest(item_ids=["a"])
-        assert req.item_ids == ["a"]
-
-    def test_dag_edge(self) -> None:
-        from agent_gtd_dispatch_protocol import DagEdge
-
-        edge = DagEdge(from_item_id="a", to_item_id="b")
-        assert edge.from_item_id == "a"
-        assert edge.to_item_id == "b"
-
-    def test_rollout_plan(self) -> None:
-        from agent_gtd_dispatch_protocol import RolloutPlan
-
-        plan = RolloutPlan(nodes=["a"], edges=[], planner_model="m")
-        assert plan.nodes == ["a"]
-        assert plan.edges == []
-        assert plan.planner_model == "m"

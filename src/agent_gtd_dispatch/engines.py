@@ -394,8 +394,9 @@ CLAUDE = Engine(
     auth_env_key="CLAUDE_CODE_OAUTH_TOKEN",
     # ANTHROPIC_API_KEY is deliberately NOT exposed to Claude Code subprocesses.
     # If it leaks through, Claude Code prefers API billing over the user's Max
-    # subscription — see kb-01512.  The planner (rollout_planner.py) reads the key
-    # via config.ANTHROPIC_API_KEY in-process, never via the subprocess env.
+    # subscription — see kb-01512.  (The in-process reader used to be the
+    # rollout planner; that is gone.  The key now only feeds the talos
+    # anthropic engines' env overlay — see talos.talos_env_overlay.)
     env_keys=frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}),
     build_command=_build_claude_command,
 )

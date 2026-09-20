@@ -262,6 +262,5 @@ or `_pending_queue`. Inserting an `await` in that gap re-introduces the race.
 | `db.py` | SQLite persistence (aiosqlite), migrations, `reconcile_orphans()` |
 | `gtd_client.py` | HTTP client for the Agent GTD API (items, projects, comments, rollouts) |
 | `config.py` | Env-var config with module-level globals + `load()` |
-| `rollout_planner.py` | LLM-based wave DAG planner for `POST /plan` |
 | `agent_discovery.py` | Runs `list_agents.sh`, exposes `ENGINE_NAME` and `SERVICE_VERSION` |
 | `show_run_transcript.py` | CLI helper: print a run's transcript (`python -m agent_gtd_dispatch.show_run_transcript <run_id>`) |

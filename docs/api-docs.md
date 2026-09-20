@@ -84,42 +84,6 @@ array of objects). The service does not validate or transform the entries.
 
 ---
 
-### `POST /plan`
-
-**Auth**: Required.
-
-Calls the LLM-based rollout planner to produce a dependency DAG for a set of GTD items.
-Called by the Agent GTD system before creating a rollout.
-
-**Request body:**
-```json
-{
-  "item_ids": ["uuid-1", "uuid-2", "uuid-3"]
-}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `item_ids` | `list[str]` | ✓ | GTD item IDs to plan |
-
-**Response 200** (`RolloutPlan`):
-```json
-{
-  "item_ids": ["uuid-1", "uuid-2", "uuid-3"],
-  "edges": [
-    {"from_item_id": "uuid-1", "to_item_id": "uuid-2"}
-  ],
-  "rationale": "uuid-2 depends on the interface introduced by uuid-1"
-}
-```
-
-**Error responses:**
-| Status | Condition |
-|---|---|
-| 502 | LLM call failed (includes `planner_model` and `item_count` in detail) |
-
----
-
 ### `POST /dispatch`
 
 **Auth**: Required.

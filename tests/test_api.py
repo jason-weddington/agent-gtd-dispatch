@@ -1005,54 +1005,6 @@ class TestDispatchManageMode:
         assert "item_id" in resp.json()["detail"]
 
 
-class TestPlan:
-    @patch("agent_gtd_dispatch.main.rollout_planner")
-    def test_no_auth_returns_401(self, mock_planner, client):
-        resp = client.post("/plan", json={"item_ids": ["id1"]})
-        assert resp.status_code == 401
-
-    @patch("agent_gtd_dispatch.main.rollout_planner")
-    def test_valid_request_returns_rollout_plan(
-        self, mock_planner, client, auth_headers
-    ):
-        from agent_gtd_dispatch.models import DagEdge, RolloutPlan
-
-        mock_planner.plan_rollout = AsyncMock(
-            return_value=RolloutPlan(
-                nodes=["id1", "id2"],
-                edges=[DagEdge(from_item_id="id1", to_item_id="id2")],
-                planner_model="claude-sonnet-4-6",
-            )
-        )
-        resp = client.post(
-            "/plan", json={"item_ids": ["id1", "id2"]}, headers=auth_headers
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["nodes"] == ["id1", "id2"]
-        assert len(data["edges"]) == 1
-        assert data["edges"][0]["from_item_id"] == "id1"
-        assert data["edges"][0]["to_item_id"] == "id2"
-        assert data["planner_model"] == "claude-sonnet-4-6"
-
-    @patch("agent_gtd_dispatch.main.rollout_planner")
-    def test_plan_rollout_raises_returns_502(self, mock_planner, client, auth_headers):
-        mock_planner.plan_rollout = AsyncMock(side_effect=Exception("GTD API down"))
-        mock_planner._active_planner_model.return_value = "claude-sonnet-4-6"
-        resp = client.post("/plan", json={"item_ids": ["id1"]}, headers=auth_headers)
-        assert resp.status_code == 502
-        detail = resp.json()["detail"]
-        assert isinstance(detail, dict)
-        assert "GTD API down" in detail["detail"]
-        assert "planner_model" in detail
-        assert detail["item_count"] == 1
-
-    @patch("agent_gtd_dispatch.main.rollout_planner")
-    def test_empty_item_ids_returns_422(self, mock_planner, client, auth_headers):
-        resp = client.post("/plan", json={"item_ids": []}, headers=auth_headers)
-        assert resp.status_code == 422
-
-
 class TestTranscriptEndpoint:
     def test_not_found(self, client, auth_headers) -> None:
         resp = client.get("/runs/nonexistent/transcript", headers=auth_headers)

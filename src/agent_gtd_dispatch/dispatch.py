@@ -2028,7 +2028,7 @@ def _build_manage_workspace_main_prompt(
 
         ## MCP Tools Available
 
-        `advance_rollout`, `complete_item_in_rollout`, `halt_rollout`, `replan_rollout`,
+        `advance_rollout`, `complete_item_in_rollout`, `halt_rollout`,
         `dispatch_item`, `add_comment`, `get_item`, `update_item`, `list_items`,
         `get_run_status`, `list_runs`, `list_comments`, `update_rollout_state`
 
@@ -2500,7 +2500,7 @@ def _build_manage_prompt(
 
         ## MCP Tools Available
 
-        `advance_rollout`, `complete_item_in_rollout`, `halt_rollout`, `replan_rollout`,
+        `advance_rollout`, `complete_item_in_rollout`, `halt_rollout`,
         `dispatch_item`, `add_comment`, `get_item`, `update_item`, `list_items`,
         `get_run_status`, `list_runs`, `list_comments`, `update_rollout_state`
 

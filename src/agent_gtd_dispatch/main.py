@@ -34,7 +34,6 @@ from . import (
     gates,
     gtd_client,
     retention,
-    rollout_planner,
     talos,
 )
 from . import (
@@ -53,10 +52,8 @@ from .models import (
     DispatchRequest,
     EngineSwap,
     InfoResponse,
-    PlanRequest,
     PushStatus,
     RepoPushStatus,
-    RolloutPlan,
     Run,
     RunResponse,
     RunStatus,
@@ -4725,25 +4722,6 @@ async def list_agents(
     """
     agents = await run_list_agents_script()
     return {"agents": agents}
-
-
-@app.post("/plan", response_model=RolloutPlan)
-async def plan_rollout_endpoint(
-    body: PlanRequest,
-    _: str = Depends(_verify_api_key),
-) -> RolloutPlan:
-    """Produce a dependency DAG for a set of items (called by plan_rollout on agent_gtd)."""
-    try:
-        return await rollout_planner.plan_rollout(body.item_ids)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "detail": str(exc),
-                "planner_model": rollout_planner._active_planner_model(),
-                "item_count": len(body.item_ids),
-            },
-        ) from exc
 
 
 @app.post("/dispatch", response_model=RunResponse)

@@ -7,10 +7,9 @@ guardrails that protect `main` while the lead is asleep.
 
 The canonical source code lives in:
 
-- `src/agent_gtd_dispatch/rollout_planner.py` — DAG construction (Sonnet call).
 - `src/agent_gtd_dispatch/dispatch.py` — prompt builders, including
   `_build_manage_prompt` and `_MANAGE_ALLOWED_TOOLS`.
-- `src/agent_gtd_dispatch/main.py` — `/dispatch` and `/plan` endpoints, the
+- `src/agent_gtd_dispatch/main.py` — the `/dispatch` endpoint, the
   `_dispatch_worker` background coroutine, and `_maybe_relaunch_manage` (the
   manage-mode auto-recovery path).
 - `src/agent_gtd_dispatch/gtd_client.py` — the HTTP calls into agent-gtd that
@@ -130,13 +129,13 @@ cannot reshape the backlog.
 ## How a rollout flows
 
 ```
-lead                       /plan endpoint                manage agent
+lead                     agent-gtd (in-process)          manage agent
  │                                │                            │
  │ plan_rollout(item_ids=[...])   │                            │
  ├──────────────────────────────▶│                            │
- │                                │  fetch items concurrently  │
- │                                │  call Sonnet planner       │
- │                                │  return RolloutPlan        │
+ │                                │  read blockers +           │
+ │                                │  files_to_modify           │
+ │                                │  derive_edges() — no LLM   │
  │◀──────────────────────────────│                            │
  │                                                             │
  │ dispatch_item(mode="manage",   │                            │
@@ -165,151 +164,41 @@ without further intervention unless it halts.
 
 ## DAG construction: `plan_rollout`
 
-The `/plan` endpoint (`POST /plan`, body `PlanRequest{item_ids: [...]}`)
-returns a `RolloutPlan`:
+**There is no LLM in this path, and no dispatch-side endpoint.** The
+planner (`POST /plan`, `rollout_planner.py`, `PlanRequest` / `DagEdge` /
+`RolloutPlan`) was deleted; the DAG is derived deterministically on the
+agent-gtd side by `agent_gtd.services.rollout_dag.derive_edges`, called
+from `rollout_service.plan_rollout`.
 
-```python
-class RolloutPlan(BaseModel):
-    nodes: list[str]
-    edges: list[DagEdge]
-    planner_model: str
+Edges come from exactly two sources, merged and deduplicated:
 
-class DagEdge(BaseModel):
-    from_item_id: str
-    to_item_id: str   # to_item_id must wait for from_item_id
-```
-
-The handler is a thin wrapper:
-
-```python
-@app.post("/plan", response_model=RolloutPlan)
-async def plan_rollout_endpoint(body: PlanRequest, ...):
-    return await rollout_planner.plan_rollout(body.item_ids)
-```
-
-Errors from the planner are wrapped as a 502 with `detail`, `planner_model`,
-and `item_count` so the caller can distinguish them from auth failures.
-
-### Inputs the planner sees
-
-For every item in `item_ids`, `rollout_planner.plan_rollout` concurrently
-fetches the full item dict from agent-gtd (`gtd_client.get_item`) and reads:
-
-| Field | Source of edge signal |
+| Source | Rule |
 |---|---|
-| `blockers` (list of item IDs) | Explicit dependency: each blocker becomes an edge from blocker → this item. The planner is told to honour these. |
-| `files_to_modify` (list of `{path, change}`) | Structural overlap. If two items both modify `src/foo.py`, that's a candidate edge — the planner serialises them. |
-| `acceptance_criteria` (list of strings) | Context for the planner to judge whether two items really conflict or just touch nearby code. |
-| `description` (free text) | Context only — the validator on the agent-gtd side reads structured fields, not description prose. |
-| `title` | Header in the planner prompt. |
+| Item **blockers** | Each unresolved blocker of item B that is also in the rollout becomes an edge blocker → B. Explicit, declared, no inference. |
+| **File overlap** in `files_to_modify` | If two items name a path in common (or one names a directory containing the other's path), they are serialised in the caller's `item_ids` order. This is what keeps two build agents off the same file. |
 
-The full prompt template lives in `_build_context` in `rollout_planner.py`:
+`derive_edges` then runs `assert_acyclic` over the merged list and raises
+rather than persisting a cyclic graph — the old LLM path had no cycle
+check at all.
 
-```python
-lines: list[str] = [
-    "You are a planning assistant. Given a list of work items, identify "
-    "dependency edges between them.\n"
-    "An edge {from_item_id: A, to_item_id: B} means B must wait for A to "
-    "complete.\n"
-    "Derive edges from declared blockers and shared file paths in the "
-    "structured `files_to_modify` field. Same file path across two items "
-    "= candidate edge.\n"
-    "Only reference item_ids from the provided list.\n",
-]
-```
+`rollout_plans.planner_model` is NOT NULL, so rows written by this path
+carry the sentinel `"derived-from-blockers"`
+(`rollout_dag.DERIVED_PLANNER_MODEL`); the frontend
+(`RolloutActivityTab.tsx`) special-cases that value when rendering plan
+provenance.
 
-Each item is rendered as:
+`acceptance_criteria` and `description` no longer influence the graph at
+all — nothing reads prose. Only `blockers` and `files_to_modify` matter,
+which means a missing `files_to_modify` entry is now the one way two
+items can be scheduled concurrently against the same file.
 
-```
-## Item <id>: <title>
-Blockers (must complete first): <comma-separated ids, or "none">
-Files to modify: <comma-separated paths, or "none">
-Acceptance criteria:
-<one AC per line, or "none">
-Description:
-<description>
----
-```
-
-### The planner call
-
-```python
-client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
-response = await client.messages.create(
-    model=config.PLANNER_MODEL,         # default: claude-sonnet-4-6
-    max_tokens=1024,
-    tools=[PRODUCE_DAG_TOOL],
-    tool_choice={"type": "tool", "name": "produce_dag"},
-    messages=[{"role": "user", "content": context}],
-)
-```
-
-The planner is forced to call a single tool, `produce_dag`, with a list of
-`edges`. The tool schema constrains the output to objects of shape
-`{from_item_id, to_item_id}` — no node list, no commentary, no metadata. Both
-endpoints are required.
-
-The Sonnet model is used (not Opus) because:
-
-- The planning task is structured and well-bounded — Sonnet has the
-  reasoning headroom for it.
-- The latency hit of Opus on every `plan_rollout` call would compound across
-  re-plans.
-- Cost matters more here than for build/manage, since this call is the
-  one part of the rollout that doesn't pay for itself in implementation
-  output.
-
-`PLANNER_MODEL` is configurable via `DISPATCH_PLANNER_MODEL`; in production
-it's `claude-sonnet-4-6`.
-
-### Edge validation
-
-`_extract_edges` filters the tool input through `valid_ids`:
-
-```python
-def _extract_edges(tool_input, valid_ids):
-    raw_edges = tool_input.get("edges", [])
-    ...
-    for raw in raw_edges:
-        ...
-        if from_id in valid_ids and to_id in valid_ids:
-            edges.append(DagEdge(from_item_id=str(from_id), to_item_id=str(to_id)))
-    return edges
-```
-
-This is the defence against the planner hallucinating item IDs that aren't in
-the rollout. Any edge that references an unknown ID is silently dropped — the
-DAG never gains a phantom node.
-
-The planner returns nodes only as the original `item_ids` list (no extra
-nodes are introduced) and edges that survived validation.
-
-### What the planner does NOT do
+### What DAG construction does NOT do
 
 - It does not assign **waves** explicitly. The DAG is the wave plan; the
   agent-gtd side's `advance_rollout` derives "what's ready now" from the DAG
   + item statuses at each call.
 - It does not pick engines. Engine selection is per-item, done by plan-mode
   dispatches (see the Engine-Selection Rubric in `_build_plan_prompt`).
-- It does not deduplicate edges or break cycles. **Neither does the
-  agent-gtd side** — `rollout_service.plan_rollout` persists the edges
-  list as JSON in the `rollout_plans.edges` column with no schema-level
-  acyclicity constraint and no application-level cycle check. The
-  legality contract (`validate_legality_contract`) only checks per-item
-  fields and project scoping; it never inspects the planner's edge
-  output.
-
-  In practice the planner is well-behaved enough that this hasn't
-  bitten us, but if a cycle did land in `rollout_plans.edges`, the
-  downstream effect would be silent: `advance_rollout` does the readiness
-  check by asking "are all of my predecessors terminal?" — for cyclic
-  items, the answer is "no, forever," so they'd stay in `blocked` and
-  the rollout would never reach `graph_complete=true`. The manager
-  would loop on `advance_rollout` returning the same `in_progress` /
-  `blocked` sets and eventually halt itself on a 3x advance failure or
-  a manage timeout. No corruption, but a wasted manage budget. If we
-  ever observe this in the wild, the fix is a cycle check in
-  `_extract_edges` on the dispatch side.
 
 ---
 
@@ -798,82 +687,6 @@ authorised the merge — for autonomous manager merges, this is
 
 ---
 
-## Replanning a live rollout: `replan_rollout`
-
-`replan_rollout` is a deliberately-narrow tool that rebuilds the DAG
-**over the rollout's remaining items** (those still in `pending` or
-`ready`) without disturbing items that have already reached a terminal
-status. It exists for the case where the lead has learned something
-mid-rollout that invalidates the original plan — a new dependency
-discovered while reviewing a halted item, a decision to drop an item
-that subsequent items don't actually need, an AC change that introduces
-a new file overlap.
-
-### What it does
-
-`rollout_service.replan_rollout` (in agent-gtd) requires
-`wave.status == "running"`. Given an optional `from_item` parameter:
-
-- **Without `from_item`:** rescans every remaining `pending`/`ready`
-  item, calls the dispatch-side planner with that subset of item IDs,
-  persists a new `rollout_plans` row at `version = old_version + 1`,
-  and re-derives readiness from the new edges.
-- **With `from_item`:** restricts the replan to that item's downstream
-  subgraph (DFS over the current edge map) before invoking the planner.
-  Useful for surgical changes that shouldn't reshuffle the whole tail
-  of the wave.
-
-After persisting the new plan, the function walks the remaining items:
-items whose new predecessors are all terminal flip from `pending` to
-`ready`, and items whose new plan re-blocks them (i.e. they were
-`ready` but the new DAG introduces a new predecessor) revert from
-`ready` to `pending`. A `wave_replanned` event is appended with
-`old_version` and `new_version` in the payload.
-
-Terminal items (`completed`, `halted`, `skipped`) are not touched. The
-new plan can reference them as predecessors of remaining items (they're
-already terminal, so they don't block anything), but their statuses
-won't change.
-
-### Who calls it — lead-only in practice
-
-`replan_rollout` is in `_MANAGE_ALLOWED_TOOLS` and listed under "MCP
-Tools Available" in the manage prompt, but **the manage prompt body
-never instructs the manager to call it.** There is no condition in the
-wave loop, AC reconciliation, halt path, or sensitive-area guidance
-that suggests a replan. The manager's options when something looks
-wrong are: inline fix and merge, or halt. Replan is not in the
-manager's playbook.
-
-In practice replans are lead-initiated, typically via the MCP tool
-directly:
-
-```
-mcp__agent-gtd__replan_rollout(rollout_id=..., from_item=...)
-```
-
-The two cases where it gets used:
-
-1. **After a halt, before re-dispatching the manager.** The lead
-   removes or restructures items, then calls `replan_rollout` to
-   rebuild the DAG over what's left, and finally re-dispatches manage
-   mode (or completes the remaining items inline).
-2. **Mid-wave course corrections.** The lead notices that two
-   in-flight items will collide on a file the planner didn't see, or
-   that an upcoming item is now redundant. Calling `replan_rollout`
-   updates the readiness map without halting the rollout — the running
-   manager will see the new DAG on its next `advance_rollout` call.
-
-The tool stays in the manage allowlist because removing it would
-require a manage-prompt change with no benefit; leaving it is harmless
-since the manager is never told to call it. If a future workflow
-genuinely needs the manager to replan (e.g. an AC-reconciliation path
-that promotes a "soft block" into a hard dependency), the prompt body
-is the place to add that instruction — the tool surface is already
-ready.
-
----
-
 ## Manage-mode allowed tools
 
 The manage subprocess gets a restricted MCP tool allowlist defined in
@@ -884,7 +697,6 @@ _MANAGE_ALLOWED_TOOLS: tuple[str, ...] = (
     "mcp__agent-gtd__advance_rollout",
     "mcp__agent-gtd__complete_item_in_rollout",
     "mcp__agent-gtd__halt_rollout",
-    "mcp__agent-gtd__replan_rollout",
     "mcp__agent-gtd__update_rollout_state",
     "mcp__agent-gtd__dispatch_item",        # dispatch child build runs
     "mcp__agent-gtd__add_comment",
@@ -909,7 +721,8 @@ before `--print` in `run_agent`).
 Notable absences:
 - `add_item` — the manager can't create new items mid-rollout.
 - `add_blocker` / `remove_blocker` — the DAG is frozen once the rollout
-  starts; only `replan_rollout` can rewrite it.
+  starts and nothing can rewrite it in place. (`replan_rollout`, which
+  could, was deleted with the LLM planner.)
 - `complete_item` — the manager completes items through `complete_item_in_rollout`
   exclusively, so the rollout state stays consistent.
 
@@ -1152,10 +965,9 @@ the lead's job in the interactive session.
 | Retry cap | `src/agent_gtd_dispatch/config.py::MAX_MANAGE_RETRIES` (default 2, no env override) |
 | Free-relaunch min uptime | `src/agent_gtd_dispatch/config.py::MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS` (default 120s) |
 | Free-relaunch lifetime cap | `src/agent_gtd_dispatch/config.py::MAX_MANAGE_FREE_RELAUNCHES` (default 25) |
-| Planner LLM call | `src/agent_gtd_dispatch/rollout_planner.py::plan_rollout` |
-| Planner prompt template | `src/agent_gtd_dispatch/rollout_planner.py::_build_context` |
-| Planner edge validation | `src/agent_gtd_dispatch/rollout_planner.py::_extract_edges` |
-| Planner model | `src/agent_gtd_dispatch/config.py::PLANNER_MODEL` (`claude-sonnet-4-6`) |
+| DAG derivation (blockers + file overlap) | agent_gtd: `src/agent_gtd/services/rollout_dag.py::derive_edges` |
+| File-overlap serialisation | agent_gtd: `src/agent_gtd/services/rollout_dag.py::compute_overlap_edges` |
+| Acyclicity check | agent_gtd: `src/agent_gtd/services/rollout_dag.py::assert_acyclic` |
 | `advance_rollout` HTTP call | `src/agent_gtd_dispatch/gtd_client.py::advance_rollout` |
 | `complete_item_in_rollout` HTTP call | `src/agent_gtd_dispatch/gtd_client.py::complete_in_rollout` |
 | `halt_rollout` HTTP call | `src/agent_gtd_dispatch/gtd_client.py::halt_rollout` |

@@ -49,7 +49,7 @@ cd agent-gtd-dispatch
 
 # 2. Prepare an env file (copy the template and fill in real values)
 cp templates/dispatch-env.tmpl /tmp/dispatch.env
-$EDITOR /tmp/dispatch.env    # set AGENT_GTD_*, ANTHROPIC_API_KEY  (DISPATCH_API_KEY is auto-minted by Step 3.5 if you leave it empty)
+$EDITOR /tmp/dispatch.env    # set AGENT_GTD_*  (DISPATCH_API_KEY is auto-minted by Step 3.5 if you leave it empty)
 
 # 3. Run the installer
 sudo ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
@@ -241,9 +241,10 @@ setup behind a corporate boundary, because the dispatched agent inherits **both*
 - your **git auth to internal repos** (e.g. GitFarm) — so the agent clones and pushes
   internal code *as you*, with no separate deploy key or service account.
 
-Pair it with a Bedrock planner (`DISPATCH_PLANNER_PROVIDER=bedrock` + `AWS_REGION`, AWS
-credentials via the standard chain) and the host needs **no Anthropic credentials at
-all** — every LLM call authenticates out of band.
+The host then needs **no Anthropic credentials at all** — every LLM call
+authenticates out of band. (The service itself no longer requires
+`ANTHROPIC_API_KEY`: the in-process rollout planner that needed it has been
+deleted.)
 
 Because the installer then runs as *you*, it is deliberately conservative with your
 home directory: it touches only `$AGENT_WORKSPACE`, never your `$HOME` (a group-writable
@@ -353,8 +354,9 @@ only `CLAUDE_CODE_OAUTH_TOKEN` for the subprocess environment of Claude Code eng
 (`src/agent_gtd_dispatch/engines.py`, lines 218–263). `ANTHROPIC_API_KEY` is deliberately
 excluded from the subprocess env: if it reached the subprocess, Claude Code would switch
 from the user's Max subscription to pay-as-you-go API billing (see kb-01512).
-`ANTHROPIC_API_KEY` is read in-process by the rollout planner only and never forwarded to
-agent subprocesses.
+`ANTHROPIC_API_KEY` is never forwarded to Claude Code agent subprocesses. (It used to be
+read in-process by the rollout planner; that planner is gone, and the key is now only an
+optional credential for the talos Anthropic engines.)
 
 **Where to paste it** — depends on your install mode:
 
@@ -421,16 +423,13 @@ All variables documented in `templates/dispatch-env.tmpl`. Key variables:
 | `DISPATCH_API_KEY` | ✓ | Bearer token callers must supply to the REST API (auto-minted by Step 3.5 if absent; see below) |
 | `AGENT_GTD_URL` | ✓ | Agent GTD API base URL (e.g. `https://r7-research:8443`) |
 | `AGENT_GTD_API_KEY` | ✓ | Agent GTD API key (`agtd_…` prefix) |
-| `ANTHROPIC_API_KEY` | ✓ | Anthropic API key for Claude Code subprocesses |
+| `ANTHROPIC_API_KEY` | – | Anthropic API key. NOT required to start the service. Gates the `talos-haiku`/`talos-sonnet`/`talos-opus` engines only; never forwarded to Claude Code subprocesses (kb-01512). |
 | `DISPATCH_AGENT_SUBPROCESS_USER` | ✓ (prod) | Agent user for user-switching (`dispatch`). Leave empty in dev to disable. |
 | `DISPATCH_WORKSPACE_ROOT` | – | Override workspace root (default: `~/workspace` relative to agent user) |
 | `DISPATCH_MAX_TURNS` | – | Claude Code turn cap (default: 100) |
 | `DISPATCH_TIMEOUT_SECONDS` | – | Agent subprocess wall-clock timeout in seconds (default: 1800) |
 | `OLLAMA_BASE_URL` | – | Root URL of an Ollama instance for `claude-code-ollama` engine dispatches |
 | `OLLAMA_DEFAULT_MODEL` | – | Default Ollama model (default: `qwen3.6:35b`) |
-| `DISPATCH_PLANNER_PROVIDER` | – | Planner LLM provider: `anthropic` (default) or `bedrock`. See [Bedrock planner provider](#bedrock-planner-provider-corporateport-environments) below. |
-| `DISPATCH_PLANNER_BEDROCK_MODEL` | – | Bedrock model ID (default: `global.anthropic.claude-sonnet-4-6`). Only used when `DISPATCH_PLANNER_PROVIDER=bedrock`. |
-| `AWS_REGION` | – | AWS region for Bedrock API calls (default: `us-east-1` per SDK fallback). Only used when `DISPATCH_PLANNER_PROVIDER=bedrock`. |
 | `PERSONAL_KB_URL` | – | Hosted personal KB service URL. Read by installer Step 4.6 (not the service) and injected into the `personal-kb` MCP server's per-server env; if unset (or `PERSONAL_KB_API_KEY` is unset), `personal-kb` registration is skipped |
 | `PERSONAL_KB_API_KEY` | – | API key for the hosted personal KB service. Read by installer Step 4.6 and injected into the `personal-kb` MCP server's per-server env |
 | `TEAM_KB_URL` | – | Hosted team KB service URL. Read by installer Step 4.6 (not the service) and injected into the `team-kb` MCP server's per-server env; if unset (or `TEAM_KB_API_KEY` is unset), `team-kb` registration is skipped |
@@ -444,29 +443,6 @@ The env file is installed at `/home/dispatch-svc/.env` with mode `0600`,
 owned by `dispatch-svc`. In single-user mode it is installed at
 `${HOME}/.config/agent-gtd-dispatch/env` instead (mode `0700` on the directory,
 `0600` on the file). Never commit it to git.
-
-### Bedrock planner provider (corporate/port environments)
-
-In environments where the Anthropic API is unreachable through corporate egress
-(e.g. internal ports where Claude access is routed through Amazon Bedrock),
-set `DISPATCH_PLANNER_PROVIDER=bedrock`. This affects the in-process rollout
-planner (`POST /plan`) only — Claude Code agent subprocess execution is
-unchanged.
-
-**Credential resolution:** AWS credentials are resolved from the standard AWS
-credential chain (`AWS_PROFILE`, environment variables, instance metadata, etc.).
-Set `AWS_PROFILE` in the service `.env` to select a named profile.
-
-**Region gotcha:** the anthropic SDK reads `AWS_REGION` for the Bedrock region;
-if unset it defaults to `us-east-1`. `AWS_PROFILE` alone does **NOT** supply the
-region — the SDK does not read `~/.aws/config` for the region. Set `AWS_REGION`
-explicitly in the service `.env`.
-
-**Model ID:** the default `global.anthropic.claude-sonnet-4-6` uses the Bedrock
-global cross-region inference endpoint. Use the `us.` regional CRIS variant
-(e.g. `us.anthropic.claude-sonnet-4-6`) if your environment requires data
-residency guarantees (+10% pricing applies). Do NOT reuse the Anthropic
-first-party model id (`claude-sonnet-4-6`) on the Bedrock client — it will error.
 
 ---
 
@@ -1270,7 +1246,7 @@ sudo journalctl -u dispatch-api -n 100 --no-pager
 
 **Common causes**:
 - Missing or incomplete `.env` file — ensure all required variables are set.
-  `sudo cat /home/dispatch-svc/.env | grep -v '^#' | grep '^\(DISPATCH_API_KEY\|AGENT_GTD_URL\|AGENT_GTD_API_KEY\|ANTHROPIC_API_KEY\)='`
+  `sudo cat /home/dispatch-svc/.env | grep -v '^#' | grep '^\(DISPATCH_API_KEY\|AGENT_GTD_URL\|AGENT_GTD_API_KEY\)='`
 - `uv` not found at `/home/dispatch-svc/.local/bin/uv` — re-run the installer
   or install manually: `sudo -u dispatch-svc curl -fsSL https://astral.sh/uv/install.sh | sudo -u dispatch-svc sh`
 - Working directory missing — ensure `/home/dispatch-svc/agent-gtd-dispatch` exists and is a valid git repo.

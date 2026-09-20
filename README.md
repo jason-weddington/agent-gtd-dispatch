@@ -38,10 +38,11 @@ export DISPATCH_WORKSPACE_RETENTION_HOURS=48            # default: 48
 export DISPATCH_RETENTION_INTERVAL_SECONDS=3600         # default: 3600
 ```
 
-> **`ANTHROPIC_API_KEY` is required** — the service raises at startup without it. It
-> powers the in-process rollout planner (`POST /plan`) and is deliberately **not**
-> forwarded to Claude Code subprocesses; those authenticate via
-> `CLAUDE_CODE_OAUTH_TOKEN` or an interactive `claude login`. See
+> **`ANTHROPIC_API_KEY` is optional.** It used to be a hard startup requirement for the
+> in-process rollout planner; that planner has been deleted, so the service starts
+> without it. It now only gates the `talos-haiku`/`talos-sonnet`/`talos-opus` engines,
+> and is deliberately **not** forwarded to Claude Code subprocesses; those authenticate
+> via `CLAUDE_CODE_OAUTH_TOKEN` or an interactive `claude login`. See
 > "Notes on `ANTHROPIC_API_KEY`" in [docs/setup.md](docs/setup.md).
 
 For how to obtain `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) and where to mint
@@ -220,7 +221,6 @@ uv run pytest --cov --cov-report=term-missing
 | GET | `/health` | None | Health check + active run count |
 | GET | `/info` | None | Engine identity and service version |
 | GET | `/agents` | Bearer | List agents advertised by `list_agents.sh` |
-| POST | `/plan` | Bearer | Plan a rollout DAG for a set of items (body: `PlanRequest`) |
 | POST | `/dispatch` | Bearer | Start a dispatch run (body: protocol `DispatchRequest` — `item_id?` (null for manage runs), `max_turns`, `engine`, `mode`, `agent_name?`, `timeout_minutes?`, `rollout_id?`, `attribution?`) |
 | GET | `/runs` | Bearer | List runs (query: `item_id`, `status`, `limit`) |
 | GET | `/runs/{run_id}` | Bearer | Get a specific run |
@@ -293,7 +293,7 @@ python -m agent_gtd_dispatch.show_run_transcript <run_id> | tail -1 | jq .
 
 ## Dispatch modes and rollouts
 
-Every `/dispatch` call carries a `mode` field: `plan` (groom a single item), `build` (implement and push a feature branch for a single item), or `manage` (drive a whole rollout — a planned wave of items in one project — end-to-end). The manage mode dispatches each child build itself, runs quality gates, squash-merges to `main`, and advances the rollout DAG built by `POST /plan`. For the full reference — DAG construction, the manager's wave loop, the `update_rollout_state` replacement contract, recovery semantics on unexpected manage exits, quality gates and sensitive-area guardrails — see **[docs/rollouts.md](docs/rollouts.md)**.
+Every `/dispatch` call carries a `mode` field: `plan` (groom a single item), `build` (implement and push a feature branch for a single item), or `manage` (drive a whole rollout — a planned wave of items in one project — end-to-end). The manage mode dispatches each child build itself, runs quality gates, squash-merges to `main`, and advances the rollout DAG, which Agent GTD derives deterministically from item blockers plus file overlap (there is no LLM planner and no `POST /plan`). For the full reference — DAG construction, the manager's wave loop, the `update_rollout_state` replacement contract, recovery semantics on unexpected manage exits, quality gates and sensitive-area guardrails — see **[docs/rollouts.md](docs/rollouts.md)**.
 
 ## Agent Discovery
 
@@ -442,15 +442,12 @@ around.
 
 ## Protocol package
 
-The `agent_gtd_dispatch_protocol` package lives in `packages/protocol/` and is the single source of truth for the dispatch wire contract. It exports eight names:
+The `agent_gtd_dispatch_protocol` package lives in `packages/protocol/` and is the single source of truth for the dispatch wire contract. It exports five names:
 
 - `RunStatus` — run lifecycle enum
 - `DispatchMode` — run mode enum (`plan` / `build` / `manage`)
 - `DispatchRequest` — `POST /dispatch` request body
 - `RunResponse` — run read model returned by run endpoints
-- `PlanRequest` — `POST /plan` request body
-- `DagEdge` — directed dependency edge in a rollout DAG
-- `RolloutPlan` — planner output: nodes + edges + model name
 - `make_branch_name` — canonical `feat/<id>-<slug>` branch naming helper
 
 ### Using from agent-gtd (or any external caller)
