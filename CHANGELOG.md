@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.0.2 (2026-09-20)
+
+### Bug Fixes
+
+- **rollout**: Only re-adopt rollouts this host actually drove
+  ([`cb7491a`](https://github.com/repos/agent-gtd-dispatch/commit/cb7491a8e775690209791f81683e455d6778110a))
+
+
 ## v2.0.1 (2026-09-20)
 
 ### Bug Fixes
