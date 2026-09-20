@@ -1,0 +1,31 @@
+[Unit]
+Description=Agent GTD dispatch rescue sweep (push unpushed work out of live clones)
+Documentation=https://github.com/jason-weddington/agent-gtd-dispatch
+After=network.target
+
+[Service]
+Type=oneshot
+
+# Runs as the AGENT user, which owns the clones — so it needs no sudo at all.
+# The previous incarnation of this sweep ran from a lead agent's session and
+# reached the clones through `sudo -u dispatch`; running as that user directly
+# removes the escalation rather than authorising it.
+User={{AGENT_USER}}
+Group={{AGENT_GROUP}}
+
+Environment=DISPATCH_WORKSPACE_ROOT={{WORKSPACE_ROOT}}
+ExecStart={{SWEEP_BIN}}
+
+# Bounded: a pass that wedges must not overlap the next one. `git push` over the
+# LAN is seconds; anything approaching this is a hung network call.
+TimeoutStartSec=300
+
+# The agent user has no login shell session; give it a writable HOME so git does
+# not fall back to a read-only or absent one.
+Environment=HOME=/home/{{AGENT_USER}}
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths={{WORKSPACE_ROOT}}

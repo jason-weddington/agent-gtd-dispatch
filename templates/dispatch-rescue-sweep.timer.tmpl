@@ -1,0 +1,23 @@
+[Unit]
+Description=Run the Agent GTD dispatch rescue sweep periodically
+Documentation=https://github.com/jason-weddington/agent-gtd-dispatch
+
+[Timer]
+# Every 4 minutes. The window this bounds is "work committed in a clone that the
+# clone's own teardown will delete", so the interval is the worst-case amount of
+# finished work at risk. Four minutes was the cadence the hand-run version used
+# and it rescued three runs in one evening; cheap enough that there is no reason
+# to lengthen it.
+OnBootSec=2min
+OnUnitActiveSec=4min
+
+# Do NOT catch up after downtime. A missed pass is not worth a thundering burst
+# of git pushes the moment a host comes back, and the next pass is four minutes
+# away regardless.
+Persistent=false
+
+# Small jitter so four hosts do not hit the git server in lockstep.
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

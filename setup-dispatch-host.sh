@@ -58,6 +58,9 @@ API_PORT=8100
 SUDOERS_FILE="/etc/sudoers.d/dispatch-svc"
 SYSTEMD_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
 TMPL_DIR="${SCRIPT_DIR}/templates"
+# Rescue sweep: a packaged systemd timer, not an agent-run watchdog. See Step 6.2.
+SWEEP_NAME="${SWEEP_NAME:-dispatch-rescue-sweep}"
+SWEEP_BIN="${SWEEP_BIN:-/usr/local/bin/dispatch-rescue-sweep}"
 # Budget per MCP server for the Step 4.6 initialize + tools/list probe. 600s is sized
 # for a cold ~/.cache/uv building personal_kb from git on the aarch64 Pi 5. Set to 0 to
 # skip the probe pass entirely.
@@ -2051,6 +2054,40 @@ elif $DRY_RUN; then
     would "systemctl daemon-reload && systemctl enable && systemctl restart ${SERVICE_NAME}"
 else
     _install_unit
+fi
+
+# ===========================================================================
+# Step 6.2: Rescue sweep timer
+# ===========================================================================
+# Pushes committed-but-unpushed work out of live clones before teardown deletes
+# them. Packaged and deployed like the service itself rather than run by a lead
+# agent on a Monitor: the previous arrangement depended on a control-plane
+# session staying alive to re-arm a 30-minute watch, which is the least reliable
+# part of the whole thing and stops the moment a session ends.
+#
+# Runs as the AGENT user, which owns the clones, so it needs no sudo. See
+# scripts/rescue-sweep.sh for what the worker's own rescue does NOT cover.
+_install_sweep_units() {
+    install -m 0755 "${SCRIPT_DIR}/scripts/rescue-sweep.sh" "$SWEEP_BIN"
+    for _kind in service timer; do
+        sed \
+            -e "s|{{AGENT_USER}}|${AGENT_USER}|g" \
+            -e "s|{{AGENT_GROUP}}|${AGENT_GROUP}|g" \
+            -e "s|{{WORKSPACE_ROOT}}|${AGENT_WORKSPACE}|g" \
+            -e "s|{{SWEEP_BIN}}|${SWEEP_BIN}|g" \
+            "${TMPL_DIR}/dispatch-rescue-sweep.${_kind}.tmpl" \
+            > "/etc/systemd/system/${SWEEP_NAME}.${_kind}"
+    done
+    systemctl daemon-reload
+    systemctl enable --now "${SWEEP_NAME}.timer"
+    info "Installed rescue sweep timer: ${SWEEP_NAME}.timer (every 4 min)"
+}
+
+if $DRY_RUN; then
+    would "install ${SWEEP_BIN} and ${SWEEP_NAME}.{service,timer}"
+    would "systemctl daemon-reload && systemctl enable --now ${SWEEP_NAME}.timer"
+else
+    _install_sweep_units
 fi
 
 # ===========================================================================

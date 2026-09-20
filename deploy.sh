@@ -76,6 +76,18 @@ deploy_one() {
     echo
     echo "########## ${host} ##########"
 
+    # Rescue sweep: ship the script and its units ahead of the wheel. They are
+    # plain files rather than package data because the sweep must keep working
+    # even when the service is broken — it exists precisely for the runs a broken
+    # service abandons, so coupling its delivery to the service's own health
+    # would remove it exactly when it is needed.
+    scp -q "${SCRIPT_DIR}/scripts/rescue-sweep.sh" \
+        "${SCRIPT_DIR}/templates/dispatch-rescue-sweep.service.tmpl" \
+        "${SCRIPT_DIR}/templates/dispatch-rescue-sweep.timer.tmpl" \
+        "${host}:/tmp/" || {
+        echo "[WARN] could not stage rescue-sweep files on ${host} — skipping sweep refresh" >&2
+    }
+
     ssh "${host}" bash -s <<EOF
 set -euo pipefail
 
@@ -216,6 +228,30 @@ if HOOK_OUT=\$(sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/uv tool i
 else
     echo "[WARN] personal-kb-hook install failed for ${AGENT_USER} — agent keeps its current binary (if any). Last output:" >&2
     printf '%s\n' "\$HOOK_OUT" | tail -n 5 | sed 's/^/[WARN]   /' >&2
+fi
+
+# Rescue sweep timer — install/refresh, then restart. Non-fatal: a host that
+# cannot take the sweep is still a working dispatch host, and failing the deploy
+# over it would leave the fleet on an older wheel for a watchdog's sake.
+if [ -f /tmp/rescue-sweep.sh ]; then
+    sudo install -m 0755 /tmp/rescue-sweep.sh /usr/local/bin/dispatch-rescue-sweep
+    for _k in service timer; do
+        sed -e "s|{{AGENT_USER}}|${AGENT_USER}|g" \
+            -e "s|{{AGENT_GROUP}}|${AGENT_USER}|g" \
+            -e "s|{{WORKSPACE_ROOT}}|/home/${AGENT_USER}/workspace|g" \
+            -e "s|{{SWEEP_BIN}}|/usr/local/bin/dispatch-rescue-sweep|g" \
+            "/tmp/dispatch-rescue-sweep.\${_k}.tmpl" \
+            | sudo tee "/etc/systemd/system/dispatch-rescue-sweep.\${_k}" >/dev/null
+    done
+    sudo systemctl daemon-reload
+    if sudo systemctl enable --now dispatch-rescue-sweep.timer >/dev/null 2>&1; then
+        echo "[OK]   rescue sweep timer active (every 4 min)"
+    else
+        echo "[WARN] rescue sweep timer failed to enable on this host" >&2
+    fi
+    rm -f /tmp/rescue-sweep.sh /tmp/dispatch-rescue-sweep.*.tmpl
+else
+    echo "[WARN] rescue-sweep files not staged — timer not refreshed" >&2
 fi
 
 # Restart the service so systemd runs the freshly-installed entry point.
