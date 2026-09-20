@@ -15,7 +15,7 @@ set -euo pipefail
 # them before this script runs.
 #
 # Environment variables:
-#   DISPATCH_HOSTS  Space-separated SSH targets (default: "pironman01 r7-research r7-server")
+#   DISPATCH_HOSTS  Space-separated SSH targets (default: "pironman01 r7-research r7-server jason-precision")
 #   DISPATCH_HOST   Single SSH target — if set, overrides DISPATCH_HOSTS (back-compat)
 #   SERVICE_USER    Service account owning the tool install (default: dispatch-svc)
 #   AGENT_USER      Agent subprocess user whose Claude Code, lefthook and dev toolchain
@@ -34,7 +34,7 @@ set -euo pipefail
 if [ -n "${DISPATCH_HOST:-}" ]; then
     HOSTS="${DISPATCH_HOST}"
 else
-    HOSTS="${DISPATCH_HOSTS:-pironman01 r7-research r7-server}"
+    HOSTS="${DISPATCH_HOSTS:-pironman01 r7-research r7-server jason-precision}"
 fi
 SERVICE_USER="${SERVICE_USER:-dispatch-svc}"
 AGENT_USER="${AGENT_USER:-dispatch}"
