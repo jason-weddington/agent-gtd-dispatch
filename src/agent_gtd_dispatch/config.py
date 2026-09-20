@@ -57,6 +57,13 @@ MAX_MANAGE_RETRIES: int = 2  # max auto-recovery relaunches for manage mode
 MAX_CONCURRENT_RUNS: int = 32  # thread-pool ceiling for run_in_executor
 CANCEL_GRACE_SECONDS: int = 5  # seconds between SIGTERM and SIGKILL on cancel
 
+# How long shutdown waits for cancelled runs to finish their teardown — evidence
+# capture and the rescue of abandoned work, both of which shell out to git.
+# Must stay comfortably under systemd's TimeoutStopSec (90s default), because
+# systemd SIGKILLs us regardless and a rescue killed mid-push is worse than one
+# that never started.
+SHUTDOWN_GRACE_SECONDS: int = 45
+
 # Floor on remaining run budget below which the push backstop (worker completes an
 # agent's unfinished `git push` after a successful build-mode exit) is not attempted
 # at all — not enough time left to plausibly succeed (e.g. a slow pre-push hook).

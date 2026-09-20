@@ -289,8 +289,53 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         _retention_task.cancel()
     if _readoption_task is not None:
         _readoption_task.cancel()
-    for task in _active_processes.values():
+    # Cancel every in-flight run, then WAIT for their teardown to finish.
+    #
+    # The wait is load-bearing and its absence was a real hole. Each run's
+    # `finally` block captures evidence and then rescues abandoned work —
+    # committing and pushing whatever the agent left to the run's own branch — and
+    # both of those are `await`s that shell out to git. Cancelling and returning
+    # immediately ends the lifespan, the event loop tears down, and those awaits
+    # never get to run. So on every service restart the rescue silently did not
+    # fire, which is precisely the case it exists for: a deploy is the most common
+    # reason a run dies part-way through real work.
+    #
+    # Bounded, because systemd will SIGKILL us at its stop timeout regardless and
+    # a rescue that cannot finish in time must not take the shutdown down with it.
+    # `return_exceptions=True` so one run's failed teardown cannot strand the rest.
+    _in_flight = []
+    for task in list(_active_processes.values()):
         task.cancel()
+        # Gather only real futures belonging to THIS loop. In production every
+        # value here is an asyncio.Task on the running loop, so this keeps all of
+        # them. It guards two things that are not worth failing a shutdown over:
+        # a test double, which is not a future at all, and a task left in this
+        # module-level dict by a previous event loop, which gather() rejects with
+        # "future belongs to a different loop".
+        if asyncio.isfuture(task):
+            try:
+                if task.get_loop() is asyncio.get_running_loop():
+                    _in_flight.append(task)
+            except RuntimeError:  # no running loop — nothing to wait on
+                pass
+    if _in_flight:
+        logger.info(
+            "shutdown: cancelled %d in-flight run(s), waiting up to %ss for"
+            " evidence capture and work rescue to finish",
+            len(_in_flight),
+            config.SHUTDOWN_GRACE_SECONDS,
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*_in_flight, return_exceptions=True),
+                timeout=config.SHUTDOWN_GRACE_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "shutdown: teardown did not finish within %ss — some work may be"
+                " unrescued in its workspace",
+                config.SHUTDOWN_GRACE_SECONDS,
+            )
 
 
 app = FastAPI(title="Agent GTD Dispatch", lifespan=lifespan)
