@@ -31,11 +31,8 @@ set -euo pipefail
 #
 # Exit code: 0 if every host succeeded. Non-zero on first failure (other hosts skipped).
 
-if [ -n "${DISPATCH_HOST:-}" ]; then
-    HOSTS="${DISPATCH_HOST}"
-else
-    HOSTS="${DISPATCH_HOSTS:-pironman01 r7-research r7-server jason-precision}"
-fi
+. "$(dirname "$0")/scripts/fleet-hosts.sh"
+resolve_fleet_hosts || exit 1
 SERVICE_USER="${SERVICE_USER:-dispatch-svc}"
 AGENT_USER="${AGENT_USER:-dispatch}"
 SERVICE_NAME="${SERVICE_NAME:-dispatch-api}"

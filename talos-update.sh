@@ -32,11 +32,8 @@ TALOS_ARTIFACT_BASE="${TALOS_ARTIFACT_BASE:-https://artifacts.lab.jasonweddingto
 AGENT_USER="${AGENT_USER:-dispatch}"
 AGENT_GROUP="${AGENT_GROUP:-${AGENT_USER}}"
 
-if [ -n "${DISPATCH_HOST:-}" ]; then
-    HOSTS="${DISPATCH_HOST}"
-else
-    HOSTS="${DISPATCH_HOSTS:-pironman01 r7-research r7-server jason-precision}"
-fi
+. "$(dirname "$0")/scripts/fleet-hosts.sh"
+resolve_fleet_hosts || exit 1
 
 TARGET_TOKEN=""  # resolved after argument parsing (below)
 
