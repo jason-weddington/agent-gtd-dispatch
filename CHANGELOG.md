@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.0.1 (2026-09-20)
+
+### Bug Fixes
+
+- **prompt**: Correct the manage prompt's already_satisfied description
+  ([`6b5a1bc`](https://github.com/repos/agent-gtd-dispatch/commit/6b5a1bc228ccff079b2986b6a4f229817c723cf5))
+
+
 ## v2.0.0 (2026-09-20)
 
 ### Bug Fixes
