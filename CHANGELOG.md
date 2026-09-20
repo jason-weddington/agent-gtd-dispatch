@@ -2,6 +2,30 @@
 
 <!-- version list -->
 
+## v2.1.0 (2026-09-20)
+
+### Bug Fixes
+
+- **dispatch**: Split abandoned work from a run that wrote nothing
+  ([`10c710d`](https://github.com/repos/agent-gtd-dispatch/commit/10c710da9922baececc98ad27283a9ee343eb1f8))
+
+- **fleet**: Derive the host list from the registry and fail closed on a short one
+  ([`5877f6f`](https://github.com/repos/agent-gtd-dispatch/commit/5877f6f8d97b394ea0e49739aa9cd43ce83a8804))
+
+- **shutdown**: Wait for cancelled runs to finish their teardown
+  ([`b2f155b`](https://github.com/repos/agent-gtd-dispatch/commit/b2f155b53c3916484477a8daac713d8e7232ef11))
+
+### Chores
+
+- **fleet**: Add jason-precision to the default host lists
+  ([`068c6e8`](https://github.com/repos/agent-gtd-dispatch/commit/068c6e802fc3991712ce84a836b7a5dfe12ac965))
+
+### Features
+
+- **watchdog**: Package the rescue sweep as a systemd timer on every host
+  ([`bbc4449`](https://github.com/repos/agent-gtd-dispatch/commit/bbc44494a65fb67fac057d7a6da3fe867ee96c8a))
+
+
 ## v2.0.2 (2026-09-20)
 
 ### Bug Fixes
