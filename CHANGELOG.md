@@ -2,6 +2,49 @@
 
 <!-- version list -->
 
+## v2.0.0 (2026-09-20)
+
+### Bug Fixes
+
+- **dispatch**: Decide a build run's outcome from mechanical evidence only
+  ([`053f554`](https://github.com/repos/agent-gtd-dispatch/commit/053f554158d0f23fd3bed61fe449c4195bcd0fdc))
+
+- **disposition**: Never derive already_satisfied from a do-nothing run
+  ([`50335eb`](https://github.com/repos/agent-gtd-dispatch/commit/50335eb53079bf7ff83c2e7ae4fdc1d10cd24db7))
+
+- **disposition**: Serve a model the endpoint answers, stop deriving failed with no gate, make
+  failures diagnosable
+  ([`dd2d5e2`](https://github.com/repos/agent-gtd-dispatch/commit/dd2d5e21ca51fd2207a5984e5450a4999c4fba07))
+
+- **retention**: Capture working-tree diffs and self-identify patches
+  ([`58574b1`](https://github.com/repos/agent-gtd-dispatch/commit/58574b1c4d476b94a6cc6deaf32e15ba0e796c86))
+
+- **talos**: Disambiguate a redundant empty commit from a do-nothing run
+  ([`9f97be3`](https://github.com/repos/agent-gtd-dispatch/commit/9f97be3965404a132f841e66e0a02810a988aaae))
+
+### Features
+
+- Delete the LLM rollout planner and retire the ANTHROPIC_API_KEY startup requirement
+  ([`e3a3186`](https://github.com/repos/agent-gtd-dispatch/commit/e3a31863bc362584fc3d44aad9bca8bd13ab6130))
+
+- **manage**: Gate_command as the merge bar, merge notes in-prompt, derived squash type
+  ([`60a72de`](https://github.com/repos/agent-gtd-dispatch/commit/60a72def28c1c3f8a00c342b8467eaac595983fe))
+
+- **rollouts**: Worker drives the wave loop; a short-lived agent reviews and merges
+  ([`a4e841a`](https://github.com/repos/agent-gtd-dispatch/commit/a4e841a98e01ed1203ed7913ebf08805194f0ca0))
+
+### Breaking Changes
+
+- Removes the POST /plan endpoint and the DagEdge, PlanRequest and RolloutPlan protocol types. No
+  consumer imports them — agent_gtd's only protocol imports are DispatchMode, DispatchRequest,
+  RunResponse and RunStatus — but they were exported from a published package, so this is honestly a
+  major.
+
+- **dispatch**: The completion-artifact contract is removed, along with the
+  `DISPOSITION_CLASSIFIER_*` configuration. A claude-code build run can no longer terminate as
+  `already_satisfied`.
+
+
 ## v1.26.0 (2026-09-19)
 
 ### Bug Fixes
