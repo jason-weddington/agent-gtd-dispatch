@@ -115,8 +115,8 @@ fi
 if [ -n "${EXPECT_VERSION:-}" ]; then
     _installed=\$(sudo -u ${SERVICE_USER} -H /home/${SERVICE_USER}/.local/bin/uv tool list \\
         | sed -n 's/^agent-gtd-dispatch v\\([0-9][0-9.]*\\).*/\\1/p' | head -n1)
-    if [ "\$_installed" != "${EXPECT_VERSION}" ]; then
-        echo "[ERR]  expected agent-gtd-dispatch ${EXPECT_VERSION} but \$_installed is installed" >&2
+    if [ "\$_installed" != "${EXPECT_VERSION:-}" ]; then
+        echo "[ERR]  expected agent-gtd-dispatch ${EXPECT_VERSION:-} but \$_installed is installed" >&2
         exit 1
     fi
     echo "[OK]   agent-gtd-dispatch \$_installed (matches expected)"
