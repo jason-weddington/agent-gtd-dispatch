@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v2.2.0 (2026-09-30)
+
+### Bug Fixes
+
+- **deploy**: Stop an unset EXPECT_VERSION aborting every deploy
+  ([`c41cbf3`](https://github.com/repos/agent-gtd-dispatch/commit/c41cbf352956cb058b68c908dd2bd7b5008d14d8))
+
+### Features
+
+- **talos**: Run the talos-opus lane on Opus 5.5
+  ([`6a74d49`](https://github.com/repos/agent-gtd-dispatch/commit/6a74d49d22e31d097b90a504dcfc186c952a51da))
+
+- **toolchain**: Provision Playwright Chromium for the dispatch agent user on every host
+  ([`1151aa0`](https://github.com/repos/agent-gtd-dispatch/commit/1151aa0594f3ba8a2975ec5ca638a08d8402376f))
+
+
 ## v2.1.0 (2026-09-20)
 
 ### Bug Fixes
