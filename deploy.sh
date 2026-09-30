@@ -244,11 +244,16 @@ else
         if ! sudo env PATH="\$(dirname "\$_pw_npx"):/usr/bin:/bin" "\$_pw_npx" --yes "playwright@\$_v" install-deps ${PLAYWRIGHT_BROWSERS:-} >/dev/null 2>&1; then
             echo "[WARN] playwright@\$_v install-deps failed for ${AGENT_USER} — system libraries for the browsers may be incomplete" >&2
         fi
-        if sudo -u ${AGENT_USER} -H bash -lc "PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=600000 '\$_pw_npx' --yes playwright@\$_v install ${PLAYWRIGHT_BROWSERS:-}" >/dev/null 2>&1; then
+        # cd /tmp: the ssh session's cwd is the deploying user's home, which the
+        # agent user usually cannot read, and npm then dies with EACCES spawning sh.
+        _pw_log=\$(mktemp)
+        if sudo -u ${AGENT_USER} -H bash -lc "cd /tmp && PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=600000 '\$_pw_npx' --yes playwright@\$_v install ${PLAYWRIGHT_BROWSERS:-}" >"\$_pw_log" 2>&1; then
             echo "[OK]   Playwright \$_v (${PLAYWRIGHT_BROWSERS:-}) for ${AGENT_USER}"
         else
-            echo "[WARN] playwright@\$_v install failed for ${AGENT_USER} — agent keeps its current browsers (if any)" >&2
+            echo "[WARN] playwright@\$_v install failed for ${AGENT_USER} — agent keeps its current browsers (if any). Last output:" >&2
+            tail -n 5 "\$_pw_log" >&2 || true
         fi
+        rm -f "\$_pw_log"
     done
 fi
 
