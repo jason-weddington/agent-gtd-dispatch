@@ -149,7 +149,7 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
     if engine_name == "talos-opus":
         return {
             "TALOS_BACKEND": "anthropic",
-            "ANTHROPIC_MODEL": "claude-opus-4-8",
+            "ANTHROPIC_MODEL": "claude-opus-5-5",
             # ANTHROPIC_API_KEY reversal vs. claude-code — see kb-01512.
             "ANTHROPIC_API_KEY": config.ANTHROPIC_API_KEY,
         }

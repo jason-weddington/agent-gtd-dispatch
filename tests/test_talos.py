@@ -158,7 +158,7 @@ class TestTalosEnvOverlay:
 
         assert talos_env_overlay("talos-opus") == {
             "TALOS_BACKEND": "anthropic",
-            "ANTHROPIC_MODEL": "claude-opus-4-8",
+            "ANTHROPIC_MODEL": "claude-opus-5-5",
             "ANTHROPIC_API_KEY": config.ANTHROPIC_API_KEY,
         }
 
