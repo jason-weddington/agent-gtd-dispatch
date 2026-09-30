@@ -23,7 +23,10 @@ This guide covers bootstrapping a fresh Ubuntu host and migrating an existing si
 > `gitleaks` release binary — see [Dev toolchain (Step 4.9)](#dev-toolchain-step-49)),
 > and **`personal-kb-hook`** (Step 4.10: `uv tool install`, wired into the agent's
 > `~/.claude/settings.json` — see
-> [personal-kb-hook (Step 4.10)](#personal-kb-hook-step-410)).
+> [personal-kb-hook (Step 4.10)](#personal-kb-hook-step-410)), and
+> **Playwright browsers** (Step 4.11: the Chromium builds dispatched repos' e2e
+> suites need, installed into the agent user's default browser cache — see
+> [Playwright browsers (Step 4.11)](#playwright-browsers-step-411)).
 > The `rustup` bootstrap also guarantees a usable default toolchain for the agent
 > user, even when `rustup` was already present with no default configured.
 > All other tooling (`python3`, `visudo`, `systemctl`) ships with standard Ubuntu.
@@ -1002,6 +1005,33 @@ sudo -u dispatch -H python3 -c "import json; print(json.load(open('/home/dispatc
 ```
 
 The cheapest proof the hook actually **ran** during a dispatched build (not just that it's installed) is `~/.cache/personal_kb/whisper-debug-<session>.log` on the host — its presence after a run confirms the hook fired and reached the KB service, without needing to inspect the agent's own transcript.
+
+---
+
+## Playwright browsers (Step 4.11)
+
+Step 4.11 provisions the Playwright browser builds — currently the bundled Chromium — that dispatched repos' e2e suites launch, installing them into the `dispatch` (agent) user's **default** browser cache (`~/.cache/ms-playwright`), where every dispatched repo finds them with zero configuration and no private browsers-path env var.
+
+### Why this matters
+
+Dispatched repos run Playwright e2e suites — camera-profiles `apps/desktop` pins `@playwright/test` 1.63.0 with a project using `devices['Desktop Chrome']`, which launches Playwright's bundled Chromium build. Two properties of dispatch make this a provisioning problem rather than a repo problem: dispatched agents run as the unprivileged `dispatch` user and **cannot install anything**, and even when a run tries `npx playwright install` anyway it dies at Playwright's **30-second download-connection cap** — a cap the homelab's links and the aarch64 Pi routinely exceed. Before this step existed, one agent on `jason-precision` worked around both by curling Chrome-for-Testing zips into a private browsers-path cache of its own — a cache no other dispatched repo could see, and one the next provisioning run could clobber. Provisioning the browsers here, into the default cache, is the same "tools the repo shells out to belong on the host" premise as Step 4.9.
+
+### Where versions are pinned
+
+`templates/dev-toolchain.sh` is the single source of truth, same as the Rust toolchain list: `PLAYWRIGHT_VERSIONS` is an array of Playwright npm versions (each entry's browser revisions install **side by side** in the agent's default cache, so multiple dispatched repos with different `@playwright/test` pins coexist), and `PLAYWRIGHT_BROWSERS` is the space-separated browser list passed to `playwright install`. Entries must match the `@playwright/test` pins of dispatched repos — camera-profiles `apps/desktop` pins 1.63.0 — and adding a version or browser is a **one-line change** in that file; both `setup-dispatch-host.sh` (Step 4.11) and `deploy.sh` read it as data.
+
+### What the step does
+
+1. Resolves the agent user's `npx` via `runuser -l dispatch -c 'command -v npx'` — a **login** shell, because the dispatch user's node lives in `~/.local/bin` on some hosts (`r7-server` runs `/home/dispatch/.local/bin/node` v20; the rest use `/usr/bin/node` v22) and a non-login shell may not see it. If `npx` is missing the step **WARNs and skips** (never `die`) — the rest of provisioning continues.
+2. For each version `V` in `PLAYWRIGHT_VERSIONS`, runs `<npx> --yes playwright@V install-deps <browsers>` **as root** — `install-deps` installs the system libraries (fonts, shared libraries, X/NSS bits) via apt, and only root can. This is exactly why the step exists in the root-run installer rather than in `deploy.sh`'s agent-user context alone.
+3. Then runs `PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=600000 <npx> --yes playwright@V install <browsers>` **as the agent user**, so the browser revisions land in `/home/dispatch/.cache/ms-playwright` owned by the agent. The 600000 ms timeout lifts Playwright's 30s download-connection cap.
+4. Every failure is a non-fatal `[WARN]` naming the version and the sub-action, collected into a single end-of-step summary WARN in the Step 4.9 style; nothing in this step can abort provisioning.
+
+`install-deps` and `install` are both idempotent — a browser revision already present is skipped — so re-running the step (or `./deploy.sh`, which re-runs the same two commands per version on every host) converges without re-downloading. `deploy.sh` deliberately re-runs `install-deps` as root on every deploy even though setup already did it: it is idempotent, and a fresh host that only ever sees `deploy.sh` still gets its system libraries.
+
+### Architecture support (aarch64)
+
+`pironman01` is a Raspberry Pi 5 (`aarch64`) and Playwright publishes **linux-arm64** Chromium builds, so the same `PLAYWRIGHT_VERSIONS` list works across the whole fleet with no per-host branching — unlike the gitleaks asset-name mapping in Step 4.9, no architecture table is needed here. As of 2026-09-30 the x86_64 hosts (`r7-research`, `r7-server`, `jason-precision`) carry hand-installed `chromium-1243` + `chromium_headless_shell-1243` from the 1.63.0 pin, and `pironman01` has none; this step is what makes both facts converge on "provisioned, not hand-installed".
 
 ---
 

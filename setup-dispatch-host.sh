@@ -1979,6 +1979,67 @@ else
 fi
 
 # ===========================================================================
+# Step 4.11: Playwright browsers (agent user)
+# ===========================================================================
+# WHY: dispatched repos run Playwright e2e suites (camera-profiles apps/desktop,
+# @playwright/test 1.63.0, devices['Desktop Chrome'] = the bundled chromium build).
+# The agent user cannot install anything (same premise as Step 4.9), and running
+# `npx playwright install` from inside a dispatched run fails at Playwright's
+# 30s download-connection cap — so provisioning belongs here, where root runs the
+# apt-backed `install-deps` and the agent user runs the browser download into its
+# DEFAULT cache (~/.cache/ms-playwright). The browsers land where every dispatched
+# repo finds them with no configuration — the default cache is deliberately NOT
+# overridden with a private browsers-path env var (a private path is what forced
+# one agent on jason-precision into a hand-rolled curl workaround no other repo
+# could see).
+#
+# The version list is data, not code: see templates/dev-toolchain.sh (sourced in
+# Step 4.9 above). Adding a Playwright version is a one-line change there.
+#
+# Non-fatal by design (same policy as Step 4.9): a failed install-deps or install
+# WARNs, is collected into the failed list reported once below, and provisioning
+# continues — a missing browser must never leave a host without sudoers/systemd
+# (Steps 5a–8). A missing npx for the agent user also only WARNs: node exists for
+# the dispatch user on every host under a LOGIN shell (r7-server's node is
+# /home/dispatch/.local/bin/node v20, the rest /usr/bin/node v22), so `runuser -l`
+# is how it is resolved; a non-login shell may not see it.
+# ===========================================================================
+echo ""
+echo "--- Step 4.11: Playwright browsers (agent user) ---"
+
+# Resolve npx via the agent's LOGIN shell so ~/.local/bin is on PATH.
+_pw_npx="$(runuser -l "$AGENT_USER" -c 'command -v npx' 2>/dev/null || true)"
+if [[ -z "$_pw_npx" ]]; then
+    warn "npx not found for ${AGENT_USER} (login shell) — cannot provision Playwright browsers; skipping Step 4.11. Install Node.js for the agent user and re-run 'sudo ./setup-dispatch-host.sh'."
+else
+    _pw_failed=()
+    for _pw_ver in "${PLAYWRIGHT_VERSIONS[@]}"; do
+        # Sub-action A: system libraries (apt) — needs root, so run as root.
+        if $DRY_RUN; then
+            would "run '${_pw_npx}' --yes playwright@${_pw_ver} install-deps ${PLAYWRIGHT_BROWSERS} (as root)"
+        else
+            # Root runs the AGENT's npx, whose `#!/usr/bin/env node` would otherwise
+            # resolve root's node (system v18 on r7-server; Playwright needs >= 20).
+            env PATH="$(dirname "${_pw_npx}"):${PATH}" "${_pw_npx}" --yes "playwright@${_pw_ver}" install-deps ${PLAYWRIGHT_BROWSERS} \
+                || { warn "playwright@${_pw_ver} install-deps failed for ${AGENT_USER} — continuing"; _pw_failed+=("${_pw_ver} install-deps"); }
+        fi
+        # Sub-action B: the browsers themselves, downloaded AS the agent user into
+        # the agent's default cache. PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT lifts
+        # Playwright's 30s download-connection cap, which the homelab's slower links
+        # (and the aarch64 Pi) routinely exceed.
+        if $DRY_RUN; then
+            would "runuser -l ${AGENT_USER} -c \"PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=600000 '${_pw_npx}' --yes playwright@${_pw_ver} install ${PLAYWRIGHT_BROWSERS}\""
+        else
+            runuser -l "$AGENT_USER" -c "PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=600000 '${_pw_npx}' --yes playwright@${_pw_ver} install ${PLAYWRIGHT_BROWSERS}" \
+                || { warn "playwright@${_pw_ver} install (${PLAYWRIGHT_BROWSERS}) failed for ${AGENT_USER} — continuing"; _pw_failed+=("${_pw_ver} install"); }
+        fi
+    done
+    if [[ ${#_pw_failed[@]} -gt 0 ]]; then
+        warn "Playwright browsers incomplete for ${AGENT_USER}: ${_pw_failed[*]} — provisioning continued; re-run 'sudo ./setup-dispatch-host.sh' to retry"
+    fi
+fi
+
+# ===========================================================================
 # Step 5a: Claude symlink (must precede sudoers so the path exists when
 #           visudo validates the fragment)
 # ===========================================================================

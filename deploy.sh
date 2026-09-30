@@ -18,8 +18,9 @@ set -euo pipefail
 #   DISPATCH_HOSTS  Space-separated SSH targets (default: "pironman01 r7-research r7-server jason-precision")
 #   DISPATCH_HOST   Single SSH target — if set, overrides DISPATCH_HOSTS (back-compat)
 #   SERVICE_USER    Service account owning the tool install (default: dispatch-svc)
-#   AGENT_USER      Agent subprocess user whose Claude Code, lefthook and dev toolchain
-#                   (Rust tools + gitleaks, Step 4.9) are refreshed (default: dispatch)
+#   AGENT_USER      Agent subprocess user whose Claude Code, lefthook, dev toolchain
+#                   (Rust tools + gitleaks, Step 4.9) and Playwright browsers
+#                   (Step 4.11) are refreshed (default: dispatch)
 #   SERVICE_NAME    Systemd service unit name (default: dispatch-api)
 #   DISPATCH_INDEX  Homelab wheel index URL (default: https://pypi.lab.jasonweddington.com/simple/)
 #   RUST_DEFAULT_TOOLCHAIN  Rust toolchain pointed at by 'rustup default' when the agent
@@ -63,12 +64,19 @@ if [ -f "${TOOLCHAIN_CONF}" ]; then
     done
     # Substitute {version} locally; {arch} is resolved on each host from `uname -m`.
     GITLEAKS_URL_VERSIONED="${GITLEAKS_URL_TEMPLATE//\{version\}/${GITLEAKS_VERSION}}"
+    # Playwright pins, same single-quoted-entry interpolation pattern as above.
+    PLAYWRIGHT_VERSION_LIST=""
+    for _e in "${PLAYWRIGHT_VERSIONS[@]}"; do
+        PLAYWRIGHT_VERSION_LIST="${PLAYWRIGHT_VERSION_LIST}'${_e}' "
+    done
 else
     echo "[WARN] ${TOOLCHAIN_CONF} not found — dev toolchain refresh will be skipped on every host" >&2
     DEV_TOOLCHAIN_PKG_LIST=""
     GITLEAKS_ARCH_MAP_LIST=""
     GITLEAKS_URL_VERSIONED=""
     GITLEAKS_VERSION=""
+    PLAYWRIGHT_VERSION_LIST=""
+    PLAYWRIGHT_BROWSERS=""
 fi
 
 deploy_one() {
@@ -211,6 +219,37 @@ else
         echo "[WARN] gitleaks ${GITLEAKS_VERSION} install failed (\$_gl_url) — agent keeps its current binary" >&2
     fi
     rm -rf "\$_gl_tmp"
+fi
+
+# Refresh the agent user's Playwright browsers (setup-dispatch-host.sh Step 4.11).
+# Dispatched repos run Playwright e2e suites (camera-profiles apps/desktop,
+# @playwright/test 1.63.0) and the agent user cannot install anything, so the
+# browsers must already be in its DEFAULT cache (~/.cache/ms-playwright — never
+# a private browsers-path env var, which only the repo that set it can see). The
+# version list and browser names come from
+# templates/dev-toolchain.sh, sourced locally above and interpolated here — never
+# hand-copied. `install-deps` (apt system libraries) needs root, so it runs as root
+# here exactly as Step 4.11 does at provision time — both are idempotent, so
+# re-running is safe. PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT lifts Playwright's
+# 30s download-connection cap, which in-run installs routinely exceed. Non-fatal
+# throughout (the whole block is wrapped in if/else — it never trips set -e): a
+# failed refresh leaves the agent on its current browsers and the deploy continues.
+_pw_npx=\$(sudo -u ${AGENT_USER} -H bash -lc 'command -v npx' 2>/dev/null || true)
+if [ -z "${PLAYWRIGHT_VERSION_LIST}" ]; then
+    echo "[WARN] no Playwright version pin available (templates/dev-toolchain.sh missing) — skipping Playwright browser refresh" >&2
+elif [ -z "\$_pw_npx" ]; then
+    echo "[WARN] npx not found for ${AGENT_USER} (login shell) — Playwright browser refresh skipped; run 'sudo ./setup-dispatch-host.sh' (Step 4.11) on this host" >&2
+else
+    for _v in ${PLAYWRIGHT_VERSION_LIST}; do
+        if ! sudo env PATH="\$(dirname "\$_pw_npx"):/usr/bin:/bin" "\$_pw_npx" --yes "playwright@\$_v" install-deps ${PLAYWRIGHT_BROWSERS:-} >/dev/null 2>&1; then
+            echo "[WARN] playwright@\$_v install-deps failed for ${AGENT_USER} — system libraries for the browsers may be incomplete" >&2
+        fi
+        if sudo -u ${AGENT_USER} -H bash -lc "PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=600000 '\$_pw_npx' --yes playwright@\$_v install ${PLAYWRIGHT_BROWSERS:-}" >/dev/null 2>&1; then
+            echo "[OK]   Playwright \$_v (${PLAYWRIGHT_BROWSERS:-}) for ${AGENT_USER}"
+        else
+            echo "[WARN] playwright@\$_v install failed for ${AGENT_USER} — agent keeps its current browsers (if any)" >&2
+        fi
+    done
 fi
 
 # Refresh personal-kb-hook for the agent user (setup-dispatch-host.sh Step 4.10).

@@ -82,3 +82,30 @@ GITLEAKS_ARCH_MAP=(
   "x86_64|x64"     # r7-research, r7-server
   "aarch64|arm64"  # pironman01 (Raspberry Pi 5)
 )
+
+# ---------------------------------------------------------------------------
+# FORMAT — PLAYWRIGHT_VERSIONS / PLAYWRIGHT_BROWSERS
+# ---------------------------------------------------------------------------
+# WHY: dispatched repos run Playwright e2e suites (camera-profiles apps/desktop,
+# @playwright/test 1.63.0, project devices['Desktop Chrome'] = bundled chromium).
+# Dispatched agents run as the unprivileged `dispatch` user and CANNOT install
+# anything, and `npx playwright install` from inside a run dies at Playwright's
+# 30s download-connection cap — on jason-precision one agent worked around this
+# by curling Chrome-for-Testing zips into a private PLAYWRIGHT_BROWSERS_PATH,
+# which no other repo can find. Provisioning the browsers here puts them in the
+# agent's DEFAULT cache (~/.cache/ms-playwright), where every dispatched repo
+# finds them with zero configuration.
+#
+# PLAYWRIGHT_VERSIONS: each entry is a Playwright npm version whose browser
+#   revisions are installed SIDE BY SIDE in that same default cache — every
+#   entry must match the @playwright/test pin of a dispatched repo (add the
+#   version the newest dispatched repo pins, keep older pins until no live
+#   dispatch still references them).
+# PLAYWRIGHT_BROWSERS: space-separated browser names passed to `playwright install`
+#   (and `playwright install-deps`).
+#
+# To ADD a version or browser: edit ONE line below. Re-run setup-dispatch-host.sh
+#   (Step 4.11) or ./deploy.sh to provision it on every host. Nothing else needs
+#   editing — both consumers read this file as data.
+PLAYWRIGHT_VERSIONS=("1.63.0")  # camera-profiles apps/desktop @playwright/test pin
+PLAYWRIGHT_BROWSERS="chromium"   # devices['Desktop Chrome'] uses the bundled chromium build
