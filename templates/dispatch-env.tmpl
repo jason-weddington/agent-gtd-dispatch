@@ -119,7 +119,7 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # Local test-Postgres DSN for @pytest.mark.postgres suites (e.g. kb-core) run by
 # dispatched agents, and the flag that turns a missing DSN into a hard test
 # failure rather than a silent skip. Both are written automatically by
-# setup-dispatch-host.sh --with-postgres — do not set these by hand.
+# setup-dispatch-host.sh (Postgres is default-on; --without-postgres removes them) — do not set these by hand.
 # KB_TEST_DATABASE_URL=
 # KB_REQUIRE_POSTGRES_TESTS=
 

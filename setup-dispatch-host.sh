@@ -17,10 +17,12 @@ set -euo pipefail
 #   --dry-run              Print 'Would: <action>' for every step; no mutations
 #   --smoke                After install, verify the API is reachable (GET /health and GET /info return HTTP 200)
 #   --with-talos           Build and install the talos engine binary for AGENT_USER (opt-in; default off)
-#   --with-postgres        Install local Postgres + pgvector, create an AGENT_USER-named
-#                          CREATEDB role (peer auth over the Unix socket), install pgvector
-#                          into template1, write KB_TEST_DATABASE_URL + KB_REQUIRE_POSTGRES_TESTS
-#                          to the service env (opt-in; default off)
+#   --without-postgres     Opt OUT of the default local Postgres + pgvector provisioning
+#                          (Step 4.5c: AGENT_USER-named CREATEDB role over the Unix socket,
+#                          pgvector in template1, KB_TEST_DATABASE_URL + KB_REQUIRE_POSTGRES_TESTS
+#                          in the service env). Also REMOVES those two keys from the service env.
+#                          Postgres is ON by default.
+#   --with-postgres        Accepted no-op alias (Postgres is already the default)
 #   --restart-if-stale     Step 6.5: when the running service environment is stale
 #                          relative to the installed env file AND zero runs are
 #                          active, restart the service automatically (opt-in;
@@ -73,7 +75,7 @@ ENV_FILE_SRC=""
 DRY_RUN=false
 SMOKE=false
 WITH_TALOS=false
-WITH_POSTGRES=false
+WITH_POSTGRES=true   # default ON; --without-postgres opts out
 # Toolchain 'rustup default' is pointed at when a host has rustup but no usable default.
 RUST_DEFAULT_TOOLCHAIN="${RUST_DEFAULT_TOOLCHAIN:-stable}"
 # Step 6.5 (service environment freshness): restart the service automatically
@@ -115,11 +117,11 @@ Options:
   --dry-run              Print 'Would: <action>' for every step; make no changes
   --smoke                After install, verify the API is reachable (GET /health and GET /info return HTTP 200)
   --with-talos           Build and install the talos engine binary for AGENT_USER (opt-in; default off)
-  --with-postgres        Install local Postgres + pgvector, create a '${AGENT_USER}' role with CREATEDB
-                         (peer-auth over the Unix socket, no password), install the vector
-                         extension into 'template1' so every database the test suite creates
-                         inherits it, and write KB_TEST_DATABASE_URL=postgresql:///postgres +
-                         KB_REQUIRE_POSTGRES_TESTS=1 to the service env file (opt-in; default off)
+  --without-postgres     Opt OUT of the default local Postgres + pgvector provisioning (Step 4.5c) and
+                         REMOVE KB_TEST_DATABASE_URL + KB_REQUIRE_POSTGRES_TESTS from the service env file.
+                         By default Postgres is installed, a '${AGENT_USER}' CREATEDB role is created (peer
+                         auth over the Unix socket), pgvector goes into template1, and both keys are written.
+  --with-postgres        Accepted no-op alias (Postgres is already the default)
   --restart-if-stale     Step 6.5: when the running service environment is stale
                          relative to the installed env file AND zero runs are
                          active, restart the service automatically (opt-in;
@@ -147,11 +149,11 @@ Examples:
   # Full install + smoke test:
   sudo ./setup-dispatch-host.sh --env-file /tmp/dispatch.env --smoke
 
-  # Install Postgres + pgvector (dispatch host only; dry-run preview):
-  sudo ./setup-dispatch-host.sh --with-postgres --dry-run
+  # Postgres + pgvector are on by default; preview them with a dry run:
+  sudo ./setup-dispatch-host.sh --dry-run
 
-  # Install Postgres + pgvector and smoke-test the vector extension:
-  sudo ./setup-dispatch-host.sh --with-postgres --smoke
+  # Opt out (also removes the Postgres env keys from the service env):
+  sudo ./setup-dispatch-host.sh --without-postgres
 EOF
     exit 0
 }
@@ -279,7 +281,8 @@ while [[ $# -gt 0 ]]; do
         --dry-run)        DRY_RUN=true;        shift   ;;
         --smoke)          SMOKE=true;          shift   ;;
         --with-talos)     WITH_TALOS=true;     shift   ;;
-        --with-postgres)  WITH_POSTGRES=true;  shift   ;;
+        --with-postgres)  WITH_POSTGRES=true;  shift   ;;  # no-op alias: default is already on
+        --without-postgres) WITH_POSTGRES=false; shift ;;
         --restart-if-stale) RESTART_IF_STALE=true; shift ;;
         -h|--help)        usage ;;
         *) die "Unknown option: $1  (run with --help for usage)" ;;
@@ -295,7 +298,7 @@ if $WITH_TALOS; then
     fi
 fi
 
-[[ $EUID -ne 0 ]] && die "This script must be run as root (use sudo)."
+[[ $EUID -ne 0 && -z "${SETUP_TEST_PG_ONLY:-}" ]] && die "This script must be run as root (use sudo)."
 
 # ===========================================================================
 # Single-user mode detection (runs after argument parsing, before derived paths)
@@ -356,6 +359,15 @@ if $SINGLE_USER; then
 else
     AGENT_GROUP="$AGENT_USER"
     SERVICE_GROUP="$SERVICE_USER"
+fi
+
+# Test seam (tests/test_setup_postgres_default.py): run ONLY the Postgres steps
+# (4.5c + 4.5d), extracted from this very file, against SETUP_TEST_SERVICE_ENV —
+# the full script needs root, apt and systemd. Never set in production.
+if [[ -n "${SETUP_TEST_PG_ONLY:-}" ]]; then
+    SERVICE_ENV="${SETUP_TEST_SERVICE_ENV:-$SERVICE_ENV}"
+    eval "$(sed -n '/^# >>> PG-STEPS$/,/^# <<< PG-STEPS$/p' "${BASH_SOURCE[0]}")"
+    exit 0
 fi
 
 # ===========================================================================
@@ -1176,8 +1188,9 @@ TALOS_PYEOF
     fi
 fi  # end: if ! $WITH_TALOS
 
+# >>> PG-STEPS
 # ===========================================================================
-# Step 4.5c: Postgres + pgvector (--with-postgres only)
+# Step 4.5c: Postgres + pgvector (default on; --without-postgres opts out)
 # ===========================================================================
 # Install a local PostgreSQL server with the pgvector extension so headless
 # test runs can exercise the PG code paths without reaching out to a desktop
@@ -1211,7 +1224,22 @@ echo ""
 echo "--- Step 4.5c: Postgres + pgvector ---"
 
 if ! $WITH_POSTGRES; then
-    skip "Postgres provisioning skipped — pass --with-postgres to install Postgres+pgvector on this host"
+    skip "Postgres provisioning skipped (--without-postgres)"
+    # A host that opts out must not claim the capability: strip both keys.
+    if [[ -f "$SERVICE_ENV" ]] && grep -qE '^(KB_TEST_DATABASE_URL|KB_REQUIRE_POSTGRES_TESTS)=' "$SERVICE_ENV"; then
+        if $DRY_RUN; then
+            would "remove KB_TEST_DATABASE_URL and KB_REQUIRE_POSTGRES_TESTS from ${SERVICE_ENV} (--without-postgres)"
+        else
+            _pg_strip_tmp="$(mktemp /tmp/dispatch-env.XXXXXX)"
+            grep -vE '^(KB_TEST_DATABASE_URL|KB_REQUIRE_POSTGRES_TESTS)=' "$SERVICE_ENV" > "$_pg_strip_tmp" || true
+            cat "$_pg_strip_tmp" > "$SERVICE_ENV"   # in place: keeps mode + ownership
+            rm -f "$_pg_strip_tmp"
+            _note_env_mutation KB_TEST_DATABASE_URL KB_REQUIRE_POSTGRES_TESTS
+            info "Removed KB_TEST_DATABASE_URL and KB_REQUIRE_POSTGRES_TESTS from ${SERVICE_ENV} (--without-postgres: this host does not claim Postgres tests)"
+        fi
+    else
+        skip "No Postgres env keys in ${SERVICE_ENV} to remove"
+    fi
 else
 
     # Detect package manager (mirrors the distro-detection approach used elsewhere in the script)
@@ -1222,7 +1250,7 @@ else
     elif command -v yum &>/dev/null; then
         _PG_PKG_MGR="yum"
     else
-        die "--with-postgres: no supported package manager found (expected apt-get, dnf, or yum)"
+        die "Postgres: no supported package manager found (expected apt-get, dnf, or yum)"
     fi
 
     _PG_ROLE="${AGENT_USER}"          # role name = OS agent user → peer auth via Unix socket
@@ -1444,54 +1472,79 @@ SEV_PYEOF
         _set_service_env_var KB_REQUIRE_POSTGRES_TESTS "1"
     fi
 
-    # Sub-step G: Postgres smoke check (when --smoke + --with-postgres)
-    # The real functional check, run AS the AGENT_USER OS user (peer auth
-    # requires it — root has no matching PG role): create a throwaway
-    # database, confirm vector is present WITHOUT running CREATE EXTENSION
-    # (proves template1 inheritance, not a per-database install), create a
-    # table with a vector(1024) column, round-trip one row, then drop the
-    # database.
-    echo ""
-    echo "  [4.5c-G] Postgres smoke check (peer auth, template1 inheritance, vector round-trip)"
-    if $DRY_RUN; then
-        would "as ${AGENT_USER} over the socket: CREATE DATABASE kb_smoke_<rand>; confirm vector present without CREATE EXTENSION; CREATE TABLE with vector(1024) col; INSERT + SELECT one row; DROP DATABASE"
-    elif $SMOKE; then
-        _smoke_db="kb_smoke_$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c8)"
-        [[ -z "$_smoke_db" || "$_smoke_db" == "kb_smoke_" ]] && _smoke_db="kb_smoke_$$"
-        _smoke_db_dsn="postgresql:///${_smoke_db}"
-        _smoke_vec_vals="$(printf '0.1,%.0s' $(seq 1 1024))"
-        _smoke_vec_literal="[${_smoke_vec_vals%,}]"
-
-        runuser -u "${AGENT_USER}" -- psql "$_PG_DSN" -v ON_ERROR_STOP=1 -c "CREATE DATABASE ${_smoke_db};" \
-            || die "Postgres smoke check FAILED: could not CREATE DATABASE ${_smoke_db} as ${AGENT_USER} (peer auth) over the socket"
-        info "Smoke: created throwaway database '${_smoke_db}' as ${AGENT_USER} (peer auth, no CREATE EXTENSION needed yet)"
-
-        if runuser -u "${AGENT_USER}" -- psql "$_smoke_db_dsn" -v ON_ERROR_STOP=1 \
-                -tAc "SELECT extversion FROM pg_extension WHERE extname='vector';" \
-                -c "CREATE TABLE smoke_vec (id serial PRIMARY KEY, embedding vector(1024));" \
-                -c "INSERT INTO smoke_vec (embedding) VALUES ('${_smoke_vec_literal}');" \
-                -tAc "SELECT count(*) FROM smoke_vec;" > "/tmp/pg-smoke-out.$$" 2>&1; then
-            _smoke_vec_ver="$(sed -n '1p' "/tmp/pg-smoke-out.$$" | tr -d '[:space:]')"
-            _smoke_rowcount="$(tail -n1 "/tmp/pg-smoke-out.$$" | tr -d '[:space:]')"
-            rm -f "/tmp/pg-smoke-out.$$"
-            runuser -u "${AGENT_USER}" -- psql "$_PG_DSN" -v ON_ERROR_STOP=1 -c "DROP DATABASE ${_smoke_db};" \
-                || warn "Smoke: could not drop throwaway database '${_smoke_db}' — clean up manually"
-            if [[ -n "$_smoke_vec_ver" && "$_smoke_rowcount" == "1" ]]; then
-                info "Postgres smoke check passed: '${_smoke_db}' inherited vector v${_smoke_vec_ver} from template1 (no CREATE EXTENSION run), and round-tripped a vector(1024) row as ${AGENT_USER} over the socket"
-            else
-                die "Postgres smoke check FAILED: expected a non-empty vector version and 1 row in smoke_vec, got version='${_smoke_vec_ver}' rows='${_smoke_rowcount}'"
-            fi
-        else
-            _smoke_err="$(cat "/tmp/pg-smoke-out.$$" 2>/dev/null)"
-            rm -f "/tmp/pg-smoke-out.$$"
-            runuser -u "${AGENT_USER}" -- psql "$_PG_DSN" -c "DROP DATABASE IF EXISTS ${_smoke_db};" &>/dev/null || true
-            die "Postgres smoke check FAILED: vector extension not inherited / table/insert failed in '${_smoke_db}' as ${AGENT_USER} — check the template1 extension install: ${_smoke_err}"
-        fi
-    else
-        skip "Postgres smoke check skipped (pass --smoke to run)"
-    fi
+    # Verification (formerly the --smoke-only sub-step G) now lives in Step 4.5d
+    # and runs whenever the service env requires Postgres, with or without --smoke.
 
 fi  # end: if ! $WITH_POSTGRES
+
+# Postgres round-trip check, shared by Step 4.5d. Runs AS the AGENT_USER OS
+# user (peer auth requires it — root has no matching PG role): connect to the
+# DSN, create a throwaway database, confirm vector is present WITHOUT running
+# CREATE EXTENSION (proves template1 inheritance), round-trip one
+# vector(1024) row, drop the database. Returns 0 on success; on failure returns
+# 1 with the reason in _PG_CHECK_ERR. Never prints the DSN.
+_pg_roundtrip() {  # $1=DSN
+    local dsn="$1" db out last="" ver="" rows="" vals lit
+    _PG_CHECK_ERR=""
+    db="kb_smoke_$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c8 || true)"
+    [[ "$db" == "kb_smoke_" ]] && db="kb_smoke_$$"
+    vals="$(printf '0.1,%.0s' $(seq 1 1024))"
+    lit="[${vals%,}]"
+    if ! out="$(runuser -u "${AGENT_USER}" -- psql "$dsn" -v ON_ERROR_STOP=1 -qc "CREATE DATABASE ${db};" 2>&1)"; then
+        _PG_CHECK_ERR="could not connect and CREATE DATABASE ${db} as ${AGENT_USER} over the socket: ${out}"
+        return 1
+    fi
+    if out="$(printf '%s\n' \
+            "\\connect ${db}" \
+            "CREATE TABLE smoke_vec (id serial PRIMARY KEY, embedding vector(1024));" \
+            "INSERT INTO smoke_vec (embedding) VALUES ('${lit}');" \
+            "SELECT (SELECT extversion FROM pg_extension WHERE extname='vector') || ',' || (SELECT count(*) FROM smoke_vec);" \
+            | runuser -u "${AGENT_USER}" -- psql "$dsn" -v ON_ERROR_STOP=1 -qtA 2>&1)"; then
+        last="$(printf '%s\n' "$out" | tail -n1 | tr -d '[:space:]')"
+        ver="${last%%,*}"; rows="${last##*,}"
+        if [[ -z "$ver" || "$rows" != "1" ]]; then
+            _PG_CHECK_ERR="expected a vector version (inherited from template1) and 1 row, got version='${ver}' rows='${rows}'"
+        fi
+    else
+        _PG_CHECK_ERR="vector extension not inherited from template1 / table or insert failed in ${db}: ${out}"
+    fi
+    runuser -u "${AGENT_USER}" -- psql "$dsn" -qc "DROP DATABASE IF EXISTS ${db};" &>/dev/null \
+        || warn "Could not drop throwaway database '${db}' — clean up manually"
+    _PG_VECTOR_VERSION="$ver"
+    [[ -z "$_PG_CHECK_ERR" ]]
+}
+
+# ===========================================================================
+# Step 4.5d: Postgres verification (fail closed)
+# ===========================================================================
+# Runs whenever the service env ends setup with KB_REQUIRE_POSTGRES_TESTS=1,
+# independent of --smoke. A host that requires Postgres tests but cannot reach
+# a working Postgres must never be left looking healthy.
+echo ""
+echo "--- Step 4.5d: Postgres verification ---"
+_pg_required=false
+if [[ -f "$SERVICE_ENV" && "$(_read_env_var KB_REQUIRE_POSTGRES_TESTS)" == "1" ]]; then
+    _pg_required=true
+elif $DRY_RUN && $WITH_POSTGRES; then
+    _pg_required=true   # Step 4.5c would have written the keys
+fi
+if ! $_pg_required; then
+    skip "Postgres not required on this host (KB_REQUIRE_POSTGRES_TESTS is not 1 in ${SERVICE_ENV}) — verification skipped"
+elif $DRY_RUN; then
+    would "verify Postgres as ${AGENT_USER} over the socket using KB_TEST_DATABASE_URL: CREATE DATABASE kb_smoke_<rand>; confirm vector present without CREATE EXTENSION (template1 inheritance); vector(1024) round-trip; DROP DATABASE — fail setup non-zero if any of it fails"
+else
+    _pg_verify_dsn="$(_read_env_var KB_TEST_DATABASE_URL)"
+    if [[ -z "$_pg_verify_dsn" ]]; then
+        _PG_CHECK_ERR="KB_TEST_DATABASE_URL is empty or missing"
+    else
+        _pg_roundtrip "$_pg_verify_dsn" || true
+    fi
+    if [[ -n "$_PG_CHECK_ERR" ]]; then
+        die "Postgres verification FAILED: ${SERVICE_ENV} sets KB_REQUIRE_POSTGRES_TESTS=1 (with KB_TEST_DATABASE_URL) but Postgres is not usable as ${AGENT_USER}: ${_PG_CHECK_ERR}. Fix: re-run setup-dispatch-host.sh to install/repair Postgres, or pass --without-postgres to remove both keys from ${SERVICE_ENV}."
+    fi
+    info "Postgres verified: throwaway database inherited vector v${_PG_VECTOR_VERSION} from template1 and round-tripped a vector(1024) row as ${AGENT_USER} over the socket"
+fi
+# <<< PG-STEPS
 
 # ===========================================================================
 # Step 4.6: MCP servers (agent user)

@@ -21,7 +21,7 @@
 # KB_DATABASE_URL          — Knowledge base database URL (agent KB access)
 # KB_TEST_DATABASE_URL     — Local test-Postgres maintenance DSN (postgresql:///postgres;
 #                            Unix socket, peer auth as {{AGENT_USER}}), written by
-#                            setup-dispatch-host.sh --with-postgres. Without this in
+#                            setup-dispatch-host.sh (default-on). Without this in
 #                            env_keep, @pytest.mark.postgres suites (e.g. kb-core) silently skip.
 # KB_REQUIRE_POSTGRES_TESTS — Flag (set to "1") that turns a missing KB_TEST_DATABASE_URL into a
 #                            hard test failure instead of a silent skip, in repos whose conftest

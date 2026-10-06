@@ -191,12 +191,11 @@ Full references: **`kb-01598`** (env-file + provisioning model — which var goe
 `kb-01583` (how env crosses the sudo boundary at runtime), `kb-01512` (OAuth vs API
 billing), `kb-01537` (install procedure).
 
-### `--with-postgres`: local Postgres + pgvector for headless test gating
+### Postgres + pgvector (default on; `--without-postgres` opts out)
 
-Pass `--with-postgres` to `setup-dispatch-host.sh` to provision a local PostgreSQL server
-with the pgvector extension on a dispatch host. This step is **opt-in and idempotent** —
-re-running on an already-provisioned host is a no-op. Without this flag, no Postgres work
-is performed and the existing host state is unchanged.
+`setup-dispatch-host.sh` provisions a local PostgreSQL server with the pgvector extension on every dispatch host by default (Step 4.5c), so new hosts just work. The step is **idempotent** — re-running on an already-provisioned host is a no-op. `--with-postgres` is still accepted as a no-op alias. Pass `--without-postgres` to opt out: Step 4.5c is skipped and `KB_TEST_DATABASE_URL` / `KB_REQUIRE_POSTGRES_TESTS` are REMOVED from the service env, because a host that opts out must not claim the capability.
+
+Step 4.5d verifies the claim on every run, independent of `--smoke`: whenever the service env ends setup with `KB_REQUIRE_POSTGRES_TESTS=1`, setup connects as `AGENT_USER` over the socket using `KB_TEST_DATABASE_URL`, creates a throwaway database, confirms `vector` is inherited from `template1`, round-trips a row, and drops it. On failure setup exits non-zero, naming the env file, both keys and the fix (re-run setup, or pass `--without-postgres`). Dry-run prints the verification it would perform.
 
 Postgres is reachable **only** over the local Unix socket with peer auth — no TCP
 listener, no `pg_hba.conf` edits, no `listen_addresses` change. Postgres's packaged
@@ -251,11 +250,14 @@ restarts when the rendered unit differs from what's installed).
 
 **To provision on a dispatch host:**
 ```bash
-# On pironman01 or r7-research (re-run with existing args + --with-postgres):
-sudo ./setup-dispatch-host.sh --with-postgres --smoke
+# Postgres is on by default; re-run setup with your existing args:
+sudo ./setup-dispatch-host.sh --smoke
 
 # Dry-run preview (no mutations):
-sudo ./setup-dispatch-host.sh --with-postgres --dry-run
+sudo ./setup-dispatch-host.sh --dry-run
+
+# Opt out (also strips the two env keys):
+sudo ./setup-dispatch-host.sh --without-postgres
 ```
 
 ## talos-update.sh — fast binary bump for the dispatch fleet
