@@ -1399,6 +1399,23 @@ class TestBuildManagePrompt:
         prompt = self._prompt()
         assert "git merge --squash" in prompt
 
+    def test_merge_block_is_fail_closed(self) -> None:
+        prompt = self._prompt()
+        assert "set -euo pipefail" in prompt
+        assert "merge-base --is-ancestor" in prompt
+        assert (
+            "never delete a feature branch whose merge did not land" in prompt.lower()
+        )
+        assert "left intact on origin" in prompt
+
+    def test_branch_delete_follows_verification(self) -> None:
+        prompt = self._prompt()
+        for delete in ("git push origin --delete <branch_name>",):
+            assert delete in prompt
+        verify = prompt.index("merge-base --is-ancestor")
+        assert verify < prompt.index("git push origin --delete <branch_name>")
+        assert prompt.index("git merge --squash") < verify
+
     def test_complete_in_rollout_actor_and_rule(self) -> None:
         prompt = self._prompt()
         assert "merge_actor" in prompt

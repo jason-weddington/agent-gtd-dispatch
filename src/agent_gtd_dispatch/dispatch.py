@@ -1996,6 +1996,7 @@ def _build_manage_workspace_main_prompt(
 
         2. Squash merge sequence (inside that repo's directory, against THAT repo's default branch):
            ```bash
+           set -euo pipefail
            git checkout <repo_default_branch>
            git merge --squash <branch_name>
            git commit -F - <<'COMMITEOF'
@@ -2006,6 +2007,10 @@ def _build_manage_workspace_main_prompt(
            COMMITEOF
            git push origin <repo_default_branch>
            ```
+
+           If ANY line above fails (a squash-merge conflict, a rejected push), STOP:
+           leave the feature branch in place and take the halt path. Never delete a
+           feature branch whose merge did not land.
 
         `<type>` is the value you derived immediately above — the SAME type in every
         repo for a given item. Never emit a `feat` type unless the derivation
@@ -2067,11 +2072,17 @@ def _build_manage_workspace_main_prompt(
         **Cleanup — after all pushed repos for an item are merged+pushed**
 
         Feature branch cleanup (run in EACH pushed repo's directory):
+        Never delete a feature branch whose merge did not land. Delete only after
+        the squash commit is verified on origin's default branch:
         ```bash
+        set -euo pipefail
         cd <repo_dir>
+        git fetch origin <repo_default_branch> && test -n "$(git log origin/<repo_default_branch> -1 --format=%H --grep='^Item: <item_id>$')"
         git push origin --delete <branch_name>
         git branch -D <branch_name>
         ```
+        If the verification fails, do NOT delete anything — leave the branch in place
+        and take the halt path.
 
         Manage branch cleanup — run ONCE in `{first_repo}/` only, NOT repeated per repo:
         ```bash
@@ -2080,6 +2091,9 @@ def _build_manage_workspace_main_prompt(
         ```
 
         **Halt path**
+
+        When halting, the feature branch must be left intact on origin (never delete
+        it) and the halt reason must include the branch name and its tip sha.
 
         Before halting, publish halted state:
         ```
@@ -2501,6 +2515,7 @@ def _build_manage_prompt(
         {commit_type}
 
         ```bash
+        set -euo pipefail
         git checkout <default_branch>
         git merge --squash <branch_name>
         git commit -F - <<'COMMITEOF'
@@ -2509,10 +2524,17 @@ def _build_manage_prompt(
         Rollout: {rollout_id}
         Item: <item_id>
         COMMITEOF
+        merge_sha=$(git rev-parse HEAD)
         git push origin <default_branch>
+        # Verify the merge landed BEFORE any branch deletion; failure aborts here.
+        git fetch origin <default_branch> && git merge-base --is-ancestor "$merge_sha" origin/<default_branch>
         git push origin --delete <branch_name>
         git branch -D <branch_name>
         ```
+
+        Never delete a feature branch whose merge did not land; on any failure, leave
+        the branch in place and take the halt path. The halt reason must include the
+        branch name and its tip sha, and the branch must stay intact on origin.
 
         `<type>` is the value you derived immediately above. Never emit a `feat`
         type unless the derivation actually produced one.
@@ -2552,6 +2574,9 @@ def _build_manage_prompt(
           unblocked items.
 
         **Halt path**
+
+        When halting, the feature branch must be left intact on origin (never delete
+        it) and the halt reason must include the branch name and its tip sha.
 
         Before halting, publish halted state:
         ```
@@ -3344,6 +3369,7 @@ for it and continue — do NOT halt for that alone."""
         Squash merge, inside each repo's directory, against THAT repo's default
         branch:
         ```bash
+        set -euo pipefail
         git checkout <default_branch>
         git merge --squash {branch_name}
         git commit -F - <<'COMMITEOF'
@@ -3355,8 +3381,13 @@ for it and continue — do NOT halt for that alone."""
         git push origin <default_branch>
         ```
 
-        Then delete the feature branch in each merged repo:
+        Never delete a feature branch whose merge did not land; on any failure,
+        leave the branch in place and take the halt path (halt reason includes the
+        branch name and tip sha). Only after verifying the merge landed, delete the
+        feature branch in each merged repo:
         ```bash
+        set -euo pipefail
+        git fetch origin <default_branch> && test -n "$(git log origin/<default_branch> -1 --format=%H --grep='^Item: {item.get("id", "")}$')"
         git push origin --delete {branch_name}
         git branch -D {branch_name}
         ```
