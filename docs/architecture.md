@@ -411,7 +411,7 @@ Output (stdout+stderr combined) goes to a `tempfile.TemporaryFile()` outside the
 workspace, never a pipe — a backgrounded grandchild holding a pipe's write end open
 can't hold up `proc.wait()`. `stdin=subprocess.DEVNULL`. The subprocess env is filtered
 to `dispatch.GATE_ENV_KEYS` (`engines.COMMON_ENV_KEYS` minus `AGENT_GTD_URL` /
-`AGENT_GTD_API_KEY` / `KB_DATABASE_URL`) — an arbitrary project-authored gate command has
+`AGENT_GTD_API_KEY`, and `engines.FORBIDDEN_ENV_KEYS` — production KB DSNs that never reach any subprocess) — an arbitrary project-authored gate command has
 no business touching GTD credentials. The gate registers itself as the run's active
 subprocess (the same `popen_callback` hook `run_agent` uses), so `cancel_run`'s SIGTERM
 reaches it.

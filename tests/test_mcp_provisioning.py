@@ -123,7 +123,14 @@ class TestTextGuards:
         text = SETUP_SCRIPT.read_text()
         assert "mcp list" not in text
         assert "KB_ANTHROPIC_API_KEY" not in text
-        assert "TEAM_KB_DATABASE_URL" not in text
+        # The retired KB DSNs may appear only in the strip step, never be read.
+        for retired in ("TEAM_KB_DATABASE_URL", "KB_DATABASE_URL"):
+            assert f"_read_env_var {retired}" not in text
+            assert f"_set_service_env_var {retired}" not in text
+        assert (
+            "_RETIRED_DSN_RE='^(KB_DATABASE_URL|KB_SERVICE_DATABASE_URL|"
+            "TEAM_KB_DATABASE_URL)='" in text
+        )
         assert "_read_env_var PERSONAL_KB_URL" in text
         assert "_read_env_var PERSONAL_KB_API_KEY" in text
         assert "_read_env_var TEAM_KB_URL" in text

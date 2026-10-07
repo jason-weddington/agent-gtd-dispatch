@@ -112,9 +112,11 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # Claude Code's OAuth login flow.
 # CLAUDE_CODE_OAUTH_TOKEN=
 
-# Knowledge base database URL — passed to agent subprocesses for KB access.
-# This points at the PERSONAL KB.
-# KB_DATABASE_URL=
+# KB_DATABASE_URL — RETIRED and FORBIDDEN. Agents reach the KB only through the
+# hosted thin-client MCP servers (PERSONAL_KB_URL / PERSONAL_KB_API_KEY below). A
+# live-KB DSN here once reached agent subprocesses, where a repo's test suite opened
+# production Postgres. setup-dispatch-host.sh strips it (and TEAM_KB_DATABASE_URL /
+# KB_SERVICE_DATABASE_URL) from the service env on every run. Do not set it.
 
 # Local test-Postgres DSN for @pytest.mark.postgres suites (e.g. kb-core) run by
 # dispatched agents, and the flag that turns a missing DSN into a hard test
@@ -123,10 +125,8 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # KB_TEST_DATABASE_URL=
 # KB_REQUIRE_POSTGRES_TESTS=
 
-# Team KB database URL — RETIRED — no longer read by installer Step 4.6. The team-kb
-# MCP server is now a thin HTTP client of the hosted team KB service; see
-# TEAM_KB_URL / TEAM_KB_API_KEY below.
-# TEAM_KB_DATABASE_URL=
+# TEAM_KB_DATABASE_URL — RETIRED and FORBIDDEN (stripped by setup-dispatch-host.sh).
+# The team-kb MCP server is a thin HTTP client; see TEAM_KB_URL / TEAM_KB_API_KEY below.
 
 # Anthropic API key for the KB MCP servers' own LLM calls — RETIRED — no longer read
 # by installer Step 4.6. Both KB MCP servers are now thin HTTP clients of a hosted KB

@@ -38,6 +38,8 @@ from agent_gtd_dispatch.engines import (
     CLAUDE_OLLAMA,
     CLAUDE_SONNET,
     COMMON_ENV_KEYS,
+    ENGINES,
+    FORBIDDEN_ENV_KEYS,
     KIRO,
     TALOS_SONNET,
     Engine,
@@ -6107,3 +6109,34 @@ class TestCrossUserReadsArePlain:
 
     def test_an_absent_verdict_reads_as_absent_not_as_a_merge(self, tmp_path) -> None:
         assert dispatch.read_review_verdict(tmp_path) == (None, "absent")
+
+
+class TestForbiddenKbDsn:
+    """A live production-KB DSN must never reach an agent or gate subprocess.
+
+    On 2026-10-07 KB_DATABASE_URL in the dispatch service env reached a build
+    agent, whose repo's smoke test spawned a real daemon against production.
+    """
+
+    @pytest.mark.parametrize("key", sorted(FORBIDDEN_ENV_KEYS))
+    @pytest.mark.parametrize("mode", ["build", "manage", "plan"])
+    def test_build_env_never_forwards_forbidden_dsn(
+        self, key, mode, monkeypatch
+    ) -> None:
+        monkeypatch.setenv(key, "postgresql://u:p@prod:5432/personal_kb")
+        for engine in ENGINES.values():
+            assert key not in build_env(engine, mode=mode), engine.name
+
+    def test_kb_test_database_url_still_forwarded(self, monkeypatch) -> None:
+        monkeypatch.setenv("KB_TEST_DATABASE_URL", "postgresql:///postgres")
+        assert "KB_TEST_DATABASE_URL" in build_env(CLAUDE, mode="build")
+
+    def test_forbidden_keys_not_in_sudoers_env_keep(self) -> None:
+        text = (
+            Path(__file__).parent.parent / "templates" / "sudoers-dispatch-svc.tmpl"
+        ).read_text()
+        for key in FORBIDDEN_ENV_KEYS:
+            assert not re.search(rf"\b{key}\b", text), key
+
+    def test_forbidden_keys_not_in_gate_env(self) -> None:
+        assert not (dispatch.GATE_ENV_KEYS & FORBIDDEN_ENV_KEYS)

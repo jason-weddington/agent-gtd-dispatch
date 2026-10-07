@@ -23,7 +23,7 @@ from agent_gtd_dispatch_protocol.branches import make_branch_name
 from agent_gtd_dispatch_protocol.models import DispatchMode
 
 from . import config, gtd_client
-from .engines import COMMON_ENV_KEYS, Engine, build_env
+from .engines import COMMON_ENV_KEYS, FORBIDDEN_ENV_KEYS, Engine, build_env
 from .models import PushStatus, RepoPushStatus
 
 logger = logging.getLogger(__name__)
@@ -38,12 +38,15 @@ GATE_OUTPUT_TAIL_CHARS: int = 3000
 
 # Env vars passed to the post-run gate subprocess — COMMON_ENV_KEYS minus the
 # secrets an arbitrary project-authored gate_command has no business touching
-# (AGENT_GTD_URL / AGENT_GTD_API_KEY / KB_DATABASE_URL).
-GATE_ENV_KEYS: frozenset[str] = COMMON_ENV_KEYS - {
-    "AGENT_GTD_URL",
-    "AGENT_GTD_API_KEY",
-    "KB_DATABASE_URL",
-}
+# (AGENT_GTD_URL / AGENT_GTD_API_KEY, plus FORBIDDEN_ENV_KEYS as a backstop).
+GATE_ENV_KEYS: frozenset[str] = (
+    COMMON_ENV_KEYS
+    - {
+        "AGENT_GTD_URL",
+        "AGENT_GTD_API_KEY",
+    }
+    - FORBIDDEN_ENV_KEYS
+)
 
 # Shim run via `/bin/bash -c` (the binary the sudoers NOPASSWD list already
 # authorizes): GNU `timeout` bounds the gate and signals its whole process

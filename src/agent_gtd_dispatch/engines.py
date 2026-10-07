@@ -26,13 +26,25 @@ COMMON_ENV_KEYS: frozenset[str] = frozenset(
         "SHELL",
         "AGENT_GTD_URL",
         "AGENT_GTD_API_KEY",
-        "KB_DATABASE_URL",
+        # KB_DATABASE_URL is deliberately ABSENT: agents reach the KB only through
+        # the hosted thin-client MCP servers, and a live-KB DSN in the agent env let
+        # a repo's own test suite open production Postgres (2026-10-07). Never re-add.
         "KB_TEST_DATABASE_URL",
         "KB_REQUIRE_POSTGRES_TESTS",
         "SSH_AUTH_SOCK",
         "GIT_SSH_COMMAND",
     }
 )
+
+
+# Production datastore DSNs that must never reach an agent or gate subprocess,
+# whatever an allowlist later says. Checked at import so re-adding one fails loudly.
+FORBIDDEN_ENV_KEYS: frozenset[str] = frozenset(
+    {"KB_DATABASE_URL", "KB_SERVICE_DATABASE_URL", "TEAM_KB_DATABASE_URL"}
+)
+_leaked = COMMON_ENV_KEYS & FORBIDDEN_ENV_KEYS
+if _leaked:  # pragma: no cover - import-time guard
+    raise RuntimeError(f"COMMON_ENV_KEYS contains forbidden keys: {sorted(_leaked)}")
 
 
 @dataclass(frozen=True, slots=True)

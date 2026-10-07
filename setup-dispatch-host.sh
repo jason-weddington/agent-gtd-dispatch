@@ -709,6 +709,24 @@ if $SINGLE_USER && [[ -f "$SERVICE_ENV" ]]; then
     fi
 fi
 
+# Retired production-KB DSNs: agents reach the KB only via the hosted thin-client MCP
+# servers, and a live DSN in this file reached every agent's env (a repo test suite
+# opened production Postgres through it, 2026-10-07). Strip on every run so a hand
+# edit or an old host cannot bring it back. KB_TEST_DATABASE_URL is NOT matched.
+_RETIRED_DSN_RE='^(KB_DATABASE_URL|KB_SERVICE_DATABASE_URL|TEAM_KB_DATABASE_URL)='
+if [[ -f "$SERVICE_ENV" ]] && grep -qE "$_RETIRED_DSN_RE" "$SERVICE_ENV"; then
+    if $DRY_RUN; then
+        would "strip KB_DATABASE_URL / KB_SERVICE_DATABASE_URL / TEAM_KB_DATABASE_URL from ${SERVICE_ENV}"
+    else
+        _dsn_strip_tmp="$(mktemp /tmp/dispatch-env.XXXXXX)"
+        grep -vE "$_RETIRED_DSN_RE" "$SERVICE_ENV" > "$_dsn_strip_tmp" || true
+        cat "$_dsn_strip_tmp" > "$SERVICE_ENV"   # in place: keeps mode + ownership
+        rm -f "$_dsn_strip_tmp"
+        _note_env_mutation KB_DATABASE_URL KB_SERVICE_DATABASE_URL TEAM_KB_DATABASE_URL
+        info "Stripped retired production-KB DSNs from ${SERVICE_ENV}"
+    fi
+fi
+
 # ===========================================================================
 # Step 3.5: DISPATCH_API_KEY (service env)
 # ===========================================================================
