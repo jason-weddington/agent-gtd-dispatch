@@ -937,14 +937,19 @@ def attachments_exclude_line(run_id: str) -> str:
 
 
 def _append_exclude_lines(git_exclude: Path, lines: Sequence[str]) -> None:
-    """Append the given exclude lines to one exclude file, idempotently."""
+    """Append the given exclude lines to one exclude file, idempotently.
+
+    Failures are logged at WARNING (never raised): a silent no-op here is how
+    ``transcript.txt`` ended up committed.
+    """
     try:
         existing = {
             line.strip()
             for line in git_exclude.read_text().splitlines()
             if line.strip()
         }
-    except OSError:
+    except OSError as exc:
+        logger.warning("git exclude: cannot read %s: %s", git_exclude, exc)
         return
     missing = [line for line in lines if line not in existing]
     if not missing:
@@ -952,8 +957,21 @@ def _append_exclude_lines(git_exclude: Path, lines: Sequence[str]) -> None:
     try:
         with git_exclude.open("a") as f:
             f.write("\n" + "\n".join(missing) + "\n")
-    except OSError:
+    except OSError as exc:
+        logger.warning("git exclude: cannot write %s: %s", git_exclude, exc)
+
+
+def _exclude_repo(repo: Path, lines: Sequence[str]) -> None:
+    """Ensure ``<repo>/.git/info/exclude`` exists, then append ``lines``."""
+    repo_exclude = repo / ".git" / "info" / "exclude"
+    try:
+        repo_exclude.parent.mkdir(parents=True, exist_ok=True)
+        if not repo_exclude.exists():
+            repo_exclude.write_text("")
+    except OSError as exc:
+        logger.warning("git exclude: cannot create %s: %s", repo_exclude, exc)
         return
+    _append_exclude_lines(repo_exclude, lines)
 
 
 def _setup_git_exclude(workspace: Path, extra_lines: Sequence[str] = ()) -> None:
@@ -963,33 +981,29 @@ def _setup_git_exclude(workspace: Path, extra_lines: Sequence[str] = ()) -> None
     per-run entries (the staged ``{run_id}-attachments/`` directory) without the
     module-level constant ever carrying run state between calls.
 
-    Handles both repo modes.  In monorepo mode the workspace root IS the repo, so
-    ``<workspace>/.git/info/exclude`` exists.  In multi-repo (workspace) mode the
-    root is not a git repo at all and each clone lives in an immediate
-    subdirectory — writing only to the root would silently no-op.
+    Handles both repo modes.  In monorepo mode the workspace root IS the repo
+    (``<workspace>/.git`` is a directory); the ``info/exclude`` file is created
+    if the clone lacks it.  In multi-repo (workspace) mode the root is not a git
+    repo at all and each clone lives in an immediate subdirectory.
+
+    If ``<workspace>/.git`` is a FILE (worktree/gitlink) behaviour is
+    deliberately unchanged: nothing is resolved or written for it.
 
     Repeated calls never duplicate an entry.
     """
     lines = (*_GIT_EXCLUDE_LINES, *extra_lines)
-    root_exclude = workspace / ".git" / "info" / "exclude"
-    if root_exclude.exists():
-        _append_exclude_lines(root_exclude, lines)
+    if (workspace / ".git").is_dir():
+        _exclude_repo(workspace, lines)
 
     try:
         children = sorted(workspace.iterdir())
-    except OSError:
+    except OSError as exc:
+        logger.warning("git exclude: cannot list %s: %s", workspace, exc)
         return
     for child in children:
         if not child.is_dir() or not (child / ".git").is_dir():
             continue
-        repo_exclude = child / ".git" / "info" / "exclude"
-        try:
-            repo_exclude.parent.mkdir(parents=True, exist_ok=True)
-            if not repo_exclude.exists():
-                repo_exclude.write_text("")
-        except OSError:
-            continue
-        _append_exclude_lines(repo_exclude, lines)
+        _exclude_repo(child, lines)
 
 
 def _sanitize_filename(filename: str) -> str:

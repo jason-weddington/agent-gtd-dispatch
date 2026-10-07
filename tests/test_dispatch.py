@@ -4194,6 +4194,46 @@ class TestSetupGitExclude:
         assert lines.count("transcript.txt") == 1
         assert lines.count(".dispatch/") == 1
 
+    def test_monorepo_without_info_dir_creates_exclude(self, tmp_path) -> None:
+        (tmp_path / ".git").mkdir()
+        dispatch._setup_git_exclude(tmp_path)
+        text = (tmp_path / ".git" / "info" / "exclude").read_text()
+        assert "transcript.txt" in text
+        assert ".dispatch/" in text
+
+    def test_monorepo_existing_lines_kept(self, tmp_path) -> None:
+        exclude = tmp_path / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True)
+        exclude.write_text("custom/\n")
+        dispatch._setup_git_exclude(tmp_path)
+        dispatch._setup_git_exclude(tmp_path)
+        lines = exclude.read_text().splitlines()
+        assert "custom/" in lines
+        assert lines.count("transcript.txt") == 1
+        assert lines.count(".dispatch/") == 1
+
+    def test_real_git_repo_without_exclude_file(self, tmp_path) -> None:
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        exclude = tmp_path / ".git" / "info" / "exclude"
+        exclude.unlink(missing_ok=True)
+        dispatch._setup_git_exclude(tmp_path)
+        (tmp_path / "transcript.txt").write_text("x")
+        subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+        out = subprocess.run(
+            ["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert out.stdout.strip() == ""
+
+    def test_write_failure_logs_warning(self, tmp_path, caplog) -> None:
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "info").write_text("not a dir")
+        with caplog.at_level(logging.WARNING):
+            dispatch._setup_git_exclude(tmp_path)
+        assert any("git exclude" in r.message for r in caplog.records)
+
     def test_multi_repo_workspace(self, tmp_path) -> None:
         # Workspace root is NOT a git repo in multi-repo mode.
         for name in ("repo_a", "repo_b"):
