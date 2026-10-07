@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.3.1 (2026-10-07)
+
+### Bug Fixes
+
+- Never forward production KB DSNs to agent or gate subprocesses
+  ([`5be5b2f`](https://github.com/repos/agent-gtd-dispatch/commit/5be5b2f85fbbd26b9f07fa097ae8a6a312ac2295))
+
+
 ## v2.3.0 (2026-10-07)
 
 ### Bug Fixes
