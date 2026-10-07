@@ -2,6 +2,25 @@
 
 <!-- version list -->
 
+## v2.3.0 (2026-10-07)
+
+### Bug Fixes
+
+- Create .git/info/exclude in monorepo clones and warn on exclude failures
+  ([`923053f`](https://github.com/repos/agent-gtd-dispatch/commit/923053fd62727d06c10e68551f99409c355f1574))
+
+- Manage prompt merge and cleanup are fail-closed before any branch delete
+  ([`ae68516`](https://github.com/repos/agent-gtd-dispatch/commit/ae6851666a3ba853cf2c96aa77d6a6c20f5b39e2))
+
+- **deploy**: Run the Playwright install from a directory the agent can read
+  ([`03bd620`](https://github.com/repos/agent-gtd-dispatch/commit/03bd620fc857b2dfdda5eb935502ccd042a5372f))
+
+### Features
+
+- **setup**: Postgres + pgvector on by default; verify Postgres fail-closed
+  ([`5421832`](https://github.com/repos/agent-gtd-dispatch/commit/542183227bc0a2fa190c33046c8b79fd91e63529))
+
+
 ## v2.2.0 (2026-09-30)
 
 ### Bug Fixes
