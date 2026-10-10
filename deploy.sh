@@ -228,7 +228,7 @@ fi
 # a private browsers-path env var, which only the repo that set it can see). The
 # version list and browser names come from
 # templates/dev-toolchain.sh, sourced locally above and interpolated here — never
-# hand-copied. `install-deps` (apt system libraries) needs root, so it runs as root
+# hand-copied. "install-deps" (apt system libraries) needs root, so it runs as root
 # here exactly as Step 4.11 does at provision time — both are idempotent, so
 # re-running is safe. PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT lifts Playwright's
 # 30s download-connection cap, which in-run installs routinely exceed. Non-fatal
