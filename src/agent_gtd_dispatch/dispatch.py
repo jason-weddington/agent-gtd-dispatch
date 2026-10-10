@@ -3257,6 +3257,12 @@ for it and continue — do NOT halt for that alone."""
         do not treat their absence as a misconfiguration. Returning
         `re-dispatch` IS how you ask for another build.
 
+        **YOU DO NOT RECORD OUTCOMES.** The worker records the item's outcome in
+        the rollout after reading your verdict. Do not call
+        `complete_item_in_rollout`, `complete_item`, `advance_rollout` or
+        `halt_rollout` yourself — these tools are blocked for you, and recording
+        an outcome yourself makes the worker's own record collide with it.
+
         {redispatch_line}
 
         **When in doubt, `halt`.** A halted rollout recovers. A merged
@@ -3590,6 +3596,21 @@ def _build_build_prompt(
     return prompt
 
 
+# Rollout-mutating tools the merge reviewer must never call: the worker records
+# the item's outcome itself after reading the verdict, and a reviewer-made call
+# makes the worker's own record collide with it.
+REVIEWER_DISALLOWED_TOOLS: tuple[str, ...] = (
+    "mcp__agent-gtd__complete_item_in_rollout",
+    "mcp__agent-gtd__complete_item",
+    "mcp__agent-gtd__advance_rollout",
+    "mcp__agent-gtd__halt_rollout",
+    "mcp__agent-gtd__cancel_rollout",
+    "mcp__agent-gtd__start_rollout",
+    "mcp__agent-gtd__dispatch_item",
+    "mcp__agent-gtd__dispatch_rollout",
+)
+
+
 async def run_agent(
     engine: Engine,
     workspace: Path,
@@ -3604,8 +3625,14 @@ async def run_agent(
     popen_callback: Callable[[subprocess.Popen[bytes]], None] | None = None,
     callback_token: str | None = None,
     run_id: str = "",
+    disallowed_tools: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a headless agent CLI as a subprocess.
+
+    ``disallowed_tools`` (claude-code engines only) is passed as
+    ``--disallowedTools``. It is a deny-list because REVIEW runs use
+    ``--dangerously-skip-permissions``, under which an allow-list restricts
+    nothing.
 
     ``callback_token`` is the run's per-run GTD JWT (scoped to the dispatching
     user). It is threaded into ``build_env`` so the agent's own agent-gtd MCP
@@ -3629,6 +3656,10 @@ async def run_agent(
         # must be the last flag before the prompt.
         print_idx = cmd.index("--print")
         cmd[print_idx:print_idx] = ["--allowedTools", ",".join(allowed_tools)]
+    if disallowed_tools and engine.name.startswith("claude-code"):
+        # Same placement rule as --allowedTools: before --print.
+        print_idx = cmd.index("--print")
+        cmd[print_idx:print_idx] = ["--disallowedTools", ",".join(disallowed_tools)]
     env = build_env(engine, mode=mode, callback_token=callback_token)
     if attribution:
         env["AGENT_GTD_AGENT_NAME"] = attribution

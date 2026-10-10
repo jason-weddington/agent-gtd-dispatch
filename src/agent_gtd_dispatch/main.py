@@ -2527,6 +2527,7 @@ async def _launch_reviewer(
             attribution=attribution,
             callback_token=token,
             run_id=reviewer_run.id,
+            disallowed_tools=list(dispatch.REVIEWER_DISALLOWED_TOOLS),
         )
         exit_code = result.returncode
     except Exception as exc:

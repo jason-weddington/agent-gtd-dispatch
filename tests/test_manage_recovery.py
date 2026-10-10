@@ -2302,6 +2302,20 @@ class TestLaunchReviewer:
         # A stale verdict from the previous item is cleared before launch.
         ctx.dispatch.clear_review_verdict.assert_called_once()
 
+    async def test_reviewer_launched_with_disallowed_tools(self) -> None:
+        from agent_gtd_dispatch import dispatch as real_dispatch
+
+        with _loop_patch_stack() as ctx:
+            ctx.dispatch.REVIEWER_DISALLOWED_TOOLS = (
+                real_dispatch.REVIEWER_DISALLOWED_TOOLS
+            )
+            await self._launch(ctx, verdict_blob=None, reason="absent")
+            kwargs = ctx.dispatch.run_agent.await_args.kwargs
+
+        assert kwargs["disallowed_tools"] == list(
+            real_dispatch.REVIEWER_DISALLOWED_TOOLS
+        )
+
     async def test_no_verdict_artifact_is_treated_as_halt(self) -> None:
         with _loop_patch_stack() as ctx:
             outcome = await self._launch(ctx, verdict_blob=None, reason="absent")

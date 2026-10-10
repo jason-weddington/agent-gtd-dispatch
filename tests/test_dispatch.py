@@ -4195,6 +4195,52 @@ class TestAllowedToolsOrderingWithOutputFormat:
         assert cmd[cmd.index("--output-format") + 1] == "json"
 
 
+class TestDisallowedTools:
+    """`--disallowedTools` is inserted before --print on claude-code engines."""
+
+    async def test_sonnet_gets_disallowed_tools_before_print(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(
+                CLAUDE_SONNET,
+                tmp_path,
+                "sys",
+                "Title",
+                20,
+                disallowed_tools=["mcp__a__x", "mcp__a__y"],
+            )
+            cmd = mock_popen.call_args[0][0]
+        idx = cmd.index("--disallowedTools")
+        assert cmd[idx + 1] == "mcp__a__x,mcp__a__y"
+        assert idx < cmd.index("--print")
+        assert cmd[-1] == "Title"
+
+    async def test_non_claude_engine_cmd_unchanged(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(KIRO, tmp_path, "sys", "Title", 20)
+            baseline = mock_popen.call_args[0][0]
+            await run_agent(KIRO, tmp_path, "sys", "Title", 20, disallowed_tools=["x"])
+            cmd = mock_popen.call_args[0][0]
+        assert "--disallowedTools" not in cmd
+        assert cmd == baseline
+
+    def test_reviewer_deny_list_keeps_update_rollout_state_allowed(self) -> None:
+        assert (
+            "mcp__agent-gtd__update_rollout_state"
+            not in dispatch.REVIEWER_DISALLOWED_TOOLS
+        )
+        assert "mcp__agent-gtd__complete_item_in_rollout" in (
+            dispatch.REVIEWER_DISALLOWED_TOOLS
+        )
+
+
 # ---------------------------------------------------------------------------
 # `.dispatch/` git exclusion in BOTH repo modes
 # ---------------------------------------------------------------------------
@@ -5556,6 +5602,13 @@ class TestReviewPromptContract:
         prompt = self._prompt()
         assert "YOU DO NOT DISPATCH." in prompt
         assert "no dispatch URL and no dispatch key" in prompt
+
+    def test_reviewer_is_told_not_to_record_outcomes(self) -> None:
+        prompt = self._prompt()
+        para = prompt[prompt.index("YOU DO NOT RECORD OUTCOMES") :]
+        para = para.split("\n\n")[0]
+        assert "complete_item_in_rollout" in para
+        assert "blocked for you" in para
 
     def test_verdict_artifact_path_and_schema_are_absolute(self) -> None:
         prompt = self._prompt()
