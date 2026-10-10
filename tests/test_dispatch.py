@@ -756,6 +756,16 @@ class TestBuildPlanPrompt:
         assert "files_to_modify" in prompt
         assert "scope_out" in prompt
 
+    def test_plan_prompt_requires_commit_type(self) -> None:
+        prompt = self._prompt()
+        assert "commit_type" in prompt
+        assert "`feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore`" in prompt
+        assert "plan_rollout rejects an item without it" in prompt
+        assert (
+            "(`acceptance_criteria`, `files_to_modify`, `scope_out`, `commit_type`)"
+            in prompt
+        )
+
     def test_no_markdown_section_write_instructions(self) -> None:
         prompt = self._prompt()
         # Prompt must NOT instruct the agent to write Markdown sections into description
@@ -6195,3 +6205,251 @@ class TestForbiddenKbDsn:
 
     def test_forbidden_keys_not_in_gate_env(self) -> None:
         assert not (dispatch.GATE_ENV_KEYS & FORBIDDEN_ENV_KEYS)
+
+
+# ---------------------------------------------------------------------------
+# Groomed commit_type: subject composer, pinned review prompt, landed lookup
+# ---------------------------------------------------------------------------
+
+_GROOMED_ID = "996b308e-7619-4ec5-9314-c3d4f37c870f"
+
+
+class TestComposeSquashSubject:
+    def test_item_commit_types_excludes_build_and_ci(self) -> None:
+        assert (
+            frozenset({"feat", "fix", "perf", "refactor", "test", "docs", "chore"})
+            == dispatch.ITEM_COMMIT_TYPES
+        )
+
+    @pytest.mark.parametrize(
+        ("title", "commit_type", "expected"),
+        [
+            ("Add X", "feat", "feat(996b308e): Add X"),
+            ("fix(api): Repair Y", "fix", "fix(996b308e): Repair Y"),
+            ("fix:", "fix", "fix(996b308e): fix:"),
+            ("feat!: Break Z", "feat", "feat(996b308e): Break Z"),
+            ("Feat: Keep case", "feat", "feat(996b308e): Feat: Keep case"),
+            ("Add X", "", None),
+            ("Add X", "build", None),
+        ],
+    )
+    def test_compose(self, title, commit_type, expected) -> None:
+        item = {"id": _GROOMED_ID, "title": title, "commit_type": commit_type}
+        assert dispatch.compose_squash_subject(item) == expected
+
+    def test_missing_key_gives_none(self) -> None:
+        assert (
+            dispatch.compose_squash_subject({"id": _GROOMED_ID, "title": "Add X"})
+            is None
+        )
+
+
+class TestPinnedReviewPrompt:
+    ITEM: ClassVar[dict] = {
+        "id": _GROOMED_ID,
+        "title": "Add X",
+        "description": "d",
+        "acceptance_criteria": ["works"],
+    }
+
+    def _prompt(self, item: dict) -> str:
+        return dispatch.build_review_prompt(
+            item,
+            {"name": "P", "gate_command": "make gate"},
+            "rollout-abc",
+            "feat/996b308e-add-x",
+            40,
+            Path("/srv/agent/workspace/rollout-abc"),
+            repo_dirs=["repo-a"],
+            default_branches={"repo-a": "main"},
+            workspace_mode=True,
+        )
+
+    def test_i_missing_and_empty_commit_type_are_byte_equal(self) -> None:
+        assert self._prompt(dict(self.ITEM)) == self._prompt(
+            {**self.ITEM, "commit_type": ""}
+        )
+
+    def test_ii_unpinned_prompt_derives(self) -> None:
+        prompt = self._prompt(dict(self.ITEM))
+        assert "3. Otherwise, derive the type from what the merged diff does" in prompt
+        assert "<type>(996b308e): Add X" in prompt
+        assert "Do NOT change the type" not in prompt
+        assert "groomed on the item" not in prompt
+
+    def test_iii_pinned_prompt_fixes_the_subject(self) -> None:
+        prompt = self._prompt({**self.ITEM, "commit_type": "fix"})
+        assert "The squash commit subject is EXACTLY: `fix(996b308e): Add X`" in prompt
+        assert "Do NOT change the type" in prompt
+        assert "3. Otherwise, derive the type" not in prompt
+        assert "<type>(996b308e)" not in prompt
+        # The heredoc's first line is the literal subject.
+        assert re.search(r"<<'COMMITEOF'\n\s*fix\(996b308e\): Add X\n", prompt)
+        # Verdict bullets replaced, not appended to.
+        assert (
+            "- `commit_type` is REQUIRED when `verdict` is `merge` and MUST be "
+            "exactly `fix` (groomed on the item)." in prompt
+        )
+        assert "- `commit_type_reason` MUST be exactly `groomed on the item`." in prompt
+        assert "it MUST equal the type of the squash commit you pushed" not in prompt
+        assert "naming which rule (1, 2 or" not in prompt
+        assert '"commit_type": "fix",' in prompt
+        assert '"commit_type_reason": "groomed on the item",' in prompt
+
+    def test_manage_commit_type_block_is_unchanged(self) -> None:
+        block = dispatch._manage_commit_type_block()
+        assert "Deriving the squash commit TYPE" in block
+        assert "groomed" not in block
+
+
+@pytest.mark.skipif(_GIT_UNAVAILABLE, reason="requires git(1)")
+class TestFindLandedCommitSubjects:
+    """Driven against real git repos with a real bare origin."""
+
+    @pytest.fixture(autouse=True)
+    def _no_sudo(self, monkeypatch):
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+
+    @staticmethod
+    def _git(repo, *args):
+        return subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+    def _repo(self, tmp_path: Path, name: str) -> tuple[Path, Path]:
+        """Return (seed, clone): seed pushes to a bare origin the clone tracks."""
+        origin = tmp_path / f"{name}-origin.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-b", "main", str(origin)],
+            check=True,
+            capture_output=True,
+        )
+        seed = tmp_path / f"{name}-seed"
+        seed.mkdir()
+        self._git(seed, "init", "-b", "main")
+        (seed / "base.txt").write_text("base\n")
+        self._git(seed, "add", "-A")
+        self._git(seed, "commit", "-m", "base")
+        self._git(seed, "remote", "add", "origin", str(origin))
+        self._git(seed, "push", "-u", "origin", "main")
+        clone = tmp_path / name
+        subprocess.run(
+            ["git", "clone", str(origin), str(clone)], check=True, capture_output=True
+        )
+        return seed, clone
+
+    def _land(self, seed: Path, subject: str, item_id: str) -> None:
+        (seed / f"{subject[:4]}.txt").write_text(subject)
+        self._git(seed, "add", "-A")
+        self._git(
+            seed,
+            "commit",
+            "-m",
+            f"{subject}\n\nRollout: rollout-abc\nItem: {item_id}",
+        )
+        self._git(seed, "push", "origin", "main")
+
+    @staticmethod
+    def _ws(tmp_path: Path, repos: dict[str, Path]) -> dispatch.RolloutWorkspace:
+        return dispatch.RolloutWorkspace(
+            root=tmp_path,
+            repo_paths=repos,
+            default_branches=dict.fromkeys(repos, "main"),
+            created=False,
+            workspace_mode=True,
+        )
+
+    def test_found(self, tmp_path: Path) -> None:
+        seed, clone = self._repo(tmp_path, "repo-a")
+        # Landed AFTER the clone: the lookup must fetch to see it.
+        self._land(seed, "fix(996b308e): Add X", _GROOMED_ID)
+        self._land(seed, "chore: later unrelated", "other-item")
+        subjects, failed = dispatch.find_landed_commit_subjects(
+            self._ws(tmp_path, {"repo-a": clone}), _GROOMED_ID
+        )
+        assert subjects == {"repo-a": "fix(996b308e): Add X"}
+        assert failed == []
+
+    def test_absent(self, tmp_path: Path) -> None:
+        seed, clone = self._repo(tmp_path, "repo-a")
+        self._land(seed, "feat(aaaaaaaa): Other", "aaaaaaaa-other")
+        subjects, failed = dispatch.find_landed_commit_subjects(
+            self._ws(tmp_path, {"repo-a": clone}), _GROOMED_ID
+        )
+        assert subjects == {}
+        assert failed == []
+
+    def test_two_repos_only_one_has_the_trailer(self, tmp_path: Path) -> None:
+        seed_a, clone_a = self._repo(tmp_path, "repo-a")
+        _seed_b, clone_b = self._repo(tmp_path, "repo-b")
+        self._land(seed_a, "feat(996b308e): Add X", _GROOMED_ID)
+        subjects, failed = dispatch.find_landed_commit_subjects(
+            self._ws(tmp_path, {"repo-a": clone_a, "repo-b": clone_b}), _GROOMED_ID
+        )
+        assert subjects == {"repo-a": "feat(996b308e): Add X"}
+        assert failed == []
+
+    def test_missing_origin_is_a_failed_repo(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _seed, clone = self._repo(tmp_path, "repo-a")
+        orphan = tmp_path / "orphan"
+        orphan.mkdir()
+        self._git(orphan, "init", "-b", "main")
+        with caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.dispatch"):
+            subjects, failed = dispatch.find_landed_commit_subjects(
+                self._ws(tmp_path, {"repo-a": clone, "orphan": orphan}), _GROOMED_ID
+            )
+        assert subjects == {}
+        assert failed == ["orphan"]
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(
+            "landed-commit-lookup-failed repo=orphan" in m and "step=fetch" in m
+            for m in msgs
+        )
+        assert any(
+            "landed-commit-lookup-failed repo=orphan" in m and "step=log" in m
+            for m in msgs
+        )
+
+    def test_grep_is_a_single_unquoted_argv_element(self, tmp_path: Path) -> None:
+        ws = self._ws(tmp_path, {"repo-a": tmp_path})
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                [], 0, stdout="fix(x): y\n", stderr=""
+            )
+            subjects, failed = dispatch.find_landed_commit_subjects(ws, _GROOMED_ID)
+        assert subjects == {"repo-a": "fix(x): y"}
+        assert failed == []
+        argvs = [c.args[0] for c in mock_run.call_args_list]
+        assert argvs[0] == ["git", "fetch", "origin", "main"]
+        assert argvs[1] == [
+            "git",
+            "log",
+            "origin/main",
+            "-1",
+            "--format=%s",
+            f"--grep=^Item: {_GROOMED_ID}$",
+        ]
+        for c in mock_run.call_args_list:
+            assert c.kwargs["timeout"] == 60
+            assert c.kwargs["check"] is False
+            assert c.kwargs["text"] is True
+
+    def test_timeout_and_oserror_never_raise(self, tmp_path: Path) -> None:
+        ws = self._ws(tmp_path, {"repo-a": tmp_path, "repo-b": tmp_path})
+        with patch(
+            "agent_gtd_dispatch.dispatch.subprocess.run",
+            side_effect=[
+                subprocess.TimeoutExpired(["git"], 60),
+                subprocess.TimeoutExpired(["git"], 60),
+                OSError("no git"),
+                OSError("no git"),
+            ],
+        ):
+            subjects, failed = dispatch.find_landed_commit_subjects(ws, _GROOMED_ID)
+        assert subjects == {}
+        assert failed == ["repo-a", "repo-b"]

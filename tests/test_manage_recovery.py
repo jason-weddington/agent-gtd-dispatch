@@ -2271,10 +2271,12 @@ class TestLaunchReviewer:
     def _item() -> dict:
         return {"id": "item-a", "title": "Do it", "acceptance_criteria": ["works"]}
 
-    async def _launch(self, ctx, *, verdict_blob, reason, exit_code=0, raises=None):
+    async def _launch(
+        self, ctx, *, verdict_blob, reason, exit_code=0, raises=None, item=None
+    ):
         from agent_gtd_dispatch.main import _launch_reviewer
 
-        ctx.gtd.get_item = AsyncMock(return_value=self._item())
+        ctx.gtd.get_item = AsyncMock(return_value=item or self._item())
         ctx.gtd.list_runs_for_item = AsyncMock(
             return_value=[
                 {
@@ -2293,6 +2295,8 @@ class TestLaunchReviewer:
         from agent_gtd_dispatch import dispatch as real_dispatch
 
         ctx.dispatch.COMMIT_TYPES = real_dispatch.COMMIT_TYPES
+        ctx.dispatch.ITEM_COMMIT_TYPES = real_dispatch.ITEM_COMMIT_TYPES
+        ctx.dispatch.compose_squash_subject = real_dispatch.compose_squash_subject
         ctx.dispatch.build_review_prompt = MagicMock(return_value="PROMPT")
         ctx.dispatch.clear_review_verdict = MagicMock()
         ctx.dispatch.read_review_verdict = MagicMock(
@@ -2379,6 +2383,75 @@ class TestLaunchReviewer:
             r.levelno == logging.WARNING and "banana" in r.getMessage()
             for r in caplog.records
         )
+
+    _MERGE_BLOB = {  # noqa: RUF012 — read-only test constant
+        "schema_version": 1,
+        "verdict": "merge",
+        "rationale": "ok",
+        "merge_note": "n",
+        "commit_type": "fix",
+        "commit_type_reason": "groomed on the item",
+    }
+
+    async def test_unknown_item_commit_type_warns_and_is_blanked(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        item = {**self._item(), "commit_type": "build"}
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            outcome = await self._launch(
+                ctx, verdict_blob=dict(self._MERGE_BLOB), reason="ok", item=item
+            )
+        assert outcome.item_commit_type == ""
+        unknown = [
+            r
+            for r in caplog.records
+            if "rollout-loop: commit-type-unknown" in r.getMessage()
+        ]
+        assert len(unknown) == 1
+        assert unknown[0].levelno == logging.WARNING
+        assert "value='build'" in unknown[0].getMessage()
+        prompt_lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "rollout-loop: review-prompt" in r.getMessage()
+        ]
+        assert len(prompt_lines) == 1
+        assert "commit_type_mode=derived subject=None" in prompt_lines[0]
+
+    async def test_groomed_item_commit_type_is_carried_and_pinned(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        item = {**self._item(), "commit_type": "fix"}
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            outcome = await self._launch(
+                ctx, verdict_blob=dict(self._MERGE_BLOB), reason="ok", item=item
+            )
+        assert outcome.item_commit_type == "fix"
+        prompt_lines = [
+            r for r in caplog.records if "rollout-loop: review-prompt" in r.getMessage()
+        ]
+        assert len(prompt_lines) == 1
+        assert prompt_lines[0].levelno == logging.INFO
+        assert (
+            "commit_type_mode=pinned subject='fix(item-a): Do it'"
+            in prompt_lines[0].getMessage()
+        )
+        assert not any("commit-type-unknown" in r.getMessage() for r in caplog.records)
+
+    async def test_halt_path_keeps_item_commit_type_default(self) -> None:
+        item = {**self._item(), "commit_type": "fix"}
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx, verdict_blob=None, reason="absent", item=item
+            )
+        assert outcome.verdict == "halt"
+        assert outcome.item_commit_type == ""
 
     async def test_reviewer_launched_with_disallowed_tools(self) -> None:
         from agent_gtd_dispatch import dispatch as real_dispatch
@@ -2690,3 +2763,291 @@ class TestRolloutLeftRunning:
             )
             ctx.gtd.get_rollout = AsyncMock(return_value={"status": "completed"})
             assert await _tick(ctx) == _TICK_DONE
+
+
+# ---------------------------------------------------------------------------
+# Post-merge commit-type verification (never halts, never changes the outcome)
+# ---------------------------------------------------------------------------
+
+
+class TestCommitTypeVerification:
+    """After a merge verdict, the landed squash commit type is checked."""
+
+    async def _act(
+        self,
+        ctx,
+        *,
+        verdict="merge",
+        item_commit_type="fix",
+        reviewer_type="fix",
+        workspace="default",
+        subjects=None,
+        failed=None,
+        raises=None,
+    ):
+        from agent_gtd_dispatch.main import ReviewVerdict, _act_on_verdict
+
+        if raises is not None:
+            ctx.dispatch.find_landed_commit_subjects = MagicMock(side_effect=raises)
+        else:
+            ctx.dispatch.find_landed_commit_subjects = MagicMock(
+                return_value=(
+                    subjects if subjects is not None else {},
+                    failed if failed is not None else [],
+                )
+            )
+        ctx.gtd.complete_in_rollout = AsyncMock(return_value={"newly_ready": []})
+        return await _act_on_verdict(
+            "rollout-abc",
+            "item-a",
+            ReviewVerdict(
+                verdict,
+                "because",
+                "note",
+                "",
+                reviewer_type,
+                "groomed on the item",
+                item_commit_type,
+            ),
+            token=None,
+            attribution=None,
+            workspace=_fake_workspace() if workspace == "default" else workspace,
+        )
+
+    @staticmethod
+    def _check_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+        return [
+            r
+            for r in caplog.records
+            if "rollout-loop: commit-type-check" in r.getMessage()
+        ]
+
+    @staticmethod
+    def _bodies(ctx) -> list[str]:
+        return [c.args[1] for c in ctx.gtd.post_comment.await_args_list]
+
+    async def test_1_match(self, caplog: pytest.LogCaptureFixture) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+            patch("agent_gtd_dispatch.main._halt_rollout_from_loop") as halt,
+        ):
+            result = await self._act(ctx, subjects={"repo-a": "fix(item-a): Do it"})
+        assert result == _TICK_CONTINUE
+        assert ctx.gtd.post_comment.await_count == 1
+        lines = self._check_lines(caplog)
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.INFO
+        assert "outcome=match" in lines[0].getMessage()
+        assert "reviewer_agrees=True" in lines[0].getMessage()
+        halt.assert_not_called()
+
+    async def test_2_mismatch(self, caplog: pytest.LogCaptureFixture) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+            patch("agent_gtd_dispatch.main._halt_rollout_from_loop") as halt,
+        ):
+            result = await self._act(ctx, subjects={"repo-a": "feat(x): y"})
+        assert result == _TICK_CONTINUE
+        assert ctx.gtd.post_comment.await_count == 2
+        mismatch = [b for b in self._bodies(ctx) if "commit type mismatch" in b]
+        assert len(mismatch) == 1
+        assert mismatch[0] == (
+            "Rollout `rollout-abc`: commit type mismatch — item is groomed `fix` "
+            "but landed squash commit(s) are `repo-a`: `feat(x): y`. Reviewer "
+            "reported `fix`. Outcome unchanged."
+        )
+        lines = self._check_lines(caplog)
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.WARNING
+        assert "outcome=mismatch" in lines[0].getMessage()
+        halt.assert_not_called()
+        ctx.gtd.halt_rollout.assert_not_awaited()
+
+    async def test_3_not_found(self, caplog: pytest.LogCaptureFixture) -> None:
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            await self._act(ctx, subjects={}, failed=[])
+        assert ctx.gtd.post_comment.await_count == 2
+        found = [b for b in self._bodies(ctx) if "could not find a landed commit" in b]
+        assert found == [
+            "Rollout `rollout-abc`: could not find a landed commit with trailer "
+            "`Item: item-a` to verify commit type `fix`. Outcome unchanged."
+        ]
+        lines = self._check_lines(caplog)
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.WARNING
+        assert "outcome=not_found" in lines[0].getMessage()
+
+    async def test_4_unset_skips_lookup(self, caplog: pytest.LogCaptureFixture) -> None:
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            await self._act(ctx, item_commit_type="")
+        ctx.dispatch.find_landed_commit_subjects.assert_not_called()
+        assert ctx.gtd.post_comment.await_count == 1
+        lines = self._check_lines(caplog)
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.INFO
+        assert "outcome=skipped_unset" in lines[0].getMessage()
+
+    async def test_5_lookup_raises(self, caplog: pytest.LogCaptureFixture) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+            patch("agent_gtd_dispatch.main._halt_rollout_from_loop") as halt,
+        ):
+            result = await self._act(ctx, raises=RuntimeError("git exploded"))
+        assert result == _TICK_CONTINUE
+        halt.assert_not_called()
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        lines = self._check_lines(caplog)
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.WARNING
+        assert "outcome=error" in lines[0].getMessage()
+
+    async def test_5b_post_comment_raises_is_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            ctx.gtd.post_comment = AsyncMock(
+                side_effect=[None, RuntimeError("gtd down")]
+            )
+            result = await self._act(ctx, subjects={"repo-a": "feat(x): y"})
+        assert result == _TICK_CONTINUE
+        lines = self._check_lines(caplog)
+        assert len(lines) == 1
+        assert "outcome=error" in lines[0].getMessage()
+
+    async def test_5c_verdict_comment_failure_does_not_suppress_check(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            ctx.gtd.post_comment = AsyncMock(side_effect=[RuntimeError("x"), None])
+            await self._act(ctx, subjects={"repo-a": "feat(x): y"})
+        assert ctx.gtd.post_comment.await_count == 2
+        assert "commit type mismatch" in ctx.gtd.post_comment.await_args.args[1]
+        assert "outcome=mismatch" in self._check_lines(caplog)[0].getMessage()
+
+    async def test_6_skip_verdict_runs_no_lookup(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            await self._act(ctx, verdict="skip")
+        ctx.dispatch.find_landed_commit_subjects.assert_not_called()
+        assert self._check_lines(caplog) == []
+
+    async def test_7_two_repos_only_the_feat_repo_is_named(self) -> None:
+        with _loop_patch_stack() as ctx:
+            await self._act(
+                ctx,
+                subjects={"repo-fix": "fix(a): b", "repo-feat": "feat(a): b"},
+            )
+        mismatch = [b for b in self._bodies(ctx) if "commit type mismatch" in b]
+        assert len(mismatch) == 1
+        assert "`repo-feat`: `feat(a): b`" in mismatch[0]
+        assert "repo-fix" not in mismatch[0]
+
+    async def test_8_unparsed_subject_is_a_mismatch(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            await self._act(ctx, subjects={"repo-a": "Merge branch x"})
+        mismatch = [b for b in self._bodies(ctx) if "commit type mismatch" in b]
+        assert len(mismatch) == 1
+        assert "`repo-a`: `Merge branch x`" in mismatch[0]
+        assert "outcome=mismatch" in self._check_lines(caplog)[0].getMessage()
+
+    async def test_9_no_workspace(self, caplog: pytest.LogCaptureFixture) -> None:
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            await self._act(ctx, workspace=None)
+        ctx.dispatch.find_landed_commit_subjects.assert_not_called()
+        lines = self._check_lines(caplog)
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.WARNING
+        assert "outcome=skipped_no_workspace" in lines[0].getMessage()
+
+    async def test_10_all_repos_failed_is_error_without_comment(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            await self._act(ctx, subjects={}, failed=["repo-a"])
+        assert ctx.gtd.post_comment.await_count == 1
+        assert not any("could not find a landed commit" in b for b in self._bodies(ctx))
+        lines = self._check_lines(caplog)
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.WARNING
+        assert "outcome=error" in lines[0].getMessage()
+
+    async def test_11_match_but_reviewer_disagrees(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            await self._act(
+                ctx, reviewer_type="feat", subjects={"repo-a": "fix(item-a): Do it"}
+            )
+        assert ctx.gtd.post_comment.await_count == 1
+        lines = self._check_lines(caplog)
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.WARNING
+        assert "outcome=match" in lines[0].getMessage()
+        assert "reviewer_agrees=False" in lines[0].getMessage()
+
+    async def test_wave_tick_passes_the_workspace(self) -> None:
+        from agent_gtd_dispatch.main import ReviewVerdict
+
+        ws = _fake_workspace()
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._launch_reviewer",
+                new=AsyncMock(return_value=ReviewVerdict("skip", "r", "", "")),
+            ),
+            patch("agent_gtd_dispatch.main._act_on_verdict", new=AsyncMock()) as act,
+        ):
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": [],
+                    "in_progress": ["item-a"],
+                    "blocked": [],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            await _tick(ctx, workspace_ref=[ws])
+        assert act.await_args.kwargs["workspace"] is ws

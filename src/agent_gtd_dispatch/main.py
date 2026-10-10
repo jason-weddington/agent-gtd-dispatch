@@ -8,6 +8,7 @@ import functools
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -2308,6 +2309,7 @@ class ReviewVerdict(NamedTuple):
     detail: str  # structured failure detail, or the rejection reason
     commit_type: str = ""  # audit only; "" when missing/invalid
     commit_type_reason: str = ""
+    item_commit_type: str = ""  # groomed type on the item; "" when unset/invalid
 
 
 def _completed_build_item_ids(
@@ -2452,6 +2454,17 @@ async def _launch_reviewer(
     undone.
     """
     item = await gtd_client.get_item(item_id, token=token)
+    raw_item_type = item.get("commit_type")
+    item_commit_type = ""
+    if raw_item_type in dispatch.ITEM_COMMIT_TYPES:
+        item_commit_type = str(raw_item_type)
+    elif raw_item_type:
+        logger.warning(
+            "rollout-loop: commit-type-unknown rollout_id=%s item_id=%s value=%r",
+            rollout_id,
+            item_id,
+            raw_item_type,
+        )
     run_row = await _latest_run_for_item(item_id, rollout_id, token=token)
     branch_name = str(run_row.get("feature_branch") or "")
     if not branch_name:
@@ -2484,6 +2497,15 @@ async def _launch_reviewer(
         merge_notes=merge_notes,
         redispatches_used=used,
         redispatch_cap=MAX_ITEM_REDISPATCHES,
+    )
+    pinned_subject = dispatch.compose_squash_subject(item)
+    logger.info(
+        "rollout-loop: review-prompt rollout_id=%s item_id=%s "
+        "commit_type_mode=%s subject=%r",
+        rollout_id,
+        item_id,
+        "pinned" if pinned_subject is not None else "derived",
+        pinned_subject,
     )
 
     reviewer_run = Run(
@@ -2610,7 +2632,13 @@ async def _launch_reviewer(
         exit_code,
     )
     return ReviewVerdict(
-        verdict, rationale, merge_note, detail, commit_type, commit_type_reason
+        verdict,
+        rationale,
+        merge_note,
+        detail,
+        commit_type,
+        commit_type_reason,
+        item_commit_type,
     )
 
 
@@ -2644,6 +2672,104 @@ async def _halt_rollout_from_loop(
     return _TICK_HALTED
 
 
+_LANDED_TYPE_RE = re.compile(r"^([a-z]+)(\([^)]*\))?!?:")
+
+
+async def _verify_landed_commit_type(
+    rollout_id: str,
+    item_id: str,
+    outcome: ReviewVerdict,
+    *,
+    workspace: dispatch.RolloutWorkspace | None,
+    token: str | None,
+    attribution: str | None,
+) -> None:
+    """Compare the landed squash commit's type with the item's groomed type.
+
+    Runs after a ``merge`` verdict has been recorded. Purely observational: a
+    mismatch or a missing commit posts ONE loud item comment and logs, but the
+    recorded outcome is never changed and the rollout is never halted. Emits
+    exactly one ``commit-type-check`` log line per call and never raises.
+    """
+    expected = outcome.item_commit_type
+    landed: dict[str, str] = {}
+    result = "error"
+    try:
+        if not expected:
+            result = "skipped_unset"
+        elif workspace is None:
+            result = "skipped_no_workspace"
+        else:
+            landed, failed_repos = await asyncio.get_running_loop().run_in_executor(
+                None,
+                dispatch.find_landed_commit_subjects,
+                workspace,
+                item_id,
+            )
+            mismatches: list[tuple[str, str]] = []
+            for repo, subject in landed.items():
+                match = _LANDED_TYPE_RE.match(subject)
+                landed_type = match.group(1) if match else "unparsed"
+                if landed_type != expected:
+                    mismatches.append((repo, subject))
+            if mismatches:
+                result = "mismatch"
+                listing = "; ".join(f"`{repo}`: `{subj}`" for repo, subj in mismatches)
+                await gtd_client.post_comment(
+                    item_id,
+                    (
+                        f"Rollout `{rollout_id}`: commit type mismatch — item is "
+                        f"groomed `{expected}` but landed squash commit(s) are "
+                        f"{listing}. Reviewer reported "
+                        f"`{outcome.commit_type or 'nothing'}`. Outcome unchanged."
+                    ),
+                    created_by=attribution or "agent-gtd-dispatch",
+                    token=token,
+                )
+            elif not landed and failed_repos:
+                result = "error"
+            elif not landed:
+                result = "not_found"
+                await gtd_client.post_comment(
+                    item_id,
+                    (
+                        f"Rollout `{rollout_id}`: could not find a landed commit "
+                        f"with trailer `Item: {item_id}` to verify commit type "
+                        f"`{expected}`. Outcome unchanged."
+                    ),
+                    created_by=attribution or "agent-gtd-dispatch",
+                    token=token,
+                )
+            else:
+                result = "match"
+    except Exception:
+        logger.exception(
+            "rollout-loop: commit-type check raised rollout_id=%s item_id=%s",
+            rollout_id,
+            item_id,
+        )
+        result = "error"
+
+    reviewer_agrees = outcome.commit_type == expected
+    level = (
+        logging.INFO
+        if result == "skipped_unset" or (result == "match" and reviewer_agrees)
+        else logging.WARNING
+    )
+    logger.log(
+        level,
+        "rollout-loop: commit-type-check rollout_id=%s item_id=%s outcome=%s "
+        "expected=%s landed=%s reviewer_reported=%s reviewer_agrees=%s",
+        rollout_id,
+        item_id,
+        result,
+        expected,
+        landed,
+        outcome.commit_type,
+        reviewer_agrees,
+    )
+
+
 async def _act_on_verdict(
     rollout_id: str,
     item_id: str,
@@ -2651,6 +2777,7 @@ async def _act_on_verdict(
     *,
     token: str | None,
     attribution: str | None,
+    workspace: dispatch.RolloutWorkspace | None = None,
 ) -> str:
     """Apply a reviewer's verdict. The WORKER acts; the reviewer only decided.
 
@@ -2720,6 +2847,15 @@ async def _act_on_verdict(
             )
         except Exception:
             logger.warning("rollout-loop: failed to comment verdict on %s", item_id)
+        if outcome.verdict == "merge":
+            await _verify_landed_commit_type(
+                rollout_id,
+                item_id,
+                outcome,
+                workspace=workspace,
+                token=token,
+                attribution=attribution,
+            )
         return _TICK_CONTINUE
 
     # re-dispatch
@@ -2850,7 +2986,12 @@ async def _rollout_wave_tick(
         )
         dispatch_attempts.pop(item_id, None)
         return await _act_on_verdict(
-            rollout_id, item_id, outcome, token=token, attribution=attribution
+            rollout_id,
+            item_id,
+            outcome,
+            token=token,
+            attribution=attribution,
+            workspace=workspace,
         )
 
     next_ready = [str(i) for i in (advance.get("next_ready") or [])]

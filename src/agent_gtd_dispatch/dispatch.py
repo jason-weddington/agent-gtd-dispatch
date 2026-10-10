@@ -1290,6 +1290,7 @@ def _build_plan_prompt(
              `files_to_modify=[{{"path": "src/foo.py", "change": "add error handling"}}, ...]`
            - `scope_out`: list of things explicitly out of scope, e.g.
              `scope_out=["Do NOT change the API surface", "Do NOT touch unrelated modules"]`
+           - `commit_type`: exactly one of `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore` — the conventional-commit type the squash commit will carry (feat = new observable capability, fix = corrects wrong behaviour, perf = faster with no behaviour change, refactor = no observable change, test = only tests, docs = only docs, chore = anything else). plan_rollout rejects an item without it, e.g. `commit_type="fix"`
            Free-form `description` is still fine for context/lead paragraph, but the structured
            fields are the source of truth that the legality validator checks.
         3. **Add patterns to follow.** Reference existing code the implementer should copy.
@@ -1310,7 +1311,7 @@ def _build_plan_prompt(
         - Do NOT write code, create branches, or push anything.
         - Do NOT modify any files in the repo.
         - Use `update_item` (with the item's current version) to set structured fields
-          (`acceptance_criteria`, `files_to_modify`, `scope_out`) and optionally `description`.
+          (`acceptance_criteria`, `files_to_modify`, `scope_out`, `commit_type`) and optionally `description`.
         - **Legality validation reads `acceptance_criteria` and `files_to_modify` from the
           structured fields only** — prose Markdown in `description` is ignored by the validator.
         - Use `add_comment` with item_id="{item_id}" for questions or notes.
@@ -2948,6 +2949,118 @@ def clear_review_verdict(workspace_root: Path) -> None:
 COMMIT_TYPES: frozenset[str] = frozenset(
     {"feat", "fix", "perf", "refactor", "test", "docs", "chore", "build", "ci"}
 )
+ITEM_COMMIT_TYPES: frozenset[str] = COMMIT_TYPES - {"build", "ci"}
+
+# A conventional-commit prefix already present on an item title, stripped so
+# the composed squash subject does not repeat it. Case-sensitive on purpose.
+_TITLE_TYPE_PREFIX_RE = re.compile(
+    r"^(feat|fix|perf|refactor|test|docs|chore|build|ci)(\([^)]*\))?!?:\s*"
+)
+
+
+def compose_squash_subject(item: dict[str, Any]) -> str | None:
+    """Compose the exact squash-commit subject from the item's groomed type.
+
+    Returns None when the item carries no valid groomed ``commit_type`` (unset,
+    empty, or outside ITEM_COMMIT_TYPES) — the reviewer then derives the type.
+    A conventional-commit prefix already on the title is stripped so it is not
+    repeated; if stripping leaves nothing, the whole title is kept.
+    """
+    commit_type = item.get("commit_type")
+    if commit_type not in ITEM_COMMIT_TYPES:
+        return None
+    raw_title = str(item.get("title") or "")
+    title = _TITLE_TYPE_PREFIX_RE.sub("", raw_title, count=1).strip()
+    if not title:
+        title = raw_title.strip()
+    return f"{commit_type}({item['id'][:8]}): {title}"
+
+
+def find_landed_commit_subjects(
+    workspace: RolloutWorkspace, item_id: str
+) -> tuple[dict[str, str], list[str]]:
+    """Find each repo's landed squash commit for ``item_id`` by its trailer.
+
+    Returns ``(subjects_by_repo, failed_repos)``. A repo whose default branch
+    has no commit carrying ``Item: <item_id>`` is simply absent from the
+    subjects; a repo whose lookup itself failed is listed in ``failed_repos``.
+    Never raises.
+    """
+    subjects: dict[str, str] = {}
+    failed: list[str] = []
+    for repo, repo_path in workspace.repo_paths.items():
+        branch = workspace.default_branches.get(repo) or _DEFAULT_BRANCH_CANDIDATES[0]
+        try:
+            fetch = subprocess.run(
+                _sudo_wrap(["git", "fetch", "origin", branch]),
+                cwd=repo_path,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if fetch.returncode != 0:
+                logger.warning(
+                    "rollout-loop: landed-commit-lookup-failed repo=%s item_id=%s "
+                    "step=fetch rc=%s stderr=%r",
+                    repo,
+                    item_id,
+                    fetch.returncode,
+                    (fetch.stderr or "")[:200],
+                )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning(
+                "rollout-loop: landed-commit-lookup-failed repo=%s item_id=%s "
+                "step=fetch rc=%s stderr=%r",
+                repo,
+                item_id,
+                None,
+                str(exc)[:200],
+            )
+        try:
+            log = subprocess.run(
+                _sudo_wrap(
+                    [
+                        "git",
+                        "log",
+                        f"origin/{branch}",
+                        "-1",
+                        "--format=%s",
+                        f"--grep=^Item: {item_id}$",
+                    ]
+                ),
+                cwd=repo_path,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning(
+                "rollout-loop: landed-commit-lookup-failed repo=%s item_id=%s "
+                "step=log rc=%s stderr=%r",
+                repo,
+                item_id,
+                None,
+                str(exc)[:200],
+            )
+            failed.append(repo)
+            continue
+        if log.returncode != 0:
+            logger.warning(
+                "rollout-loop: landed-commit-lookup-failed repo=%s item_id=%s "
+                "step=log rc=%s stderr=%r",
+                repo,
+                item_id,
+                log.returncode,
+                (log.stderr or "")[:200],
+            )
+            failed.append(repo)
+            continue
+        subject = (log.stdout or "").strip()
+        if subject:
+            subjects[repo] = subject
+    return subjects, failed
 
 
 def read_review_verdict(workspace_root: Path) -> tuple[dict[str, Any] | None, str]:
@@ -3219,7 +3332,35 @@ for it and continue — do NOT halt for that alone."""
         item, branch_name, run_status, gate_result, merge_notes
     )
     conflict_contract = _review_conflict_contract_block(workspace_mode=workspace_mode)
-    commit_type = _manage_commit_type_block()
+    pinned_subject = compose_squash_subject(item)
+    if pinned_subject is not None:
+        pinned_type = str(item["commit_type"])
+        commit_type = (
+            f"This item's commit type was groomed: `{pinned_type}`. The squash "
+            f"commit subject is EXACTLY: `{pinned_subject}`. Do NOT change the "
+            "type, the scope or the subject text. Do not apply the derivation rules."
+        )
+        squash_subject = pinned_subject
+        verdict_type_example = pinned_type
+        verdict_reason_example = "groomed on the item"
+        verdict_type_rules = _indent_prompt_block(
+            f"""\
+- `commit_type` is REQUIRED when `verdict` is `merge` and MUST be exactly `{pinned_type}` (groomed on the item).
+- `commit_type_reason` MUST be exactly `groomed on the item`."""
+        )
+    else:
+        commit_type = _manage_commit_type_block()
+        squash_subject = f"<type>({item.get('id', '')[:8]}): {item.get('title', '')}"
+        verdict_type_example = "feat"
+        verdict_reason_example = "rule 3: adds a new MCP endpoint"
+        verdict_type_rules = _indent_prompt_block(
+            """\
+- `commit_type` is REQUIRED when `verdict` is `merge` and is exactly one
+  of `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore`,
+  `build`, `ci`; it MUST equal the type of the squash commit you pushed.
+- `commit_type_reason` is one short sentence naming which rule (1, 2 or
+  3) fired and why."""
+        )
     merge_note_rules = _manage_merge_note_block()
 
     redispatch_line = (
@@ -3394,7 +3535,7 @@ for it and continue — do NOT halt for that alone."""
         git checkout <default_branch>
         git merge --squash {branch_name}
         git commit -F - <<'COMMITEOF'
-        <type>({item.get("id", "")[:8]}): {item.get("title", "")}
+        {squash_subject}
 
         Rollout: {rollout_id}
         Item: {item.get("id", "")}
@@ -3445,8 +3586,8 @@ for it and continue — do NOT halt for that alone."""
           "verdict": "merge",
           "rationale": "one or two sentences on why",
           "merge_note": "signature/rename/config-key changes, or 'no signature, rename or config-key changes'",
-          "commit_type": "feat",
-          "commit_type_reason": "rule 3: adds a new MCP endpoint",
+          "commit_type": "{verdict_type_example}",
+          "commit_type_reason": "{verdict_reason_example}",
           "repo_states": {{"<repo_dir>": "merged"}},
           "failure": {{"kind": "", "detail": ""}}
         }}
@@ -3456,11 +3597,7 @@ for it and continue — do NOT halt for that alone."""
           Any other string is rejected and treated as `halt`.
         - `rationale` is REQUIRED and must be non-empty.
         - `merge_note` is REQUIRED when `verdict` is `merge`.
-        - `commit_type` is REQUIRED when `verdict` is `merge` and is exactly one
-          of `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore`,
-          `build`, `ci`; it MUST equal the type of the squash commit you pushed.
-        - `commit_type_reason` is one short sentence naming which rule (1, 2 or
-          3) fired and why.
+        {verdict_type_rules}
         - `repo_states` maps each repo directory to exactly one of `merged`,
           `failed`, `untouched`. Required whenever anything was merged or
           attempted.
