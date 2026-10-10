@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.3.2 (2026-10-09)
+
+### Bug Fixes
+
+- **review**: Block rollout-mutating tools for the merge reviewer
+  ([`a715b06`](https://github.com/repos/agent-gtd-dispatch/commit/a715b06e1745fc5b07cb7f1bba8897184dcd541d))
+
+
 ## v2.3.1 (2026-10-07)
 
 ### Bug Fixes
