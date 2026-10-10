@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v2.4.0 (2026-10-10)
+
+### Bug Fixes
+
+- **deploy**: Stop a backticked word in a heredoc comment running as a command
+  ([`eb01516`](https://github.com/repos/agent-gtd-dispatch/commit/eb01516408d27ffeeb6ba04a1aa6935aea163293))
+
+### Features
+
+- **review**: Derive the squash commit type from the diff and report it in the verdict
+  ([`79d2936`](https://github.com/repos/agent-gtd-dispatch/commit/79d29365abdf9e4d7699a24732b53ddce1938307))
+
+- **review**: Pin the groomed commit type as the squash subject and verify it after merge
+  ([`746d53e`](https://github.com/repos/agent-gtd-dispatch/commit/746d53e78a280ba2c368dcb19c1c7518d3e04b97))
+
+
 ## v2.3.2 (2026-10-09)
 
 ### Bug Fixes
