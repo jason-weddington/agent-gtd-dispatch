@@ -1548,12 +1548,19 @@ first that matches:
 2. Otherwise, the item's LABELS name a type: `bug` or `fix` → `fix`;
    `feature` or `enhancement` → `feat`; `docs` → `docs`;
    `refactor` → `refactor`; `chore`, `prep` or `maintenance` → `chore`.
-3. Otherwise → `chore`.
+3. Otherwise, derive the type from what the merged diff does. First match wins:
+   - `feat` — adds or changes a capability a user, operator or calling agent
+     can observe (new or changed endpoint, CLI verb, MCP tool, config option or
+     env var, UI, or behaviour).
+   - `fix` — corrects behaviour that was wrong.
+   - `perf` — same behaviour, measurably faster or cheaper.
+   - `refactor` — restructures code with no observable behaviour change.
+   - `test` — only tests or test fixtures change.
+   - `docs` — only documentation changes.
+   - `chore` — anything else (dependency bumps, build or tooling housekeeping).
 
-Rule 3 falls back to `chore` ON PURPOSE. An unintended MINOR bump from a wrong
-`feat` is worse than an unintended no-op bump from a `chore`: the no-op is
-invisible, the minor bump is a published claim about what shipped. Never fall
-back to `feat`."""
+A change someone using the project could notice is `feat` or `fix`, never
+`chore`, because a chore is invisible to the changelog."""
     return _indent_prompt_block(body)
 
 
@@ -2938,6 +2945,11 @@ def clear_review_verdict(workspace_root: Path) -> None:
     )
 
 
+COMMIT_TYPES: frozenset[str] = frozenset(
+    {"feat", "fix", "perf", "refactor", "test", "docs", "chore", "build", "ci"}
+)
+
+
 def read_review_verdict(workspace_root: Path) -> tuple[dict[str, Any] | None, str]:
     """Read and validate the reviewer's verdict artifact.
 
@@ -3433,6 +3445,8 @@ for it and continue — do NOT halt for that alone."""
           "verdict": "merge",
           "rationale": "one or two sentences on why",
           "merge_note": "signature/rename/config-key changes, or 'no signature, rename or config-key changes'",
+          "commit_type": "feat",
+          "commit_type_reason": "rule 3: adds a new MCP endpoint",
           "repo_states": {{"<repo_dir>": "merged"}},
           "failure": {{"kind": "", "detail": ""}}
         }}
@@ -3442,6 +3456,11 @@ for it and continue — do NOT halt for that alone."""
           Any other string is rejected and treated as `halt`.
         - `rationale` is REQUIRED and must be non-empty.
         - `merge_note` is REQUIRED when `verdict` is `merge`.
+        - `commit_type` is REQUIRED when `verdict` is `merge` and is exactly one
+          of `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore`,
+          `build`, `ci`; it MUST equal the type of the squash commit you pushed.
+        - `commit_type_reason` is one short sentence naming which rule (1, 2 or
+          3) fired and why.
         - `repo_states` maps each repo directory to exactly one of `merged`,
           `failed`, `untouched`. Required whenever anything was merged or
           attempted.

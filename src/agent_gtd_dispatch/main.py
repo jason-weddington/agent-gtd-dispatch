@@ -2306,6 +2306,8 @@ class ReviewVerdict(NamedTuple):
     rationale: str
     merge_note: str
     detail: str  # structured failure detail, or the rejection reason
+    commit_type: str = ""  # audit only; "" when missing/invalid
+    commit_type_reason: str = ""
 
 
 def _completed_build_item_ids(
@@ -2561,6 +2563,26 @@ async def _launch_reviewer(
         : dispatch.REVIEW_RATIONALE_MAX_CHARS
     ]
     merge_note = str(verdict_blob.get("merge_note") or "")
+    raw_type = verdict_blob.get("commit_type")
+    commit_type = ""
+    if isinstance(raw_type, str) and raw_type in dispatch.COMMIT_TYPES:
+        commit_type = raw_type
+    elif verdict == "merge":
+        # Audit field only: never changes the verdict.
+        logger.warning(
+            "rollout-loop: reviewer commit_type missing or invalid rollout_id=%s "
+            "item_id=%s value=%r",
+            rollout_id,
+            item_id,
+            raw_type,
+        )
+    commit_type_reason = (
+        str(verdict_blob.get("commit_type_reason") or "")[
+            : dispatch.REVIEW_RATIONALE_MAX_CHARS
+        ]
+        if commit_type
+        else ""
+    )
     fail = verdict_blob.get("failure")
     detail = ""
     if isinstance(fail, dict) and (fail.get("kind") or fail.get("detail")):
@@ -2587,7 +2609,9 @@ async def _launch_reviewer(
         verdict,
         exit_code,
     )
-    return ReviewVerdict(verdict, rationale, merge_note, detail)
+    return ReviewVerdict(
+        verdict, rationale, merge_note, detail, commit_type, commit_type_reason
+    )
 
 
 async def _halt_rollout_from_loop(
@@ -2676,12 +2700,20 @@ async def _act_on_verdict(
             if newly_ready
             else "No downstream items unblocked."
         )
+        commit_line = ""
+        if outcome.verdict == "merge":
+            commit_line = (
+                f" Commit type: `{outcome.commit_type}` ({outcome.commit_type_reason})."
+                if outcome.commit_type
+                else " Commit type: not reported by reviewer."
+            )
         try:
             await gtd_client.post_comment(
                 item_id,
                 (
                     f"Rollout `{rollout_id}`: reviewer verdict `{outcome.verdict}` — "
-                    f"item recorded as {recorded}. {outcome.rationale} {unblocked}"
+                    f"item recorded as {recorded}. {outcome.rationale}"
+                    f"{commit_line} {unblocked}"
                 ),
                 created_by=attribution or "agent-gtd-dispatch",
                 token=token,

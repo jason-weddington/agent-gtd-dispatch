@@ -1891,13 +1891,24 @@ class TestAdvanceInFlightCombination:
 class TestVerdictHandling:
     """The reviewer decides; the WORKER acts — including any re-dispatch."""
 
-    async def _act(self, ctx, verdict, *, rationale="because", merge_note="note"):
+    async def _act(
+        self,
+        ctx,
+        verdict,
+        *,
+        rationale="because",
+        merge_note="note",
+        commit_type="",
+        commit_type_reason="",
+    ):
         from agent_gtd_dispatch.main import ReviewVerdict, _act_on_verdict
 
         return await _act_on_verdict(
             "rollout-abc",
             "item-a",
-            ReviewVerdict(verdict, rationale, merge_note, ""),
+            ReviewVerdict(
+                verdict, rationale, merge_note, "", commit_type, commit_type_reason
+            ),
             token=None,
             attribution=None,
         )
@@ -1916,6 +1927,28 @@ class TestVerdictHandling:
         assert call.kwargs["outcome"] == "completed"
         assert call.kwargs["merge_note"] == "note"
         ctx.gtd.halt_rollout.assert_not_awaited()
+
+    async def test_merge_comment_reports_commit_type(self) -> None:
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.complete_in_rollout = AsyncMock(return_value={})
+            await self._act(
+                ctx, "merge", commit_type="feat", commit_type_reason="rule 3: new tool"
+            )
+        text = ctx.gtd.post_comment.await_args.args[1]
+        assert "Commit type: `feat` (rule 3: new tool)." in text
+
+    async def test_merge_comment_without_commit_type(self) -> None:
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.complete_in_rollout = AsyncMock(return_value={})
+            await self._act(ctx, "merge")
+        text = ctx.gtd.post_comment.await_args.args[1]
+        assert "Commit type: not reported by reviewer." in text
+
+    async def test_skip_comment_has_no_commit_type(self) -> None:
+        with _loop_patch_stack() as ctx:
+            await self._act(ctx, "skip")
+        text = ctx.gtd.post_comment.await_args.args[1]
+        assert "Commit type" not in text
 
     async def test_skip_advances_the_wave(self) -> None:
         from agent_gtd_dispatch.main import _TICK_CONTINUE
@@ -2257,6 +2290,9 @@ class TestLaunchReviewer:
         ctx.gtd.get_rollout_merge_notes = AsyncMock(return_value=[])
         ctx.dispatch.MERGE_NOTE_CONTEXT_LIMIT = 10
         ctx.dispatch.REVIEW_RATIONALE_MAX_CHARS = 2000
+        from agent_gtd_dispatch import dispatch as real_dispatch
+
+        ctx.dispatch.COMMIT_TYPES = real_dispatch.COMMIT_TYPES
         ctx.dispatch.build_review_prompt = MagicMock(return_value="PROMPT")
         ctx.dispatch.clear_review_verdict = MagicMock()
         ctx.dispatch.read_review_verdict = MagicMock(
@@ -2301,6 +2337,48 @@ class TestLaunchReviewer:
         assert inserted.rollout_id == "rollout-abc"
         # A stale verdict from the previous item is cleared before launch.
         ctx.dispatch.clear_review_verdict.assert_called_once()
+
+    async def test_commit_type_round_trips(self) -> None:
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "merge",
+                    "rationale": "ok",
+                    "merge_note": "n",
+                    "commit_type": "feat",
+                    "commit_type_reason": "rule 3: adds a tool",
+                },
+                reason="ok",
+            )
+        assert outcome.commit_type == "feat"
+        assert outcome.commit_type_reason == "rule 3: adds a tool"
+
+    async def test_invalid_commit_type_is_blanked_and_warned(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.main"),
+        ):
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "merge",
+                    "rationale": "ok",
+                    "merge_note": "n",
+                    "commit_type": "banana",
+                },
+                reason="ok",
+            )
+        assert outcome.verdict == "merge"
+        assert outcome.commit_type == ""
+        assert any(
+            r.levelno == logging.WARNING and "banana" in r.getMessage()
+            for r in caplog.records
+        )
 
     async def test_reviewer_launched_with_disallowed_tools(self) -> None:
         from agent_gtd_dispatch import dispatch as real_dispatch

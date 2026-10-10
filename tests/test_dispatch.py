@@ -5501,12 +5501,14 @@ class TestManagePromptMergeBarAndNotes:
         for prompt in self._prompts():
             assert "Deriving the squash commit TYPE" in prompt
             assert "`bug` or `fix` → `fix`" in prompt
-            assert "Otherwise → `chore`" in prompt
+            assert "derive the type from what the merged diff does" in prompt
 
-    def test_commit_type_fallback_is_chore_and_says_why(self) -> None:
+    def test_rule_3_defines_feat_and_drops_the_chore_fallback(self) -> None:
         for prompt in self._prompts():
-            assert "falls back to `chore` ON PURPOSE" in prompt
-            assert "Never fall\nback to `feat`" in prompt
+            assert "`feat` — adds or changes a capability" in prompt
+            assert "Never fall back to" not in prompt
+            assert "Never fall\nback" not in prompt
+            assert "never\n`chore`" in prompt
 
     # --- dedent sanity: interpolated blocks must not break textwrap.dedent ---
 
