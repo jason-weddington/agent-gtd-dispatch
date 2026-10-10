@@ -130,7 +130,21 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
       hard fixtures, one MaxIterations miss); flash@low produced a false-done
       where flash@high had none. Never leave OLLAMA_THINK unset for either GLM
       engine.
+
+    KB access: talos runs get ``PERSONAL_KB_URL`` + ``PERSONAL_KB_API_KEY``. The
+    key comes from ``TALOS_PERSONAL_KB_API_KEY`` in the service env (a key minted
+    for talos with the autonomous surface, deliberately separate from the
+    claude-code agents' MCP key). Both are omitted when either is unset.
     """
+    overlay = _engine_env_overlay(engine_name)
+    if config.PERSONAL_KB_URL and config.TALOS_PERSONAL_KB_API_KEY:
+        overlay["PERSONAL_KB_URL"] = config.PERSONAL_KB_URL
+        overlay["PERSONAL_KB_API_KEY"] = config.TALOS_PERSONAL_KB_API_KEY
+    return overlay
+
+
+def _engine_env_overlay(engine_name: str) -> dict[str, str]:
+    """Per-engine overlay (no KB keys). Raises ValueError for non-talos names."""
     if engine_name == "talos-haiku":
         return {
             "TALOS_BACKEND": "anthropic",

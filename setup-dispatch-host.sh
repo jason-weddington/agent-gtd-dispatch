@@ -1603,6 +1603,9 @@ else
     #   PERSONAL_KB_URL / PERSONAL_KB_API_KEY → hosted personal-KB service URL + API
     #     key, injected into the personal-kb MCP server's own env block. personal-kb is
     #     skipped when either is unset.
+    #   TALOS_PERSONAL_KB_API_KEY → NOT read by this installer. The dispatch service
+    #     reads it at run time and hands it to talos runs as PERSONAL_KB_API_KEY
+    #     (with PERSONAL_KB_URL); talos gets no KB access when it is unset.
     #   TEAM_KB_URL / TEAM_KB_API_KEY → hosted team-KB service URL + API key, injected
     #     into the team-kb MCP server's own env block (bound there to the same
     #     PERSONAL_KB_URL / PERSONAL_KB_API_KEY variable NAMES — see

@@ -156,6 +156,11 @@ MAX_ITEM_REDISPATCHES: int = 1
 # exposed to claude-code subprocesses — see kb-01512.
 ANTHROPIC_API_KEY: str = ""
 
+# Personal-KB access handed to talos runs only (claude-code engines reach the KB
+# via MCP). Both must be set for the pair to be injected; see talos_env_overlay.
+PERSONAL_KB_URL: str = ""
+TALOS_PERSONAL_KB_API_KEY: str = ""
+
 # Ollama local inference backend.
 # OLLAMA_BASE_URL is the Ollama root URL, e.g. "http://10.0.0.5:11434".
 # Do NOT include /v1 or any path suffix — Ollama exposes the Anthropic
@@ -233,6 +238,7 @@ def load() -> None:
     global DISPATCH_API_KEY, AGENT_GTD_URL, AGENT_GTD_API_KEY
     global WORKSPACE_ROOT, MAX_TURNS, TIMEOUT_SECONDS, MANAGE_TIMEOUT_SECONDS
     global ANTHROPIC_API_KEY, MAX_CONCURRENT_RUNS
+    global PERSONAL_KB_URL, TALOS_PERSONAL_KB_API_KEY
     global OLLAMA_BASE_URL, OLLAMA_API_KEY, OLLAMA_DEFAULT_MODEL
     global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS, PUSH_BACKSTOP_MIN_SECONDS
     global GATE_INSTALL_TIMEOUT_SECONDS, POST_RUN_GATE_MIN_SECONDS
@@ -256,6 +262,8 @@ def load() -> None:
     # Optional: gates the talos anthropic engines only (see the declaration
     # above). Absent = those engines are simply not advertised.
     ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+    PERSONAL_KB_URL = os.environ.get("PERSONAL_KB_URL", "").strip()
+    TALOS_PERSONAL_KB_API_KEY = os.environ.get("TALOS_PERSONAL_KB_API_KEY", "").strip()
 
     AGENT_SUBPROCESS_USER = os.environ.get("DISPATCH_AGENT_SUBPROCESS_USER", "")
     _workspace_env = os.environ.get("DISPATCH_WORKSPACE_ROOT", "")

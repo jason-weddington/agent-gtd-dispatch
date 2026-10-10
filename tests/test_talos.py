@@ -3163,3 +3163,67 @@ class TestFailedCommitDecisionTable:
             if c.kwargs.get("error")
         ]
         assert "no committed changes" in errors[-1], errors
+
+
+# ---------------------------------------------------------------------------
+# KB env pair
+# ---------------------------------------------------------------------------
+
+_KB_KEYS = ("PERSONAL_KB_URL", "PERSONAL_KB_API_KEY")
+
+
+class TestTalosKbEnv:
+    def _names(self):
+        from agent_gtd_dispatch.engines import TALOS_ENGINES
+
+        return list(TALOS_ENGINES)
+
+    def test_both_set_injects_pair_into_every_engine(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "PERSONAL_KB_URL", "https://kb.example")
+        monkeypatch.setattr(config, "TALOS_PERSONAL_KB_API_KEY", "talos-kb-key")
+        names = self._names()
+        assert names
+        for name in names:
+            overlay = talos_env_overlay(name)
+            assert overlay["PERSONAL_KB_URL"] == "https://kb.example"
+            assert overlay["PERSONAL_KB_API_KEY"] == "talos-kb-key"
+            assert "TALOS_BACKEND" in overlay
+
+    @pytest.mark.parametrize(
+        ("url", "key"),
+        [("https://kb.example", ""), ("", "talos-kb-key"), ("", "")],
+    )
+    def test_partial_or_unset_omits_pair(self, monkeypatch, url, key) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "PERSONAL_KB_URL", url)
+        monkeypatch.setattr(config, "TALOS_PERSONAL_KB_API_KEY", key)
+        for name in self._names():
+            overlay = talos_env_overlay(name)
+            for k in _KB_KEYS:
+                assert k not in overlay
+            assert "TALOS_BACKEND" in overlay
+
+    def test_unknown_engine_still_raises(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "PERSONAL_KB_URL", "https://kb.example")
+        monkeypatch.setattr(config, "TALOS_PERSONAL_KB_API_KEY", "k")
+        with pytest.raises(ValueError, match="Not a talos engine"):
+            talos_env_overlay("claude-code-sonnet")
+
+    def test_claude_code_build_env_never_carries_kb_pair(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.engines import CLAUDE_SONNET, build_env
+        from agent_gtd_dispatch.models import DispatchMode
+
+        monkeypatch.setattr(config, "PERSONAL_KB_URL", "https://kb.example")
+        monkeypatch.setattr(config, "TALOS_PERSONAL_KB_API_KEY", "talos-kb-key")
+        env = build_env(CLAUDE_SONNET, mode=DispatchMode.BUILD)
+        for k in _KB_KEYS:
+            assert k not in env
