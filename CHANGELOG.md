@@ -2,6 +2,27 @@
 
 <!-- version list -->
 
+## v2.7.0 (2026-10-11)
+
+### Bug Fixes
+
+- **0b966bc3**: The rollout loop run is marked failed when its final advance returns 422 on an
+  already-completed rollout
+  ([`d287afb`](https://github.com/repos/agent-gtd-dispatch/commit/d287afb18517d7bb146cf311dfbb6aa4c7893c3b))
+
+### Features
+
+- **433478ad**: Register agent-gtd for the agent user as the board's HTTPS /mcp server instead of a
+  stdio uvx package
+  ([`2d98796`](https://github.com/repos/agent-gtd-dispatch/commit/2d98796d8beabf0e684d5c4503a65c8e72dc1e4d))
+
+### Testing
+
+- **fb3994cd**: Make test_sudo_wrap_path_includes_local_bin hermetic; move the real-sudo check
+  behind an opt-in marker
+  ([`862e530`](https://github.com/repos/agent-gtd-dispatch/commit/862e530de299e19847a63150e787bed97f99ba14))
+
+
 ## v2.6.1 (2026-10-11)
 
 ### Bug Fixes
