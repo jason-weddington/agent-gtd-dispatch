@@ -14,6 +14,7 @@ uv run pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-t
 ```bash
 uv run pytest -v                              # run tests
 uv run pytest --cov --cov-report=term-missing  # tests + coverage report
+uv run pytest -m sudo_integration tests/test_dispatch.py  # opt-in real-sudo check, deselected by default; run as the dispatch service user (SKIPPED means it did not run)
 uv run ruff check src/ tests/                 # lint
 uv run ruff format src/ tests/                # auto-format
 uv run mypy src/                              # type check

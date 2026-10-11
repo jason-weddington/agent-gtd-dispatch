@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import json
 import logging
 import os
@@ -71,9 +72,6 @@ def _dispatch_sudo_available() -> bool:
         ["/usr/bin/sudo", "-n", "-u", "dispatch", "true"], capture_output=True
     )
     return result.returncode == 0
-
-
-_DISPATCH_SUDO_AVAILABLE = _dispatch_sudo_available()
 
 
 class TestRepoNameFromOrigin:
@@ -1282,20 +1280,67 @@ class TestSudoWrapping:
             "-H",
         ]
 
-    @pytest.mark.skipif(
-        not _DISPATCH_SUDO_AVAILABLE,
-        reason="requires 'dispatch' system user and passwordless sudo access",
-    )
     def test_sudo_wrap_path_includes_local_bin(self, monkeypatch) -> None:
+        from agent_gtd_dispatch.dispatch import _sudo_wrap
+
+        with (
+            patch("subprocess.run", side_effect=AssertionError("no subprocess")),
+            patch("subprocess.Popen", side_effect=AssertionError("no subprocess")),
+        ):
+            monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+            monkeypatch.setenv("PATH", "/usr/bin:/bin")
+            assert _sudo_wrap(["bash", "-c", "true"]) == [
+                "sudo",
+                "-u",
+                "dispatch",
+                "-H",
+                "bash",
+                "-c",
+                "true",
+            ]
+            mock_pw = MagicMock()
+            mock_pw.pw_dir = "/home/dispatch"
+            with patch("pwd.getpwnam", return_value=mock_pw):
+                path = build_env(CLAUDE)["PATH"]
+            assert path.split(":")[0] == "/home/dispatch/.local/bin"
+            tmpl = (
+                Path(__file__).parent.parent / "templates" / "sudoers-dispatch-svc.tmpl"
+            )
+            line = next(
+                ln
+                for ln in tmpl.read_text().splitlines()
+                if ln.lstrip().startswith("Defaults:{{SERVICE_USER}} secure_path=")
+            )
+            value = line[line.index('"') + 1 : line.rindex('"')]
+            entries = value.split(":")
+            assert "/home/{{AGENT_USER}}/.local/bin" in entries, entries
+
+    def test_path_is_in_sudoers_env_keep(self) -> None:
+        assert "PATH" in TestBuildEnv._sudoers_env_keep_keys()
+
+    @pytest.mark.sudo_integration
+    def test_sudo_wrap_path_includes_local_bin_real_sudo(self, monkeypatch) -> None:
+        """Real sudo to the agent user; opt-in via ``-m sudo_integration``.
+
+        Meaningful only when run as the dispatch service user: the sudoers
+        ``Defaults:<service user>`` secure_path and env_keep lines apply only to
+        that user, so on any other user this can fail falsely or skip.
+        """
+        if not _dispatch_sudo_available():
+            pytest.skip(
+                f"sudo -n -u dispatch true not permitted for {getpass.getuser()}; "
+                "run as the dispatch service user"
+            )
         from agent_gtd_dispatch.dispatch import _sudo_wrap
 
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
         env = build_env(CLAUDE)
         cmd = _sudo_wrap(["bash", "-c", "printf '%s' \"$PATH\""])
+        assert cmd[:4] == ["sudo", "-u", "dispatch", "-H"]
         result = subprocess.run(
             cmd, env=env, capture_output=True, text=True, timeout=10
         )
-        assert "/home/dispatch/.local/bin" in result.stdout
+        assert "/home/dispatch/.local/bin" in result.stdout, result.stdout
 
 
 class TestBuildManagePrompt:
