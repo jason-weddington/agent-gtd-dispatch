@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.6.1 (2026-10-11)
+
+### Bug Fixes
+
+- **rollout**: Re-adopt a rollout on startup only when this host drove its loop
+  ([`089a8f6`](https://github.com/repos/agent-gtd-dispatch/commit/089a8f6cf67b10e775a49c88f37d06978bde794b))
+
+
 ## v2.6.0 (2026-10-11)
 
 ### Bug Fixes
