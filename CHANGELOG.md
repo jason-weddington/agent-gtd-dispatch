@@ -2,6 +2,27 @@
 
 <!-- version list -->
 
+## v2.6.0 (2026-10-11)
+
+### Bug Fixes
+
+- **9f00b5f1**: A bookkeeping failure after a successful merge halts the whole rollout
+  ([`243d348`](https://github.com/repos/agent-gtd-dispatch/commit/243d348ee612c02982e6ebf29ce61b2465fc4a0d))
+
+- **a9875420**: Deploy.sh never refreshes /etc/sudoers.d/dispatch-svc, so sudoers template changes
+  silently miss existing hosts
+  ([`27ce5e1`](https://github.com/repos/agent-gtd-dispatch/commit/27ce5e1b9ff68ff5a85827309314dfa4b0d8787f))
+
+- **cb8a48df**: Gate the squash-merged tree on current origin/main before it is pushed
+  ([`4b146ef`](https://github.com/repos/agent-gtd-dispatch/commit/4b146efda23c73f542f5d10b7e84b679372cea39))
+
+### Features
+
+- **dispatch**: Register personal-kb and team-kb as hosted HTTPS /mcp servers for the agent user,
+  refreshed on every deploy
+  ([`0f6453c`](https://github.com/repos/agent-gtd-dispatch/commit/0f6453c08fac23e2af1c1db1663dd0f07b1e7299))
+
+
 ## v2.5.0 (2026-10-11)
 
 ### Features
