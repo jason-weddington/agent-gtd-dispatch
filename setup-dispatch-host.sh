@@ -162,28 +162,6 @@ EOF
 # Helper functions (defined before use)
 # ===========================================================================
 
-_render_sudoers() {
-    local tmpl="${TMPL_DIR}/sudoers-dispatch-svc.tmpl"
-    [[ -f "$tmpl" ]] || die "Template not found: ${tmpl}"
-    sed \
-        -e "s|{{SERVICE_USER}}|${SERVICE_USER}|g" \
-        -e "s|{{AGENT_USER}}|${AGENT_USER}|g" \
-        "$tmpl"
-}
-
-_install_sudoers() {
-    local tmpfile
-    tmpfile="$(mktemp /tmp/dispatch-sudoers.XXXXXX)"
-    _render_sudoers > "$tmpfile"
-    if ! visudo -c -f "$tmpfile"; then
-        rm -f "$tmpfile"
-        die "visudo validation failed — sudoers fragment NOT installed"
-    fi
-    install -m 0440 -o root -g root "$tmpfile" "$SUDOERS_FILE"
-    rm -f "$tmpfile"
-    info "Installed sudoers fragment: ${SUDOERS_FILE}"
-}
-
 _render_unit() {
     local tmpl="${TMPL_DIR}/dispatch-api.service.tmpl"
     [[ -f "$tmpl" ]] || die "Template not found: ${tmpl}"
@@ -2123,45 +2101,21 @@ echo "--- Step 5a: Claude symlink ---"
 CLAUDE_LINK="/usr/local/bin/claude"
 
 if $SINGLE_USER; then
-    skip "single-user mode — no sudoers boundary; skipping claude symlink at ${CLAUDE_LINK}"
-elif [[ -L "$CLAUDE_LINK" ]] && [[ "$(readlink -f "$CLAUDE_LINK" 2>/dev/null)" == "$(readlink -f "$CLAUDE_SRC" 2>/dev/null)" ]]; then
-    skip "${CLAUDE_LINK} already points to ${CLAUDE_SRC} — already configured"
-elif $DRY_RUN; then
-    would "create symlink ${CLAUDE_LINK} -> ${CLAUDE_SRC}"
-else
-    if [[ ! -f "$CLAUDE_SRC" ]]; then
-        warn "Agent claude binary not found at ${CLAUDE_SRC} — skipping symlink (install claude as ${AGENT_USER} first)"
-    else
-        ln -sf "$CLAUDE_SRC" "$CLAUDE_LINK"
-        info "Created symlink ${CLAUDE_LINK} -> ${CLAUDE_SRC}"
-    fi
-fi
-
-# ===========================================================================
-# Step 5b: Sudoers fragment
-# ===========================================================================
-echo ""
-echo "--- Step 5b: Sudoers ---"
-
-if $SINGLE_USER; then
     skip "single-user mode — no sudoers boundary; skipping sudoers fragment (${SUDOERS_FILE} not created)"
-elif [[ -f "$SUDOERS_FILE" ]]; then
-    current_sudoers="$(cat "$SUDOERS_FILE")"
-    rendered_sudoers="$(_render_sudoers)"
-    if [[ "$current_sudoers" == "$rendered_sudoers" ]]; then
-        skip "${SUDOERS_FILE} already up to date — already configured"
-    else
-        warn "${SUDOERS_FILE} exists but content differs — will overwrite"
-        if $DRY_RUN; then
-            would "overwrite ${SUDOERS_FILE} with rendered sudoers template"
-        else
-            _install_sudoers
-        fi
-    fi
-elif $DRY_RUN; then
-    would "render sudoers template → validate with visudo -c → install ${SUDOERS_FILE} (mode 0440)"
 else
-    _install_sudoers
+    _sr="${SCRIPT_DIR}/scripts/sudoers-refresh.sh"
+    [[ -x "$_sr" ]] || die "Missing or non-executable ${_sr} — this ships in the repo; its absence means a broken checkout"
+    if $DRY_RUN; then
+        if [[ ! -f "$SUDOERS_FILE" ]]; then
+            would "render sudoers template → validate with visudo -c → install ${SUDOERS_FILE} (mode 0440)"
+        elif cmp -s <("$_sr" --render-only --template "${TMPL_DIR}/sudoers-dispatch-svc.tmpl" --service-user "$SERVICE_USER" --agent-user "$AGENT_USER") "$SUDOERS_FILE"; then
+            skip "${SUDOERS_FILE} already up to date — already configured"
+        else
+            would "overwrite ${SUDOERS_FILE} with rendered sudoers template"
+        fi
+    else
+        "$_sr" --create --template "${TMPL_DIR}/sudoers-dispatch-svc.tmpl" --sudoers-file "$SUDOERS_FILE" --service-user "$SERVICE_USER" --agent-user "$AGENT_USER" || die "sudoers-refresh.sh failed — see [ERR] lines above"
+    fi
 fi
 
 # ===========================================================================

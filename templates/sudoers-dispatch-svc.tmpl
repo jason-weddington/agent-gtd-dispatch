@@ -1,6 +1,6 @@
 # sudoers-dispatch-svc.tmpl — sudoers fragment for the dispatch service user.
-# This file is rendered by setup-dispatch-host.sh and installed to
-# /etc/sudoers.d/dispatch-svc after validation with visudo -c.
+# This file is rendered and installed by scripts/sudoers-refresh.sh, called from
+# setup-dispatch-host.sh (provision, --create) and deploy.sh (every deploy, refresh-only).
 #
 # {{SERVICE_USER}} = the dispatch service user (default: dispatch-svc)
 # {{AGENT_USER}}   = the agent subprocess user (default: dispatch)

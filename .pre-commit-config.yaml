@@ -32,7 +32,7 @@ repos:
         entry: bash -n
         language: system
         pass_filenames: true
-        files: '^(setup-dispatch-host\.sh|deploy\.sh|serve\.sh|templates/.*\.sh)$'
+        files: '^(setup-dispatch-host\.sh|deploy\.sh|serve\.sh|templates/.*\.sh|scripts/sudoers-refresh\.sh)$'
 
       - id: mypy
         name: mypy

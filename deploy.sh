@@ -7,6 +7,8 @@ set -euo pipefail
 # service user on each host, then restarts the systemd unit and probes /health.
 # Hosts consume the wheel published to the homelab index (pi-04 pypi.lab) by
 # release.sh; no working copy on the host, no source-tree state.
+# It also refreshes /etc/sudoers.d/dispatch-svc via scripts/sudoers-refresh.sh
+# before the wheel install.
 #
 # The homelab index is passed via `--index` (NOT `--index-url`) so it is
 # ADDED to the default PyPI list; uv resolves fastapi/uvicorn/anthropic/etc.
@@ -96,8 +98,15 @@ deploy_one() {
         echo "[WARN] could not stage rescue-sweep files on ${host} — skipping sweep refresh" >&2
     }
 
+    local _stage
+    _stage=$(ssh "${host}" mktemp -d) || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
+    [[ "$_stage" == /tmp/* ]] || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
+    scp -q "${SCRIPT_DIR}/scripts/sudoers-refresh.sh" "${SCRIPT_DIR}/templates/sudoers-dispatch-svc.tmpl" "${host}:${_stage}/" || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
+
     ssh "${host}" bash -s <<EOF
 set -euo pipefail
+if ! sudo bash "${_stage}/sudoers-refresh.sh" --template "${_stage}/sudoers-dispatch-svc.tmpl" --service-user ${SERVICE_USER} --agent-user ${AGENT_USER} 2>&1 | sed "s/^/[${host}] /"; then rm -rf "${_stage}"; echo "[ERR]  sudoers refresh failed on ${host} — host left untouched" >&2; exit 1; fi
+rm -rf "${_stage}"
 
 # Install/refresh the wheel from the homelab index.
 # -H sets HOME=/home/${SERVICE_USER} so uv installs the tool under the service

@@ -558,20 +558,12 @@ agent user's static global gitconfig (which had drifted independently per host),
    model-swap bug, whereas an obviously generic name is obviously wrong the moment
    the env override fails. See kb-02979 ("engine label is not identity").
 
-### Operator note: existing hosts do not pick this up automatically
+### Operator note: deploys refresh the sudoers fragment
 
-**`./deploy.sh` does not rewrite `/etc/sudoers.d/dispatch-svc`.** It updates the
-installed wheel and (conditionally) the systemd unit, but the sudoers fragment is only
-(re)rendered by `setup-dispatch-host.sh`. Until a host's `setup-dispatch-host.sh` is
-re-run, that host's `env_keep` stays stale, the five attribution variables keep getting
-stripped, and dispatched commits on that host keep carrying whatever identity its
-gitconfig happened to have — **the attribution stays wrong until the host is
-re-provisioned**, deploys alone will not fix it.
-
-```bash
-# Re-run on each existing host to pick up the env_keep + git identity changes:
-sudo ./setup-dispatch-host.sh   # existing args (--agent-user, --service-user, etc.) as before
-```
+`./deploy.sh` refreshes `/etc/sudoers.d/dispatch-svc` from the template on every
+two-user host via `scripts/sudoers-refresh.sh`, before the wheel install. It prints
+`[OK]`, `[CHANGED]` or `[SKIP]` lines prefixed with the host. A host whose file is
+absent (single-user) is skipped, with a `[WARN]` if the service user exists.
 
 ---
 
@@ -1122,7 +1114,7 @@ sudo systemctl daemon-reload
 
 ### Step 5b — Sudoers fragment
 ```bash
-sudo rm /etc/sudoers.d/dispatch-svc
+sudo rm -f /etc/sudoers.d/dispatch-svc /etc/sudoers.d/dispatch-svc.bak.*
 ```
 
 ### Step 5a — Claude symlink
@@ -1285,12 +1277,12 @@ sudo journalctl -u dispatch-api -n 100 --no-pager
 
 ### `visudo` validation fails during sudoers install
 
-**Symptom**: Script exits with `visudo validation failed — sudoers fragment NOT installed`.
+**Symptom**: `[ERR]  visudo rejected rendered sudoers — <file> NOT modified`, followed by visudo's own `[ERR]   ` lines.
 
 **Cause**: The sudoers template was rendered with an unexpected character (e.g. special characters in usernames).
 
 **Fix**: Verify that `--agent-user` and `--service-user` contain only `[a-z0-9_-]` characters.
-Inspect the rendered fragment: `sudo cat /tmp/dispatch-sudoers.*` (before the temp file is cleaned up).
+The temp file is `/etc/sudoers.d/dispatch-svc.tmp.*` and is removed by a trap. To inspect the render, run `scripts/sudoers-refresh.sh --render-only --template templates/sudoers-dispatch-svc.tmpl --service-user <u> --agent-user <u>`.
 
 ---
 
