@@ -172,9 +172,9 @@ def build_env(
     NOTE: reusing the ``AGENT_GTD_API_KEY`` name (rather than a new var) means
     the token already survives the ``sudo -u dispatch`` boundary via the
     existing ``env_keep`` entry in ``sudoers-dispatch-svc.tmpl``. The agent-gtd
-    MCP server picks it up from the subprocess env only once the literal value
-    is no longer baked into its ``.claude.json`` registration — see
-    ``templates/mcp-servers.sh`` (host reprovisioning is an operator step).
+    MCP server is the board's HTTP ``/mcp`` endpoint, whose ``headersHelper``
+    reads the bearer from this subprocess env at connect time (no key is baked
+    into ``.claude.json``) — see ``scripts/kb-mcp-refresh.sh``.
     """
     allowed = COMMON_ENV_KEYS | engine.env_keys
     # Manage-mode env exposure: add dispatch URL + key for ANY claude-code-family
@@ -208,7 +208,7 @@ def build_env(
     env["GIT_COMMITTER_EMAIL"] = f"{engine.name}@agent-gtd-dispatch"
 
     # Prepend ~/.local/bin and ~/.cargo/bin for the agent user so uvx/MCP
-    # binaries (personal-kb, agent-gtd) and rustup toolchain binaries (cargo,
+    # binaries and rustup toolchain binaries (cargo,
     # cog, typos, cargo-sort, ...) are discoverable after sudo's env_reset
     # strips PATH.
     env["PATH"] = prepend_agent_bin_dirs(env.get("PATH", ""))

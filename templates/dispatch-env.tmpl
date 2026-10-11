@@ -13,7 +13,12 @@
 DISPATCH_API_KEY=
 
 # Agent GTD API (for fetching items/projects and posting comments).
-AGENT_GTD_URL=https://r7-research:8443
+# The agent's agent-gtd MCP server is <AGENT_GTD_URL>/mcp, registered as an HTTP /mcp
+# server by scripts/kb-mcp-refresh.sh (setup Step 4.6 and every deploy.sh). The URL
+# must serve <AGENT_GTD_URL>/mcp over a TLS certificate Node trusts by default, since
+# Claude Code (Node) connects to it directly. AGENT_GTD_API_KEY is never written into
+# that registration; agents send their per-run callback token instead.
+AGENT_GTD_URL=https://gtd.example.com
 AGENT_GTD_API_KEY=agtd_...
 
 # Anthropic API key — used ONLY by the in-process rollout planner (POST /plan).

@@ -424,7 +424,7 @@ All variables documented in `templates/dispatch-env.tmpl`. Key variables:
 | Variable | Required | Description |
 |---|---|---|
 | `DISPATCH_API_KEY` | ✓ | Bearer token callers must supply to the REST API (auto-minted by Step 3.5 if absent; see below) |
-| `AGENT_GTD_URL` | ✓ | Agent GTD API base URL (e.g. `https://r7-research:8443`) |
+| `AGENT_GTD_URL` | ✓ | Agent GTD API base URL (e.g. `https://gtd.example.com`). Also the base of the agent's agent-gtd MCP server: Step 4.6 and `deploy.sh` register `<AGENT_GTD_URL>/mcp` via `scripts/kb-mcp-refresh.sh`, so the URL must serve `<URL>/mcp` over a TLS certificate Node trusts by default |
 | `AGENT_GTD_API_KEY` | ✓ | Agent GTD API key (`agtd_…` prefix) |
 | `ANTHROPIC_API_KEY` | – | Anthropic API key. NOT required to start the service. Gates the `talos-haiku`/`talos-sonnet`/`talos-opus` engines only; never forwarded to Claude Code subprocesses (kb-01512). |
 | `DISPATCH_AGENT_SUBPROCESS_USER` | ✓ (prod) | Agent user for user-switching (`dispatch`). Leave empty in dev to disable. |
@@ -576,7 +576,7 @@ falling back to raw `curl` calls.
 
 | Server | Purpose |
 |---|---|
-| `agent-gtd` | GTD items, comments, and dispatch (prevents `created_by="human"` regression) |
+| `agent-gtd` | GTD items, comments, and dispatch (prevents `created_by="human"` regression) — the board's hosted HTTP `/mcp` server (`<AGENT_GTD_URL>/mcp`), registered by `scripts/kb-mcp-refresh.sh`; **required**: Step 4.6 dies if `AGENT_GTD_URL` is unset or the registration is not in place |
 | `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) — a hosted HTTP `/mcp` server, **conditional**: only registered (by `scripts/kb-mcp-refresh.sh`) when `PERSONAL_KB_URL` and `PERSONAL_KB_API_KEY` are both set in the service `.env` |
 | `team-kb` | Team knowledge base — a hosted HTTP `/mcp` server, **conditional**: only registered when `TEAM_KB_URL` and `TEAM_KB_API_KEY` are both set in the service `.env` |
 | `aws-documentation-mcp-server` | AWS docs for any AWS-related implementation work |
@@ -594,6 +594,8 @@ need `uvx` or git-ssh. The script is idempotent and prints `[OK]` / `[CHANGED]` 
 a URL is unset the installer prints a `[WARN]` and skips that server entirely; if the
 URL is set but its API key is not, the installer warns that a URL without a key cannot
 authenticate and skips that server too.
+
+Step 4.6 also reads `AGENT_GTD_URL` and `AGENT_GTD_API_KEY`. agent-gtd is the board's hosted HTTP `/mcp` server at `<AGENT_GTD_URL>/mcp`, registered by the same `scripts/kb-mcp-refresh.sh` as `type: http` with an env-only bearer `headersHelper`: it reads `AGENT_GTD_API_KEY` from the agent's env at connect time, where the dispatch worker sets it per run to the run's callback token. There is no agent-gtd key file and the key is never written into `.claude.json`, by design: a static key would pin every run to one identity. The helper also forwards `AGENT_GTD_AGENT_NAME` as the `X-Agent-Name` header, which the board uses only when the bearer is not a run token. Only `AGENT_GTD_URL` is required to register it; a legacy stdio `uvx` registration is migrated in place, and a failed add restores the previous entry. After the refresh, Step 4.6 dies unless `agent-gtd` is registered as `http <AGENT_GTD_URL>/mcp`, then probes it with `templates/mcp-probe.py` using the host's static `AGENT_GTD_API_KEY` (a real `initialize` + `tools/list` handshake over HTTP, expecting `add_item`). Every `./deploy.sh` re-runs the refresh with `--probe`; a failed deploy-time probe prints a `[WARN]` and is never fatal. The URL must serve `<URL>/mcp` over a TLS certificate Node trusts by default, because Claude Code (Node) connects to it directly, while the probe validates TLS against Python's trust store.
 
 Registration is **per-host and per-user** using `--scope user`, which writes to
 `/home/dispatch/.claude.json` in the two-user split. **In single-user mode the agent
@@ -1063,7 +1065,7 @@ This exists because **a restart looks like run completion to the status poller**
 
 ### Two-consumer model: process env vs. `.claude.json`
 
-Some keys written to `$SERVICE_ENV` are consumed twice: once by the `dispatch-api` **process environment** (this step's concern), and once applied to the agent's `${AGENT_HOME}/.claude.json` registrations or KB key files by [Step 4.6 — MCP servers](#mcp-servers-for-the-agent-user), which re-reads `$SERVICE_ENV` fresh on every run. For any stale key that is also one of Step 4.6's inputs (`AGENT_GTD_URL`, `AGENT_GTD_API_KEY`, `AGENT_GTD_MCP_SRC`, `PERSONAL_KB_URL`, `PERSONAL_KB_API_KEY`, `TEAM_KB_URL`, `TEAM_KB_API_KEY`), Step 6.5's banner adds a line reminding the operator that Step 4.6 already refreshed the `.claude.json` registration or key file this invocation, and that restarting `dispatch-api` does **not** refresh it — the two consumers are independent and need independent thinking about, not just a restart.
+Some keys written to `$SERVICE_ENV` are consumed twice: once by the `dispatch-api` **process environment** (this step's concern), and once applied to the agent's `${AGENT_HOME}/.claude.json` registrations or KB key files by [Step 4.6 — MCP servers](#mcp-servers-for-the-agent-user), which re-reads `$SERVICE_ENV` fresh on every run. For any stale key that is also one of Step 4.6's inputs (`AGENT_GTD_URL`, `AGENT_GTD_API_KEY`, `PERSONAL_KB_URL`, `PERSONAL_KB_API_KEY`, `TEAM_KB_URL`, `TEAM_KB_API_KEY`), Step 6.5's banner adds a line reminding the operator that Step 4.6 already refreshed the `.claude.json` registration or key file this invocation, and that restarting `dispatch-api` does **not** refresh it — the two consumers are independent and need independent thinking about, not just a restart.
 
 ### `scripts/env-staleness-check.sh`
 

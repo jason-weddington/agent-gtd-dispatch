@@ -274,10 +274,7 @@ the rollout is advanced (the manage agent's caller handles that).
 
 ## Attribution
 
-When `POST /dispatch` includes `attribution: str`, the spawned subprocess receives
-`AGENT_GTD_AGENT_NAME=<attribution>`. The agent uses this as its identity when posting GTD
-comments — comments appear under the attribution name (e.g. `claude-build-abc12345`) rather
-than the dispatch service's default (`agent-gtd-dispatch`).
+When `POST /dispatch` includes `attribution: str`, the spawned subprocess receives `AGENT_GTD_AGENT_NAME=<attribution>`. The agent's agent-gtd MCP server is the board's HTTP `/mcp` endpoint at `<AGENT_GTD_URL>/mcp`, registered by `scripts/kb-mcp-refresh.sh` with an env-only bearer `headersHelper` (no key file, by design: per-run identity) that also forwards `AGENT_GTD_AGENT_NAME` as the `X-Agent-Name` header. The board uses that name (e.g. `claude-build-abc12345`) as the comment author only when the bearer is not a run token; a run's callback token already identifies the run, and the board derives `created_by` from it server-side.
 
 This prevents the service account from appearing as the author of agent-written comments
 and enables per-agent audit trails in the GTD item comment history.

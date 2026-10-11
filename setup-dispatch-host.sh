@@ -1551,8 +1551,8 @@ echo "--- Step 4.6: MCP servers (agent user) ---"
 if ! $DRY_RUN && [[ ! -f "$CLAUDE_SRC" ]]; then
     warn "Claude Code not found at ${CLAUDE_SRC} — skipping MCP server registration (install claude as ${AGENT_USER} first)"
 elif $DRY_RUN; then
-    would "read AGENT_GTD_URL, AGENT_GTD_API_KEY, AGENT_GTD_MCP_SRC, PERSONAL_KB_URL, PERSONAL_KB_API_KEY, TEAM_KB_URL, TEAM_KB_API_KEY from ${SERVICE_ENV}"
-    would "run scripts/kb-mcp-refresh.sh: register personal-kb/team-kb as HTTP /mcp servers for ${AGENT_USER} and write their key files (mode 0600)"
+    would "read AGENT_GTD_URL, AGENT_GTD_API_KEY, PERSONAL_KB_URL, PERSONAL_KB_API_KEY, TEAM_KB_URL, TEAM_KB_API_KEY from ${SERVICE_ENV}"
+    would "run scripts/kb-mcp-refresh.sh: register personal-kb/team-kb/agent-gtd as HTTP /mcp servers for ${AGENT_USER} and write the KB key files (mode 0600)"
     would "GET <PERSONAL_KB_URL>/api/health and <TEAM_KB_URL>/api/health (reachability warn-check)"
     would "probe each registered MCP server as ${AGENT_USER} with an MCP initialize + tools/list handshake (timeout ${MCP_PROBE_TIMEOUT}s per server)"
 else
@@ -1560,18 +1560,18 @@ else
     if [[ ! -f "$MCP_CONF" ]]; then
         die "MCP server config not found at ${MCP_CONF} — cannot register MCP servers"
     fi
-    # Pull secrets and config from the installed service .env and export so
-    # mcp-servers.sh can inject them per-server.  Variables exported here:
+    # Pull secrets and config from the installed service .env and export them.
+    # Variables exported here:
     #
-    #   AGENT_GTD_URL         → GTD app base URL for the agent-gtd MCP server.
-    #   AGENT_GTD_API_KEY     → API key for the agent-gtd MCP server.
+    #   AGENT_GTD_URL         → GTD board base URL. scripts/kb-mcp-refresh.sh registers
+    #     agent-gtd as the HTTP /mcp server <AGENT_GTD_URL>/mcp with an env-only bearer
+    #     headersHelper (no key file, by design: per-run identity).
+    #   AGENT_GTD_API_KEY     → static host key. Never written into the registration;
+    #     used only to probe agent-gtd below (agents get the per-run callback token).
     #     LOAD-BEARING: agent-gtd MCP must connect for Step 4 verification to pass.
-    #     If either var is unset, the agent can't comment back and dispatch will appear
-    #     to succeed while the step-4 verification stays stuck.
-    #
-    #   AGENT_GTD_MCP_SRC     → optional override for the agent-gtd package source
-    #     (e.g. git+ssh://git@<host>/path/agent_gtd for a homelab/private mirror).
-    #     Defaults to public GitHub when unset — no entry needed for standard installs.
+    #     If the URL is unset or the registration is missing, the agent can't comment
+    #     back and dispatch will appear to succeed while the step-4 verification stays
+    #     stuck.
     #
     #   PERSONAL_KB_URL / PERSONAL_KB_API_KEY → hosted personal-KB service URL + API
     #     key, consumed by scripts/kb-mcp-refresh.sh (HTTP /mcp registration + 0600 key
@@ -1585,15 +1585,14 @@ else
     if [[ -f "$SERVICE_ENV" ]]; then
         AGENT_GTD_URL="$(_read_env_var AGENT_GTD_URL)";                 export AGENT_GTD_URL
         AGENT_GTD_API_KEY="$(_read_env_var AGENT_GTD_API_KEY)";         export AGENT_GTD_API_KEY
-        AGENT_GTD_MCP_SRC="$(_read_env_var AGENT_GTD_MCP_SRC)";         export AGENT_GTD_MCP_SRC
         PERSONAL_KB_URL="$(_read_env_var PERSONAL_KB_URL)";             export PERSONAL_KB_URL
         PERSONAL_KB_API_KEY="$(_read_env_var PERSONAL_KB_API_KEY)";     export PERSONAL_KB_API_KEY
         TEAM_KB_URL="$(_read_env_var TEAM_KB_URL)";                     export TEAM_KB_URL
         TEAM_KB_API_KEY="$(_read_env_var TEAM_KB_API_KEY)";             export TEAM_KB_API_KEY
     fi
     # agent-gtd warnings are elevated (LOAD-BEARING for step-4 verification)
-    [[ -z "${AGENT_GTD_URL:-}" ]]     && warn "AGENT_GTD_URL not set in ${SERVICE_ENV} — agent-gtd MCP will launch without a URL; Step 4 verification will fail"
-    [[ -z "${AGENT_GTD_API_KEY:-}" ]] && warn "AGENT_GTD_API_KEY not set in ${SERVICE_ENV} — agent-gtd MCP will launch without credentials; Step 4 verification will fail"
+    [[ -z "${AGENT_GTD_URL:-}" ]]     && warn "AGENT_GTD_URL not set in ${SERVICE_ENV} — agent-gtd cannot be registered as an HTTP /mcp server; Step 4 verification will fail"
+    [[ -z "${AGENT_GTD_API_KEY:-}" ]] && warn "AGENT_GTD_API_KEY not set in ${SERVICE_ENV} — the agent-gtd HTTP /mcp probe will send an empty bearer, and dispatches without a per-run token will be unauthenticated; Step 4 verification will fail"
     [[ -z "${PERSONAL_KB_URL:-}" ]] && warn "PERSONAL_KB_URL not set in ${SERVICE_ENV} — personal-kb will be skipped"
     [[ -n "${PERSONAL_KB_URL:-}" && -z "${PERSONAL_KB_API_KEY:-}" ]] && warn "PERSONAL_KB_API_KEY not set in ${SERVICE_ENV} — personal-kb will be skipped (a URL without a key cannot authenticate)"
     [[ -z "${TEAM_KB_URL:-}" ]] && warn "TEAM_KB_URL not set in ${SERVICE_ENV} — team-kb will be skipped"
@@ -1629,9 +1628,10 @@ else
 
     # Unconditional de-registration pass over the fixed set of stdio server names —
     # this is what makes a server that's newly skipped actually disappear, instead of
-    # surviving in its stale shape from a previous run. Stale personal-kb/team-kb
-    # removal is handled by scripts/kb-mcp-refresh.sh.
-    for _known_name in agent-gtd aws-documentation-mcp-server; do
+    # surviving in its stale shape from a previous run. agent-gtd, personal-kb and
+    # team-kb (including stale-entry removal and the legacy stdio agent-gtd migration)
+    # are handled by scripts/kb-mcp-refresh.sh.
+    for _known_name in aws-documentation-mcp-server; do
         runuser -l "$AGENT_USER" -c \
             "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp remove ${_known_name} --scope user 2>/dev/null || true"
     done
@@ -1648,37 +1648,35 @@ else
             warn "claude mcp add ${mcp_name} failed (rc=${rc}): ${out}"
             continue
         fi
-        case "$mcp_name" in
-            agent-gtd)
-                info "Registered MCP server '${mcp_name}' for ${AGENT_USER} src=${_agent_gtd_mcp_src}"
-                ;;
-            *)
-                info "Registered MCP server '${mcp_name}' for ${AGENT_USER}"
-                ;;
-        esac
+        info "Registered MCP server '${mcp_name}' for ${AGENT_USER}"
     done
 
-    # agent-gtd is LOAD-BEARING: assert the REGISTERED (not just intended) env carries
-    # a non-empty AGENT_GTD_URL, or the server silently falls back to its local SQLite
-    # backend and Step 4 verification would pass against the wrong database.
-    rc=0
-    agent_gtd_url_registered="$(runuser -l "$AGENT_USER" -c \
-        "python3 -c \"import json; d=json.load(open('${AGENT_HOME}/.claude.json')); print(d.get('mcpServers', {}).get('agent-gtd', {}).get('env', {}).get('AGENT_GTD_URL', ''))\"" \
-        2>/dev/null)" || rc=$?
-    if [[ "$rc" -ne 0 || -z "$agent_gtd_url_registered" ]]; then
-        die "agent-gtd MCP registered without AGENT_GTD_URL — the server would fall back to its local SQLite backend and Step 4 verification would silently pass against the wrong database"
-    fi
-
-    # personal-kb / team-kb: hosted HTTP /mcp servers, registered (and their 0600 key
-    # files written) by scripts/kb-mcp-refresh.sh. Non-fatal: a failure leaves the
-    # agent on its current registrations.
+    # agent-gtd / personal-kb / team-kb: hosted HTTP /mcp servers, registered (and the
+    # KB 0600 key files written) by scripts/kb-mcp-refresh.sh. Non-fatal: a failure
+    # leaves the agent on its current registrations (a failed agent-gtd add restores
+    # the previous entry). The agent-gtd gate below is what makes a missing
+    # agent-gtd registration fatal.
     _kbr="${SCRIPT_DIR}/scripts/kb-mcp-refresh.sh"
     [[ -x "$_kbr" ]] || die "Missing or non-executable ${_kbr} — this ships in the repo; its absence means a broken checkout"
     if [[ -f "$SERVICE_ENV" ]]; then
         "$_kbr" --env-file "$SERVICE_ENV" --agent-user "$AGENT_USER" --agent-home "$AGENT_HOME" --agent-group "$AGENT_GROUP" --claude "$CLAUDE_SRC" \
-            || warn "kb-mcp-refresh.sh failed — personal-kb/team-kb registrations may be stale"
+            --probe "${TMPL_DIR}/mcp-probe.py" \
+            || warn "kb-mcp-refresh.sh failed — agent-gtd/personal-kb/team-kb registrations may be stale"
     else
         warn "kb-mcp-refresh.sh skipped: ${SERVICE_ENV} not found"
+    fi
+
+    # agent-gtd is LOAD-BEARING: assert the REGISTERED (not just intended) entry is the
+    # board's HTTP /mcp endpoint, or agents could not comment back.
+    if [[ -z "${AGENT_GTD_URL:-}" ]]; then
+        die "AGENT_GTD_URL not set in ${SERVICE_ENV} — agent-gtd MCP cannot be registered; agents could not comment back and Step 4 verification would fail"
+    fi
+    rc=0
+    agent_gtd_registered="$(runuser -l "$AGENT_USER" -c \
+        "python3 -c \"import json; e=json.load(open('${AGENT_HOME}/.claude.json')).get('mcpServers', {}).get('agent-gtd', {}); print(e.get('type', '') + ' ' + e.get('url', ''))\"" \
+        2>/dev/null)" || rc=$?
+    if [[ "$rc" -ne 0 || "$agent_gtd_registered" != "http ${AGENT_GTD_URL%/}/mcp" ]]; then
+        die "agent-gtd MCP is not registered as http ${AGENT_GTD_URL%/}/mcp — agents could not comment back and Step 4 verification would fail"
     fi
 
     # MCP probes: a real initialize + tools/list handshake per registered server, as
@@ -1693,7 +1691,7 @@ else
         cp "${TMPL_DIR}/mcp-probe.py" "${_mcp_probe_tmp}"
         chmod 0755 "${_mcp_probe_tmp}"
 
-        info "MCP probes: up to ${MCP_PROBE_TIMEOUT}s per server × ${#MCP_SERVERS[@]} servers — a cold uv cache can make the first run take several minutes per server"
+        info "MCP probes: up to ${MCP_PROBE_TIMEOUT}s per server × $(( ${#MCP_SERVERS[@]} + 1 )) servers — a cold uv cache can slow the first stdio server launch"
 
         _mcp_probe() {  # $1=name $2=expect_tool(or "") $3=extra env prefix (or "")
             local name="$1" expect_tool="$2" env_prefix="$3" expect_flag=""
@@ -1707,7 +1705,7 @@ else
             _MCP_PROBE_OUT="$out"
         }
 
-        for entry in "${MCP_SERVERS[@]}"; do
+        for entry in "agent-gtd|" "${MCP_SERVERS[@]}"; do
             mcp_name="${entry%%|*}"
             case "$mcp_name" in
                 agent-gtd)   expect_tool="add_item" ;;
@@ -1716,7 +1714,7 @@ else
 
             if [[ "$mcp_name" == "agent-gtd" ]]; then
                 # AGENT_GTD_API_KEY is deliberately NOT baked into the registration
-                # (see mcp-servers.sh), so it must be supplied as an extra env var at
+                # (see scripts/kb-mcp-refresh.sh), so it must be supplied as an extra env var at
                 # probe time — mirroring the run-time injection in
                 # engines.py::build_env(), where the dispatch worker sets this same
                 # var per-run. A probe against only the registered env would test a
@@ -1726,13 +1724,13 @@ else
                     if [[ "$_MCP_PROBE_RC" -eq 1 ]]; then
                         die "agent-gtd MCP probe failed: ${_MCP_PROBE_OUT}"
                     fi
-                    # rc 2 (launch/resolution) or 3 (timeout): retry once — cold uv
-                    # cache building agent-gtd-mcp from source is the common cause.
+                    # rc 2 (connect/DNS/5xx) or 3 (timeout): retry once — a transient
+                    # network, proxy or TLS-endpoint hiccup is the common cause.
                     _mcp_probe "$mcp_name" "$expect_tool" "AGENT_GTD_API_KEY='${AGENT_GTD_API_KEY:-}'"
                     if [[ "$_MCP_PROBE_RC" -eq 1 ]]; then
                         die "agent-gtd MCP probe failed: ${_MCP_PROBE_OUT}"
                     elif [[ "$_MCP_PROBE_RC" -ne 0 ]]; then
-                        warn "agent-gtd MCP probe could not complete (${_MCP_PROBE_OUT}) — cold uv cache or git/PyPI reachability; registration is in place, re-run the installer to confirm"
+                        warn "agent-gtd MCP probe could not complete (${_MCP_PROBE_OUT}) — network, proxy or TLS reachability of the board's /mcp endpoint; registration is in place, re-run the installer to confirm"
                     fi
                 fi
             else
@@ -2190,7 +2188,7 @@ echo "--- Step 6.5: Service environment freshness ---"
 # step). A restart of ${SERVICE_NAME} does NOT refresh that file — only a
 # re-run of Step 4.6 does — so a stale key from this set needs an extra line
 # telling the operator that restarting alone will not fix the agent side.
-STEP46_KEYS=(AGENT_GTD_URL AGENT_GTD_API_KEY AGENT_GTD_MCP_SRC PERSONAL_KB_URL PERSONAL_KB_API_KEY TEAM_KB_URL TEAM_KB_API_KEY)
+STEP46_KEYS=(AGENT_GTD_URL AGENT_GTD_API_KEY PERSONAL_KB_URL PERSONAL_KB_API_KEY TEAM_KB_URL TEAM_KB_API_KEY)
 
 if $DRY_RUN; then
     would "compare ${SERVICE_ENV} against the running ${SERVICE_NAME} process environment (/proc/<MainPID>/environ) and, with --restart-if-stale and zero active runs, restart ${SERVICE_NAME}"

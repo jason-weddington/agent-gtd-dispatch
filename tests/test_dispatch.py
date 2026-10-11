@@ -46,7 +46,13 @@ from agent_gtd_dispatch.engines import (
     build_env,
     get_engine,
 )
-from agent_gtd_dispatch.models import DispatchRequest, PushStatus, RepoPushStatus, Run
+from agent_gtd_dispatch.models import (
+    DispatchMode,
+    DispatchRequest,
+    PushStatus,
+    RepoPushStatus,
+    Run,
+)
 from tests.completion_fixtures import (
     MAX_TURNS_ENVELOPE,
     seed_build_evidence,
@@ -481,14 +487,42 @@ class TestBuildEnv:
         )
 
     def test_callback_token_not_baked_into_mcp_registration(self) -> None:
-        """No-leak guard: mcp-servers.sh must NOT bake a literal AGENT_GTD_API_KEY
-        into the agent-gtd MCP block (that would pin every agent to the static key
-        and defeat per-run auth). The key is inherited from the subprocess env."""
-        tmpl = Path(__file__).parent.parent / "templates" / "mcp-servers.sh"
-        text = tmpl.read_text()
+        """No-leak guard: nothing may bake a literal AGENT_GTD_API_KEY (or a key
+        file read) into the agent-gtd MCP registration — that would pin every
+        agent to the static key and defeat per-run auth. The HTTP registration's
+        headersHelper reads the key from the agent subprocess env only."""
+        root = Path(__file__).parent.parent
+        text = (root / "templates" / "mcp-servers.sh").read_text()
         assert "-e AGENT_GTD_API_KEY=" not in text
-        # AGENT_GTD_URL is still injected as a literal flag.
-        assert "-e AGENT_GTD_URL=" in text
+        assert '"agent-gtd|' not in text
+        assert "AGENT_GTD_MCP_SRC" not in text
+        helper_line = (
+            'HELPER_GTD=$\'if [ -n "${AGENT_GTD_AGENT_NAME:-}" ]; then printf '
+            '\\\'{"Authorization": "Bearer %s", "X-Agent-Name": "%s"}\\\' '
+            '"${AGENT_GTD_API_KEY:-}" "$AGENT_GTD_AGENT_NAME"; else printf '
+            '\\\'{"Authorization": "Bearer %s"}\\\' "${AGENT_GTD_API_KEY:-}"; fi\''
+        )
+        refresh = (root / "scripts" / "kb-mcp-refresh.sh").read_text()
+        assert helper_line in refresh.splitlines()
+        assert "cat " not in helper_line
+        assert "~/" not in helper_line
+
+    @pytest.mark.parametrize(
+        "mode", [DispatchMode.BUILD, DispatchMode.PLAN, DispatchMode.REVIEW]
+    )
+    def test_callback_token_becomes_agent_gtd_api_key(
+        self, mode: DispatchMode, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AGENT_GTD_API_KEY", "static")
+        env = build_env(CLAUDE, mode=mode, callback_token="tok")
+        assert env["AGENT_GTD_API_KEY"] == "tok"
+
+    def test_static_agent_gtd_api_key_without_callback_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AGENT_GTD_API_KEY", "static")
+        env = build_env(CLAUDE, callback_token=None)
+        assert env["AGENT_GTD_API_KEY"] == "static"
 
     @staticmethod
     def _sudoers_env_keep_keys() -> set[str]:

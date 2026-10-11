@@ -22,42 +22,27 @@
 #
 # IMPORTANT — agent-gtd is LOAD-BEARING for Step 4 verification (START-HERE.md):
 #   The verification step dispatches an item and checks whether the agent comments back
-#   to that GTD item. If agent-gtd MCP fails to start (wrong source URL, missing
-#   AGENT_GTD_URL, missing AGENT_GTD_API_KEY), dispatch appears to succeed but the agent
-#   cannot comment — and the silence IS the failure signal. Fix agent-gtd first.
+#   to that GTD item. If the agent-gtd MCP server is unreachable (missing or wrong
+#   AGENT_GTD_URL, a TLS certificate Node does not trust, a bad bearer), dispatch
+#   appears to succeed but the agent cannot comment — and the silence IS the failure
+#   signal. Fix agent-gtd first. It is registered by scripts/kb-mcp-refresh.sh, and
+#   setup-dispatch-host.sh Step 4.6 dies if that registration is not in place.
 #
-# personal-kb / team-kb are NOT defined here. They are hosted HTTP /mcp servers,
-# registered (and their 0600 key files written) by scripts/kb-mcp-refresh.sh, which
-# setup-dispatch-host.sh Step 4.6 and deploy.sh both run. The KB servers no longer
-# need uvx or git-ssh.
+# agent-gtd, personal-kb and team-kb are NOT defined here. Like personal-kb and team-kb,
+# agent-gtd is a hosted HTTP /mcp server (<AGENT_GTD_URL>/mcp), registered by
+# scripts/kb-mcp-refresh.sh, which setup-dispatch-host.sh Step 4.6 and deploy.sh both
+# run (deploy.sh also probes agent-gtd). None of them needs uvx or git-ssh any more.
 #
-# --- agent-gtd source ---
-# Defaults to public GitHub so any host can install without homelab access.
-# Override via AGENT_GTD_MCP_SRC (read from service .env by setup-dispatch-host.sh)
-# for private/local mirrors: e.g. git+ssh://git@<host>/path/to/agent_gtd
-_agent_gtd_mcp_src="${AGENT_GTD_MCP_SRC:-git+https://github.com/jason-weddington/agent-gtd}"
-
-# --- agent-gtd env flags (AGENT_GTD_URL only) ---
-# Read from the service .env by setup-dispatch-host.sh and exported before sourcing
-# this file. Injected into the MCP server's subprocess env (NOT Claude Code's env).
-#
-# AGENT_GTD_API_KEY is deliberately NOT baked in here. A literal value in the MCP
-# server's `env` block takes precedence over the subprocess environment, which would
-# pin every agent to the host's static (admin@local) key and make per-run, per-user
-# auth impossible. Instead the key is INHERITED from the agent subprocess env, where
+# No AGENT_GTD_API_KEY and no agent-gtd key file is baked into the registration. Its
+# headersHelper reads AGENT_GTD_API_KEY from the agent's env at connect time, where
 # the dispatch worker sets it per-run to the run's callback_token — a 72h JWT scoped
 # to the dispatching user — falling back to the static host AGENT_GTD_API_KEY when no
-# token is present (admin dispatch, legacy senders, watchdog/recovery/plan paths).
-# See engines.py build_env() and sudoers-dispatch-svc.tmpl env_keep (Phase 3, kb-03189).
-_agent_gtd_flags=""
-if [[ -n "${AGENT_GTD_URL:-}" ]]; then
-    _agent_gtd_flags+="-e AGENT_GTD_URL=${AGENT_GTD_URL} "
-fi
+# token is present (admin dispatch, legacy senders, watchdog/recovery/plan paths). A
+# static key in the registration pins every run to one (admin@local) identity
+# and makes per-run, per-user auth impossible. See engines.py build_env() and
+# sudoers-dispatch-svc.tmpl env_keep (Phase 3, kb-03189).
 
 MCP_SERVERS=(
-  # agent-gtd: LOAD-BEARING — must resolve for Step 4 verification to pass.
-  # Source defaults to public GitHub; override via AGENT_GTD_MCP_SRC in service .env.
-  "agent-gtd|--scope user -t stdio ${_agent_gtd_flags}-- uvx --python 3.13 --from ${_agent_gtd_mcp_src} agent-gtd-mcp"
   "aws-documentation-mcp-server|--scope user -t stdio -e FASTMCP_LOG_LEVEL=ERROR -e AWS_DOCUMENTATION_PARTITION=aws -- uvx awslabs.aws-documentation-mcp-server@latest"
 )
 
