@@ -2,6 +2,17 @@
 
 <!-- version list -->
 
+## v2.5.0 (2026-10-11)
+
+### Features
+
+- **talos**: Fleet-wide TALOS_MEMORY switch passes --memory to talos runs
+  ([`c34cb7f`](https://github.com/repos/agent-gtd-dispatch/commit/c34cb7f7bdfb62e84f79a90a2bb9a5ec5e4b8b56))
+
+- **talos**: Give talos runs PERSONAL_KB_URL and PERSONAL_KB_API_KEY from TALOS_PERSONAL_KB_API_KEY
+  ([`6079eef`](https://github.com/repos/agent-gtd-dispatch/commit/6079eefa78352a8b39bda83d1c4f77d78ff4d41d))
+
+
 ## v2.4.0 (2026-10-10)
 
 ### Bug Fixes
