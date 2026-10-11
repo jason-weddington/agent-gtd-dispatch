@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import urllib.parse
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _require(name: str) -> str:
@@ -194,6 +197,9 @@ TALOS_BIN: str = "talos"
 # Talos gate-command timeout. Talos' own default is 300 s; 900 s is chosen to
 # survive a COLD fmt+clippy+nextest gate run on the Pi (pironman01).
 TALOS_GATE_TIMEOUT_SECS: int = 900
+# Fleet-wide talos KB memory mode, passed as `talos run --memory <mode>` when not 'off'.
+TALOS_MEMORY_MODES = frozenset({"off", "annotate", "deny-once"})
+TALOS_MEMORY: str = "off"
 
 # Root log level for THIS package's loggers.  `uvicorn.run()` configures only
 # uvicorn's own loggers and leaves the root logger alone, so before 2026-09-19
@@ -243,7 +249,7 @@ def load() -> None:
     global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS, PUSH_BACKSTOP_MIN_SECONDS
     global GATE_INSTALL_TIMEOUT_SECONDS, POST_RUN_GATE_MIN_SECONDS
     global OLLAMA_CLOUD_API_KEY, OLLAMA_CLOUD_BASE_URL, OLLAMA_CLOUD_MODEL
-    global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS
+    global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS, TALOS_MEMORY
     global AGENT_SUBPROCESS_USER
     global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
     global MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS, MAX_MANAGE_FREE_RELAUNCHES
@@ -313,6 +319,11 @@ def load() -> None:
     OLLAMA_CLOUD_MODEL = os.environ.get("OLLAMA_CLOUD_MODEL", "glm-5.3:cloud")
     TALOS_BIN = os.environ.get("TALOS_BIN", "talos")
     TALOS_GATE_TIMEOUT_SECS = int(os.environ.get("TALOS_GATE_TIMEOUT_SECS", "900"))
+    _memory = os.environ.get("TALOS_MEMORY", "off").strip().lower()
+    if _memory not in TALOS_MEMORY_MODES:
+        logger.warning("Ignoring invalid TALOS_MEMORY=%r; using 'off'", _memory)
+        _memory = "off"
+    TALOS_MEMORY = _memory
     OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "qwen3.6:35b")
     OLLAMA_TIMEOUT_MULTIPLIER = float(
         os.environ.get("OLLAMA_TIMEOUT_MULTIPLIER", "2.0")

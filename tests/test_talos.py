@@ -428,6 +428,43 @@ class TestOllamaCloudApiKeyConfig:
             config.load()
             assert config.TALOS_GATE_TIMEOUT_SECS == 600
 
+    def test_talos_memory_bogus_falls_back_to_off(self, tmp_path, caplog) -> None:
+        import logging
+
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://x",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "a",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+            "TALOS_MEMORY": "bogus",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            from agent_gtd_dispatch import config
+
+            with caplog.at_level(logging.WARNING):
+                config.load()
+            assert config.TALOS_MEMORY == "off"
+            assert any(
+                r.levelno == logging.WARNING and "bogus" in r.getMessage()
+                for r in caplog.records
+            )
+
+    def test_talos_memory_mixed_case_normalised(self, tmp_path) -> None:
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://x",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "a",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+            "TALOS_MEMORY": "Annotate",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            from agent_gtd_dispatch import config
+
+            config.load()
+            assert config.TALOS_MEMORY == "annotate"
+
 
 # ---------------------------------------------------------------------------
 # CAPABILITIES ADVERTISEMENT + is_engine_available GATING
@@ -687,6 +724,28 @@ class TestBuildTalosArgv:
         is_last = i == len(argv) - 1
         next_is_flag = not is_last and argv[i + 1].startswith("--")
         assert is_last or next_is_flag
+
+    def test_argv_memory_off_has_no_memory_flag(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import build_talos_argv
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(config, "TALOS_MEMORY", "off")
+        argv = build_talos_argv(Path("/workspace/work"), "task-123", attempt=1)
+        assert "--memory" not in argv
+        assert argv[-1] == "--transcript"
+
+    @pytest.mark.parametrize("mode", ["annotate", "deny-once"])
+    def test_argv_memory_mode_before_transcript(self, monkeypatch, mode) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import build_talos_argv
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(config, "TALOS_MEMORY", mode)
+        argv = build_talos_argv(Path("/workspace/work"), "task-123", attempt=1)
+        i = argv.index("--memory")
+        assert argv[i + 1] == mode
+        assert argv[i + 2] == "--transcript"
 
     def test_argv_gate_timeout_secs_still_paired_after_transcript_added(
         self, monkeypatch

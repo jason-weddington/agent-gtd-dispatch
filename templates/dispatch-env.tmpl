@@ -144,6 +144,9 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # KB API key handed to talos runs as PERSONAL_KB_API_KEY (paired with PERSONAL_KB_URL
 # above). Use a key minted for talos. Talos runs get no KB access when it is unset.
 # TALOS_PERSONAL_KB_API_KEY=
+# TALOS_MEMORY=off
+# One of off | annotate | deny-once; passed to every talos fleet run as --memory.
+# An unknown value is treated as off. Needs TALOS_PERSONAL_KB_API_KEY to reach a remote KB.
 
 # Hosted team KB service URL + API key. Read by installer Step 4.6 and injected into
 # the team-kb MCP server's OWN env block — bound there to the PERSONAL_KB_URL /
