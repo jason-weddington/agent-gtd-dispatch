@@ -2242,6 +2242,32 @@ class TestReadoptionSweep:
         mock_loop.assert_not_called()
         ctx.db.insert_run.assert_not_called()
 
+    async def test_readopt_skips_rollout_where_this_host_only_ran_a_child_build(
+        self,
+    ) -> None:
+        """A child build row is not ownership of the loop.
+
+        Child build runs carry the rollout_id too. A host that built one item
+        of a rollout whose loop lives on another host must not resume that loop
+        on restart, or two loops drive one rollout (rollout d79f2243, 2026-10-11).
+        """
+        from agent_gtd_dispatch.main import _readopt_running_rollouts
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._start_rollout_loop") as mock_loop,
+        ):
+            ctx.db.list_runs_by_rollout = AsyncMock(
+                return_value=[_make_run(mode="build", rollout_id="other-hosts-loop")]
+            )
+            ctx.gtd.list_running_rollouts = AsyncMock(
+                return_value=[{"id": "other-hosts-loop", "project_name": "p"}]
+            )
+            await _readopt_running_rollouts()
+
+        mock_loop.assert_not_called()
+        ctx.db.insert_run.assert_not_called()
+
     async def test_resumed_loop_does_not_double_dispatch_an_in_flight_item(
         self,
     ) -> None:

@@ -4465,9 +4465,16 @@ async def _readopt_running_rollouts() -> None:
     logger.info("re-adoption sweep: %d running rollout(s) fleet-wide", len(rollouts))
     for rollout in rollouts:
         rollout_id = str(rollout.get("id") or "")
-        if rollout_id and not await db.list_runs_by_rollout(rollout_id):
+        # Only a local MANAGE row proves this host drove the loop. Child build
+        # runs carry the same rollout_id, so counting them let a host that had
+        # merely built one item resume a loop still live on another host:
+        # two loops on one rollout, one of which halted it (d79f2243).
+        if rollout_id and not any(
+            r.mode == DispatchMode.MANAGE
+            for r in await db.list_runs_by_rollout(rollout_id)
+        ):
             logger.info(
-                "re-adoption sweep: skipping rollout_id=%s — no local run row,"
+                "re-adoption sweep: skipping rollout_id=%s — no local loop run,"
                 " so this host never drove it",
                 rollout_id,
             )
