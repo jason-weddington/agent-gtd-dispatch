@@ -17,7 +17,7 @@ from agent_gtd_dispatch.main import (
     MAX_MANAGE_RETRIES,
     _maybe_relaunch_manage,
 )
-from agent_gtd_dispatch.models import Run
+from agent_gtd_dispatch.models import Run, RunStatus
 
 
 def _make_run(mode: str = "manage", rollout_id: str = "rollout-abc") -> Run:
@@ -1939,6 +1939,55 @@ class TestVerdictHandling:
         assert call.kwargs["merge_note"] == "note"
         ctx.gtd.halt_rollout.assert_not_awaited()
 
+    async def test_merge_with_graph_complete_ends_the_loop(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch.main import _TICK_DONE
+
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, "agent_gtd_dispatch.main"),
+        ):
+            ctx.gtd.complete_in_rollout = AsyncMock(
+                return_value={"newly_ready": [], "graph_complete": True}
+            )
+            assert await self._act(ctx, "merge") == _TICK_DONE
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        hits = [r for r in caplog.records if "via=completion" in r.getMessage()]
+        assert len(hits) == 1
+        assert "item-a" in hits[0].getMessage()
+
+    async def test_skip_with_graph_complete_ends_the_loop(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_DONE
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.complete_in_rollout = AsyncMock(
+                return_value={"newly_ready": [], "graph_complete": True}
+            )
+            assert await self._act(ctx, "skip") == _TICK_DONE
+
+    async def test_graph_complete_false_continues(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, "agent_gtd_dispatch.main"),
+        ):
+            ctx.gtd.complete_in_rollout = AsyncMock(
+                return_value={"newly_ready": [], "graph_complete": False}
+            )
+            assert await self._act(ctx, "merge") == _TICK_CONTINUE
+        assert not any("via=completion" in r.getMessage() for r in caplog.records)
+
+    async def test_missing_graph_complete_continues(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.complete_in_rollout = AsyncMock(return_value={"newly_ready": []})
+            assert await self._act(ctx, "merge") == _TICK_CONTINUE
+
     async def test_merge_comment_reports_commit_type(self) -> None:
         with _loop_patch_stack() as ctx:
             ctx.gtd.complete_in_rollout = AsyncMock(return_value={})
@@ -2789,6 +2838,63 @@ class TestRolloutLoopWorker:
 
         assert ctx.db.update_run.await_args.kwargs["status"].value == "cancelled"
 
+    async def test_graph_complete_via_completion_ends_succeeded(self) -> None:
+        """Real _drive_rollout/_rollout_wave_tick: no trailing advance after done."""
+        from agent_gtd_dispatch.main import ReviewVerdict, _rollout_loop_worker
+
+        verdict = ReviewVerdict("merge", "r", "note", "")
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._launch_reviewer",
+                new=AsyncMock(return_value=verdict),
+            ),
+            patch(
+                "agent_gtd_dispatch.main._land_reviewed_merge",
+                new=AsyncMock(return_value=verdict),
+            ),
+            patch(
+                "agent_gtd_dispatch.main._verify_landed_commit_type", new=AsyncMock()
+            ),
+        ):
+            ctx.dispatch.prepare_rollout_workspace = MagicMock(
+                return_value=_fake_workspace()
+            )
+            ctx.dispatch.land_origin_shas = MagicMock(return_value={"repo-a": "abc"})
+            ctx.gtd.get_project = AsyncMock(
+                return_value={"name": "p", "workspace_repos": ["git@h:o/repo-a"]}
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={
+                    "project_id": "proj-1",
+                    "status": "running",
+                    "inFlightBuildRuns": [],
+                }
+            )
+            ctx.gtd.advance_rollout = AsyncMock(
+                side_effect=[
+                    {
+                        "next_ready": [],
+                        "in_progress": ["item-a"],
+                        "blocked": [],
+                        "graph_complete": False,
+                    },
+                    _http_error(422),
+                    _http_error(422),
+                ]
+            )
+            ctx.gtd.complete_in_rollout = AsyncMock(
+                return_value={"newly_ready": [], "graph_complete": True}
+            )
+            await _rollout_loop_worker(self._run())
+
+        assert ctx.gtd.advance_rollout.await_count == 1
+        kw = ctx.db.update_run.await_args.kwargs
+        assert kw["status"] == RunStatus.succeeded
+        assert kw["error"] == ""
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        assert ctx.dispatch.cleanup_workspace.call_count == 1
+
 
 class TestPublishRolloutPhase:
     async def test_a_publish_failure_never_stops_the_wave(self) -> None:
@@ -2826,6 +2932,7 @@ class TestDispatchAttemptGuard:
 
 class TestRolloutLeftRunning:
     async def test_a_halted_rollout_stops_the_loop(self) -> None:
+        """Status flips between the advance call and the get_rollout read."""
         from agent_gtd_dispatch.main import _TICK_HALTED
 
         with _loop_patch_stack() as ctx:
@@ -2837,6 +2944,7 @@ class TestRolloutLeftRunning:
         ctx.gtd.halt_rollout.assert_not_awaited()
 
     async def test_a_completed_rollout_stops_the_loop(self) -> None:
+        """Status flips between the advance call and the get_rollout read."""
         from agent_gtd_dispatch.main import _TICK_DONE
 
         with _loop_patch_stack() as ctx:
@@ -2845,6 +2953,79 @@ class TestRolloutLeftRunning:
             )
             ctx.gtd.get_rollout = AsyncMock(return_value={"status": "completed"})
             assert await _tick(ctx) == _TICK_DONE
+
+    async def test_advance_422_on_completed_rollout_is_done(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch.main import _TICK_DONE
+
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.WARNING, "agent_gtd_dispatch.main"),
+        ):
+            ctx.gtd.advance_rollout = AsyncMock(side_effect=_http_error(422))
+            ctx.gtd.get_rollout = AsyncMock(return_value={"status": "completed"})
+            assert await _tick(ctx) == _TICK_DONE
+        assert ctx.gtd.get_rollout.await_count == 1
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "advance-422-reread" in m and "rollout-abc" in m and "action=done" in m
+            for m in msgs
+        )
+
+    async def test_advance_422_on_halted_rollout_is_halted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.WARNING, "agent_gtd_dispatch.main"),
+        ):
+            ctx.gtd.advance_rollout = AsyncMock(side_effect=_http_error(422))
+            ctx.gtd.get_rollout = AsyncMock(return_value={"status": "halted"})
+            assert await _tick(ctx) == _TICK_HALTED
+        assert ctx.gtd.get_rollout.await_count == 1
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        assert any(
+            "advance-422-reread" in r.getMessage() and "action=halted" in r.getMessage()
+            for r in caplog.records
+        )
+
+    async def test_advance_422_on_running_rollout_reraises(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        err = _http_error(422)
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.WARNING, "agent_gtd_dispatch.main"),
+        ):
+            ctx.gtd.advance_rollout = AsyncMock(side_effect=err)
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            with pytest.raises(httpx.HTTPStatusError) as ei:
+                await _tick(ctx)
+        assert ei.value is err
+        assert ctx.gtd.get_rollout.await_count == 1
+        assert any("action=reraise" in r.getMessage() for r in caplog.records)
+
+    async def test_advance_500_is_not_reread(self) -> None:
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(side_effect=_http_error(500))
+            ctx.gtd.get_rollout = AsyncMock()
+            with pytest.raises(httpx.HTTPStatusError):
+                await _tick(ctx)
+        ctx.gtd.get_rollout.assert_not_awaited()
+
+    async def test_advance_422_with_failing_reread_propagates(self) -> None:
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(side_effect=_http_error(422))
+            ctx.gtd.get_rollout = AsyncMock(side_effect=_http_error(503))
+            with pytest.raises(httpx.HTTPStatusError) as ei:
+                await _tick(ctx)
+        assert ei.value.response.status_code == 503
 
 
 # ---------------------------------------------------------------------------

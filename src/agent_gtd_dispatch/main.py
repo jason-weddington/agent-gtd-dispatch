@@ -3241,6 +3241,15 @@ async def _act_on_verdict(
                 token=token,
                 attribution=attribution,
             )
+        if isinstance(result, dict) and result.get("graph_complete") is True:
+            logger.info(
+                "rollout-loop: rollout_id=%s item_id=%s verdict=%s "
+                "graph_complete=True via=completion — loop exits",
+                rollout_id,
+                item_id,
+                outcome.verdict,
+            )
+            return _TICK_DONE
         return _TICK_CONTINUE
 
     # re-dispatch
@@ -4087,7 +4096,30 @@ async def _rollout_wave_tick(
     items are dispatched, so a dependent item is never dispatched against a
     base its predecessor has not yet been merged into.
     """
-    advance = await gtd_client.advance_rollout(rollout_id, token=token)
+    try:
+        advance = await gtd_client.advance_rollout(rollout_id, token=token)
+    except httpx.HTTPStatusError as exc:
+        if _http_status(exc) != 422:
+            raise
+        # The board answers 422 once the rollout is no longer running; re-read
+        # once to tell a terminal rollout from a genuine 422.
+        reread = await gtd_client.get_rollout(rollout_id, token=token)
+        reread_status = str(reread.get("status") or "")
+        if reread_status == "running":
+            logger.warning(
+                "rollout-loop: advance-422-reread rollout_id=%s "
+                "reread_status=running action=reraise",
+                rollout_id,
+            )
+            raise
+        action = "halted" if reread_status == "halted" else "done"
+        logger.warning(
+            "rollout-loop: advance-422-reread rollout_id=%s reread_status=%s action=%s",
+            rollout_id,
+            reread_status,
+            action,
+        )
+        return _TICK_HALTED if reread_status == "halted" else _TICK_DONE
     rollout = await gtd_client.get_rollout(rollout_id, token=token)
 
     status = str(rollout.get("status") or "")
