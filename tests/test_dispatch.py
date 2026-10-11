@@ -5654,10 +5654,10 @@ class TestReviewPromptContract:
         assert "FALLBACK mode" in prompt
         assert "not a rollout with no quality" in prompt
 
-    def test_conflict_contract_covers_abort_and_non_fast_forward(self) -> None:
+    def test_conflict_contract_covers_abort(self) -> None:
         prompt = self._prompt()
         assert "git merge --abort" in prompt
-        assert "non_fast_forward" in prompt
+        assert "non_fast_forward" not in prompt
         assert "merge_conflict" in prompt
         assert "NEVER `git push --force`" in prompt
         assert "git status --porcelain" in prompt
@@ -5665,9 +5665,91 @@ class TestReviewPromptContract:
 
     def test_workspace_mode_states_the_partial_merge_behaviour(self) -> None:
         prompt = self._prompt(workspace_mode=True)
-        assert "conflict on repo 2 of 3" in prompt
+        assert (
+            "reset every repo's local default branch to\n"
+            "`origin/<default_branch>` and return `halt`; no repo has been pushed, "
+            "so there\nis no split state."
+        ) in prompt
         assert "repo_states" in prompt
-        assert "No revert, no force-push" in prompt
+        assert "conflict on repo 2 of 3" not in prompt
+
+    def test_normal_prompt_never_pushes(self) -> None:
+        for workspace_mode in (True, False):
+            prompt = self._prompt(workspace_mode=workspace_mode)
+            for forbidden in (
+                "git push origin",
+                "you pushed",
+                "merged and pushed",
+                "--grep='^Item:",
+                "non_fast_forward",
+                "push_failed",
+                'phase="merging"',
+                "Never roll back a repo that already merged",
+            ):
+                assert forbidden not in prompt, forbidden
+            assert "Item: abcdef01-2345-6789-abcd-ef0123456789" in prompt
+            assert "Rollout: rollout-abc" in prompt
+
+    def test_normal_prompt_says_the_worker_lands(self) -> None:
+        prompt = self._prompt()
+        assert "YOU DO NOT PUSH." in prompt
+        assert "runs the project gate" in prompt
+        assert 'repo_states[<repo>] = "committed"' in prompt
+        assert '"repo_states": {"<repo_dir>": "committed"}' in prompt
+        assert "before you create the squash commit; after the squash commit" in (
+            " ".join(prompt.split())
+        )
+        assert "the build was APPROVED and that the dispatch" in prompt
+        assert "FIX MODE" not in prompt
+        flat = " ".join(prompt.split())
+        assert (
+            "`failure.kind` is one of `merge_conflict`, `gate_failed`, "
+            "`commit_count_zero`, `ac_not_satisfied`, `sensitive_area`"
+        ) in flat
+
+    def _fix_prompt(self, *, workspace_mode: bool = True) -> str:
+        dirs = ["repo-a", "repo-b"] if workspace_mode else ["repo-a"]
+        return dispatch.build_review_prompt(
+            self.ITEM,
+            self.PROJECT,
+            "rollout-abc",
+            "feat/abcdef01-do-the-thing",
+            40,
+            Path("/srv/agent/workspace/rollout-abc"),
+            repo_dirs=dirs,
+            default_branches=dict.fromkeys(dirs, "main"),
+            workspace_mode=workspace_mode,
+            gate_failure_output="FAILED tests/test_x.py::MARKER-7731\nlast line",
+        )
+
+    def test_fix_mode_prompt(self) -> None:
+        for workspace_mode in (True, False):
+            prompt = self._fix_prompt(workspace_mode=workspace_mode)
+            assert "FIX MODE" in prompt
+            assert "MARKER-7731" in prompt
+            assert "git commit --amend --no-edit" in prompt
+            for forbidden in ("git merge --squash", "ls-remote", "git push origin"):
+                assert forbidden not in prompt, forbidden
+            flat = " ".join(prompt.split())
+            assert (
+                "FORBIDDEN in this mode: `git checkout`, `git reset`, `git rebase`, "
+                "`git merge` and `git push`."
+            ) in flat
+            assert prompt.count("git checkout") == 1
+            assert not any(
+                line.lstrip().startswith("git checkout") for line in prompt.splitlines()
+            )
+            assert "restricted to `merge`" in prompt
+            assert "NO squash commit for this" in prompt
+            # Kept sections.
+            assert "The thing works" in prompt
+            assert "Guardrails" in prompt
+            assert "Turn Discipline" in prompt
+            assert "/srv/agent/workspace/rollout-abc/.dispatch/verdict.json" in prompt
+            assert "MERGE NOTE" in prompt
+
+    def test_reviewer_deny_list_blocks_git_push(self) -> None:
+        assert "Bash(git push:*)" in dispatch.REVIEWER_DISALLOWED_TOOLS
 
     def test_monorepo_mode_says_there_is_no_partial_state(self) -> None:
         prompt = self._prompt(workspace_mode=False)
@@ -6295,6 +6377,23 @@ class TestPinnedReviewPrompt:
         assert "naming which rule (1, 2 or" not in prompt
         assert '"commit_type": "fix",' in prompt
         assert '"commit_type_reason": "groomed on the item",' in prompt
+        assert "you pushed" not in prompt
+        assert "git push origin" not in prompt
+
+    def test_iv_pinned_prompt_keeps_trailers_without_push(self) -> None:
+        prompt = self._prompt({**self.ITEM, "commit_type": "fix"})
+        assert dispatch.compose_squash_subject({**self.ITEM, "commit_type": "fix"}) == (
+            "fix(996b308e): Add X"
+        )
+        assert "fix(996b308e): Add X" in prompt
+        assert f"Item: {_GROOMED_ID}" in prompt
+        assert "Rollout: rollout-abc" in prompt
+        assert "--grep='^Item:" not in prompt
+
+    def test_v_unpinned_rule_says_created(self) -> None:
+        prompt = self._prompt(dict(self.ITEM))
+        assert "it MUST equal the type of the squash commit you created" in prompt
+        assert "the squash commit you pushed" not in prompt
 
     def test_manage_commit_type_block_is_unchanged(self) -> None:
         block = dispatch._manage_commit_type_block()

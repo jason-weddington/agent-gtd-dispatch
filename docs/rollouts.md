@@ -51,17 +51,12 @@ branch is pushed, runs review + merge themselves, and deletes the branch.
 A rollout is the wave shape:
 
 - The lead calls `plan_rollout(item_ids=[...])` once to build the DAG.
-- The lead calls `dispatch_item(mode="manage", rollout_id=...)` once to start
-  the manager.
-- The **manager** dispatches each child build agent, runs quality gates,
-  squash-merges to `main`, and advances the rollout — with no lead involvement
-  per item.
+- The lead starts the rollout once. On the dispatch host, that request (a `/dispatch` with `mode="manage"` and the `rollout_id`) no longer launches a resident manager agent: the dispatch worker itself drives the wave loop in-process (`_rollout_loop_worker` → `_drive_rollout` → `_rollout_wave_tick` in `main.py`).
+- Each tick dispatches the items that are ready, waits on in-flight builds, and launches ONE short-lived reviewer per completed build. The reviewer reconciles the acceptance criteria, runs the merge bar and, if it approves, creates the item's squash commit LOCALLY — it never pushes.
+- The worker then lands that commit itself (see "The worker-owned land step" below): it fetches origin, rebases the squash onto current `origin/<default_branch>`, runs the project's `gate_command` on that exact tree, and pushes only on green. Only after the push does it record the item complete and advance the rollout — with no lead involvement per item.
 - The lead only intervenes if the rollout halts.
 
-Default to rollouts whenever you have two or more items in the same project
-that benefit from a shared narrator and uniform merge cadence. Single
-dispatches are for one-off items or cross-project pairs that can't share a
-rollout.
+Default to rollouts whenever you have two or more items in the same project that benefit from a uniform review and merge cadence. Single dispatches are for one-off items or cross-project pairs that can't share a rollout.
 
 ---
 
@@ -100,29 +95,52 @@ response (`src/agent_gtd_dispatch/main.py:563-567`).
 
 ### `mode="manage"` — driving a rollout
 
-- **Input:** one `rollout_id` (the `item_id` field on the request is unused;
-  see "Launch item_id — Ignore It" below).
-- **Workspace:** shallow clone (`--depth=50`) of the project's auto-detected
-  default branch — **not** a feature branch. The manager merges to this
-  branch.
-- **Job:** drive the rollout from start to terminal state — dispatch each
-  child build agent, poll them to completion, reconcile AC, run quality
-  gates, squash-merge clean builds, delete branches, advance the rollout.
-- **Output:** a sequence of squash-merge commits on `main` (one per item) and
-  a closed rollout (`completed`, `halted`, or — in failure modes — left
-  `running` for auto-recovery).
+- **Input:** one `rollout_id` (the `item_id` field on the request is unused).
+- **What runs:** no long-lived agent. The dispatch worker drives a wave loop in-process for the life of the rollout and occupies one run slot while it does.
+- **Workspace:** one persistent per-rollout workspace (`rollout-<rollout_id>`, `dispatch.prepare_rollout_workspace`) shared by every reviewer of that rollout. Before each review it is fetched and hard-reset to `origin/<default_branch>` in every repo, so no reviewer inherits a previous reviewer's tree.
+- **Per completed build:** one short-lived reviewer (`mode=review`, engine from the rollout's `reviewer_engine` or `DISPATCH_REVIEWER_ENGINE`) reviews ONE build and writes a verdict from a closed set — `merge`, `re-dispatch`, `skip`, `halt` — to `.dispatch/verdict.json`. On `merge` it has created the squash commit locally on the default branch, with the `Rollout: <rollout_id>` and `Item: <item_id>` trailers, and has pushed nothing. The worker executes every verdict; the reviewer cannot dispatch, record outcomes or (by contract, and detected if it tries) push.
+- **Output:** a sequence of squash commits on `main` (one per item), each pushed by the worker after its own land gate, and a closed rollout (`completed` or `halted`).
 
-Manage-mode dispatches always use `claude-code` (Opus). If `claude-code-ollama`
-is requested, the same engine swap as plan-mode applies. The default timeout
-is `MANAGE_TIMEOUT_SECONDS` (4 hours) versus `TIMEOUT_SECONDS` (30 min) for
-build/plan.
+`gate_command` is read from the project record snapshotted when the rollout starts; a change to a project's `gate_command` mid-rollout takes effect on the next rollout.
 
-Manage-mode subprocesses get a restricted MCP tool allowlist (the
-`_MANAGE_ALLOWED_TOOLS` tuple in `dispatch.py`) plus `Bash`, `Read`, `Write`,
-`Edit`, `Glob`, `Grep`. The build tools used by plan/build mode (e.g.
-`add_item`, `add_blocker`, `add_note`) are deliberately *not* in the allowlist
-— the manager can read, dispatch, comment, and update rollout state, but it
-cannot reshape the backlog.
+### The worker-owned land step
+
+Items that were gate-green on their own clones can still turn `main` red together when one item carries a contract another item changes (a test in one asserting state the other moves). File-overlap planning cannot see that. So the land is deterministic and owned by the worker (`_land_reviewed_merge` in `main.py`), never by the reviewer prompt.
+
+After a `merge` verdict, and before anything is recorded on the board, the worker:
+
+1. Takes a per-remote lock for every repo in the workspace, keyed by (normalized origin URL, default branch), in sorted order, and holds them through any fix relaunch until the final push or halt. Two lands to the same remote branch on one host are serialized, so they can never both pass the gate against the same old `main`. The lock is per host only; there is no cross-host lock service.
+2. Fetches origin and runs a reviewer-pushed guard: a commit for this item that reached origin after the review started halts the rollout with nothing pushed.
+3. Reads the landing set from git, not from the reviewer: the repos exactly one trailer-bearing commit ahead of `origin/<default_branch>`, with HEAD on the default branch.
+4. Rebases every not-yet-pushed landing repo onto the freshly fetched `origin/<default_branch>`. In a workspace project, every repo NOT in the landing set is reset to its origin, so the compound gate sees current siblings.
+5. Runs the project's gate install step (hook managers) once, then the `gate_command` from the workspace root on that exact tree, and records the gated sha of each landing repo.
+6. Pushes exactly the gated sha (`git push --no-verify origin <gated_sha>:refs/heads/<default_branch>`; `--no-verify` because the land gate just judged that sha). It never forces. A project with no `gate_command` skips the gate and pushes with the repo's own hooks instead.
+7. Audits each push with `git ls-remote`, deletes the feature branch (best effort), posts one `Landed <sha> on <repo>/<branch> ...` comment on the item, and only then records the item complete.
+
+A non-fast-forward rejection (another host pushed first) re-fetches, re-rebases, resets the siblings and re-gates before pushing again, bounded by `MAX_LAND_PUSH_ATTEMPTS` (3) rejections. This push rejection plus regate is the only cross-host race protection.
+
+A red land gate before any repo has been pushed gets ONE fix relaunch (`MAX_LAND_FIX_RELAUNCHES`): the reviewer is relaunched in FIX MODE with the gate output, may amend the squash commit in place (`git commit --amend --no-edit`), and the worker re-checks, re-rebases and re-gates. A second red gate, a red gate after any repo has pushed, or a fix verdict other than `merge` halts. A gate timeout, a gate launch error or a gate install failure halts without a relaunch.
+
+While it waits on locks or runs a gate, the land republishes `phase=merging` every `LAND_HEARTBEAT_SECONDS`, so the watchdog never mistakes a long gate for a stale rollout.
+
+Every halt reason from the land starts with one of these prefixes:
+
+- `commit for item <item_id> appeared on origin during review, before the worker's land` — the reviewer pushed.
+- `land bad local state for item <item_id>` — not exactly one trailer-bearing commit ahead, HEAD off the default branch, a squash the rebase emptied, or HEAD moved during the gate.
+- `merge verdict but no local squash commit for item <item_id>` — nothing to land in any repo.
+- `land gate install failed for item <item_id>`
+- `land gate failed for item <item_id>: ` — followed by the TAIL of the gate output.
+- `land gate timed out for item <item_id>`
+- `land gate launch error for item <item_id>`
+- `land rebase conflict for item <item_id>` — names the repo and every conflicting path; the rebase is aborted and nothing is pushed.
+- `land push rejected <N> times for item <item_id>`
+- `land push failed for item <item_id>`
+- `land audit mismatch: remote <remote_sha> != gated <gated_sha>`
+- `land git timed out` — names the git command.
+
+In a workspace project every landing repo is rebased before anything is pushed, the gate runs once from the workspace root, and pushes go in repo order. A halt after the first push lists each landing repo as `<repo>: pushed` or `<repo>: not pushed`. On every halt the feature branch is left in place.
+
+Each push attempt writes one `rollout-loop: land ...` log line per landing repo carrying `base_before`, `base_after`, `origin_advanced`, `gated_sha`, `pushed_sha`, the gate decision and an `outcome`.
 
 ---
 
@@ -203,6 +221,8 @@ items can be scheduled concurrently against the same file.
 ---
 
 ## The manager's lifecycle
+
+> **Retired.** The resident manager agent described from here down to "Recovery semantics" is no longer launched; the worker-driven loop and land step above replace it. The text is kept as a reference for the legacy prompt (`_build_manage_prompt`), which is still in the codebase until its removal item lands.
 
 A manage-mode dispatch is a single Claude Code subprocess that runs for up to
 4 hours of wall-clock time. The full system prompt is generated by

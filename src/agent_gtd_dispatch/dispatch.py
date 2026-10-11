@@ -3063,6 +3063,252 @@ def find_landed_commit_subjects(
     return subjects, failed
 
 
+# ---------------------------------------------------------------------------
+# Land step git helpers — the worker's fetch / rebase / gate / push of a
+# reviewer-approved squash commit.  Every call goes through ``_sudo_wrap``
+# with an explicit timeout; a timeout raises :class:`LandGitTimeout`, which the
+# worker turns into a halt naming the command.  These are synchronous and MUST
+# be called via ``loop.run_in_executor``.
+# ---------------------------------------------------------------------------
+
+
+class LandGitTimeout(Exception):  # noqa: N818 — reads as the event it names
+    """A land-step git command exceeded its timeout."""
+
+    def __init__(self, command: str) -> None:
+        """Record the timed-out git subcommand (e.g. ``fetch``)."""
+        super().__init__(f"git {command}")
+        self.command = command
+
+
+class LandGitError(Exception):
+    """A land-step git command that must succeed exited non-zero."""
+
+    def __init__(self, command: str, excerpt: str) -> None:
+        """Record the failed git subcommand and its output excerpt."""
+        super().__init__(f"git {command} failed: {excerpt}")
+        self.command = command
+        self.excerpt = excerpt
+
+
+def _land_git(
+    repo: Path, args: list[str], timeout: int
+) -> subprocess.CompletedProcess[bytes]:
+    """Run ``git <args>`` in *repo*; raise :class:`LandGitTimeout` on timeout."""
+    try:
+        return subprocess.run(
+            _sudo_wrap(["git", *args]),
+            cwd=repo,
+            check=False,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise LandGitTimeout(args[0]) from exc
+
+
+def _land_git_ok(repo: Path, args: list[str], timeout: int) -> str:
+    """Run ``git <args>``, raise :class:`LandGitError` on non-zero, return stdout."""
+    proc = _land_git(repo, args, timeout)
+    if proc.returncode != 0:
+        raise LandGitError(" ".join(args[:2]), git_output_excerpt(proc))
+    return proc.stdout.decode("utf-8", errors="replace").strip()
+
+
+def land_fetch(repo: Path, branch: str, timeout: int) -> None:
+    """``git fetch origin <branch>``; raises on failure or timeout."""
+    _land_git_ok(repo, ["fetch", "origin", branch], timeout)
+
+
+def land_rev_parse(repo: Path, ref: str, timeout: int) -> str:
+    """``git rev-parse <ref>``; raises on failure or timeout."""
+    return _land_git_ok(repo, ["rev-parse", ref], timeout)
+
+
+def land_origin_shas(
+    repo_paths: dict[str, Path], branches: dict[str, str], timeout: int
+) -> dict[str, str]:
+    """Map each repo to ``git rev-parse origin/<default_branch>`` ("" on failure)."""
+    shas: dict[str, str] = {}
+    for repo, path in repo_paths.items():
+        branch = branches.get(repo) or _DEFAULT_BRANCH_CANDIDATES[0]
+        try:
+            shas[repo] = land_rev_parse(path, f"origin/{branch}", timeout)
+        except (LandGitError, LandGitTimeout, OSError) as exc:
+            logger.warning(
+                "rollout-loop: pre-review-origin lookup failed repo=%s: %s", repo, exc
+            )
+            shas[repo] = ""
+    return shas
+
+
+def land_ahead_count(repo: Path, branch: str, timeout: int) -> int:
+    """``git rev-list --count origin/<branch>..<branch>``."""
+    out = _land_git_ok(
+        repo, ["rev-list", "--count", f"origin/{branch}..{branch}"], timeout
+    )
+    return int(out or "0")
+
+
+def land_count_between(repo: Path, base: str, tip: str, timeout: int) -> int:
+    """``git rev-list --count <base>..<tip>``; 0 when either side is unknown."""
+    if not base or not tip:
+        return 0
+    proc = _land_git(repo, ["rev-list", "--count", f"{base}..{tip}"], timeout)
+    if proc.returncode != 0:
+        return 0
+    try:
+        return int(proc.stdout.decode().strip() or "0")
+    except ValueError:
+        return 0
+
+
+def land_current_branch(repo: Path, timeout: int) -> str:
+    """``git rev-parse --abbrev-ref HEAD``."""
+    return _land_git_ok(repo, ["rev-parse", "--abbrev-ref", "HEAD"], timeout)
+
+
+def land_has_item_trailer(repo: Path, branch: str, item_id: str, timeout: int) -> bool:
+    """True when some line of ``git log -1 --format=%B <branch>`` is the trailer."""
+    body = _land_git_ok(repo, ["log", "-1", "--format=%B", branch], timeout)
+    want = f"Item: {item_id}"
+    return any(line.strip() == want for line in body.splitlines())
+
+
+def land_reviewer_pushed(
+    repo: Path,
+    base: str,
+    branch: str,
+    rollout_id: str,
+    item_id: str,
+    timeout: int,
+) -> list[str]:
+    """Commits for this item that reached origin AFTER *base* (time-scoped)."""
+    out = _land_git_ok(
+        repo,
+        [
+            "log",
+            f"{base}..origin/{branch}",
+            "--format=%H",
+            f"--grep=^Rollout: {rollout_id}$",
+            f"--grep=^Item: {item_id}$",
+            "--all-match",
+        ],
+        timeout,
+    )
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def land_rebase(repo: Path, branch: str, timeout: int) -> tuple[bool, list[str], str]:
+    """``git rebase origin/<branch>``.
+
+    Returns ``(ok, conflict_paths, excerpt)``. On failure the conflicting paths
+    are collected BEFORE ``git rebase --abort``, so the repo is left with no
+    rebase in progress.
+    """
+    proc = _land_git(repo, ["rebase", f"origin/{branch}"], timeout)
+    if proc.returncode == 0:
+        return True, [], ""
+    excerpt = git_output_excerpt(proc)
+    diff = _land_git(repo, ["diff", "--name-only", "--diff-filter=U"], timeout)
+    paths = [
+        p
+        for p in diff.stdout.decode("utf-8", errors="replace").splitlines()
+        if p.strip()
+    ]
+    _land_git(repo, ["rebase", "--abort"], timeout)
+    return False, paths, excerpt
+
+
+def land_reset_to_origin(repo: Path, branch: str, timeout: int) -> None:
+    """Put a NON-landing repo on ``origin/<branch>`` (checkout, then hard reset)."""
+    _land_git_ok(repo, ["checkout", "-f", branch], timeout)
+    _land_git_ok(repo, ["reset", "--hard", f"origin/{branch}"], timeout)
+
+
+_NON_FAST_FORWARD_MARKERS: tuple[str, ...] = (
+    "[rejected]",
+    "non-fast-forward",
+    "fetch first",
+)
+
+
+def land_push(
+    repo: Path, sha: str, branch: str, *, no_verify: bool, timeout: int
+) -> tuple[str, str]:
+    """Push exactly *sha* to ``refs/heads/<branch>``. Never forces.
+
+    Returns ``(status, excerpt)`` where status is ``pushed``,
+    ``non_fast_forward`` or ``failed``.
+    """
+    argv = ["push"]
+    if no_verify:
+        argv.append("--no-verify")
+    argv += ["origin", f"{sha}:refs/heads/{branch}"]
+    proc = _land_git(repo, argv, timeout)
+    if proc.returncode == 0:
+        return "pushed", ""
+    excerpt = git_output_excerpt(proc)
+    if any(marker in excerpt for marker in _NON_FAST_FORWARD_MARKERS):
+        return "non_fast_forward", excerpt
+    return "failed", excerpt
+
+
+def land_ls_remote(repo: Path, branch: str, timeout: int) -> str:
+    """The live remote sha of ``refs/heads/<branch>`` ("" when absent)."""
+    out = _land_git_ok(repo, ["ls-remote", "origin", f"refs/heads/{branch}"], timeout)
+    return out.split()[0] if out.split() else ""
+
+
+def normalize_remote_url(url: str) -> str:
+    """Strip one trailing ``/`` and then one trailing ``.git``."""
+    url = url.strip()
+    url = url.removesuffix("/")
+    return url.removesuffix(".git")
+
+
+def land_remote_url(repo: Path, timeout: int) -> str:
+    """The normalized ``git remote get-url origin``."""
+    return normalize_remote_url(
+        _land_git_ok(repo, ["remote", "get-url", "origin"], timeout)
+    )
+
+
+def land_diff_stat(
+    repo: Path, before: str, after: str, timeout: int
+) -> tuple[int, int, int, list[str]]:
+    """``(files_changed, insertions, deletions, paths)`` between two shas."""
+    out = _land_git_ok(repo, ["diff", "--numstat", before, after], timeout)
+    files = ins = dels = 0
+    paths: list[str] = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:  # numstat: added<TAB>deleted<TAB>path
+            continue
+        files += 1
+        ins += int(parts[0]) if parts[0].isdigit() else 0
+        dels += int(parts[1]) if parts[1].isdigit() else 0
+        paths.append(parts[2])
+    return files, ins, dels, paths
+
+
+def land_delete_feature_branch(repo: Path, branch_name: str, timeout: int) -> list[str]:
+    """Best-effort remote + local feature-branch deletion. Returns failure notes."""
+    notes: list[str] = []
+    for argv in (
+        ["push", "--no-verify", "origin", "--delete", branch_name],
+        ["branch", "-D", branch_name],
+    ):
+        try:
+            proc = _land_git(repo, argv, timeout)
+        except LandGitTimeout:
+            notes.append(f"git {argv[0]} timed out")
+            continue
+        if proc.returncode != 0:
+            notes.append(f"git {' '.join(argv[:2])}: {git_output_excerpt(proc)[:200]}")
+    return notes
+
+
 def read_review_verdict(workspace_root: Path) -> tuple[dict[str, Any] | None, str]:
     """Read and validate the reviewer's verdict artifact.
 
@@ -3102,45 +3348,36 @@ def read_review_verdict(workspace_root: Path) -> tuple[dict[str, Any] | None, st
 
 
 def _review_conflict_contract_block(*, workspace_mode: bool) -> str:
-    """The merge-conflict / non-fast-forward contract. Verbatim in the prompt.
+    """The merge-conflict contract. Verbatim in the prompt.
 
-    Neither manage prompt mentioned either failure today: no ``git status``, no
-    ``--abort``, and nothing at all for the rejection you get when the default
-    branch moved between your fetch and your push — which is live, because
-    other sessions push to the same origin.
+    The reviewer no longer pushes, so the non-fast-forward rejection it used to
+    handle is gone from this block: the worker's land step owns the push and
+    retries a rejection itself (fetch, rebase, re-gate).  What remains is the
+    local ``git merge --squash`` conflict, which is still the reviewer's to
+    detect and report — never to resolve.
     """
     if workspace_mode:
         partial = """\
 
-**Workspace mode — a conflict on repo 2 of 3.** Repos are merged in order and
-the earlier ones are already pushed. You may NOT roll them back, and you may
-NOT continue to repo 3. Do exactly this:
-
-1. `git merge --abort` in the failing repo. Leave it on its default branch
-   with a clean tree.
-2. Touch NOTHING in the repos that already merged, and nothing in the repos
-   that have not been reached. No revert, no force-push, no cleanup.
-3. Write the verdict artifact with `verdict: "halt"` and a `repo_states`
-   object naming every repo with exactly one of `merged`, `failed` or
-   `untouched`, plus `failure.kind` and `failure.detail`.
-
-The wave stops there and a human resolves the split state. That is the
-DETERMINISTIC outcome: a half-merged wave that is accurately described is
-recoverable; a half-merged wave that something tried to tidy up is not."""
+**Workspace mode.** On any failure, reset every repo's local default branch to
+`origin/<default_branch>` and return `halt`; no repo has been pushed, so there
+is no split state. Name every repo in `repo_states` with exactly one of
+`committed`, `failed` or `untouched`, plus `failure.kind` and
+`failure.detail`."""
     else:
         partial = """\
 
-**Single repo.** There is no partial state to describe: either the one merge
-landed or nothing did."""
+**Single repo.** There is no partial state to describe: either the one squash
+commit exists locally or nothing does."""
 
     body = f"""\
-## Merge Conflict and Non-Fast-Forward — the contract
+## Merge Conflict — the contract
 
-Two failures can happen during the merge itself, and you handle BOTH the same
-way: **attempt, detect, abort cleanly, report. Never improvise a resolution.**
+A merge conflict is handled one way: **attempt, detect, abort cleanly, report.
+Never improvise a resolution.**
 
-**1. Merge conflict.** `git merge --squash <branch>` exits non-zero and leaves
-conflict markers in the tree.
+`git merge --squash <branch>` exits non-zero and leaves conflict markers in the
+tree.
 
 ```bash
 git merge --squash <branch> || {{
@@ -3154,32 +3391,15 @@ branch's version wins". A conflict means two changes disagree about the same
 lines and nobody has decided which is right — that is a human's call, and a
 reviewer that picks one has silently discarded the other.
 
-**2. Non-fast-forward push.** `git push origin <default_branch>` is rejected
-because the default branch moved between your fetch and your push. Other
-sessions push to this same origin; this is expected, not exotic.
+**NEVER `git push --force` and NEVER `--force-with-lease`** — and in fact never
+push at all: the worker lands your squash commit.
 
-```bash
-git push origin <default_branch> || {{
-    git reset --hard origin/<default_branch>   # after a fresh fetch
-    git status --porcelain                     # MUST be empty
-}}
-```
+**Leaving the workspace unmodified is part of the contract.** After an abort,
+`git status --porcelain` must be EMPTY and HEAD must be on the repo's default
+branch. Verify it; do not assume it.
 
-**NEVER `git push --force` and NEVER `--force-with-lease`.** A rejected push
-means someone else's commit is on the branch. Discard YOUR merge commit (it is
-a squash of a branch that still exists on the remote — nothing is lost) and
-report the failure. Do not re-fetch, rebase and retry: the tree you gated is no
-longer the tree you would be pushing, so a retry would merge work that was
-never reviewed against a base that was never verified.
-
-**Leaving the workspace unmodified is part of the contract.** After either
-abort, `git status --porcelain` must be EMPTY and HEAD must be on the repo's
-default branch. Verify it; do not assume it.
-
-**Report it structurally.** Set `failure.kind` to exactly one of
-`merge_conflict` or `non_fast_forward` (or `gate_failed`, `commit_count_zero`,
-`push_failed` for the other merge-step failures), and put the git output tail
-in `failure.detail`.
+**Report it structurally.** Set `failure.kind` to `merge_conflict` and put the
+git output tail in `failure.detail`.
 {partial}"""
     return _indent_prompt_block(body)
 
@@ -3254,6 +3474,53 @@ are not supposed to.
     return _indent_prompt_block(body)
 
 
+def _review_fix_mode_block(
+    gate_failure_output: str, *, workspace_mode: bool, where: str
+) -> str:
+    """The FIX MODE section that replaces Steps 2-5 on a land-gate relaunch."""
+    repos = (
+        "each landing repo (every repo that has a squash commit for this item)"
+        if workspace_mode
+        else "the repo"
+    )
+    body = f"""\
+## FIX MODE — the land gate failed on your squash commit
+
+You already approved this build and created its squash commit. The dispatch
+worker then fetched origin, rebased that squash commit onto the CURRENT
+`origin/<default_branch>`, and ran the project gate from {where} on the exact
+tree it was about to push. The gate FAILED. This is its output (tail):
+
+```text
+{gate_failure_output}
+```
+
+HEAD in {repos} is the item's squash commit, already rebased onto current
+origin. Usually the failure is a contract between this item and a commit that
+landed on origin after the build was cut (a test asserting state another item
+changed).
+
+Do exactly this:
+
+1. Read the failure and make the MINIMAL fix that makes the gate green.
+2. `git add` the changed files, then `git commit --amend --no-edit` in the repo
+   that needs the fix, so the squash commit keeps its subject and both its
+   `Rollout:` and `Item:` trailers and stays the ONLY commit ahead of origin.
+3. Re-run the gate yourself to confirm it is green.
+
+FORBIDDEN in this mode: `git checkout`, `git reset`, `git rebase`, `git merge`
+and `git push`. The worker owns the branch layout and the push; it re-fetches,
+re-rebases and re-gates your amended commit itself.
+
+If the fix would need a change in a repo that has NO squash commit for this
+item, the verdict is `halt` — do not create a new commit there.
+
+Your verdict in this mode is restricted to `merge` (fixed and amended) or
+`halt` (anything else, including a fix that is not small). Never
+`re-dispatch` or `skip`."""
+    return _indent_prompt_block(body)
+
+
 def build_review_prompt(
     item: dict[str, Any],
     project: dict[str, Any],
@@ -3270,24 +3537,33 @@ def build_review_prompt(
     merge_notes: list[dict[str, Any]] | None = None,
     redispatches_used: int = 0,
     redispatch_cap: int = 1,
+    gate_failure_output: str | None = None,
 ) -> str:
-    """System prompt for REVIEW mode — review ONE build, then merge or refuse.
+    """System prompt for REVIEW mode — review ONE build, then approve or refuse.
 
     The scope is deliberately one item.  A full map of both manage prompt
     variants found that of roughly twenty steps, exactly FOUR are irreducibly
     model work — acceptance-criteria reconciliation, the unrelated-manifest
     scope judgment, the inline-fix small-or-not decision, and sensitive-area
-    discretion — and all four sit inside the review-and-merge window for a
-    SINGLE completed build.  Everything else in the old loop is deterministic
-    and now lives in the worker.
+    discretion — and all four sit inside the review window for a SINGLE
+    completed build.  Everything else in the old loop is deterministic and
+    lives in the worker — including, now, the push: the reviewer leaves its
+    squash commit LOCAL and the worker's land step fetches, rebases onto
+    current origin, gates that exact tree and pushes it.
+
+    When *gate_failure_output* is not None the prompt is in FIX MODE: Steps 2-5
+    and the conflict contract are replaced by a section asking for a minimal
+    amend of the existing squash commit after the land gate failed.
     """
+    fix_mode = gate_failure_output is not None
     project_name = project.get("name", "")
     dirs = list(repo_dirs or [])
     branches = dict(default_branches or {})
     gate_command = (project.get("gate_command") or "").strip()
+    item_id = str(item.get("id", ""))
 
     if workspace_mode:
-        repo_bullets = "\n        ".join(
+        repo_bullets = "\n".join(
             f"- `{d}/` (default branch `{branches.get(d, 'main')}`)" for d in dirs
         )
         layout = f"""\
@@ -3296,7 +3572,7 @@ already checked out on its own default branch and hard-reset to origin:
 
 {repo_bullets}
 
-Merge order is that list order, pushed repos only."""
+Squash-commit order is that list order, repos that received the branch only."""
         where = "the workspace root"
     else:
         only = dirs[0] if dirs else project_name
@@ -3310,23 +3586,24 @@ Merge order is that list order, pushed repos only."""
         gate_block = f"""\
 The merge bar is the project's stored `gate_command`. It is NOT something you
 infer, and it is the same command the dispatch worker already ran as the
-post-run gate. Run it verbatim from {where}:
+post-run gate (and will run again on the rebased tree before it pushes). Run it
+verbatim from {where}:
 
 ```bash
-{gate_command.replace(chr(10), chr(10) + "        ")}
+{gate_command}
 ```
 
 Do not derive a different test/lint command from `CLAUDE.md` or `README.md` and
-merge against that instead. Two reviewers inferring two different bars for the
-same repo apply two different standards to consecutive items — that is a
+approve against that instead. Two reviewers inferring two different bars for
+the same repo apply two different standards to consecutive items — that is a
 correctness problem, not a style one."""
     else:
         gate_block = f"""\
 This project has NO stored `gate_command`, so you are in FALLBACK mode: read
 `CLAUDE.md` / `README.md`, infer the test and lint commands, and run them from
-{where} before merging. A gate-less project is not a rollout with no quality
-bar. If a repo has no discoverable test or lint command at all, record `none`
-for it and continue — do NOT halt for that alone."""
+{where} before creating the squash commit. A gate-less project is
+not a rollout with no quality bar. If a repo has no discoverable test or lint command at all,
+record `none` for it and continue — do NOT halt for that alone."""
 
     envelope = _review_envelope_block(
         item, branch_name, run_status, gate_result, merge_notes
@@ -3350,18 +3627,19 @@ for it and continue — do NOT halt for that alone."""
         )
     else:
         commit_type = _manage_commit_type_block()
-        squash_subject = f"<type>({item.get('id', '')[:8]}): {item.get('title', '')}"
+        squash_subject = f"<type>({item_id[:8]}): {item.get('title', '')}"
         verdict_type_example = "feat"
         verdict_reason_example = "rule 3: adds a new MCP endpoint"
         verdict_type_rules = _indent_prompt_block(
             """\
 - `commit_type` is REQUIRED when `verdict` is `merge` and is exactly one
   of `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore`,
-  `build`, `ci`; it MUST equal the type of the squash commit you pushed.
+  `build`, `ci`; it MUST equal the type of the squash commit you created.
 - `commit_type_reason` is one short sentence naming which rule (1, 2 or
   3) fired and why."""
         )
     merge_note_rules = _manage_merge_note_block()
+    turn_discipline = _turn_discipline_block()
 
     redispatch_line = (
         f"This item has already been re-dispatched {redispatches_used} time(s); "
@@ -3375,14 +3653,194 @@ for it and continue — do NOT halt for that alone."""
         )
     )
 
+    layout = _indent_prompt_block(layout)
+    if fix_mode:
+        steps = _review_fix_mode_block(
+            str(gate_failure_output), workspace_mode=workspace_mode, where=where
+        )
+    else:
+        steps = textwrap.indent(
+            textwrap.dedent(
+                f"""\
+                ## Step 2 — Find which repos actually received the branch
+
+                In EVERY repo directory:
+                ```bash
+                git fetch origin
+                git ls-remote origin refs/heads/{branch_name}
+                ```
+                Non-empty output means that repo has the branch. `git ls-remote` is
+                AUTHORITATIVE. Cross-check against the build agent's final comment,
+                which is required to list exactly which repos it pushed to. Either
+                direction of disagreement is a `halt` — name both sources in your
+                rationale:
+                - the comment claims a repo the remote does not have: a push was
+                  reported that did not land;
+                - the remote has a branch the comment did not list: unreported work.
+
+                If NO repo has the branch: read the child run's terminal status in the
+                envelope above. `already_satisfied` can now only come from a talos child,
+                where the talos harness itself ran the item's checks and exited 30 to say
+                the criteria were already met — it is the harness's verdict, not anything
+                the agent claimed, and a `claude-code` child can no longer produce it at
+                all. Return `skip`. Any other status with no branch is a `halt` (or a
+                `re-dispatch`, if the run failed for a reason another build would
+                plausibly not hit).
+
+                Do NOT infer "the work was already done" from a green gate plus no
+                commits. An unchanged tree passes a gate trivially because it IS the base
+                commit, and treating that as evidence of a completed no-op is what
+                discarded four agents' worth of real work in a single night.
+
+                ## Step 3 — Reconcile the acceptance criteria against the diff
+
+                ```bash
+                git checkout {branch_name}
+                git diff origin/<default_branch>...{branch_name}
+                ```
+
+                This is the judgment you were launched for. Read the diff against the
+                acceptance criteria listed above, one at a time, and decide whether the
+                work actually satisfies them — not whether it looks plausible, and not
+                whether the tests pass (the gate answers that separately).
+
+                Three specific judgments are yours and cannot be reduced to a predicate:
+
+                1. **Unrelated manifest changes.** If the diff adds to
+                   `package.json` / `package-lock.json` / `pyproject.toml` / `uv.lock`
+                   things not tied to the item's stated scope, treat them as suspect:
+                   revert those specific changes with `git checkout HEAD -- <file>` and
+                   re-run the bar. A dependency added in passing is how supply chain
+                   surface grows without anyone deciding to grow it.
+                2. **Is the fix small?** See Step 4.
+                3. **Sensitive areas.** If the diff touches auth code (`**/auth.py`,
+                   `**/auth_routes.py`, route authentication), deploy/release scripts
+                   (`deploy.sh`, `release.sh`, `start.sh`), CI or hooks (`.github/**`,
+                   `.pre-commit-config.yaml`), infrastructure units (`*.service`,
+                   `Dockerfile*`, `nginx*.conf`) or env/secrets (`.env*`, `.envrc*`),
+                   prefer `halt` over `merge`. This is discretion, not a hard predicate:
+                   a one-word typo fix in a Dockerfile comment is routine; a change to
+                   how a route authenticates is not.
+
+                If the approved work will invalidate a LATER item's spec, say so in your
+                rationale — the worker persists it as this rollout's merge note and
+                every subsequent reviewer is handed it.
+
+                ## Step 4 — Run the merge bar in every repo that received the branch
+
+                {{gate_block}}
+
+                **Inline-fix phase boundary.** A SMALL gate failure may be fixed inline
+                before you create the squash commit; after the squash commit exists, any
+                failure is `halt`. Small means formatting, a single missing import, a
+                one-line change, a coverage ratchet bump, a stale test assertion — then
+                re-run the bar. "Small" is your judgment; if the fix is non-trivial, or
+                your first attempt does not make the bar green, stop and return
+                `re-dispatch` (the build agent has the item's full context and you do
+                not) or `halt`.
+
+                ALL repos that received the branch must pass the bar before ANY squash
+                commit is created.
+
+                ## Step 5 — Create the squash commit LOCALLY (never push)
+
+                Immediately before each repo's squash, run the commit-count guard using
+                THAT repo's recorded default branch:
+                ```bash
+                git fetch origin {branch_name}
+                commit_count=$(git rev-list origin/<default_branch>..{branch_name} --count)
+                ```
+                `commit_count == 0` with a child status of `already_satisfied` is a
+                `skip`. `commit_count == 0` with any other status is a `halt`.
+
+                {{commit_type}}
+
+                Squash, inside each repo's directory, onto THAT repo's LOCAL default
+                branch:
+                ```bash
+                set -euo pipefail
+                git checkout <default_branch>
+                git merge --squash {branch_name}
+                git commit -F - <<'COMMITEOF'
+                {squash_subject}
+
+                Rollout: {rollout_id}
+                Item: {item_id}
+                COMMITEOF
+                ```
+
+                Leave the commit UNPUSHED, leave HEAD on `<default_branch>`, and set
+                `repo_states[<repo>] = "committed"` for that repo. The squash commit
+                must be the ONLY commit your default branch has ahead of
+                `origin/<default_branch>`. Do not delete the feature branch.
+
+                {{conflict_contract}}"""
+            ),
+            " " * 8,
+        ).lstrip(" ")
+        # str.replace, not str.format: the rendered text carries the item
+        # title and shell braces, either of which would break format().
+        steps = (
+            steps.replace("{gate_block}", _indent_prompt_block(gate_block))
+            .replace("{commit_type}", commit_type)
+            .replace("{conflict_contract}", conflict_contract)
+        )
+
+    if fix_mode:
+        decide = """\
+## What You Decide In FIX MODE
+
+You return `merge` once your amended squash commit makes the gate green, or
+`halt` for anything else. The worker re-checks, re-rebases, re-gates and pushes
+on `merge`; it halts the rollout on `halt`."""
+    else:
+        decide = f"""\
+## What You Decide, And What You Do Not
+
+You return a VERDICT from a CLOSED set. When — and only when — that verdict is
+`merge`, you create the item's squash commit LOCALLY; you never push it:
+
+| verdict | meaning | who acts |
+|---|---|---|
+| `merge` | the work satisfies the ACs and passes the bar — YOU created the local squash commit | the WORKER fetches, rebases onto current origin, runs the project gate and pushes; then it records the item complete |
+| `re-dispatch` | the work is wrong or incomplete but another build plausibly fixes it | the WORKER re-dispatches the item |
+| `skip` | nothing to merge — the work was already done, or the branch is empty and legitimately so | the WORKER records the item skipped and advances |
+| `halt` | anything you are not certain about | the WORKER halts the rollout for a human |
+
+**YOU DO NOT PUSH.** The dispatch worker fetches origin, rebases your squash
+commit onto the CURRENT `origin/<default_branch>`, runs the project gate on that
+exact tree and pushes it only on green. Another item may land on origin while
+you review; only the worker can see that. A push from you is detected and halts
+the rollout.
+
+**YOU DO NOT DISPATCH.** You have no dispatch URL and no dispatch key,
+deliberately: re-dispatching is the worker's decision to execute, not
+yours. Do not try to call a dispatch tool, do not shell out to one, and
+do not treat their absence as a misconfiguration. Returning
+`re-dispatch` IS how you ask for another build.
+
+**YOU DO NOT RECORD OUTCOMES.** The worker records the item's outcome in
+the rollout after reading your verdict. Do not call
+`complete_item_in_rollout`, `complete_item`, `advance_rollout` or
+`halt_rollout` yourself — these tools are blocked for you, and recording
+an outcome yourself makes the worker's own record collide with it.
+
+{redispatch_line}
+
+**When in doubt, `halt`.** A halted rollout recovers. A landed
+regression does not. `halt` is never the wrong answer when you are
+uncertain; `merge` frequently is."""
+    decide = _indent_prompt_block(decide)
+
     return textwrap.dedent(
         f"""\
         You are a headless MERGE REVIEWER dispatched by the Agent GTD wave loop.
         No human is available for questions — you must work autonomously.
 
-        **Mode: REVIEW** — You review ONE completed build and either merge it or
-        refuse it. You are short-lived by design: you were launched for this one
-        item and you exit when you have written your verdict.
+        **Mode: REVIEW** — You review ONE completed build and either approve it
+        (by creating its squash commit locally) or refuse it. You are short-lived
+        by design: you were launched for this one item and you exit when you have
+        written your verdict.
 
         **Project:** {project_name}
         **Rollout ID:** {rollout_id}
@@ -3392,35 +3850,7 @@ for it and continue — do NOT halt for that alone."""
 
         {envelope}
 
-        ## What You Decide, And What You Do Not
-
-        You return a VERDICT from a CLOSED set, and you perform the git merge
-        yourself when — and only when — that verdict is `merge`:
-
-        | verdict | meaning | who acts |
-        |---|---|---|
-        | `merge` | the work satisfies the ACs and passes the bar — YOU merged it | you merged; the worker records the item complete |
-        | `re-dispatch` | the work is wrong or incomplete but another build plausibly fixes it | the WORKER re-dispatches the item |
-        | `skip` | nothing to merge — the work was already done, or the branch is empty and legitimately so | the WORKER records the item skipped and advances |
-        | `halt` | anything you are not certain about | the WORKER halts the rollout for a human |
-
-        **YOU DO NOT DISPATCH.** You have no dispatch URL and no dispatch key,
-        deliberately: re-dispatching is the worker's decision to execute, not
-        yours. Do not try to call a dispatch tool, do not shell out to one, and
-        do not treat their absence as a misconfiguration. Returning
-        `re-dispatch` IS how you ask for another build.
-
-        **YOU DO NOT RECORD OUTCOMES.** The worker records the item's outcome in
-        the rollout after reading your verdict. Do not call
-        `complete_item_in_rollout`, `complete_item`, `advance_rollout` or
-        `halt_rollout` yourself — these tools are blocked for you, and recording
-        an outcome yourself makes the worker's own record collide with it.
-
-        {redispatch_line}
-
-        **When in doubt, `halt`.** A halted rollout recovers. A merged
-        regression does not. `halt` is never the wrong answer when you are
-        uncertain; `merge` frequently is.
+        {decide}
 
         ## Step 1 — Publish your phase
 
@@ -3428,133 +3858,13 @@ for it and continue — do NOT halt for that alone."""
         mcp__agent-gtd__update_rollout_state(
             rollout_id="{rollout_id}",
             phase="reviewing",
-            current_item_id="{item.get("id", "")}",
+            current_item_id="{item_id}",
             current_step="Reviewing {branch_name}",
         )
         ```
-        Call it again with `phase="merging"` when you start the merge. Each call
-        REPLACES all four state fields — pass `current_item_id` every time.
+        The call REPLACES all four state fields — pass `current_item_id`.
 
-        ## Step 2 — Find which repos actually received the branch
-
-        In EVERY repo directory:
-        ```bash
-        git fetch origin
-        git ls-remote origin refs/heads/{branch_name}
-        ```
-        Non-empty output means that repo has the branch. `git ls-remote` is
-        AUTHORITATIVE. Cross-check against the build agent's final comment,
-        which is required to list exactly which repos it pushed to. Either
-        direction of disagreement is a `halt` — name both sources in your
-        rationale:
-        - the comment claims a repo the remote does not have: a push was
-          reported that did not land;
-        - the remote has a branch the comment did not list: unreported work.
-
-        If NO repo has the branch: read the child run's terminal status in the
-        envelope above. `already_satisfied` can now only come from a talos child,
-        where the talos harness itself ran the item's checks and exited 30 to say
-        the criteria were already met — it is the harness's verdict, not anything
-        the agent claimed, and a `claude-code` child can no longer produce it at
-        all. Return `skip`. Any other status with no branch is a `halt` (or a
-        `re-dispatch`, if the run failed for a reason another build would
-        plausibly not hit).
-
-        Do NOT infer "the work was already done" from a green gate plus no
-        commits. An unchanged tree passes a gate trivially because it IS the base
-        commit, and treating that as evidence of a completed no-op is what
-        discarded four agents' worth of real work in a single night.
-
-        ## Step 3 — Reconcile the acceptance criteria against the diff
-
-        ```bash
-        git checkout {branch_name}
-        git diff origin/<default_branch>...{branch_name}
-        ```
-
-        This is the judgment you were launched for. Read the diff against the
-        acceptance criteria listed above, one at a time, and decide whether the
-        work actually satisfies them — not whether it looks plausible, and not
-        whether the tests pass (the gate answers that separately).
-
-        Three specific judgments are yours and cannot be reduced to a predicate:
-
-        1. **Unrelated manifest changes.** If the diff adds to
-           `package.json` / `package-lock.json` / `pyproject.toml` / `uv.lock`
-           things not tied to the item's stated scope, treat them as suspect:
-           revert those specific changes with `git checkout HEAD -- <file>` and
-           re-run the bar. A dependency added in passing is how supply chain
-           surface grows without anyone deciding to grow it.
-        2. **Is the fix small?** See Step 4.
-        3. **Sensitive areas.** If the diff touches auth code (`**/auth.py`,
-           `**/auth_routes.py`, route authentication), deploy/release scripts
-           (`deploy.sh`, `release.sh`, `start.sh`), CI or hooks (`.github/**`,
-           `.pre-commit-config.yaml`), infrastructure units (`*.service`,
-           `Dockerfile*`, `nginx*.conf`) or env/secrets (`.env*`, `.envrc*`),
-           prefer `halt` over `merge`. This is discretion, not a hard predicate:
-           a one-word typo fix in a Dockerfile comment is routine; a change to
-           how a route authenticates is not.
-
-        If the merged work will invalidate a LATER item's spec, say so in your
-        rationale — the worker persists it as this rollout's merge note and
-        every subsequent reviewer is handed it.
-
-        ## Step 4 — Run the merge bar in every pushed repo, BEFORE any merge
-
-        {gate_block}
-
-        **Inline-fix phase boundary.** While ZERO repos for this item have been
-        merged, a SMALL gate failure may be fixed inline — formatting, a single
-        missing import, a one-line change, a coverage ratchet bump, a stale test
-        assertion — then re-run the bar. "Small" is your judgment; if the fix is
-        non-trivial, or your first attempt does not make the bar green, stop and
-        return `re-dispatch` (the build agent has the item's full context and
-        you do not) or `halt`. Once the FIRST repo has been merged and pushed,
-        ANY subsequent failure is an immediate `halt` — no inline fixes, no
-        retries.
-
-        ALL pushed repos must pass the bar before ANY repo is merged.
-
-        ## Step 5 — Merge
-
-        Immediately before each repo's merge, run the commit-count guard using
-        THAT repo's recorded default branch:
-        ```bash
-        git fetch origin {branch_name}
-        commit_count=$(git rev-list origin/<default_branch>..{branch_name} --count)
-        ```
-        `commit_count == 0` with a child status of `already_satisfied` is a
-        `skip`. `commit_count == 0` with any other status is a `halt`.
-
-        {commit_type}
-
-        Squash merge, inside each repo's directory, against THAT repo's default
-        branch:
-        ```bash
-        set -euo pipefail
-        git checkout <default_branch>
-        git merge --squash {branch_name}
-        git commit -F - <<'COMMITEOF'
-        {squash_subject}
-
-        Rollout: {rollout_id}
-        Item: {item.get("id", "")}
-        COMMITEOF
-        git push origin <default_branch>
-        ```
-
-        Never delete a feature branch whose merge did not land; on any failure,
-        leave the branch in place and take the halt path (halt reason includes the
-        branch name and tip sha). Only after verifying the merge landed, delete the
-        feature branch in each merged repo:
-        ```bash
-        set -euo pipefail
-        git fetch origin <default_branch> && test -n "$(git log origin/<default_branch> -1 --format=%H --grep='^Item: {item.get("id", "")}$')"
-        git push origin --delete {branch_name}
-        git branch -D {branch_name}
-        ```
-
-        {conflict_contract}
+        {steps}
 
         {merge_note_rules}
 
@@ -3562,10 +3872,13 @@ for it and continue — do NOT halt for that alone."""
 
         - NEVER lower `[tool.coverage.report] fail_under`. Coverage ratchets up
           only. A `chore: lower coverage threshold` commit on the branch is a
-          guardrail violation: revert it before merging, or halt.
+          guardrail violation: revert it before creating the squash commit, or
+          halt.
         - Do not comment out test hooks, skip the suite, add blanket
-          `# type: ignore`, or push with `--no-verify`.
-        - Never force-push. Never roll back a repo that already merged.
+          `# type: ignore`, or bypass hooks with `--no-verify`.
+        - Never force-push, and never push at all.
+
+        {turn_discipline}
 
         ## Completion Artifact — this is how you return your verdict
 
@@ -3588,7 +3901,7 @@ for it and continue — do NOT halt for that alone."""
           "merge_note": "signature/rename/config-key changes, or 'no signature, rename or config-key changes'",
           "commit_type": "{verdict_type_example}",
           "commit_type_reason": "{verdict_reason_example}",
-          "repo_states": {{"<repo_dir>": "merged"}},
+          "repo_states": {{"<repo_dir>": "committed"}},
           "failure": {{"kind": "", "detail": ""}}
         }}
         ```
@@ -3598,13 +3911,12 @@ for it and continue — do NOT halt for that alone."""
         - `rationale` is REQUIRED and must be non-empty.
         - `merge_note` is REQUIRED when `verdict` is `merge`.
         {verdict_type_rules}
-        - `repo_states` maps each repo directory to exactly one of `merged`,
-          `failed`, `untouched`. Required whenever anything was merged or
+        - `repo_states` maps each repo directory to exactly one of `committed`,
+          `failed`, `untouched`. Required whenever anything was committed or
           attempted.
-        - `failure.kind` is one of `merge_conflict`, `non_fast_forward`,
-          `gate_failed`, `commit_count_zero`, `push_failed`,
-          `ac_not_satisfied`, `sensitive_area`, `` (empty when there was no
-          failure).
+        - `failure.kind` is one of `merge_conflict`, `gate_failed`,
+          `commit_count_zero`, `ac_not_satisfied`, `sensitive_area`, ``
+          (empty when there was no failure).
 
         ## Rules
 
@@ -3612,7 +3924,10 @@ for it and continue — do NOT halt for that alone."""
         - Never touch rollouts or items outside `rollout_id={rollout_id}`.
         - Do not dispatch anything. Do not halt the rollout yourself — return
           the `halt` verdict and let the worker do it.
-        - Post at most one comment on the item, summarising your verdict.
+        - Post at most one comment on the item, summarising your verdict. On
+          `merge` it must say the build was APPROVED and that the dispatch
+          worker lands it — not that it was merged, because nothing has
+          reached origin yet.
     """
     )
 
@@ -3764,6 +4079,9 @@ REVIEWER_DISALLOWED_TOOLS: tuple[str, ...] = (
     "mcp__agent-gtd__start_rollout",
     "mcp__agent-gtd__dispatch_item",
     "mcp__agent-gtd__dispatch_rollout",
+    # Advisory only: claude-code engines honour it and it does not match
+    # `git -C <dir> push`. The worker's reviewer-pushed guard is authoritative.
+    "Bash(git push:*)",
 )
 
 

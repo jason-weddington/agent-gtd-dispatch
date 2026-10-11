@@ -126,6 +126,13 @@ REVIEW_MAX_TURNS: int = 40
 # finished one build in this long is wedged, not slow.
 REVIEW_TIMEOUT_SECONDS: int = 45 * 60
 
+# The worker's land step (fetch, rebase onto current origin, gate the exact
+# tree, push).  The gate timeout also bounds the push, because a push may run
+# the repo's own pre-push hook when the project has no gate_command.
+LAND_GATE_TIMEOUT_SECONDS: int = 1800
+# Per-invocation ceiling for every other git call in the land step.
+LAND_GIT_TIMEOUT_SECONDS: int = 120
+
 # Seconds the wave loop sleeps between ticks while builds are in flight.
 # The loop is a poller by necessity — child build runs are executed by a
 # different process (possibly on a different host) and there is no push
@@ -254,6 +261,7 @@ def load() -> None:
     global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
     global MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS, MAX_MANAGE_FREE_RELAUNCHES
     global REVIEWER_ENGINE, REVIEW_MAX_TURNS, REVIEW_TIMEOUT_SECONDS
+    global LAND_GATE_TIMEOUT_SECONDS, LAND_GIT_TIMEOUT_SECONDS
     global ROLLOUT_LOOP_POLL_SECONDS, MAX_ITEM_REDISPATCHES
     global EVIDENCE_ROOT, EVIDENCE_RETENTION_DAYS, WORKSPACE_RETENTION_HOURS
     global RETENTION_INTERVAL_SECONDS
@@ -356,6 +364,12 @@ def load() -> None:
     REVIEW_MAX_TURNS = int(os.environ.get("DISPATCH_REVIEW_MAX_TURNS", "40"))
     REVIEW_TIMEOUT_SECONDS = int(
         os.environ.get("DISPATCH_REVIEW_TIMEOUT_SECONDS", "2700")
+    )
+    LAND_GATE_TIMEOUT_SECONDS = int(
+        os.environ.get("DISPATCH_LAND_GATE_TIMEOUT_SECONDS", "1800")
+    )
+    LAND_GIT_TIMEOUT_SECONDS = int(
+        os.environ.get("DISPATCH_LAND_GIT_TIMEOUT_SECONDS", "120")
     )
     ROLLOUT_LOOP_POLL_SECONDS = int(
         os.environ.get("DISPATCH_ROLLOUT_LOOP_POLL_SECONDS", "30")

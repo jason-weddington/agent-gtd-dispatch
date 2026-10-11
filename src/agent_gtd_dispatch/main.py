@@ -39,6 +39,7 @@ from . import (
     talos,
 )
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
+from .dispatch import LandGitError, LandGitTimeout
 from .engines import (
     COMMON_ENV_KEYS,
     Engine,
@@ -2294,6 +2295,22 @@ _TICK_WAIT = "wait"  # builds in flight — sleep, then re-read
 _TICK_DONE = "done"  # graph_complete, or the rollout left `running`
 _TICK_HALTED = "halted"  # the loop halted the rollout (or it was halted)
 
+# The worker's land step (see `_land_reviewed_merge`).
+# Total `git push` REJECTIONS tolerated per land before it halts; on a
+# monorepo this is exactly the number of push invocations.  Fix relaunches do
+# not count against it.
+MAX_LAND_PUSH_ATTEMPTS: int = 3
+# Reviewer FIX MODE relaunches allowed per land after a red land gate.
+MAX_LAND_FIX_RELAUNCHES: int = 1
+# Watchdog heartbeat cadence while a land waits on locks or a gate.  Must stay
+# below config.MANAGE_STALE_THRESHOLD_SECONDS.
+LAND_HEARTBEAT_SECONDS: int = 300
+
+# (normalized origin URL, default branch) -> lock.  Serializes lands to one
+# remote branch on THIS host, so two items cannot both pass the gate against
+# the same old main.  Cross-host races fall back to push rejection + regate.
+_land_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
 # Guard against a dispatch that reports success but does not move the item out
 # of `next_ready` (the wave linkage is guarded by `AND status = 'ready'`, so a
 # `pending` item would be dispatched forever).  Two attempts, then halt loudly.
@@ -2341,6 +2358,9 @@ class ReviewVerdict(NamedTuple):
     commit_type: str = ""  # audit only; "" when missing/invalid
     commit_type_reason: str = ""
     item_commit_type: str = ""  # groomed type on the item; "" when unset/invalid
+    branch_name: str = ""  # the feature branch reviewed; the land step deletes it
+    # The reviewer's per-repo claim (diagnostic only; the land reads git).
+    repo_states: tuple[tuple[str, str], ...] = ()
 
 
 def _completed_build_item_ids(
@@ -2400,9 +2420,11 @@ async def _publish_rollout_phase(
     The stage -> ``ManagerPhase`` mapping is 1:1 with the existing enum, which
     is why no UI change is needed: ``warm_up`` (adopting the rollout and
     preparing the shared workspace), ``dispatching``, ``polling`` (waiting on
-    in-flight builds), ``reviewing`` and ``merging`` (published by the reviewer
-    itself, which is the agent actually in those phases), ``reconciling_ac``
-    (also the reviewer's), and ``halted``.
+    in-flight builds), ``reviewing`` (published by the reviewer itself, which
+    is the agent actually in that phase), ``merging`` (now published by the
+    worker's land step — :func:`_land_reviewed_merge` — which owns the fetch,
+    rebase, gate and push, and republishes it as a heartbeat while it waits on
+    locks or a gate), ``reconciling_ac`` (the reviewer's), and ``halted``.
     """
     try:
         await gtd_client.update_rollout_state(
@@ -2463,8 +2485,13 @@ async def _launch_reviewer(
     reviewer_engine: Engine,
     token: str | None,
     attribution: str | None,
+    gate_failure_output: str | None = None,
 ) -> ReviewVerdict:
     """Run ONE short-lived reviewer for ONE completed build and read its verdict.
+
+    With *gate_failure_output* set, the reviewer is relaunched in FIX MODE by
+    the land step: the worker's land gate failed on the rebased squash commit,
+    and the reviewer may amend that commit (see ``dispatch.build_review_prompt``).
 
     The reviewer run carries ``mode=DispatchMode.REVIEW``.  That is the chosen
     mechanism for keeping a reviewer's exit away from the manage relaunch
@@ -2528,6 +2555,7 @@ async def _launch_reviewer(
         merge_notes=merge_notes,
         redispatches_used=used,
         redispatch_cap=MAX_ITEM_REDISPATCHES,
+        gate_failure_output=gate_failure_output,
     )
     pinned_subject = dispatch.compose_squash_subject(item)
     logger.info(
@@ -2609,7 +2637,13 @@ async def _launch_reviewer(
             reviewer_run.id,
             reason,
         )
-        return ReviewVerdict("halt", "reviewer returned no usable verdict", "", detail)
+        return ReviewVerdict(
+            "halt",
+            "reviewer returned no usable verdict",
+            "",
+            detail,
+            branch_name=branch_name,
+        )
 
     verdict = str(verdict_blob["verdict"])
     rationale = str(verdict_blob.get("rationale") or "")[
@@ -2670,6 +2704,12 @@ async def _launch_reviewer(
         commit_type,
         commit_type_reason,
         item_commit_type,
+        branch_name,
+        tuple(
+            sorted((str(k), str(v)) for k, v in repo_states.items())
+            if isinstance(repo_states, dict)
+            else ()
+        ),
     )
 
 
@@ -3133,8 +3173,9 @@ async def _act_on_verdict(
       ``skip``, halts as before.
     - **Best effort, never fatal:** the verdict ``gtd_client.post_comment``
       and ``_verify_landed_commit_type``.
-    - Branch deletion is done by the reviewer itself and is not worker
-      bookkeeping.
+    - For a ``merge``, the push has ALREADY happened by the time this runs:
+      :func:`_land_reviewed_merge` fetched, rebased, gated and pushed the
+      reviewer's local squash commit (and deleted the feature branch) first.
     """
     if outcome.verdict == "halt":
         reason = f"reviewer halted item {item_id}: {outcome.rationale}"
@@ -3247,6 +3288,788 @@ async def _act_on_verdict(
     return _TICK_CONTINUE
 
 
+class _LandHalt(Exception):  # noqa: N818 — a control-flow signal, not an error
+    """Raised inside the land step to stop it and halt the rollout.
+
+    ``head`` is the halt reason; ``tail`` (gate output) is appended last and is
+    the part trimmed to fit ``ERROR_TEXT_MAX_CHARS``, keeping its END.
+    """
+
+    def __init__(self, outcome: str, head: str, tail: str = "") -> None:
+        """Record the land outcome code and the halt reason parts."""
+        super().__init__(head)
+        self.outcome = outcome
+        self.head = head
+        self.tail = tail
+
+
+class _Lander:
+    """State for ONE worker-owned land of a reviewer-approved squash commit.
+
+    See :func:`_land_reviewed_merge` for the contract.  Split into a class only
+    because the land threads a dozen pieces of per-attempt state (pushed repos,
+    gated shas, the gate's last result, the fix budget) through every log line
+    and halt reason.
+    """
+
+    def __init__(
+        self,
+        rollout_id: str,
+        item_id: str,
+        outcome: ReviewVerdict,
+        *,
+        project: dict[str, Any],
+        workspace: dispatch.RolloutWorkspace,
+        pre_review_origin: dict[str, str],
+        reviewer_engine: Engine,
+        loop_run_id: str,
+        token: str | None,
+        attribution: str | None,
+    ) -> None:
+        """Capture the land's inputs; nothing runs until :meth:`run`."""
+        self.rollout_id = rollout_id
+        self.item_id = item_id
+        self.outcome = outcome
+        self.project = project
+        self.workspace = workspace
+        self.pre_review_origin = dict(pre_review_origin or {})
+        self.reviewer_engine = reviewer_engine
+        self.loop_run_id = loop_run_id
+        self.token = token
+        self.attribution = attribution
+        self.repos: list[str] = list(workspace.repo_paths)
+        self.branches: dict[str, str] = {
+            r: workspace.default_branches.get(r) or "main" for r in self.repos
+        }
+        raw_gate = project.get("gate_command")
+        self.gate_command = raw_gate.strip() if isinstance(raw_gate, str) else ""
+        self.landing: list[str] = []
+        self.pushed: dict[str, str] = {}
+        self.push_round = 0
+        self.fix_relaunches = 0
+        self.fix_files = 0
+        self.fix_rationale = ""
+        self.base_after: dict[str, str] = {}
+        self.origin_advanced: dict[str, int] = {}
+        self.gated: dict[str, str] = {}
+        self.gate_state = "not_run"
+        self.gate_rc = "-"
+        self.gate_secs = 0.0
+        self.step = "Land: starting"
+
+    # -- plumbing ---------------------------------------------------------
+
+    async def _git(
+        self, repo: str, fn: Callable[..., Any], *args: Any, **kw: Any
+    ) -> Any:
+        """Run a sync dispatch land helper in the executor, mapping git errors."""
+        try:
+            return await asyncio.get_running_loop().run_in_executor(
+                dispatch._executor, functools.partial(fn, *args, **kw)
+            )
+        except LandGitTimeout as exc:
+            raise _LandHalt(
+                "git_timeout",
+                f"land git timed out for item {self.item_id}: "
+                f"git {exc.command} in {repo}",
+            ) from exc
+        except LandGitError as exc:
+            raise _LandHalt(
+                "bad_local_state",
+                f"land bad local state for item {self.item_id}: repo {repo}: {exc}",
+            ) from exc
+
+    def _path(self, repo: str) -> Path:
+        return self.workspace.repo_paths[repo]
+
+    async def publish(self, step: str) -> None:
+        """Publish ``merging`` with *step*; the heartbeat republishes it."""
+        self.step = step
+        await _publish_rollout_phase(
+            self.rollout_id,
+            "merging",
+            item_id=self.item_id,
+            step=step[:200],
+            token=self.token,
+        )
+
+    async def _heartbeat(self, stop: asyncio.Event) -> None:
+        # wait_for on an Event rather than asyncio.sleep: the heartbeat must
+        # yield to the loop even where a test has patched sleep away.
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=LAND_HEARTBEAT_SECONDS)
+                return
+            except TimeoutError:
+                await _publish_rollout_phase(
+                    self.rollout_id,
+                    "merging",
+                    item_id=self.item_id,
+                    step=self.step[:200],
+                    token=self.token,
+                )
+
+    def _log_land(self, repo: str, outcome: str, pushed_sha: str = "-") -> None:
+        logger.log(
+            logging.INFO if outcome == "pushed" else logging.WARNING,
+            "rollout-loop: land rollout_id=%s item_id=%s push_attempt=%d/%d "
+            "fix_relaunches=%d repo=%s base_before=%s base_after=%s "
+            "origin_advanced=%d gated_sha=%s pushed_sha=%s gate=%s gate_rc=%s "
+            "gate_secs=%.1f outcome=%s",
+            self.rollout_id,
+            self.item_id,
+            self.push_round,
+            MAX_LAND_PUSH_ATTEMPTS,
+            self.fix_relaunches,
+            repo,
+            self.pre_review_origin.get(repo) or "-",
+            self.base_after.get(repo) or "-",
+            self.origin_advanced.get(repo, 0),
+            self.gated.get(repo) or "-",
+            pushed_sha,
+            self.gate_state,
+            self.gate_rc,
+            self.gate_secs,
+            outcome,
+        )
+
+    # -- the steps --------------------------------------------------------
+
+    async def _fetch(self, repo: str) -> None:
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        branch = self.branches[repo]
+        await self._git(repo, dispatch.land_fetch, self._path(repo), branch, timeout)
+        base_after = await self._git(
+            repo, dispatch.land_rev_parse, self._path(repo), f"origin/{branch}", timeout
+        )
+        self.base_after[repo] = base_after
+        self.origin_advanced[repo] = await self._git(
+            repo,
+            dispatch.land_count_between,
+            self._path(repo),
+            self.pre_review_origin.get(repo, ""),
+            base_after,
+            timeout,
+        )
+
+    async def _lock_keys(self) -> list[tuple[str, str]]:
+        keys: set[tuple[str, str]] = set()
+        for repo in self.repos:
+            url = await self._git(
+                repo,
+                dispatch.land_remote_url,
+                self._path(repo),
+                config.LAND_GIT_TIMEOUT_SECONDS,
+            )
+            keys.add((url, self.branches[repo]))
+        return sorted(keys)
+
+    async def _reviewer_pushed_guard(self) -> None:
+        hits: list[str] = []
+        for repo in self.repos:
+            base = self.pre_review_origin.get(repo) or ""
+            if not base:
+                logger.warning(
+                    "rollout-loop: land reviewer-pushed guard skipped rollout_id=%s "
+                    "item_id=%s repo=%s reason=no-pre-review-origin",
+                    self.rollout_id,
+                    self.item_id,
+                    repo,
+                )
+                continue
+            shas = await self._git(
+                repo,
+                dispatch.land_reviewer_pushed,
+                self._path(repo),
+                base,
+                self.branches[repo],
+                self.rollout_id,
+                self.item_id,
+                config.LAND_GIT_TIMEOUT_SECONDS,
+            )
+            if shas:
+                hits.append(repo)
+        if hits:
+            raise _LandHalt(
+                "reviewer_pushed",
+                f"commit for item {self.item_id} appeared on origin during review, "
+                f"before the worker's land: {', '.join(hits)}",
+            )
+
+    async def _check_landing_repo(self, repo: str) -> None:
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        path = self._path(repo)
+        branch = self.branches[repo]
+        prefix = f"land bad local state for item {self.item_id}: repo {repo}"
+        current = await self._git(repo, dispatch.land_current_branch, path, timeout)
+        if current != branch:
+            raise _LandHalt(
+                "bad_local_state",
+                f"{prefix}: HEAD is on {current!r}, not the default branch {branch!r}",
+            )
+        ahead = await self._git(repo, dispatch.land_ahead_count, path, branch, timeout)
+        if ahead != 1:
+            raise _LandHalt(
+                "bad_local_state",
+                f"{prefix}: {ahead} commit(s) ahead of origin/{branch}, "
+                "expected exactly 1 squash commit",
+            )
+        if not await self._git(
+            repo, dispatch.land_has_item_trailer, path, branch, self.item_id, timeout
+        ):
+            raise _LandHalt(
+                "bad_local_state",
+                f"{prefix}: the squash commit carries no 'Item: {self.item_id}' "
+                "trailer",
+            )
+
+    async def _landing_set(self, *, report_disagreement: bool) -> list[str]:
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        claims = dict(self.outcome.repo_states)
+        landing: list[str] = []
+        for repo in self.repos:
+            ahead = await self._git(
+                repo,
+                dispatch.land_ahead_count,
+                self._path(repo),
+                self.branches[repo],
+                timeout,
+            )
+            if ahead >= 1:
+                landing.append(repo)
+            claim = claims.get(repo, "-")
+            if report_disagreement and (claim == "committed") != (ahead >= 1):
+                logger.warning(
+                    "rollout-loop: land-state-disagreement rollout_id=%s item_id=%s "
+                    "repo=%s reviewer_claim=%s git_ahead=%d",
+                    self.rollout_id,
+                    self.item_id,
+                    repo,
+                    claim,
+                    ahead,
+                )
+        if not landing:
+            raise _LandHalt(
+                "no_squash_commit",
+                f"merge verdict but no local squash commit for item {self.item_id} "
+                f"in any repo ({', '.join(self.repos)})",
+            )
+        for repo in landing:
+            await self._check_landing_repo(repo)
+        return landing
+
+    async def _install_gate(self) -> None:
+        root = self.workspace.root
+        if self.workspace.workspace_mode:
+            gate_repos = [(d, root / d) for d in self.repos]
+        else:
+            gate_repos = [
+                (
+                    dispatch.repo_name_from_origin(
+                        str(self.project.get("git_origin", ""))
+                    ),
+                    root,
+                )
+            ]
+        steps = gates.detect_gate_steps(gate_repos, run_id=self.loop_run_id)
+        if not steps:
+            return
+        failure = await asyncio.get_running_loop().run_in_executor(
+            dispatch._executor,
+            functools.partial(
+                gates.run_gate_steps,
+                steps,
+                config.GATE_INSTALL_TIMEOUT_SECONDS,
+                run_id=self.loop_run_id,
+            ),
+        )
+        if failure is not None:
+            raise _LandHalt(
+                "gate_install_failed",
+                f"land gate install failed for item {self.item_id}: "
+                f"{failure.repo_label}: {failure.step}: {failure.reason}",
+            )
+
+    async def _reset_non_landing(self) -> None:
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        for repo in self.repos:
+            if repo in self.landing:
+                continue
+            path = self._path(repo)
+            branch = self.branches[repo]
+            await self._fetch(repo)
+            ahead = await self._git(
+                repo, dispatch.land_ahead_count, path, branch, timeout
+            )
+            if ahead != 0:
+                raise _LandHalt(
+                    "bad_local_state",
+                    f"land bad local state for item {self.item_id}: repo {repo}: "
+                    f"not in the landing set but {ahead} commit(s) ahead of "
+                    f"origin/{branch}",
+                )
+            await self._git(repo, dispatch.land_reset_to_origin, path, branch, timeout)
+
+    async def _run_gate(self) -> dispatch.GateResult:
+        await self.publish(f"Land: running the project gate for {self.item_id}")
+
+        def _land_popen_cb(proc: subprocess.Popen[bytes]) -> None:
+            _active_subprocesses[self.loop_run_id] = proc
+
+        try:
+            result: dispatch.GateResult = (
+                await asyncio.get_running_loop().run_in_executor(
+                    dispatch._executor,
+                    functools.partial(
+                        dispatch.run_gate_command,
+                        self.workspace.root,
+                        self.gate_command,
+                        config.LAND_GATE_TIMEOUT_SECONDS,
+                        self.reviewer_engine,
+                        _land_popen_cb,
+                    ),
+                )
+            )
+        finally:
+            _active_subprocesses.pop(self.loop_run_id, None)
+        self.gate_rc = str(result.returncode)
+        self.gate_secs = result.duration_seconds
+        if result.timed_out:
+            self.gate_state = "timed_out"
+        elif result.returncode is None:
+            self.gate_state = "launch_error"
+        elif result.returncode != 0:
+            self.gate_state = "failed"
+        else:
+            self.gate_state = "passed"
+        return result
+
+    async def _fix_relaunch(self, result: dispatch.GateResult) -> None:
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        self.fix_relaunches += 1
+        before = dict(self.gated)
+        for repo in self.landing:
+            self._log_land(repo, "fix_relaunched")
+        await self.publish(
+            f"Land: gate failed for {self.item_id} — relaunching the reviewer to fix"
+        )
+        fix = await _launch_reviewer(
+            self.rollout_id,
+            self.item_id,
+            project=self.project,
+            workspace=self.workspace,
+            reviewer_engine=self.reviewer_engine,
+            token=self.token,
+            attribution=self.attribution,
+            gate_failure_output=result.output,
+        )
+        if fix.verdict != "merge":
+            raise _LandHalt(
+                "fix_verdict_not_merge",
+                f"land gate failed for item {self.item_id} and the fix relaunch "
+                f"returned {fix.verdict!r}: {fix.rationale}",
+            )
+        self.fix_rationale = fix.rationale
+        for repo in self.repos:
+            await self._fetch(repo)
+        landing = await self._landing_set(report_disagreement=False)
+        if landing != self.landing:
+            raise _LandHalt(
+                "bad_local_state",
+                f"land bad local state for item {self.item_id}: the fix relaunch "
+                f"changed the landing set from {self.landing} to {landing}",
+            )
+        files = ins = dels = 0
+        paths: list[str] = []
+        for repo in self.landing:
+            after = await self._git(
+                repo, dispatch.land_rev_parse, self._path(repo), "HEAD", timeout
+            )
+            f, i, d, p = await self._git(
+                repo,
+                dispatch.land_diff_stat,
+                self._path(repo),
+                before.get(repo, ""),
+                after,
+                timeout,
+            )
+            files, ins, dels = files + f, ins + i, dels + d
+            paths += [f"{repo}/{x}" if self.workspace.workspace_mode else x for x in p]
+        self.fix_files = files
+        logger.info(
+            "rollout-loop: land-fix rollout_id=%s item_id=%s files_changed=%d "
+            "insertions=%d deletions=%d paths=%s",
+            self.rollout_id,
+            self.item_id,
+            files,
+            ins,
+            dels,
+            ",".join(paths) or "-",
+        )
+
+    def _gate_halt(self, result: dispatch.GateResult) -> _LandHalt:
+        if result.timed_out:
+            return _LandHalt(
+                "gate_timed_out",
+                f"land gate timed out for item {self.item_id} after "
+                f"{result.duration_seconds:.0f}s",
+            )
+        if result.returncode is None:
+            return _LandHalt(
+                "gate_launch_error",
+                f"land gate launch error for item {self.item_id}: {result.output}",
+            )
+        return _LandHalt(
+            "gate_failed",
+            f"land gate failed for item {self.item_id}: ",
+            tail=result.output,
+        )
+
+    async def _push_round(self, remaining: list[str], *, gate_on: bool) -> bool:
+        """Push every remaining repo in order. Returns True if one was rejected."""
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        self.push_round += 1
+        for repo in remaining:
+            path = self._path(repo)
+            branch = self.branches[repo]
+            await self.publish(
+                f"Land: pushing {repo} (push attempt "
+                f"{self.push_round}/{MAX_LAND_PUSH_ATTEMPTS})"
+            )
+            status, excerpt = await self._git(
+                repo,
+                dispatch.land_push,
+                path,
+                self.gated[repo],
+                branch,
+                no_verify=gate_on,
+                timeout=config.LAND_GATE_TIMEOUT_SECONDS,
+            )
+            if status == "non_fast_forward":
+                self._log_land(repo, "non_fast_forward")
+                if self.push_round >= MAX_LAND_PUSH_ATTEMPTS:
+                    raise _LandHalt(
+                        "push_attempts_exhausted",
+                        f"land push rejected {self.push_round} times for item "
+                        f"{self.item_id} (repo {repo}): {excerpt[:500]}",
+                    )
+                return True
+            if status != "pushed":
+                raise _LandHalt(
+                    "push_failed",
+                    f"land push failed for item {self.item_id}: repo {repo}: {excerpt}",
+                )
+            remote = await self._git(
+                repo, dispatch.land_ls_remote, path, branch, timeout
+            )
+            if remote != self.gated[repo]:
+                logger.error(
+                    "rollout-loop: land-audit rollout_id=%s item_id=%s repo=%s "
+                    "gated_sha=%s remote_sha=%s outcome=mismatch",
+                    self.rollout_id,
+                    self.item_id,
+                    repo,
+                    self.gated[repo],
+                    remote or "-",
+                )
+                raise _LandHalt(
+                    "audit_mismatch",
+                    f"land audit mismatch: remote {remote or '(none)'} != gated "
+                    f"{self.gated[repo]} for item {self.item_id} in {repo}",
+                )
+            logger.info(
+                "rollout-loop: land-audit rollout_id=%s item_id=%s repo=%s "
+                "gated_sha=%s remote_sha=%s outcome=match",
+                self.rollout_id,
+                self.item_id,
+                repo,
+                self.gated[repo],
+                remote,
+            )
+            self.pushed[repo] = self.gated[repo]
+            self._log_land(repo, "pushed", pushed_sha=self.gated[repo])
+        return False
+
+    async def _land(self) -> ReviewVerdict:
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        await self.publish(f"Land: fetching origin for {self.item_id}")
+        for repo in self.repos:
+            await self._fetch(repo)
+        await self._reviewer_pushed_guard()
+        self.landing = await self._landing_set(report_disagreement=True)
+
+        gate_on = bool(self.gate_command)
+        if gate_on:
+            await self._install_gate()
+        else:
+            self.gate_state = "skipped_no_gate_command"
+            logger.info(
+                "rollout-loop: land-gate skipped_no_gate_command rollout_id=%s "
+                "item_id=%s",
+                self.rollout_id,
+                self.item_id,
+            )
+
+        first = True
+        while True:
+            remaining = [r for r in self.landing if r not in self.pushed]
+            await self.publish(f"Land: rebasing {', '.join(remaining)} onto origin")
+            # Rebase EVERY remaining repo before anything is pushed, so a
+            # conflict halts with nothing (more) pushed.
+            for repo in remaining:
+                if not first:
+                    await self._fetch(repo)
+                ok, paths, excerpt = await self._git(
+                    repo,
+                    dispatch.land_rebase,
+                    self._path(repo),
+                    self.branches[repo],
+                    timeout,
+                )
+                if not ok:
+                    detail = (
+                        f"conflicting paths: {', '.join(paths)}"
+                        if paths
+                        else f"no conflicting paths reported; git: {excerpt[:500]}"
+                    )
+                    raise _LandHalt(
+                        "rebase_conflict",
+                        f"land rebase conflict for item {self.item_id} in repo "
+                        f"{repo}: {detail}",
+                    )
+                await self._check_landing_repo(repo)
+            first = False
+            if self.workspace.workspace_mode:
+                await self._reset_non_landing()
+            for repo in remaining:
+                self.gated[repo] = await self._git(
+                    repo, dispatch.land_rev_parse, self._path(repo), "HEAD", timeout
+                )
+            if gate_on:
+                result = await self._run_gate()
+                if not result.passed:
+                    if (
+                        self.gate_state == "failed"
+                        and not self.pushed
+                        and self.fix_relaunches < MAX_LAND_FIX_RELAUNCHES
+                    ):
+                        await self._fix_relaunch(result)
+                        continue
+                    raise self._gate_halt(result)
+                for repo in remaining:
+                    head = await self._git(
+                        repo, dispatch.land_rev_parse, self._path(repo), "HEAD", timeout
+                    )
+                    if head != self.gated[repo]:
+                        logger.error(
+                            "rollout-loop: land-invariant-violation rollout_id=%s "
+                            "item_id=%s repo=%s gated_sha=%s head_after_gate=%s",
+                            self.rollout_id,
+                            self.item_id,
+                            repo,
+                            self.gated[repo],
+                            head,
+                        )
+                        raise _LandHalt(
+                            "bad_local_state",
+                            f"land bad local state for item {self.item_id}: repo "
+                            f"{repo}: HEAD moved during the gate "
+                            f"({self.gated[repo]} -> {head})",
+                        )
+            if not await self._push_round(remaining, gate_on=gate_on):
+                break
+        return await self._finish(gate_on=gate_on)
+
+    async def _finish(self, *, gate_on: bool) -> ReviewVerdict:
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        branch_name = self.outcome.branch_name
+        if branch_name:
+            for repo in self.landing:
+                notes = await self._git(
+                    repo,
+                    dispatch.land_delete_feature_branch,
+                    self._path(repo),
+                    branch_name,
+                    timeout,
+                )
+                for note in notes:
+                    logger.warning(
+                        "rollout-loop: land branch-cleanup-failed rollout_id=%s "
+                        "item_id=%s repo=%s branch=%s detail=%s",
+                        self.rollout_id,
+                        self.item_id,
+                        repo,
+                        branch_name,
+                        note,
+                    )
+        gate_text = (
+            f"passed in {self.gate_secs:.1f}s"
+            if gate_on
+            else "SKIPPED — project has no gate_command"
+        )
+        fix_text = (
+            f"used, amended {self.fix_files} file(s)" if self.fix_relaunches else "none"
+        )
+        lines = [
+            f"Landed {self.pushed[repo][:12]} on {repo}/{self.branches[repo]} "
+            f"(rebased over {self.origin_advanced.get(repo, 0)} new origin "
+            f"commit(s); gate: {gate_text}; push attempts: {self.push_round}; "
+            f"fix relaunch: {fix_text})"
+            for repo in self.landing
+        ]
+        try:
+            await gtd_client.post_comment(
+                self.item_id,
+                "\n".join(lines),
+                created_by=self.attribution or "agent-gtd-dispatch",
+                token=self.token,
+            )
+        except Exception:
+            logger.warning(
+                "rollout-loop: failed to post land comment on item %s", self.item_id
+            )
+        if self.fix_relaunches:
+            return self.outcome._replace(
+                rationale=f"{self.outcome.rationale} (land fix: {self.fix_rationale})"
+            )
+        return self.outcome
+
+    async def _halt(self, halt: _LandHalt) -> str:
+        for repo in self.landing or self.repos:
+            if repo not in self.pushed:
+                self._log_land(repo, halt.outcome)
+        status = ""
+        if self.pushed:
+            status = (
+                "("
+                + ", ".join(
+                    f"{r}: {'pushed' if r in self.pushed else 'not pushed'}"
+                    for r in self.landing
+                )
+                + ")"
+            )
+        if halt.tail:
+            head = f"{halt.head}{status + ' ' if status else ''}"
+            budget = max(ERROR_TEXT_MAX_CHARS - len(head), 0)
+            reason = head + (halt.tail[-budget:] if budget else "")
+        else:
+            reason = f"{halt.head} {status}".rstrip()
+        return await _halt_rollout_from_loop(
+            self.rollout_id,
+            reason[:ERROR_TEXT_MAX_CHARS],
+            item_id=self.item_id,
+            token=self.token,
+            attribution=self.attribution,
+        )
+
+    async def run(self) -> ReviewVerdict | str:
+        """Acquire the locks, land, release. Returns the verdict or a halt."""
+        await self.publish(f"Land: starting for {self.item_id}")
+        stop = asyncio.Event()
+        heartbeat = asyncio.create_task(self._heartbeat(stop))
+        held: list[asyncio.Lock] = []
+        keys: list[tuple[str, str]] = []
+        acquired_at = 0.0
+        try:
+            try:
+                keys = await self._lock_keys()
+                wait_start = time.monotonic()
+                for key in keys:
+                    lock = _land_locks.setdefault(key, asyncio.Lock())
+                    await lock.acquire()
+                    held.append(lock)
+                acquired_at = time.monotonic()
+                logger.info(
+                    "rollout-loop: land-lock rollout_id=%s item_id=%s keys=%s "
+                    "waited_secs=%.1f",
+                    self.rollout_id,
+                    self.item_id,
+                    keys,
+                    acquired_at - wait_start,
+                )
+                await self.publish(f"Land: lock acquired for {self.item_id}")
+                return await self._land()
+            except _LandHalt as halt:
+                return await self._halt(halt)
+        finally:
+            for lock in reversed(held):
+                lock.release()
+            if held:
+                logger.info(
+                    "rollout-loop: land-lock-release rollout_id=%s item_id=%s "
+                    "keys=%s held_secs=%.1f",
+                    self.rollout_id,
+                    self.item_id,
+                    keys,
+                    time.monotonic() - acquired_at,
+                )
+            stop.set()
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
+
+
+async def _land_reviewed_merge(
+    rollout_id: str,
+    item_id: str,
+    outcome: ReviewVerdict,
+    *,
+    project: dict[str, Any],
+    workspace: dispatch.RolloutWorkspace,
+    pre_review_origin: dict[str, str],
+    reviewer_engine: Engine,
+    loop_run_id: str,
+    token: str | None,
+    attribution: str | None,
+) -> ReviewVerdict | str:
+    """Land a reviewer-approved squash commit: fetch, rebase, gate, push.
+
+    The reviewer approves a build by creating its squash commit LOCALLY and
+    never pushes.  Items that were gate-green on their own clones can still
+    break ``main`` together when one carries a contract another changes (a test
+    asserting state the other item moves), which file-overlap planning cannot
+    see.  So, immediately before the push, the worker rebases the squash onto
+    freshly fetched ``origin/<default>``, runs the project's ``gate_command``
+    on that exact tree, and pushes exactly the gated sha — only on green.
+
+    Contract, in order:
+
+    - Per-remote locks (``_land_locks``) for every repo in the workspace,
+      acquired in sorted key order and held until the final push or halt, so
+      two lands on this host never gate against the same old main.
+    - A time-scoped reviewer-pushed guard: a commit for this item that reached
+      origin after ``pre_review_origin`` halts with nothing pushed.
+    - The landing set is read from git (repos exactly one trailer-bearing
+      commit ahead of origin, HEAD on the default branch), not from the
+      reviewer's ``repo_states``.
+    - Rebase every not-yet-pushed landing repo, reset non-landing repos to
+      origin (workspace mode), gate once from the workspace root, push in repo
+      order with ``--no-verify`` (the land gate just judged that exact sha; a
+      project with no ``gate_command`` pushes WITH hooks instead).
+    - A red gate before any push gets ONE reviewer FIX MODE relaunch; a
+      non-fast-forward push re-fetches, re-rebases and re-gates, bounded by
+      ``MAX_LAND_PUSH_ATTEMPTS``; every other failure halts.
+    - Each pushed sha is audited with ``ls-remote``; then the feature branch
+      is deleted (best effort) and one comment is posted on the item.
+
+    Returns:
+        The original verdict (with any fix rationale appended) on success, or
+        the ``_TICK_HALTED`` directive after halting the rollout.
+    """
+    return await _Lander(
+        rollout_id,
+        item_id,
+        outcome,
+        project=project,
+        workspace=workspace,
+        pre_review_origin=pre_review_origin,
+        reviewer_engine=reviewer_engine,
+        loop_run_id=loop_run_id,
+        token=token,
+        attribution=attribution,
+    ).run()
+
+
 async def _rollout_wave_tick(
     rollout_id: str,
     *,
@@ -3256,6 +4079,7 @@ async def _rollout_wave_tick(
     dispatch_attempts: dict[str, int],
     token: str | None,
     attribution: str | None,
+    loop_run_id: str,
 ) -> str:
     """One pass of the wave loop. Returns a ``_TICK_*`` directive.
 
@@ -3334,6 +4158,19 @@ async def _rollout_wave_tick(
         await asyncio.get_running_loop().run_in_executor(
             None, dispatch.refresh_rollout_workspace, workspace
         )
+        # Origin's tip per repo as the reviewer starts: the reviewer-pushed
+        # guard in the land step only looks at commits that landed AFTER this.
+        pre_review_origin: dict[
+            str, str
+        ] = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                dispatch.land_origin_shas,
+                dict(workspace.repo_paths),
+                dict(workspace.default_branches),
+                config.LAND_GIT_TIMEOUT_SECONDS,
+            ),
+        )
         await _publish_rollout_phase(
             rollout_id,
             "reviewing",
@@ -3351,6 +4188,22 @@ async def _rollout_wave_tick(
             attribution=attribution,
         )
         dispatch_attempts.pop(item_id, None)
+        if outcome.verdict == "merge":
+            landed = await _land_reviewed_merge(
+                rollout_id,
+                item_id,
+                outcome,
+                project=project,
+                workspace=workspace,
+                pre_review_origin=pre_review_origin,
+                reviewer_engine=reviewer_engine,
+                loop_run_id=loop_run_id,
+                token=token,
+                attribution=attribution,
+            )
+            if isinstance(landed, str):
+                return landed
+            outcome = landed
         return await _act_on_verdict(
             rollout_id,
             item_id,
@@ -3493,6 +4346,7 @@ async def _drive_rollout(
                 dispatch_attempts=dispatch_attempts,
                 token=token,
                 attribution=attribution,
+                loop_run_id=run.id,
             )
             if directive in (_TICK_DONE, _TICK_HALTED):
                 return directive

@@ -1757,6 +1757,7 @@ async def _tick(ctx, **overrides):
         "dispatch_attempts": {},
         "token": None,
         "attribution": None,
+        "loop_run_id": "loop-run-1",
     }
     kwargs.update(overrides)
     return await _rollout_wave_tick("rollout-abc", **kwargs)
@@ -2282,7 +2283,15 @@ class TestLaunchReviewer:
         return {"id": "item-a", "title": "Do it", "acceptance_criteria": ["works"]}
 
     async def _launch(
-        self, ctx, *, verdict_blob, reason, exit_code=0, raises=None, item=None
+        self,
+        ctx,
+        *,
+        verdict_blob,
+        reason,
+        exit_code=0,
+        raises=None,
+        item=None,
+        **extra,
     ):
         from agent_gtd_dispatch.main import _launch_reviewer
 
@@ -2326,7 +2335,44 @@ class TestLaunchReviewer:
             reviewer_engine=SimpleNamespace(name="claude-code-sonnet"),
             token=None,
             attribution=None,
+            **extra,
         )
+
+    async def test_branch_name_and_repo_states_are_carried(self) -> None:
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "merge",
+                    "rationale": "ok",
+                    "merge_note": "n",
+                    "repo_states": {"repo-a": "committed"},
+                },
+                reason="ok",
+            )
+        assert outcome.branch_name == "feat/item-a"
+        assert outcome.repo_states == (("repo-a", "committed"),)
+        kwargs = ctx.dispatch.build_review_prompt.call_args.kwargs
+        assert kwargs["gate_failure_output"] is None
+
+    async def test_gate_failure_output_reaches_the_prompt(self) -> None:
+        with _loop_patch_stack() as ctx:
+            await self._launch(
+                ctx,
+                verdict_blob={"schema_version": 1, "verdict": "halt", "rationale": "x"},
+                reason="ok",
+                gate_failure_output="GATE-TAIL",
+            )
+        kwargs = ctx.dispatch.build_review_prompt.call_args.kwargs
+        assert kwargs["gate_failure_output"] == "GATE-TAIL"
+        ctx.dispatch.clear_review_verdict.assert_called_once()
+
+    async def test_no_verdict_still_carries_the_branch(self) -> None:
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(ctx, verdict_blob=None, reason="absent")
+        assert outcome.verdict == "halt"
+        assert outcome.branch_name == "feat/item-a"
 
     async def test_valid_verdict_is_returned_and_the_run_succeeds(self) -> None:
         with _loop_patch_stack() as ctx:
@@ -3061,6 +3107,109 @@ class TestCommitTypeVerification:
             )
             await _tick(ctx, workspace_ref=[ws])
         assert act.await_args.kwargs["workspace"] is ws
+
+
+class TestWaveTickLandStep:
+    """A merge verdict goes through the worker's land step before bookkeeping."""
+
+    @staticmethod
+    def _reviewable(ctx) -> None:
+        ctx.gtd.advance_rollout = AsyncMock(
+            return_value={
+                "next_ready": [],
+                "in_progress": ["item-a"],
+                "blocked": [],
+                "graph_complete": False,
+            }
+        )
+        ctx.gtd.get_rollout = AsyncMock(
+            return_value={"status": "running", "inFlightBuildRuns": []}
+        )
+
+    async def test_merge_lands_then_acts_on_the_returned_verdict(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE, ReviewVerdict
+
+        original = ReviewVerdict("merge", "r", "note", "")
+        landed = original._replace(rationale="r (land fix: y)")
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._launch_reviewer",
+                new=AsyncMock(return_value=original),
+            ),
+            patch(
+                "agent_gtd_dispatch.main._land_reviewed_merge",
+                new=AsyncMock(return_value=landed),
+            ) as land,
+            patch(
+                "agent_gtd_dispatch.main._act_on_verdict",
+                new=AsyncMock(return_value=_TICK_CONTINUE),
+            ) as act,
+        ):
+            ctx.dispatch.land_origin_shas = MagicMock(return_value={"repo-a": "abc"})
+            self._reviewable(ctx)
+            assert await _tick(ctx) == _TICK_CONTINUE
+        kwargs = land.await_args.kwargs
+        assert kwargs["pre_review_origin"] == {"repo-a": "abc"}
+        assert kwargs["loop_run_id"] == "loop-run-1"
+        assert land.await_args.args[2] is original
+        assert act.await_args.args[2] is landed
+
+    async def test_land_halt_skips_act_on_verdict(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED, ReviewVerdict
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._launch_reviewer",
+                new=AsyncMock(return_value=ReviewVerdict("merge", "r", "n", "")),
+            ),
+            patch(
+                "agent_gtd_dispatch.main._land_reviewed_merge",
+                new=AsyncMock(return_value=_TICK_HALTED),
+            ),
+            patch("agent_gtd_dispatch.main._act_on_verdict", new=AsyncMock()) as act,
+        ):
+            self._reviewable(ctx)
+            assert await _tick(ctx) == _TICK_HALTED
+        act.assert_not_awaited()
+        ctx.gtd.complete_in_rollout.assert_not_awaited()
+
+    @pytest.mark.parametrize("verdict", ["re-dispatch", "skip", "halt"])
+    async def test_other_verdicts_bypass_the_land(self, verdict) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE, ReviewVerdict
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._launch_reviewer",
+                new=AsyncMock(return_value=ReviewVerdict(verdict, "r", "", "")),
+            ),
+            patch("agent_gtd_dispatch.main._land_reviewed_merge") as land,
+            patch(
+                "agent_gtd_dispatch.main._act_on_verdict",
+                new=AsyncMock(return_value=_TICK_CONTINUE),
+            ),
+        ):
+            self._reviewable(ctx)
+            await _tick(ctx)
+        land.assert_not_called()
+
+    async def test_drive_rollout_passes_its_run_id(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_DONE, _drive_rollout
+
+        run = Run(project_name="p", mode="manage", rollout_id="rollout-abc", engine="x")
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._rollout_wave_tick",
+                new=AsyncMock(return_value=_TICK_DONE),
+            ) as tick,
+        ):
+            ctx.gtd.get_rollout = AsyncMock(return_value={"project_id": "p1"})
+            ctx.gtd.get_project = AsyncMock(return_value={"name": "P"})
+            await _drive_rollout(run)
+        assert tick.await_args.kwargs["loop_run_id"] == run.id
 
 
 # ---------------------------------------------------------------------------
