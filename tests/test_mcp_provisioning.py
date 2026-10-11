@@ -47,38 +47,17 @@ def _entry_names(proc: subprocess.CompletedProcess[str]) -> list[str]:
 
 
 class TestMcpServersRender:
-    def test_personal_kb_registered_with_expected_args(self) -> None:
+    def test_kb_servers_not_rendered_even_when_configured(self) -> None:
         proc = _render(
-            {"PERSONAL_KB_URL": "https://kb.example", "PERSONAL_KB_API_KEY": "pk-test"}
+            {
+                "PERSONAL_KB_URL": "https://kb.example",
+                "PERSONAL_KB_API_KEY": "pk-test",
+                "TEAM_KB_URL": "https://team-kb.example",
+                "TEAM_KB_API_KEY": "tk-test",
+            }
         )
         assert proc.returncode == 0, proc.stderr
-        line = next(
-            ln for ln in proc.stdout.splitlines() if ln.startswith("personal-kb|")
-        )
-        assert "-e PERSONAL_KB_URL=https://kb.example" in line
-        assert "-e PERSONAL_KB_API_KEY=pk-test" in line
-        assert "-e KB_CONTRIBUTOR=jason" in line
-        # PEP 508 form: the extra belongs to the PACKAGE NAME, not the URL path.
-        # `git+ssh://...personal_kb[postgres]@<ref>` makes git clone a repo
-        # literally named "personal_kb[postgres]@<ref>" and fails at launch.
-        assert "personal-kb[postgres]@git+ssh://" in line
-        assert line.endswith(" personal-kb")
-        assert "ANTHROPIC_API_KEY" not in line
-        assert "KB_DATABASE_URL" not in line
-        assert "KB_INSTANCE_ROLE" not in line
-
-    def test_team_kb_registered_with_expected_args(self) -> None:
-        proc = _render(
-            {"TEAM_KB_URL": "https://team-kb.example", "TEAM_KB_API_KEY": "tk-test"}
-        )
-        assert proc.returncode == 0, proc.stderr
-        line = next(ln for ln in proc.stdout.splitlines() if ln.startswith("team-kb|"))
-        assert "-e PERSONAL_KB_URL=https://team-kb.example" in line
-        assert "-e PERSONAL_KB_API_KEY=tk-test" in line
-        assert "-e KB_INSTANCE_ROLE=team" in line
-        assert "-e KB_TEAM=grit-mile" in line
-        assert "KB_CONTRIBUTOR" not in line
-        assert "KB_DATABASE_URL" not in line
+        assert _entry_names(proc) == ["agent-gtd", "aws-documentation-mcp-server"]
 
     def test_no_kb_vars_yields_two_servers(self) -> None:
         proc = _render({})
@@ -95,20 +74,6 @@ class TestMcpServersRender:
         assert proc.returncode == 0, proc.stderr
         assert _entry_names(proc) == ["agent-gtd", "aws-documentation-mcp-server"]
 
-    def test_personal_kb_mcp_src_override(self) -> None:
-        proc = _render(
-            {
-                "PERSONAL_KB_URL": "https://kb.example",
-                "PERSONAL_KB_API_KEY": "pk-test",
-                "PERSONAL_KB_MCP_SRC": "git+ssh://example/x@deadbeef",
-            }
-        )
-        assert proc.returncode == 0, proc.stderr
-        line = next(
-            ln for ln in proc.stdout.splitlines() if ln.startswith("personal-kb|")
-        )
-        assert "--from git+ssh://example/x@deadbeef personal-kb" in line
-
 
 class TestTextGuards:
     def test_mcp_servers_sh(self) -> None:
@@ -116,6 +81,8 @@ class TestTextGuards:
         assert "-e ANTHROPIC_API_KEY=" not in text
         assert "KB_ANTHROPIC_API_KEY" not in text
         assert "KB_DATABASE_URL" not in text
+        assert "ubuntu-vm01" not in text
+        assert "PERSONAL_KB_MCP_SRC" not in text
         for token in ("warn ", "info ", "die ", "would "):
             assert token not in text
 
@@ -139,12 +106,10 @@ class TestTextGuards:
         assert "/api/health" in text
         assert (
             'would "read AGENT_GTD_URL, AGENT_GTD_API_KEY, AGENT_GTD_MCP_SRC, '
-            "PERSONAL_KB_URL, PERSONAL_KB_API_KEY, TEAM_KB_URL, TEAM_KB_API_KEY, "
-            'PERSONAL_KB_MCP_SRC from ${SERVICE_ENV}"'
+            "PERSONAL_KB_URL, PERSONAL_KB_API_KEY, TEAM_KB_URL, TEAM_KB_API_KEY "
+            'from ${SERVICE_ENV}"'
         ) in text
-        # PERSONAL_KB_MCP_SRC must be readable from the service env, so a host can
-        # pin the personal_kb ref; the template's default tracks the branch head.
-        assert 'PERSONAL_KB_MCP_SRC="$(_read_env_var PERSONAL_KB_MCP_SRC)"' in text
+        assert "PERSONAL_KB_MCP_SRC" not in text
         assert (
             'would "GET <PERSONAL_KB_URL>/api/health and <TEAM_KB_URL>/api/health '
             '(reachability warn-check)"'

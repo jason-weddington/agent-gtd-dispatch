@@ -26,23 +26,11 @@
 #   AGENT_GTD_URL, missing AGENT_GTD_API_KEY), dispatch appears to succeed but the agent
 #   cannot comment — and the silence IS the failure signal. Fix agent-gtd first.
 #
-# personal-kb / team-kb are OPTIONAL (homelab-only). They are skipped when their
-# required env vars are absent, so non-homelab installs work cleanly without them.
+# personal-kb / team-kb are NOT defined here. They are hosted HTTP /mcp servers,
+# registered (and their 0600 key files written) by scripts/kb-mcp-refresh.sh, which
+# setup-dispatch-host.sh Step 4.6 and deploy.sh both run. The KB servers no longer
+# need uvx or git-ssh.
 #
-# Both KB servers are thin HTTP clients of a HOSTED knowledge-base web service — they
-# make no direct database connection and run no LLM calls of their own. Each needs a
-# service URL and an API key in its OWN MCP env block:
-#   - personal-kb points at the personal KB service (PERSONAL_KB_URL / PERSONAL_KB_API_KEY).
-#   - team-kb is the SAME package pointed at the team KB service instead. Its URL/key
-#     still bind to the PERSONAL_KB_URL / PERSONAL_KB_API_KEY variable NAMES in its own
-#     env block, because that is what personal_kb/src/personal_kb/config.py reads —
-#     only the shell-variable SOURCE differs (TEAM_KB_URL / TEAM_KB_API_KEY here).
-#
-# [postgres] quoting note: the login shell on AL2023 (and some other distros) is zsh.
-# Zsh glob-expands bare brackets, so --from pkg[extras] → "no matches found".
-# The entries below quote the bracket as pkg'[extras]' — shell concatenation that zsh
-# (and bash) treat as the literal string pkg[extras] after quote removal.
-
 # --- agent-gtd source ---
 # Defaults to public GitHub so any host can install without homelab access.
 # Override via AGENT_GTD_MCP_SRC (read from service .env by setup-dispatch-host.sh)
@@ -66,12 +54,6 @@ if [[ -n "${AGENT_GTD_URL:-}" ]]; then
     _agent_gtd_flags+="-e AGENT_GTD_URL=${AGENT_GTD_URL} "
 fi
 
-# --- personal_kb package source (shared by personal-kb AND team-kb) ---
-# Same precedent as _agent_gtd_mcp_src above: override via PERSONAL_KB_MCP_SRC for a
-# pinned ref (recommended — see PERSONAL_KB_MCP_SRC note in dispatch-env.tmpl) or a
-# private/local mirror. The '[postgres]' bracket is quoted per the zsh note above.
-_personal_kb_mcp_src="${PERSONAL_KB_MCP_SRC:-personal-kb[postgres]@git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb}"
-
 MCP_SERVERS=(
   # agent-gtd: LOAD-BEARING — must resolve for Step 4 verification to pass.
   # Source defaults to public GitHub; override via AGENT_GTD_MCP_SRC in service .env.
@@ -79,26 +61,6 @@ MCP_SERVERS=(
   "aws-documentation-mcp-server|--scope user -t stdio -e FASTMCP_LOG_LEVEL=ERROR -e AWS_DOCUMENTATION_PARTITION=aws -- uvx awslabs.aws-documentation-mcp-server@latest"
 )
 
-# personal-kb: registered only when both PERSONAL_KB_URL and PERSONAL_KB_API_KEY are
-# present (a URL without a key cannot authenticate; non-homelab installs omit both
-# cleanly). KB_INSTANCE_ROLE is deliberately OMITTED here so _get_tool_prefix() falls
-# to its `kb_` default (tools kb_search, kb_store, ...).
-if [[ -n "${PERSONAL_KB_URL:-}" && -n "${PERSONAL_KB_API_KEY:-}" ]]; then
-  MCP_SERVERS+=(
-    "personal-kb|--scope user -t stdio -e PERSONAL_KB_URL=${PERSONAL_KB_URL} -e PERSONAL_KB_API_KEY=${PERSONAL_KB_API_KEY} -e KB_CONTRIBUTOR=jason -- uvx --python 3.13 --from ${_personal_kb_mcp_src} personal-kb"
-  )
-fi
-
-# team-kb: same package as personal-kb, pointed at the team KB service instead.
-# Registered only when both TEAM_KB_URL and TEAM_KB_API_KEY are present.
-# KB_CONTRIBUTOR is deliberately OMITTED (unset == empty for the team instance).
-if [[ -n "${TEAM_KB_URL:-}" && -n "${TEAM_KB_API_KEY:-}" ]]; then
-  MCP_SERVERS+=(
-    "team-kb|--scope user -t stdio -e PERSONAL_KB_URL=${TEAM_KB_URL} -e PERSONAL_KB_API_KEY=${TEAM_KB_API_KEY} -e KB_INSTANCE_ROLE=team -e KB_TEAM=grit-mile -- uvx --python 3.13 --from ${_personal_kb_mcp_src} personal-kb"
-  )
-fi
-
-# No Anthropic key is ever injected here for the KB servers — they are thin HTTP
-# clients of the hosted KB service and make no LLM calls of their own. A literal
-# ANTHROPIC_API_KEY in the agent's own process env flips Claude Code off Max/OAuth
-# billing onto pay-per-token API billing (kb-01512).
+# No Anthropic key is ever injected here. A literal ANTHROPIC_API_KEY in the agent's
+# own process env flips Claude Code off Max/OAuth billing onto pay-per-token API
+# billing (kb-01512).

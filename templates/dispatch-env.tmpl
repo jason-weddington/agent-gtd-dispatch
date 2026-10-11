@@ -113,7 +113,7 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # CLAUDE_CODE_OAUTH_TOKEN=
 
 # KB_DATABASE_URL — RETIRED and FORBIDDEN. Agents reach the KB only through the
-# hosted thin-client MCP servers (PERSONAL_KB_URL / PERSONAL_KB_API_KEY below). A
+# hosted KB MCP servers (PERSONAL_KB_URL / PERSONAL_KB_API_KEY below). A
 # live-KB DSN here once reached agent subprocesses, where a repo's test suite opened
 # production Postgres. setup-dispatch-host.sh strips it (and TEAM_KB_DATABASE_URL /
 # KB_SERVICE_DATABASE_URL) from the service env on every run. Do not set it.
@@ -126,19 +126,20 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # KB_REQUIRE_POSTGRES_TESTS=
 
 # TEAM_KB_DATABASE_URL — RETIRED and FORBIDDEN (stripped by setup-dispatch-host.sh).
-# The team-kb MCP server is a thin HTTP client; see TEAM_KB_URL / TEAM_KB_API_KEY below.
+# The team-kb MCP server is a hosted HTTP server; see TEAM_KB_URL / TEAM_KB_API_KEY below.
 
 # Anthropic API key for the KB MCP servers' own LLM calls — RETIRED — no longer read
 # by installer Step 4.6. Both KB MCP servers are now thin HTTP clients of a hosted KB
 # web service and make no LLM calls of their own.
 # KB_ANTHROPIC_API_KEY=
 
-# Hosted personal KB service URL + API key. Read by installer Step 4.6 (not the
-# service) and injected into the personal-kb MCP server's OWN env block
-# (PERSONAL_KB_URL / PERSONAL_KB_API_KEY there too — see templates/mcp-servers.sh).
-# personal-kb is skipped when either is unset. No sudoers env_keep entry is needed:
-# the values are baked into the agent user's ~/.claude.json at provision time, not
-# inherited by the agent subprocess at run time.
+# Hosted personal KB service URL + API key. Read by installer Step 4.6 and deploy.sh
+# (not the service) via scripts/kb-mcp-refresh.sh. PERSONAL_KB_URL is the service base
+# URL; `/mcp` is appended to register personal-kb as an HTTP MCP server. The key is
+# written to `~/.personal_kb_hook_key` (0600) in the agent home and never into
+# `~/.claude.json`. personal-kb is skipped when either is unset. No sudoers env_keep
+# entry is needed: the values are applied at provision/deploy time, not inherited by
+# the agent subprocess at run time.
 # PERSONAL_KB_URL=
 # PERSONAL_KB_API_KEY=
 # KB API key handed to talos runs as PERSONAL_KB_API_KEY (paired with PERSONAL_KB_URL
@@ -148,21 +149,14 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # One of off | annotate | deny-once; passed to every talos fleet run as --memory.
 # An unknown value is treated as off. Needs TALOS_PERSONAL_KB_API_KEY to reach a remote KB.
 
-# Hosted team KB service URL + API key. Read by installer Step 4.6 and injected into
-# the team-kb MCP server's OWN env block — bound there to the PERSONAL_KB_URL /
-# PERSONAL_KB_API_KEY variable NAMES (same personal_kb package, pointed at the team
-# service instead; personal_kb's config module reads those names regardless of which
-# service it targets). team-kb is skipped when either is unset. No sudoers env_keep
-# entry is needed, for the same reason as PERSONAL_KB_URL above.
+# Hosted team KB service URL + API key. Read by installer Step 4.6 and deploy.sh via
+# scripts/kb-mcp-refresh.sh. TEAM_KB_URL is the service base URL; `/mcp` is appended
+# to register team-kb as an HTTP MCP server. The key is written to `~/.team_kb_key`
+# (0600) in the agent home and never into `~/.claude.json`. team-kb is skipped when
+# either is unset. No sudoers env_keep entry is needed, for the same reason as
+# PERSONAL_KB_URL above.
 # TEAM_KB_URL=
 # TEAM_KB_API_KEY=
-
-# Optional override for the personal_kb package source used by BOTH personal-kb and
-# team-kb (see _personal_kb_mcp_src in templates/mcp-servers.sh). Pin this to a commit
-# SHA so an upstream change to the personal_kb repo can't silently break agents again.
-# Must be a single whitespace-free token, e.g.:
-#   personal-kb[postgres]@git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb@<sha>
-# PERSONAL_KB_MCP_SRC=
 
 # Agent identity name — used for GTD comment attribution so comments appear
 # under a specific agent name (e.g. claude-build-abc12345) rather than the

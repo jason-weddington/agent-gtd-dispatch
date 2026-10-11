@@ -171,8 +171,8 @@ runs as **`dispatch-svc`**; it launches the Claude Code agent as **`dispatch`** 
   login user's `~/.env` and strip `DISPATCH_AGENT_SUBPROCESS_USER`; see
   `docs/install.md#single-user-mode`.) It is the systemd
   `EnvironmentFile` (→ the service's `os.environ`; `config.py` reads `os.environ` only,
-  no dotenv) *and* the file `setup-dispatch-host.sh` reads at provision time to inject
-  KB secrets into the agent's `~/.claude.json`.
+  no dotenv) *and* the file `setup-dispatch-host.sh` and `deploy.sh` read (via
+  `scripts/kb-mcp-refresh.sh`) to register the KB MCP servers and write their key files.
 - **`/home/dispatch/.env` is vestigial** (pre-split leftover) — nothing reads it. Don't
   put vars there; safe to delete where it lingers.
 - **`setup-dispatch-host.sh` runs as ROOT** (`sudo`, asserts `EUID==0`), not as
@@ -180,12 +180,13 @@ runs as **`dispatch-svc`**; it launches the Claude Code agent as **`dispatch`** 
   `/home/dispatch-svc/.env` to register MCP servers (Step 4.6, driven by
   `templates/mcp-servers.sh`).
 - **KB MCP secrets** live in `/home/dispatch-svc/.env` as `PERSONAL_KB_URL` /
-  `PERSONAL_KB_API_KEY` / `TEAM_KB_URL` / `TEAM_KB_API_KEY` (both KB MCP servers are
-  thin HTTP clients of a hosted KB web service, so no `ANTHROPIC_API_KEY` is injected
-  here — that name would reach the agent's env and flip Claude Code off Max/OAuth
-  billing). They are injected into the per-server `env` blocks of
-  `personal-kb`/`team-kb` at provision time; `mcp-servers.sh` references the env vars,
-  never literals (gitleaks-safe).
+  `PERSONAL_KB_API_KEY` / `TEAM_KB_URL` / `TEAM_KB_API_KEY`. `personal-kb` and `team-kb`
+  are hosted HTTP `/mcp` servers (`<URL>/mcp`), registered for the agent user by
+  `scripts/kb-mcp-refresh.sh` (run by setup Step 4.6 and every `deploy.sh`) with a
+  `headersHelper` that reads the key at connect time from a mode-0600 key file in the
+  agent home (`~/.personal_kb_hook_key`, `~/.team_kb_key`). The key is never written
+  into `~/.claude.json`, and no `ANTHROPIC_API_KEY` is injected (that name would reach
+  the agent's env and flip Claude Code off Max/OAuth billing).
 
 Full references: **`kb-01598`** (env-file + provisioning model — which var goes where),
 `kb-01583` (how env crosses the sudo boundary at runtime), `kb-01512` (OAuth vs API

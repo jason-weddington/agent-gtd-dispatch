@@ -166,18 +166,21 @@ and AWS documentation:
 | Server | Purpose |
 |---|---|
 | `agent-gtd` | GTD items, comments, and dispatch — lets agents post comments and update items via MCP rather than raw `curl` |
-| `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) — a thin HTTP client of the hosted personal KB service; registered only when `PERSONAL_KB_URL` and `PERSONAL_KB_API_KEY` are both present in the service `.env` |
-| `team-kb` | Team knowledge base (same package, pointed at the team KB service instead) — registered only when `TEAM_KB_URL` and `TEAM_KB_API_KEY` are both present in the service `.env` |
+| `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) — a hosted HTTP `/mcp` server (`<PERSONAL_KB_URL>/mcp`) registered by `scripts/kb-mcp-refresh.sh`, only when `PERSONAL_KB_URL` and `PERSONAL_KB_API_KEY` are both present in the service `.env` |
+| `team-kb` | Team knowledge base — a hosted HTTP `/mcp` server (`<TEAM_KB_URL>/mcp`) registered the same way, only when `TEAM_KB_URL` and `TEAM_KB_API_KEY` are both present in the service `.env` |
 | `aws-documentation-mcp-server` | AWS docs for any AWS-related implementation work |
 
 Registration is **per-host and per-user** (`--scope user`, writes to
-`/home/dispatch/.claude.json`). Step 4.6 of the installer handles this automatically,
-injecting each KB server's URL and API key into its OWN per-server `env` block (see
-`templates/mcp-servers.sh`). Neither KB server makes its own LLM calls anymore — both
-are thin HTTP clients of a hosted KB web service — so no `ANTHROPIC_API_KEY` is ever
-injected here. A literal `ANTHROPIC_API_KEY` in the service `.env` would reach the
-agent subprocess env and flip Claude Code off OAuth/Max billing onto pay-as-you-go API
-billing (kb-01512); that rule still applies elsewhere in this file.
+`/home/dispatch/.claude.json`). Step 4.6 of the installer handles this automatically for
+`agent-gtd` and `aws-documentation-mcp-server` (see `templates/mcp-servers.sh`).
+`personal-kb` and `team-kb` are hosted HTTP servers registered by
+`scripts/kb-mcp-refresh.sh`, which both Step 4.6 and every `./deploy.sh` run: each is
+registered as `type: http` with a `headersHelper` that reads the API key at connect time
+from a mode-0600 key file in the agent home (`~/.personal_kb_hook_key`, `~/.team_kb_key`),
+so the key never lands in `.claude.json`. No `ANTHROPIC_API_KEY` is ever injected here.
+A literal `ANTHROPIC_API_KEY` in the service `.env` would reach the agent subprocess env
+and flip Claude Code off OAuth/Max billing onto pay-as-you-go API billing (kb-01512);
+that rule still applies elsewhere in this file.
 
 **Config file**: `templates/mcp-servers.sh`
 
@@ -203,8 +206,8 @@ sudo -u dispatch -H bash -lc "claude mcp add <name> --scope user <args>"
 when run from a shell whose cwd/PATH differ from the agent's. Use the real MCP
 handshake probe the installer runs in Step 4.6 instead:
 ```bash
-ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && python3 /path/to/mcp-probe.py --claude-json ~/.claude.json --name personal-kb --expect-tool kb_search"'
-# → PASS personal-kb tools=<N> elapsed_s=<S>
+ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && python3 /path/to/mcp-probe.py --claude-json ~/.claude.json --name agent-gtd --expect-tool add_item"'
+# → PASS agent-gtd tools=<N> elapsed_s=<S>
 ```
 
 ## Tests

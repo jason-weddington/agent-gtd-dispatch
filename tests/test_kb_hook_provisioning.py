@@ -5,7 +5,7 @@ Two concerns:
      documented idiom, references the hook binary by absolute path, carries the
      exact PostToolUse matcher and --format=claude-json flag, uses $(cat ...)
      key indirection, reads PERSONAL_KB_HOOK_SRC from the service env, and is
-     deliberately unpinned (unlike PERSONAL_KB_MCP_SRC).
+     deliberately unpinned.
   2. A hermetic exercise of the settings-merge logic in
      templates/personal-kb-hook-settings.py: pre-existing settings survive,
      re-running yields exactly four personal-kb-hook blocks (never eight), and
@@ -53,7 +53,7 @@ class TestTextGuards:
     def test_install_is_unpinned_and_forced(self) -> None:
         text = SETUP_SCRIPT.read_text()
         assert "uv tool install --force --from '${_hook_src}' personal-kb-hook" in text
-        # The default source carries no @<sha> pin, unlike PERSONAL_KB_MCP_SRC.
+        # The default source carries no @<sha> pin.
         assert (
             "PERSONAL_KB_HOOK_SRC_DEFAULT="
             '"git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb'

@@ -433,10 +433,10 @@ All variables documented in `templates/dispatch-env.tmpl`. Key variables:
 | `DISPATCH_TIMEOUT_SECONDS` | – | Agent subprocess wall-clock timeout in seconds (default: 1800) |
 | `OLLAMA_BASE_URL` | – | Root URL of an Ollama instance for `claude-code-ollama` engine dispatches |
 | `OLLAMA_DEFAULT_MODEL` | – | Default Ollama model (default: `qwen3.6:35b`) |
-| `PERSONAL_KB_URL` | – | Hosted personal KB service URL. Read by installer Step 4.6 (not the service) and injected into the `personal-kb` MCP server's per-server env; if unset (or `PERSONAL_KB_API_KEY` is unset), `personal-kb` registration is skipped |
-| `PERSONAL_KB_API_KEY` | – | API key for the hosted personal KB service. Read by installer Step 4.6 and injected into the `personal-kb` MCP server's per-server env |
-| `TEAM_KB_URL` | – | Hosted team KB service URL. Read by installer Step 4.6 (not the service) and injected into the `team-kb` MCP server's per-server env; if unset (or `TEAM_KB_API_KEY` is unset), `team-kb` registration is skipped |
-| `TEAM_KB_API_KEY` | – | API key for the hosted team KB service. Read by installer Step 4.6 and injected into the `team-kb` MCP server's per-server env |
+| `PERSONAL_KB_URL` | – | Hosted personal KB service URL. Service base URL (`/mcp` is appended). Read by installer Step 4.6 and `deploy.sh` via `scripts/kb-mcp-refresh.sh` (not the service); if unset (or `PERSONAL_KB_API_KEY` is unset), `personal-kb` registration is skipped |
+| `PERSONAL_KB_API_KEY` | – | API key for the hosted personal KB service. Read by `scripts/kb-mcp-refresh.sh`; written to `~/.personal_kb_hook_key` (mode 0600) in the agent home, never into `.claude.json` |
+| `TEAM_KB_URL` | – | Hosted team KB service URL. Service base URL (`/mcp` is appended). Read by installer Step 4.6 and `deploy.sh` via `scripts/kb-mcp-refresh.sh` (not the service); if unset (or `TEAM_KB_API_KEY` is unset), `team-kb` registration is skipped |
+| `TEAM_KB_API_KEY` | – | API key for the hosted team KB service. Read by `scripts/kb-mcp-refresh.sh`; written to `~/.team_kb_key` (mode 0600) in the agent home, never into `.claude.json` |
 
 Both KB services are **LAN-only** (no public DNS or ingress). Mint a dispatch-specific
 API key per host from each KB service's Settings → API Keys pane *before* running the
@@ -577,14 +577,20 @@ falling back to raw `curl` calls.
 | Server | Purpose |
 |---|---|
 | `agent-gtd` | GTD items, comments, and dispatch (prevents `created_by="human"` regression) |
-| `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) — a thin HTTP client of the hosted personal KB service, **conditional**: only registered when `PERSONAL_KB_URL` and `PERSONAL_KB_API_KEY` are both set in the service `.env` |
-| `team-kb` | Team knowledge base — same package as `personal-kb`, pointed at the team KB service instead, **conditional**: only registered when `TEAM_KB_URL` and `TEAM_KB_API_KEY` are both set in the service `.env` |
+| `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) — a hosted HTTP `/mcp` server, **conditional**: only registered (by `scripts/kb-mcp-refresh.sh`) when `PERSONAL_KB_URL` and `PERSONAL_KB_API_KEY` are both set in the service `.env` |
+| `team-kb` | Team knowledge base — a hosted HTTP `/mcp` server, **conditional**: only registered when `TEAM_KB_URL` and `TEAM_KB_API_KEY` are both set in the service `.env` |
 | `aws-documentation-mcp-server` | AWS docs for any AWS-related implementation work |
 
 Step 4.6 reads `PERSONAL_KB_URL`, `PERSONAL_KB_API_KEY`, `TEAM_KB_URL` and
-`TEAM_KB_API_KEY` out of the installed service `.env` and exports them before sourcing
-`templates/mcp-servers.sh`, so the KB servers get their secrets in their **per-server**
-MCP env blocks (see the [environment file reference](#environment-file-reference)). If
+`TEAM_KB_API_KEY` out of the installed service `.env` and passes that file to
+`scripts/kb-mcp-refresh.sh`, which registers `personal-kb` and `team-kb` as `type: http`
+servers at `<URL>/mcp` with a `headersHelper` that reads the key at connect time. The
+keys are written to mode-0600 key files in the agent home (`~/.personal_kb_hook_key`,
+`~/.team_kb_key`) and never into `.claude.json`. Every `./deploy.sh` re-runs the same
+script (non-fatal), so template changes reach existing hosts; the KB servers no longer
+need `uvx` or git-ssh. The script is idempotent and prints `[OK]` / `[CHANGED]` /
+`[SKIP]` lines plus a final `kb-mcp-refresh:` summary line
+(see the [environment file reference](#environment-file-reference)). If
 a URL is unset the installer prints a `[WARN]` and skips that server entirely; if the
 URL is set but its API key is not, the installer warns that a URL without a key cannot
 authenticate and skips that server too.
@@ -633,8 +639,8 @@ when run from a shell whose cwd/PATH differ from the agent's, so it can't distin
 a healthy server from a broken one. Use the same probe the installer runs in Step 4.6:
 
 ```bash
-ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && python3 /path/to/mcp-probe.py --claude-json ~/.claude.json --name personal-kb --expect-tool kb_search"'
-# → PASS personal-kb tools=<N> elapsed_s=<S>
+ssh <HOST> 'sudo -u dispatch -H bash -lc "cd /home/dispatch && python3 /path/to/mcp-probe.py --claude-json ~/.claude.json --name agent-gtd --expect-tool add_item"'
+# → PASS agent-gtd tools=<N> elapsed_s=<S>
 ```
 
 Copy `templates/mcp-probe.py` to the host to run this manually, or inspect
@@ -642,8 +648,8 @@ Copy `templates/mcp-probe.py` to the host to run this manually, or inspect
 
 ```bash
 ssh <HOST> 'sudo cat /home/dispatch/.claude.json' | jq '.mcpServers | keys'
-# → ["agent-gtd", "aws-documentation-mcp-server", "personal-kb"]
-# → (plus "team-kb" on hosts where TEAM_KB_URL / TEAM_KB_API_KEY were set)
+# → ["agent-gtd", "aws-documentation-mcp-server"]
+# → (plus "personal-kb" / "team-kb" where their URL and key were set)
 ```
 
 ### Idempotency check
@@ -944,8 +950,8 @@ Telemetry from the KB side: 2,067 map-push rows since June, with `build_engine` 
 
 ### What the step does
 
-1. Installs `personal-kb-hook` as the agent user: `uv tool install --force --from '<SRC>' personal-kb-hook`, where `<SRC>` defaults to `git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb#subdirectory=packages/personal-kb-hook`, overridable via `PERSONAL_KB_HOOK_SRC` in the service env (same override mechanism as `PERSONAL_KB_MCP_SRC` in [Step 4.6](#mcp-servers-for-the-agent-user)). `--force` is both the install and the upgrade path — every run reinstalls from the current source. Non-fatal: a failed install warns and provisioning continues.
-2. Writes the hook's API key file at `/home/dispatch/.personal_kb_hook_key` (owner `dispatch`, mode `0600`) from the **existing** `PERSONAL_KB_API_KEY` in the service env — the same key this host already uses for its `personal-kb` MCP server. No separate hook-specific key is minted, required, or documented.
+1. Installs `personal-kb-hook` as the agent user: `uv tool install --force --from '<SRC>' personal-kb-hook`, where `<SRC>` defaults to `git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb#subdirectory=packages/personal-kb-hook`, overridable via `PERSONAL_KB_HOOK_SRC` in the service env. `--force` is both the install and the upgrade path — every run reinstalls from the current source. Non-fatal: a failed install warns and provisioning continues.
+2. Writes the hook's API key file at `/home/dispatch/.personal_kb_hook_key` (owner `dispatch`, mode `0600`) from the **existing** `PERSONAL_KB_API_KEY` in the service env — the same key this host already uses for its `personal-kb` MCP registration (Step 4.6 writes the same key file). No separate hook-specific key is minted, required, or documented.
 3. Merges four hook blocks into `/home/dispatch/.claude/settings.json` — a read-modify-write of the parsed JSON via `templates/personal-kb-hook-settings.py`, never a wholesale overwrite, so any other settings already in that file survive:
    - `SessionStart`, `UserPromptSubmit`, `Stop` — no matcher.
    - `PostToolUse` — matcher `mcp__personal-kb__kb_get|mcp__team-kb__team_kb_get`.
@@ -960,11 +966,11 @@ Telemetry from the KB side: 2,067 map-push rows since June, with `build_engine` 
 
 ### Why the source is unpinned while the MCP server is pinned
 
-The `personal_kb` MCP server source (`PERSONAL_KB_MCP_SRC`, Step 4.6) **is** pinned to a SHA on production hosts, because an upstream rewrite there once silently broke every dispatched agent's KB access (`kb-01598`). `personal-kb-hook`'s source is **deliberately left unpinned**: it is changing rapidly upstream, is purely additive, and degrades silently rather than breaking a run — so tracking the branch head is the lower-risk choice for it. Do not "fix" this by adding a pin.
+`personal-kb-hook`'s source is **unpinned by design**: it is changing rapidly upstream, is purely additive, and degrades silently rather than breaking a run — so tracking the branch head is the lower-risk choice for it. Do not "fix" this by adding a pin.
 
 ### Key reuse — no separate key
 
-The hook reads the same `PERSONAL_KB_API_KEY` this host already has configured for its `personal-kb` MCP server (Step 4.6). It does not mint, require, or document a second hook-specific key — a second key on a LAN-only KB is toil, not security (Jason, 2026-09-18).
+The hook reads the same `PERSONAL_KB_API_KEY` this host already has configured for its `personal-kb` MCP registration (Step 4.6). It does not mint, require, or document a second hook-specific key — a second key on a LAN-only KB is toil, not security (Jason, 2026-09-18).
 
 ### Silent-degradation warning
 
@@ -1057,7 +1063,7 @@ This exists because **a restart looks like run completion to the status poller**
 
 ### Two-consumer model: process env vs. `.claude.json`
 
-Some keys written to `$SERVICE_ENV` are consumed twice: once by the `dispatch-api` **process environment** (this step's concern), and once baked into the agent's `${AGENT_HOME}/.claude.json` by [Step 4.6 — MCP servers](#mcp-servers-for-the-agent-user), which re-reads `$SERVICE_ENV` fresh on every run. For any stale key that is also one of Step 4.6's inputs (`AGENT_GTD_URL`, `AGENT_GTD_API_KEY`, `AGENT_GTD_MCP_SRC`, `PERSONAL_KB_URL`, `PERSONAL_KB_API_KEY`, `TEAM_KB_URL`, `TEAM_KB_API_KEY`, `PERSONAL_KB_MCP_SRC`), Step 6.5's banner adds a line reminding the operator that Step 4.6 already refreshed the `.claude.json` copy this invocation, and that restarting `dispatch-api` does **not** refresh it — the two consumers are independent and need independent thinking about, not just a restart.
+Some keys written to `$SERVICE_ENV` are consumed twice: once by the `dispatch-api` **process environment** (this step's concern), and once applied to the agent's `${AGENT_HOME}/.claude.json` registrations or KB key files by [Step 4.6 — MCP servers](#mcp-servers-for-the-agent-user), which re-reads `$SERVICE_ENV` fresh on every run. For any stale key that is also one of Step 4.6's inputs (`AGENT_GTD_URL`, `AGENT_GTD_API_KEY`, `AGENT_GTD_MCP_SRC`, `PERSONAL_KB_URL`, `PERSONAL_KB_API_KEY`, `TEAM_KB_URL`, `TEAM_KB_API_KEY`), Step 6.5's banner adds a line reminding the operator that Step 4.6 already refreshed the `.claude.json` registration or key file this invocation, and that restarting `dispatch-api` does **not** refresh it — the two consumers are independent and need independent thinking about, not just a restart.
 
 ### `scripts/env-staleness-check.sh`
 
@@ -1176,7 +1182,11 @@ the `bash -lc` login shell is required, same as the installer itself uses.)
 sudo -u dispatch -H bash -lc 'claude mcp remove <name> --scope user'
 # Or remove all registrations at once:
 sudo rm /home/dispatch/.claude.json
+# Team KB key file written by scripts/kb-mcp-refresh.sh:
+sudo rm -f /home/dispatch/.team_kb_key
 ```
+
+`/home/dispatch/.personal_kb_hook_key` is shared with Step 4.10 (personal-kb-hook); remove it only when uninstalling that step too.
 
 ### Step 4.5 — Claude Code
 No separate rollback — Step 4's removal of `/home/dispatch/.local` also deletes the
@@ -1231,6 +1241,7 @@ claude mcp remove agent-gtd --scope user
 claude mcp remove personal-kb --scope user
 claude mcp remove aws-documentation-mcp-server --scope user
 claude mcp remove team-kb --scope user   # only if it was registered
+rm -f ~/.team_kb_key
 
 # Pre-commit template (Step 4.7)
 git config --global --unset init.templateDir

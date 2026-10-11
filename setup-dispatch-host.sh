@@ -1551,7 +1551,8 @@ echo "--- Step 4.6: MCP servers (agent user) ---"
 if ! $DRY_RUN && [[ ! -f "$CLAUDE_SRC" ]]; then
     warn "Claude Code not found at ${CLAUDE_SRC} — skipping MCP server registration (install claude as ${AGENT_USER} first)"
 elif $DRY_RUN; then
-    would "read AGENT_GTD_URL, AGENT_GTD_API_KEY, AGENT_GTD_MCP_SRC, PERSONAL_KB_URL, PERSONAL_KB_API_KEY, TEAM_KB_URL, TEAM_KB_API_KEY, PERSONAL_KB_MCP_SRC from ${SERVICE_ENV}"
+    would "read AGENT_GTD_URL, AGENT_GTD_API_KEY, AGENT_GTD_MCP_SRC, PERSONAL_KB_URL, PERSONAL_KB_API_KEY, TEAM_KB_URL, TEAM_KB_API_KEY from ${SERVICE_ENV}"
+    would "run scripts/kb-mcp-refresh.sh: register personal-kb/team-kb as HTTP /mcp servers for ${AGENT_USER} and write their key files (mode 0600)"
     would "GET <PERSONAL_KB_URL>/api/health and <TEAM_KB_URL>/api/health (reachability warn-check)"
     would "probe each registered MCP server as ${AGENT_USER} with an MCP initialize + tools/list handshake (timeout ${MCP_PROBE_TIMEOUT}s per server)"
 else
@@ -1572,24 +1573,15 @@ else
     #     (e.g. git+ssh://git@<host>/path/agent_gtd for a homelab/private mirror).
     #     Defaults to public GitHub when unset — no entry needed for standard installs.
     #
-    #   PERSONAL_KB_MCP_SRC   → optional override for the personal_kb package source,
-    #     used by BOTH KB servers. Set it to a PINNED ref
-    #     (personal-kb[postgres]@git+ssh://…/personal_kb@<sha>) on production hosts: the default tracks the
-    #     branch head, and an upstream rewrite is exactly what silently broke KB access
-    #     for every dispatched agent (this item). Defaults to the unpinned homelab source.
-    #
     #   PERSONAL_KB_URL / PERSONAL_KB_API_KEY → hosted personal-KB service URL + API
-    #     key, injected into the personal-kb MCP server's own env block. personal-kb is
-    #     skipped when either is unset.
+    #     key, consumed by scripts/kb-mcp-refresh.sh (HTTP /mcp registration + 0600 key
+    #     file). personal-kb is skipped when either is unset.
     #   TALOS_PERSONAL_KB_API_KEY → NOT read by this installer. The dispatch service
     #     reads it at run time and hands it to talos runs as PERSONAL_KB_API_KEY
     #     (with PERSONAL_KB_URL); talos gets no KB access when it is unset.
-    #   TEAM_KB_URL / TEAM_KB_API_KEY → hosted team-KB service URL + API key, injected
-    #     into the team-kb MCP server's own env block (bound there to the same
-    #     PERSONAL_KB_URL / PERSONAL_KB_API_KEY variable NAMES — see
-    #     templates/mcp-servers.sh; personal_kb's config module reads those names
-    #     regardless of which service it is pointed at). team-kb is skipped when
-    #     either TEAM_KB_URL or TEAM_KB_API_KEY is unset.
+    #   TEAM_KB_URL / TEAM_KB_API_KEY → hosted team-KB service URL + API key, consumed
+    #     by scripts/kb-mcp-refresh.sh the same way. team-kb is skipped when either
+    #     TEAM_KB_URL or TEAM_KB_API_KEY is unset.
     if [[ -f "$SERVICE_ENV" ]]; then
         AGENT_GTD_URL="$(_read_env_var AGENT_GTD_URL)";                 export AGENT_GTD_URL
         AGENT_GTD_API_KEY="$(_read_env_var AGENT_GTD_API_KEY)";         export AGENT_GTD_API_KEY
@@ -1598,15 +1590,14 @@ else
         PERSONAL_KB_API_KEY="$(_read_env_var PERSONAL_KB_API_KEY)";     export PERSONAL_KB_API_KEY
         TEAM_KB_URL="$(_read_env_var TEAM_KB_URL)";                     export TEAM_KB_URL
         TEAM_KB_API_KEY="$(_read_env_var TEAM_KB_API_KEY)";             export TEAM_KB_API_KEY
-        PERSONAL_KB_MCP_SRC="$(_read_env_var PERSONAL_KB_MCP_SRC)";     export PERSONAL_KB_MCP_SRC
     fi
     # agent-gtd warnings are elevated (LOAD-BEARING for step-4 verification)
     [[ -z "${AGENT_GTD_URL:-}" ]]     && warn "AGENT_GTD_URL not set in ${SERVICE_ENV} — agent-gtd MCP will launch without a URL; Step 4 verification will fail"
     [[ -z "${AGENT_GTD_API_KEY:-}" ]] && warn "AGENT_GTD_API_KEY not set in ${SERVICE_ENV} — agent-gtd MCP will launch without credentials; Step 4 verification will fail"
-    [[ -z "${PERSONAL_KB_URL:-}" ]] && warn "PERSONAL_KB_URL not set in ${SERVICE_ENV} — personal-kb MCP server will be skipped"
-    [[ -n "${PERSONAL_KB_URL:-}" && -z "${PERSONAL_KB_API_KEY:-}" ]] && warn "PERSONAL_KB_API_KEY not set in ${SERVICE_ENV} — personal-kb MCP server will be skipped (a URL without a key cannot authenticate)"
-    [[ -z "${TEAM_KB_URL:-}" ]] && warn "TEAM_KB_URL not set in ${SERVICE_ENV} — team-kb MCP server will be skipped"
-    [[ -n "${TEAM_KB_URL:-}" && -z "${TEAM_KB_API_KEY:-}" ]] && warn "TEAM_KB_API_KEY not set in ${SERVICE_ENV} — team-kb MCP server will be skipped (a URL without a key cannot authenticate)"
+    [[ -z "${PERSONAL_KB_URL:-}" ]] && warn "PERSONAL_KB_URL not set in ${SERVICE_ENV} — personal-kb will be skipped"
+    [[ -n "${PERSONAL_KB_URL:-}" && -z "${PERSONAL_KB_API_KEY:-}" ]] && warn "PERSONAL_KB_API_KEY not set in ${SERVICE_ENV} — personal-kb will be skipped (a URL without a key cannot authenticate)"
+    [[ -z "${TEAM_KB_URL:-}" ]] && warn "TEAM_KB_URL not set in ${SERVICE_ENV} — team-kb will be skipped"
+    [[ -n "${TEAM_KB_URL:-}" && -z "${TEAM_KB_API_KEY:-}" ]] && warn "TEAM_KB_API_KEY not set in ${SERVICE_ENV} — team-kb will be skipped (a URL without a key cannot authenticate)"
 
     # Reachability warn-check: both KB services are LAN-only (no public DNS/ingress),
     # so a failure here is informational, never fatal — registration continues either way.
@@ -1636,11 +1627,11 @@ else
     # shellcheck source=templates/mcp-servers.sh
     source "$MCP_CONF"
 
-    # Unconditional de-registration pass over the fixed set of known server names —
-    # this is what makes a server that's newly skipped (e.g. a KB var removed from the
-    # .env) actually disappear, instead of surviving in its stale shape from a
-    # previous run. The per-entry remove-then-add loop below is no longer needed.
-    for _known_name in agent-gtd aws-documentation-mcp-server personal-kb team-kb; do
+    # Unconditional de-registration pass over the fixed set of stdio server names —
+    # this is what makes a server that's newly skipped actually disappear, instead of
+    # surviving in its stale shape from a previous run. Stale personal-kb/team-kb
+    # removal is handled by scripts/kb-mcp-refresh.sh.
+    for _known_name in agent-gtd aws-documentation-mcp-server; do
         runuser -l "$AGENT_USER" -c \
             "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp remove ${_known_name} --scope user 2>/dev/null || true"
     done
@@ -1661,14 +1652,6 @@ else
             agent-gtd)
                 info "Registered MCP server '${mcp_name}' for ${AGENT_USER} src=${_agent_gtd_mcp_src}"
                 ;;
-            personal-kb)
-                _api_key_state="ABSENT"; [[ -n "${PERSONAL_KB_API_KEY:-}" ]] && _api_key_state="present"
-                info "Registered MCP server '${mcp_name}' for ${AGENT_USER} — mode=hosted url=${PERSONAL_KB_URL:-} api_key=${_api_key_state} src=${_personal_kb_mcp_src}"
-                ;;
-            team-kb)
-                _api_key_state="ABSENT"; [[ -n "${TEAM_KB_API_KEY:-}" ]] && _api_key_state="present"
-                info "Registered MCP server '${mcp_name}' for ${AGENT_USER} — mode=hosted url=${TEAM_KB_URL:-} api_key=${_api_key_state} src=${_personal_kb_mcp_src}"
-                ;;
             *)
                 info "Registered MCP server '${mcp_name}' for ${AGENT_USER}"
                 ;;
@@ -1684,6 +1667,18 @@ else
         2>/dev/null)" || rc=$?
     if [[ "$rc" -ne 0 || -z "$agent_gtd_url_registered" ]]; then
         die "agent-gtd MCP registered without AGENT_GTD_URL — the server would fall back to its local SQLite backend and Step 4 verification would silently pass against the wrong database"
+    fi
+
+    # personal-kb / team-kb: hosted HTTP /mcp servers, registered (and their 0600 key
+    # files written) by scripts/kb-mcp-refresh.sh. Non-fatal: a failure leaves the
+    # agent on its current registrations.
+    _kbr="${SCRIPT_DIR}/scripts/kb-mcp-refresh.sh"
+    [[ -x "$_kbr" ]] || die "Missing or non-executable ${_kbr} — this ships in the repo; its absence means a broken checkout"
+    if [[ -f "$SERVICE_ENV" ]]; then
+        "$_kbr" --env-file "$SERVICE_ENV" --agent-user "$AGENT_USER" --agent-home "$AGENT_HOME" --agent-group "$AGENT_GROUP" --claude "$CLAUDE_SRC" \
+            || warn "kb-mcp-refresh.sh failed — personal-kb/team-kb registrations may be stale"
+    else
+        warn "kb-mcp-refresh.sh skipped: ${SERVICE_ENV} not found"
     fi
 
     # MCP probes: a real initialize + tools/list handshake per registered server, as
@@ -1716,8 +1711,6 @@ else
             mcp_name="${entry%%|*}"
             case "$mcp_name" in
                 agent-gtd)   expect_tool="add_item" ;;
-                personal-kb) expect_tool="kb_search" ;;
-                team-kb)     expect_tool="team_kb_search" ;;
                 *)           expect_tool="" ;;
             esac
 
@@ -1931,13 +1924,9 @@ fi
 # pironman01/r7-research/r7-server (2026-09-18) from being clobbered the next time
 # this script runs on those hosts, and gets it onto every new host automatically.
 #
-# PINNING ASYMMETRY (deliberate — do not "fix" by pinning this like Step 4.6 does):
-# the personal_kb MCP server source (PERSONAL_KB_MCP_SRC, Step 4.6) IS pinned to a SHA
-# on production hosts because an upstream rewrite there once silently broke every
-# dispatched agent's KB access (kb-01598). This hook's source is intentionally left
-# UNPINNED: it is changing rapidly upstream, is purely additive, and degrades silently
-# rather than breaking a run — so tracking the branch head is the lower-risk choice
-# here. `--force` on `uv tool install` is both the initial install AND the upgrade
+# PINNING ASYMMETRY (deliberate — do not "fix" by pinning): this hook's source is unpinned by
+# design. It is changing rapidly upstream, is purely additive, and degrades silently
+# rather than breaking a run — so tracking the branch head is the lower-risk choice. `--force` on `uv tool install` is both the initial install AND the upgrade
 # path: every re-run reinstalls from whatever the branch head currently is.
 #
 # NO SERVICE RESTART: Claude Code reads the agent user's settings.json when each
@@ -2197,11 +2186,11 @@ echo ""
 echo "--- Step 6.5: Service environment freshness ---"
 
 # Two-consumer warning: the exact set of $SERVICE_ENV keys Step 4.6 reads and
-# bakes into ${AGENT_HOME}/.claude.json (see the _read_env_var calls in that
+# feeds into the agent's MCP registration in ${AGENT_HOME}/.claude.json or its KB key files (see the _read_env_var calls in that
 # step). A restart of ${SERVICE_NAME} does NOT refresh that file — only a
 # re-run of Step 4.6 does — so a stale key from this set needs an extra line
 # telling the operator that restarting alone will not fix the agent side.
-STEP46_KEYS=(AGENT_GTD_URL AGENT_GTD_API_KEY AGENT_GTD_MCP_SRC PERSONAL_KB_URL PERSONAL_KB_API_KEY TEAM_KB_URL TEAM_KB_API_KEY PERSONAL_KB_MCP_SRC)
+STEP46_KEYS=(AGENT_GTD_URL AGENT_GTD_API_KEY AGENT_GTD_MCP_SRC PERSONAL_KB_URL PERSONAL_KB_API_KEY TEAM_KB_URL TEAM_KB_API_KEY)
 
 if $DRY_RUN; then
     would "compare ${SERVICE_ENV} against the running ${SERVICE_NAME} process environment (/proc/<MainPID>/environ) and, with --restart-if-stale and zero active runs, restart ${SERVICE_NAME}"
@@ -2286,7 +2275,7 @@ else
                 for _n in "${_stale_names[@]}"; do
                     for _s46 in "${STEP46_KEYS[@]}"; do
                         if [[ "$_n" == "$_s46" ]]; then
-                            echo "  NOTE: ${_n} is also consumed by the agent's \${AGENT_HOME}/.claude.json,"
+                            echo "  NOTE: ${_n} is also consumed by the agent's \${AGENT_HOME}/.claude.json or KB key files,"
                             echo "        which Step 4.6 already refreshed this invocation — a service"
                             echo "        restart does not refresh that file."
                             break

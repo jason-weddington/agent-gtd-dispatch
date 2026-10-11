@@ -9,6 +9,7 @@ set -euo pipefail
 # release.sh; no working copy on the host, no source-tree state.
 # It also refreshes /etc/sudoers.d/dispatch-svc via scripts/sudoers-refresh.sh
 # before the wheel install.
+# It also refreshes the agent user's personal-kb/team-kb registrations via scripts/kb-mcp-refresh.sh (non-fatal).
 #
 # The homelab index is passed via `--index` (NOT `--index-url`) so it is
 # ADDED to the default PyPI list; uv resolves fastapi/uvicorn/anthropic/etc.
@@ -101,11 +102,12 @@ deploy_one() {
     local _stage
     _stage=$(ssh "${host}" mktemp -d) || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
     [[ "$_stage" == /tmp/* ]] || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
-    scp -q "${SCRIPT_DIR}/scripts/sudoers-refresh.sh" "${SCRIPT_DIR}/templates/sudoers-dispatch-svc.tmpl" "${host}:${_stage}/" || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
+    scp -q "${SCRIPT_DIR}/scripts/sudoers-refresh.sh" "${SCRIPT_DIR}/scripts/kb-mcp-refresh.sh" "${SCRIPT_DIR}/templates/sudoers-dispatch-svc.tmpl" "${host}:${_stage}/" || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
 
     ssh "${host}" bash -s <<EOF
 set -euo pipefail
 if ! sudo bash "${_stage}/sudoers-refresh.sh" --template "${_stage}/sudoers-dispatch-svc.tmpl" --service-user ${SERVICE_USER} --agent-user ${AGENT_USER} 2>&1 | sed "s/^/[${host}] /"; then rm -rf "${_stage}"; echo "[ERR]  sudoers refresh failed on ${host} — host left untouched" >&2; exit 1; fi
+if sudo test -f /home/${SERVICE_USER}/.env; then if ! sudo bash "${_stage}/kb-mcp-refresh.sh" --env-file /home/${SERVICE_USER}/.env --agent-user ${AGENT_USER} 2>&1 | sed "s/^/[${host}] /"; then echo "[WARN] KB MCP refresh failed on ${host} — agent KB registrations may be stale" >&2; fi; else echo "[SKIP] KB MCP refresh: /home/${SERVICE_USER}/.env not present on ${host}"; fi
 rm -rf "${_stage}"
 
 # Install/refresh the wheel from the homelab index.
@@ -269,9 +271,9 @@ fi
 # Refresh personal-kb-hook for the agent user (setup-dispatch-host.sh Step 4.10).
 # --force is both the install and the upgrade path, so this always reinstalls from
 # whatever PERSONAL_KB_HOOK_SRC currently resolves to — deliberately UNPINNED (see
-# the PINNING ASYMMETRY note in Step 4.10 of setup-dispatch-host.sh: unlike the
-# personal_kb MCP server, this hook is additive and degrades silently rather than
-# breaking a run, so tracking the branch head is the lower-risk choice). Non-fatal:
+# the PINNING ASYMMETRY note in Step 4.10 of setup-dispatch-host.sh: this hook is
+# additive and degrades silently rather than breaking a run, so tracking the
+# branch head is the lower-risk choice). Non-fatal:
 # a failed refresh leaves the agent on its current binary (if any) and must not
 # abort the deploy. Does NOT touch settings.json (wiring is setup's job, not
 # deploy's) and does NOT restart the service.
