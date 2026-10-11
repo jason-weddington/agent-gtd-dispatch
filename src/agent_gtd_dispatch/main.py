@@ -2299,6 +2299,37 @@ _TICK_HALTED = "halted"  # the loop halted the rollout (or it was halted)
 # `pending` item would be dispatched forever).  Two attempts, then halt loudly.
 _MAX_DISPATCH_ATTEMPTS_PER_ITEM = 2
 
+# Recording a reviewer's merge/skip on the board is retried in-tick before it
+# is treated as a failure: the merge has already landed by then, so a transient
+# board error must not halt the rollout.  4xx responses are not retried.
+_BOOKKEEPING_RETRY_DELAYS_SECONDS: tuple[float, ...] = (2.0, 5.0)
+_BOOKKEEPING_ATTEMPTS = len(_BOOKKEEPING_RETRY_DELAYS_SECONDS) + 1
+
+# A merge confirmed on origin whose board record keeps failing is retried once
+# per poll interval; after this many passes the rollout halts with a recovery
+# instruction.
+_MAX_UNRECORDED_MERGE_PASSES = 10
+
+
+class _UnrecordedMerge(NamedTuple):
+    """A merge confirmed on origin that the board has not yet recorded."""
+
+    passes: int
+    merge_note: str
+    next_attempt_at: float
+
+
+# rollout_id -> item_id -> merged-but-unrecorded entry.  In-memory like
+# `_rollout_redispatches`: on a dispatch-service restart the item is simply
+# re-reviewed once (accepted).  The only writer that ADDS entries is the
+# confirmed-merge branch of `_act_on_verdict`.
+_rollout_unrecorded_merges: dict[str, dict[str, _UnrecordedMerge]] = {}
+
+
+def _monotonic() -> float:
+    """Clock seam for the unrecorded-merge retry throttle (patched in tests)."""
+    return time.monotonic()
+
 
 class ReviewVerdict(NamedTuple):
     """A reviewer's bounded answer about ONE completed build."""
@@ -2770,6 +2801,308 @@ async def _verify_landed_commit_type(
     )
 
 
+def _http_status(exc: BaseException) -> int | None:
+    """The HTTP status code of an ``httpx.HTTPStatusError``, else None."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    return None
+
+
+async def _complete_in_rollout_with_retry(
+    rollout_id: str,
+    item_id: str,
+    *,
+    outcome: str,
+    merge_note: str,
+    token: str | None,
+) -> tuple[dict[str, Any] | None, Exception | None]:
+    """Record a reviewer outcome on the board, retrying transient failures.
+
+    ``complete_in_rollout`` is idempotent by item id (a repeat heals any side
+    effect a partial earlier write left undone), so retrying is safe.  A 4xx
+    response is a definitive rejection and is returned at once; every other
+    exception is retried after each delay in
+    ``_BOOKKEEPING_RETRY_DELAYS_SECONDS``.
+
+    Returns:
+        ``(result, None)`` on the first success, ``(None, last_exc)`` after
+        the final failed attempt.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _BOOKKEEPING_ATTEMPTS + 1):
+        try:
+            result = await gtd_client.complete_in_rollout(
+                rollout_id,
+                item_id,
+                outcome=outcome,
+                merge_actor="reviewer-autonomous",
+                decision_rule="agent-judgment",
+                merge_note=merge_note,
+                token=token,
+            )
+        except Exception as exc:
+            last_exc = exc
+            status = _http_status(exc)
+            retryable = not (status is not None and 400 <= status <= 499)
+            logger.warning(
+                "rollout-loop: complete-item-attempt-failed rollout_id=%s "
+                "item_id=%s attempt=%d/%d exc=%s status=%s retryable=%s",
+                rollout_id,
+                item_id,
+                attempt,
+                _BOOKKEEPING_ATTEMPTS,
+                type(exc).__name__,
+                status if status is not None else "-",
+                "true" if retryable else "false",
+            )
+            if not retryable or attempt >= _BOOKKEEPING_ATTEMPTS:
+                return None, exc
+            await asyncio.sleep(_BOOKKEEPING_RETRY_DELAYS_SECONDS[attempt - 1])
+            continue
+        if attempt > 1:
+            logger.warning(
+                "rollout-loop: complete-item-recovered rollout_id=%s item_id=%s "
+                "attempt=%d/%d already_recorded=%s",
+                rollout_id,
+                item_id,
+                attempt,
+                _BOOKKEEPING_ATTEMPTS,
+                result.get("already_recorded") if isinstance(result, dict) else None,
+            )
+        return result, None
+    return None, last_exc  # pragma: no cover — loop always returns
+
+
+async def _confirm_merge_landed(
+    workspace: dispatch.RolloutWorkspace | None,
+    item_id: str,
+    *,
+    errors: list[Exception] | None = None,
+) -> tuple[str, dict[str, str], list[str]]:
+    """Check whether the item's squash commit landed on origin's default branch.
+
+    Args:
+        workspace: The shared rollout workspace, or None if never prepared.
+        item_id: The item whose ``Item: <id>`` trailer is looked up.
+        errors: Optional out-list; on ``lookup-raised`` the exception is
+            appended so the caller can name it in its log line.
+
+    Returns:
+        ``(confirmation, subjects_by_repo, failed_repos)`` where confirmation
+        is one of ``confirmed``, ``no-workspace``, ``lookup-raised`` (subjects
+        and failed repos empty) or ``no-trailer-found``.  Never raises.
+    """
+    if workspace is None:
+        return "no-workspace", {}, []
+    try:
+        subjects, failed = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(dispatch.find_landed_commit_subjects, workspace, item_id),
+        )
+    except Exception as exc:
+        if errors is not None:
+            errors.append(exc)
+        return "lookup-raised", {}, []
+    if subjects:
+        return "confirmed", dict(subjects), list(failed)
+    return "no-trailer-found", {}, list(failed)
+
+
+def _unblocked_text(result: Any) -> str:
+    """The 'Downstream items unblocked' sentence for a completion result."""
+    newly_ready = result.get("newly_ready") if isinstance(result, dict) else None
+    return (
+        f"Downstream items unblocked: {', '.join(str(x) for x in newly_ready)}."
+        if newly_ready
+        else "No downstream items unblocked."
+    )
+
+
+def _merge_commit_line(outcome: ReviewVerdict) -> str:
+    """The ' Commit type: ...' sentence for a merge verdict comment."""
+    return (
+        f" Commit type: `{outcome.commit_type}` ({outcome.commit_type_reason})."
+        if outcome.commit_type
+        else " Commit type: not reported by reviewer."
+    )
+
+
+async def _handle_unrecorded_merge(
+    rollout_id: str,
+    item_id: str,
+    outcome: ReviewVerdict,
+    exc: Exception,
+    *,
+    token: str | None,
+    attribution: str | None,
+    workspace: dispatch.RolloutWorkspace | None,
+) -> str:
+    """A merge verdict whose board record failed: confirm the merge, then decide.
+
+    A merge confirmed on origin is a success whose record is late — the
+    rollout continues and the record is retried each poll interval.  An
+    unconfirmed merge halts the rollout as before.
+    """
+    lookup_errors: list[Exception] = []
+    confirmation, subjects, failed_repos = await _confirm_merge_landed(
+        workspace, item_id, errors=lookup_errors
+    )
+    log_args: list[Any] = [
+        rollout_id,
+        item_id,
+        confirmation,
+        ",".join(sorted(subjects)) or "-",
+        subjects,
+        ",".join(failed_repos) or "-",
+    ]
+    fmt = (
+        "rollout-loop: merge-confirmation rollout_id=%s item_id=%s outcome=%s "
+        "repos=%s subjects=%r failed_repos=%s"
+    )
+    if confirmation == "lookup-raised" and lookup_errors:
+        fmt += " exc=%s"
+        log_args.append(type(lookup_errors[0]).__name__)
+    logger.warning(fmt, *log_args)
+
+    if confirmation != "confirmed":
+        reason = (
+            f"failed to record item {item_id} as completed: "
+            f"{type(exc).__name__}: {exc} (merge not confirmed on origin; "
+            f"confirmation: {confirmation}"
+            + (f"; failed_repos={','.join(failed_repos)}" if failed_repos else "")
+            + ")"
+        )
+        return await _halt_rollout_from_loop(
+            rollout_id,
+            reason[:ERROR_TEXT_MAX_CHARS],
+            item_id=item_id,
+            token=token,
+            attribution=attribution,
+        )
+
+    _rollout_unrecorded_merges.setdefault(rollout_id, {})[item_id] = _UnrecordedMerge(
+        1, outcome.merge_note, _monotonic() + config.ROLLOUT_LOOP_POLL_SECONDS
+    )
+    commit_line = _merge_commit_line(outcome)
+    try:
+        await gtd_client.post_comment(
+            item_id,
+            (
+                f"Rollout `{rollout_id}`: WARNING — reviewer merged this item "
+                f"(landed in: {', '.join(sorted(subjects))}) but recording it on "
+                f"the board failed after {_BOOKKEEPING_ATTEMPTS} attempts: "
+                f"{type(exc).__name__}: {exc}. Dependents stay blocked until it "
+                "is recorded; the rollout continues and retries the record each "
+                f"poll interval. Reviewer: {outcome.rationale}{commit_line}"
+            ),
+            created_by=attribution or "agent-gtd-dispatch",
+            token=token,
+        )
+    except Exception:
+        logger.warning(
+            "rollout-loop: failed to comment unrecorded merge on %s", item_id
+        )
+    logger.warning(
+        "rollout-loop: bookkeeping-failed-after-merge rollout_id=%s item_id=%s "
+        "repos=%s exc=%s",
+        rollout_id,
+        item_id,
+        ",".join(sorted(subjects)),
+        type(exc).__name__,
+    )
+    await _publish_rollout_phase(
+        rollout_id,
+        "polling",
+        item_id=item_id,
+        step=f"WARNING: item {item_id} merged but not recorded on the board",
+        token=token,
+    )
+    await _verify_landed_commit_type(
+        rollout_id,
+        item_id,
+        outcome,
+        workspace=workspace,
+        token=token,
+        attribution=attribution,
+    )
+    return _TICK_CONTINUE
+
+
+async def _retry_unrecorded_merges(
+    rollout_id: str,
+    pending: dict[str, _UnrecordedMerge],
+    *,
+    token: str | None,
+    attribution: str | None,
+) -> str | None:
+    """Retry board records for merged-but-unrecorded items that are due.
+
+    Returns a ``_TICK_*`` directive when the tick should end here (a record
+    succeeded, or the pass cap was reached and the rollout halted), else None.
+    """
+    for item_id in list(pending):
+        entry = pending[item_id]
+        if _monotonic() < entry.next_attempt_at:
+            continue
+        result, exc = await _complete_in_rollout_with_retry(
+            rollout_id,
+            item_id,
+            outcome="completed",
+            merge_note=entry.merge_note,
+            token=token,
+        )
+        if exc is None:
+            del pending[item_id]
+            try:
+                await gtd_client.post_comment(
+                    item_id,
+                    (
+                        f"Rollout `{rollout_id}`: board record for the merged item "
+                        f"succeeded on retry pass {entry.passes + 1}. "
+                        f"{_unblocked_text(result)}"
+                    ),
+                    created_by=attribution or "agent-gtd-dispatch",
+                    token=token,
+                )
+            except Exception:
+                logger.warning(
+                    "rollout-loop: failed to comment recorded merge on %s", item_id
+                )
+            logger.info(
+                "rollout-loop: unrecorded-merge-retry rollout_id=%s item_id=%s "
+                "pass=%d/%d outcome=recorded",
+                rollout_id,
+                item_id,
+                entry.passes + 1,
+                _MAX_UNRECORDED_MERGE_PASSES,
+            )
+            return _TICK_CONTINUE
+        n = entry.passes + 1
+        logger.warning(
+            "rollout-loop: unrecorded-merge-retry rollout_id=%s item_id=%s "
+            "pass=%d/%d outcome=failed exc=%s",
+            rollout_id,
+            item_id,
+            n,
+            _MAX_UNRECORDED_MERGE_PASSES,
+            type(exc).__name__,
+        )
+        if n >= _MAX_UNRECORDED_MERGE_PASSES:
+            return await _halt_rollout_from_loop(
+                rollout_id,
+                f"item {item_id} merged on origin but recording it on the board "
+                f"failed after {n} passes: {type(exc).__name__}: {exc} — record "
+                "it with complete_item_in_rollout (outcome=completed) and resume",
+                item_id=item_id,
+                token=token,
+                attribution=attribution,
+            )
+        pending[item_id] = _UnrecordedMerge(
+            n, entry.merge_note, _monotonic() + config.ROLLOUT_LOOP_POLL_SECONDS
+        )
+    return None
+
+
 async def _act_on_verdict(
     rollout_id: str,
     item_id: str,
@@ -2787,6 +3120,21 @@ async def _act_on_verdict(
     rollout halts — which is also the DEFAULT behaviour for a failed child, and
     deliberately unchanged: absent an explicit ``re-dispatch`` verdict, a failed
     child halts the rollout exactly as it does today.
+
+    Bookkeeping classification for ``merge`` / ``skip``:
+
+    - **Must succeed:** ``gtd_client.complete_in_rollout`` — it moves the board
+      graph and unblocks dependents.  It is retried
+      (``_complete_in_rollout_with_retry``).  If it still fails after a
+      ``merge``, the landed commit is looked up on origin: a confirmed merge
+      does NOT halt the rollout (the work has landed; only its record is late)
+      — it is tracked in ``_rollout_unrecorded_merges`` and retried each poll
+      interval by ``_rollout_wave_tick``.  An unconfirmed merge, or a failed
+      ``skip``, halts as before.
+    - **Best effort, never fatal:** the verdict ``gtd_client.post_comment``
+      and ``_verify_landed_commit_type``.
+    - Branch deletion is done by the reviewer itself and is not worker
+      bookkeeping.
     """
     if outcome.verdict == "halt":
         reason = f"reviewer halted item {item_id}: {outcome.rationale}"
@@ -2802,38 +3150,34 @@ async def _act_on_verdict(
 
     if outcome.verdict in ("merge", "skip"):
         recorded = "completed" if outcome.verdict == "merge" else "skipped"
-        try:
-            result = await gtd_client.complete_in_rollout(
+        result, exc = await _complete_in_rollout_with_retry(
+            rollout_id,
+            item_id,
+            outcome=recorded,
+            merge_note=outcome.merge_note,
+            token=token,
+        )
+        if exc is not None:
+            if outcome.verdict == "skip":
+                return await _halt_rollout_from_loop(
+                    rollout_id,
+                    f"failed to record item {item_id} as {recorded}: "
+                    f"{type(exc).__name__}: {exc}",
+                    item_id=item_id,
+                    token=token,
+                    attribution=attribution,
+                )
+            return await _handle_unrecorded_merge(
                 rollout_id,
                 item_id,
-                outcome=recorded,
-                merge_actor="reviewer-autonomous",
-                decision_rule="agent-judgment",
-                merge_note=outcome.merge_note,
-                token=token,
-            )
-        except Exception as exc:
-            return await _halt_rollout_from_loop(
-                rollout_id,
-                f"failed to record item {item_id} as {recorded}: "
-                f"{type(exc).__name__}: {exc}",
-                item_id=item_id,
+                outcome,
+                exc,
                 token=token,
                 attribution=attribution,
+                workspace=workspace,
             )
-        newly_ready = result.get("newly_ready") if isinstance(result, dict) else None
-        unblocked = (
-            f"Downstream items unblocked: {', '.join(str(x) for x in newly_ready)}."
-            if newly_ready
-            else "No downstream items unblocked."
-        )
-        commit_line = ""
-        if outcome.verdict == "merge":
-            commit_line = (
-                f" Commit type: `{outcome.commit_type}` ({outcome.commit_type_reason})."
-                if outcome.commit_type
-                else " Commit type: not reported by reviewer."
-            )
+        unblocked = _unblocked_text(result)
+        commit_line = _merge_commit_line(outcome) if outcome.verdict == "merge" else ""
         try:
             await gtd_client.post_comment(
                 item_id,
@@ -2944,8 +3288,30 @@ async def _rollout_wave_tick(
     in_flight = _in_flight_build_runs(rollout)
     completed = _completed_build_item_ids(advance, in_flight)
 
-    if completed:
-        item_id = completed[0]
+    # Merged-but-unrecorded items: drop any that left `in_progress` (recorded
+    # by someone else, or reset), retry the due ones, and never re-review them.
+    pending = _rollout_unrecorded_merges.get(rollout_id, {})
+    in_progress_ids = {str(i) for i in (advance.get("in_progress") or [])}
+    for stale_id in [k for k in pending if k not in in_progress_ids]:
+        logger.warning(
+            "rollout-loop: unrecorded-merge-dropped rollout_id=%s item_id=%s "
+            "passes=%d reason=left-in-progress",
+            rollout_id,
+            stale_id,
+            pending[stale_id].passes,
+        )
+        del pending[stale_id]
+    if pending:
+        directive = await _retry_unrecorded_merges(
+            rollout_id, pending, token=token, attribution=attribution
+        )
+        if directive is not None:
+            return directive
+
+    reviewable = [i for i in completed if i not in pending]
+
+    if reviewable:
+        item_id = reviewable[0]
         if workspace_ref[0] is None:
             await _publish_rollout_phase(
                 rollout_id,
@@ -3045,6 +3411,20 @@ async def _rollout_wave_tick(
         )
         return _TICK_WAIT
 
+    if pending:
+        await _publish_rollout_phase(
+            rollout_id,
+            "polling",
+            step=f"Waiting to record merged item(s) on the board: {', '.join(pending)}",
+            token=token,
+        )
+        logger.warning(
+            "rollout-loop: waiting-on-unrecorded-merges rollout_id=%s pending=%s",
+            rollout_id,
+            ",".join(f"{k}:{v.passes}" for k, v in pending.items()),
+        )
+        return _TICK_WAIT
+
     return await _halt_rollout_from_loop(
         rollout_id,
         "rollout stalled: nothing ready, nothing in flight, graph not complete "
@@ -3120,6 +3500,7 @@ async def _drive_rollout(
                 await asyncio.sleep(config.ROLLOUT_LOOP_POLL_SECONDS)
     finally:
         _rollout_redispatches.pop(rollout_id, None)
+        _rollout_unrecorded_merges.pop(rollout_id, None)
         ws = workspace_ref[0]
         # The shared workspace is torn down only when the loop itself ends. A
         # halted rollout keeps it: the tree is the evidence a human needs.

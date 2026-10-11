@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from agent_gtd_dispatch.main import (
@@ -1700,6 +1701,7 @@ def _loop_patch_stack():
         patch("agent_gtd_dispatch.main._active_processes", {}) as active,
         patch("agent_gtd_dispatch.main._rollout_to_run", {}) as rollout_to_run,
         patch("agent_gtd_dispatch.main._rollout_redispatches", {}) as redispatches,
+        patch("agent_gtd_dispatch.main._rollout_unrecorded_merges", {}) as unrecorded,
     ):
         mock_gtd.update_rollout_state = AsyncMock()
         mock_gtd.post_comment = AsyncMock()
@@ -1721,7 +1723,15 @@ def _loop_patch_stack():
             active=active,
             rollout_to_run=rollout_to_run,
             redispatches=redispatches,
+            unrecorded=unrecorded,
         )
+
+
+def _http_error(code):
+    req = httpx.Request("POST", "http://gtd.test/x")
+    return httpx.HTTPStatusError(
+        f"{code}", request=req, response=httpx.Response(code, request=req)
+    )
 
 
 def _fake_workspace():
@@ -3051,3 +3061,399 @@ class TestCommitTypeVerification:
             )
             await _tick(ctx, workspace_ref=[ws])
         assert act.await_args.kwargs["workspace"] is ws
+
+
+# ---------------------------------------------------------------------------
+# Bookkeeping after a merge: retry, confirm on origin, never halt unrelated work
+# ---------------------------------------------------------------------------
+
+
+async def _act_bk(
+    ctx,
+    verdict="merge",
+    *,
+    rollout_id="r1",
+    workspace="default",
+    item_commit_type="",
+    commit_type="",
+    merge_note="note",
+):
+    from agent_gtd_dispatch.main import ReviewVerdict, _act_on_verdict
+
+    return await _act_on_verdict(
+        rollout_id,
+        "item-a",
+        ReviewVerdict(
+            verdict,
+            "because",
+            merge_note,
+            "",
+            commit_type,
+            "groomed" if commit_type else "",
+            item_commit_type,
+        ),
+        token=None,
+        attribution=None,
+        workspace=_fake_workspace() if workspace == "default" else workspace,
+    )
+
+
+def _bodies(ctx) -> list[str]:
+    return [c.args[1] for c in ctx.gtd.post_comment.await_args_list]
+
+
+def _sleeps(ctx) -> list[float]:
+    return [c.args[0] for c in ctx.sleep.await_args_list]
+
+
+class TestBookkeepingRetry:
+    async def test_transient_failure_then_success_does_not_halt(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.complete_in_rollout = AsyncMock(
+                side_effect=[_http_error(503), {"newly_ready": ["item-b"]}]
+            )
+            ctx.dispatch.find_landed_commit_subjects = MagicMock()
+            assert await _act_bk(ctx) == _TICK_CONTINUE
+
+        assert ctx.gtd.complete_in_rollout.await_count == 2
+        call = ctx.gtd.complete_in_rollout.await_args
+        assert call.kwargs["merge_actor"] == "reviewer-autonomous"
+        assert call.kwargs["decision_rule"] == "agent-judgment"
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        assert _sleeps(ctx) == [2.0]
+        bodies = _bodies(ctx)
+        assert len(bodies) == 1
+        assert "Downstream items unblocked: item-b." in bodies[0]
+        assert "r1" not in ctx.unrecorded
+        ctx.dispatch.find_landed_commit_subjects.assert_not_called()
+
+    async def test_unconfirmed_merge_halts(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.complete_in_rollout = AsyncMock(side_effect=_http_error(503))
+            ctx.dispatch.find_landed_commit_subjects = MagicMock(return_value=({}, []))
+            assert await _act_bk(ctx) == _TICK_HALTED
+
+        ctx.gtd.halt_rollout.assert_awaited_once()
+        assert ctx.gtd.complete_in_rollout.await_count == 3
+        assert _sleeps(ctx) == [2.0, 5.0]
+        reason = ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+        assert reason.startswith("failed to record item item-a as completed:")
+        assert "confirmation: no-trailer-found" in reason
+        assert not any("item recorded as" in b for b in _bodies(ctx))
+        assert ctx.dispatch.find_landed_commit_subjects.call_count == 1
+        assert ctx.unrecorded == {}
+
+    async def test_no_workspace_halts_without_lookup(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.complete_in_rollout = AsyncMock(side_effect=_http_error(503))
+            ctx.dispatch.find_landed_commit_subjects = MagicMock(return_value=({}, []))
+            assert await _act_bk(ctx, workspace=None) == _TICK_HALTED
+
+        ctx.dispatch.find_landed_commit_subjects.assert_not_called()
+        reason = ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+        assert "confirmation: no-workspace" in reason
+        assert ctx.unrecorded == {}
+
+    async def test_lookup_raised_halts(self, caplog: pytest.LogCaptureFixture) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.main"),
+        ):
+            ctx.gtd.complete_in_rollout = AsyncMock(side_effect=_http_error(422))
+            ctx.dispatch.find_landed_commit_subjects = MagicMock(
+                side_effect=RuntimeError("git")
+            )
+            assert await _act_bk(ctx) == _TICK_HALTED
+
+        reason = ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+        assert "confirmation: lookup-raised" in reason
+        assert any(
+            "outcome=lookup-raised" in r.getMessage()
+            and "exc=RuntimeError" in r.getMessage()
+            for r in caplog.records
+        )
+        assert ctx.unrecorded == {}
+
+    async def test_skip_persistent_failure_halts_without_lookup(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.complete_in_rollout = AsyncMock(side_effect=_http_error(503))
+            ctx.dispatch.find_landed_commit_subjects = MagicMock(return_value=({}, []))
+            assert await _act_bk(ctx, "skip") == _TICK_HALTED
+
+        assert ctx.gtd.complete_in_rollout.await_count == 3
+        assert _sleeps(ctx) == [2.0, 5.0]
+        ctx.dispatch.find_landed_commit_subjects.assert_not_called()
+        reason = ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+        assert reason.startswith("failed to record item item-a as skipped:")
+        assert not any("item recorded as" in b for b in _bodies(ctx))
+
+    async def test_confirmed_merge_warns_and_continues(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.main import _TICK_CONTINUE, _UnrecordedMerge
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._monotonic", return_value=100.0),
+            caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.main"),
+            patch(
+                "agent_gtd_dispatch.main._halt_rollout_from_loop", new=AsyncMock()
+            ) as halt,
+        ):
+            ctx.gtd.complete_in_rollout = AsyncMock(side_effect=_http_error(503))
+            ctx.dispatch.find_landed_commit_subjects = MagicMock(
+                return_value=({"repo-a": "fix(x): y"}, [])
+            )
+            assert await _act_bk(ctx) == _TICK_CONTINUE
+
+        halt.assert_not_called()
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        assert ctx.unrecorded["r1"]["item-a"] == _UnrecordedMerge(
+            1, "note", 100.0 + config.ROLLOUT_LOOP_POLL_SECONDS
+        )
+        assert ctx.gtd.post_comment.await_count == 1
+        body = _bodies(ctx)[0]
+        assert body.startswith(
+            "Rollout `r1`: WARNING — reviewer merged this item (landed in: repo-a)"
+        )
+        assert "after 3 attempts" in body
+        assert "HTTPStatusError" in body
+        assert "Commit type: not reported by reviewer." in body
+        assert ctx.dispatch.find_landed_commit_subjects.call_count == 1
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("outcome=confirmed" in m for m in messages)
+        assert any("bookkeeping-failed-after-merge" in m for m in messages)
+        steps = [
+            c.kwargs.get("current_step")
+            for c in ctx.gtd.update_rollout_state.await_args_list
+        ]
+        assert "WARNING: item item-a merged but not recorded on the board" in steps
+
+    async def test_confirmed_merge_still_checks_commit_type(self) -> None:
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.complete_in_rollout = AsyncMock(side_effect=_http_error(503))
+            ctx.dispatch.find_landed_commit_subjects = MagicMock(
+                return_value=({"repo-a": "fix(x): y"}, [])
+            )
+            await _act_bk(ctx, item_commit_type="fix", commit_type="fix")
+
+        assert ctx.dispatch.find_landed_commit_subjects.call_count == 2
+
+    async def test_4xx_fails_fast_confirmed(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.complete_in_rollout = AsyncMock(side_effect=_http_error(422))
+            ctx.dispatch.find_landed_commit_subjects = MagicMock(
+                return_value=({"repo-a": "fix(x): y"}, [])
+            )
+            assert await _act_bk(ctx) == _TICK_CONTINUE
+
+        assert ctx.gtd.complete_in_rollout.await_count == 1
+        ctx.sleep.assert_not_awaited()
+        assert "item-a" in ctx.unrecorded["r1"]
+        assert _bodies(ctx)[0].startswith("Rollout `r1`: WARNING")
+
+    async def test_4xx_fails_fast_unconfirmed_names_failed_repos(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.complete_in_rollout = AsyncMock(side_effect=_http_error(422))
+            ctx.dispatch.find_landed_commit_subjects = MagicMock(
+                return_value=({}, ["repo-a"])
+            )
+            assert await _act_bk(ctx) == _TICK_HALTED
+
+        assert ctx.gtd.complete_in_rollout.await_count == 1
+        ctx.sleep.assert_not_awaited()
+        reason = ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+        assert "confirmation: no-trailer-found" in reason
+        assert "failed_repos=repo-a" in reason
+
+
+def _advance(completed, *, next_ready=None):
+    return AsyncMock(
+        return_value={
+            "next_ready": next_ready or [],
+            "in_progress": list(completed),
+            "blocked": [],
+            "graph_complete": False,
+        }
+    )
+
+
+class TestUnrecordedMergeRetryPass:
+    async def test_due_entry_recorded_without_rereview(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE, _UnrecordedMerge
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._monotonic", return_value=100.0),
+            patch("agent_gtd_dispatch.main._launch_reviewer") as reviewer,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            ctx.unrecorded["rollout-abc"] = {"item-a": _UnrecordedMerge(1, "note", 0.0)}
+            ctx.gtd.advance_rollout = _advance(["item-a"])
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            ctx.gtd.complete_in_rollout = AsyncMock(
+                return_value={"newly_ready": ["item-b"]}
+            )
+            assert await _tick(ctx) == _TICK_CONTINUE
+
+        reviewer.assert_not_called()
+        assert ctx.unrecorded["rollout-abc"] == {}
+        kwargs = ctx.gtd.complete_in_rollout.await_args.kwargs
+        assert kwargs["merge_note"] == "note"
+        assert kwargs["outcome"] == "completed"
+        assert any("outcome=recorded" in r.getMessage() for r in caplog.records)
+        assert _bodies(ctx) == [
+            "Rollout `rollout-abc`: board record for the merged item succeeded on "
+            "retry pass 2. Downstream items unblocked: item-b."
+        ]
+
+    async def test_failed_retry_reviews_other_item(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch.main import ReviewVerdict, _UnrecordedMerge
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._monotonic", return_value=100.0),
+            patch(
+                "agent_gtd_dispatch.main._launch_reviewer",
+                new=AsyncMock(return_value=ReviewVerdict("halt", "x", "", "")),
+            ) as reviewer,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            ctx.unrecorded["rollout-abc"] = {"item-a": _UnrecordedMerge(1, "n", 0.0)}
+            ctx.gtd.advance_rollout = _advance(["item-a", "item-b"])
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            ctx.gtd.complete_in_rollout = AsyncMock(side_effect=_http_error(503))
+            await _tick(ctx)
+
+        reviewer.assert_awaited_once()
+        assert reviewer.await_args.args[1] == "item-b"
+        assert ctx.unrecorded["rollout-abc"]["item-a"].passes == 2
+        assert any("pass=2/10 outcome=failed" in r.getMessage() for r in caplog.records)
+
+    async def test_not_due_is_skipped(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_WAIT, _UnrecordedMerge
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._monotonic", return_value=100.0),
+        ):
+            ctx.unrecorded["rollout-abc"] = {"item-a": _UnrecordedMerge(1, "n", 200.0)}
+            ctx.gtd.advance_rollout = _advance(["item-a"])
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            assert await _tick(ctx) == _TICK_WAIT
+
+        ctx.gtd.complete_in_rollout.assert_not_awaited()
+        assert ctx.unrecorded["rollout-abc"]["item-a"].passes == 1
+
+
+class TestWaitOnUnrecordedMerges:
+    async def test_waits_instead_of_stall_halt(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_WAIT, _UnrecordedMerge
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._monotonic", return_value=100.0),
+        ):
+            ctx.unrecorded["rollout-abc"] = {"item-a": _UnrecordedMerge(1, "n", 0.0)}
+            ctx.gtd.advance_rollout = _advance(["item-a"])
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            ctx.gtd.complete_in_rollout = AsyncMock(side_effect=_http_error(503))
+            assert await _tick(ctx) == _TICK_WAIT
+
+        assert ctx.unrecorded["rollout-abc"]["item-a"].passes == 2
+        ctx.gtd.halt_rollout.assert_not_awaited()
+
+    async def test_halts_at_pass_cap(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED, _UnrecordedMerge
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._monotonic", return_value=100.0),
+        ):
+            ctx.unrecorded["rollout-abc"] = {"item-a": _UnrecordedMerge(9, "n", 0.0)}
+            ctx.gtd.advance_rollout = _advance(["item-a"])
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            ctx.gtd.complete_in_rollout = AsyncMock(side_effect=_http_error(503))
+            assert await _tick(ctx) == _TICK_HALTED
+
+        reason = ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+        assert (
+            "merged on origin but recording it on the board failed after 10 passes"
+            in (reason)
+        )
+        assert "complete_item_in_rollout" in reason
+
+    async def test_entry_left_in_progress_is_dropped(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED, _UnrecordedMerge
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._monotonic", return_value=100.0),
+            caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.main"),
+        ):
+            ctx.unrecorded["rollout-abc"] = {"item-a": _UnrecordedMerge(1, "n", 0.0)}
+            ctx.gtd.advance_rollout = _advance([])
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            assert await _tick(ctx) == _TICK_HALTED
+
+        assert ctx.unrecorded["rollout-abc"] == {}
+        assert any("unrecorded-merge-dropped" in r.getMessage() for r in caplog.records)
+        assert "stalled" in ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+        ctx.gtd.complete_in_rollout.assert_not_awaited()
+
+
+class TestDriveRolloutClearsUnrecordedMerges:
+    async def test_finally_pops_entry(self) -> None:
+        from agent_gtd_dispatch.main import (
+            _TICK_DONE,
+            _drive_rollout,
+            _UnrecordedMerge,
+        )
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._rollout_wave_tick",
+                new=AsyncMock(return_value=_TICK_DONE),
+            ),
+            patch("agent_gtd_dispatch.main.get_engine", return_value=MagicMock()),
+        ):
+            ctx.unrecorded["rollout-abc"] = {"item-a": _UnrecordedMerge(1, "n", 0.0)}
+            ctx.gtd.get_rollout = AsyncMock(return_value={"project_id": "p"})
+            ctx.gtd.get_project = AsyncMock(return_value={"name": "p"})
+            assert await _drive_rollout(_make_run()) == _TICK_DONE
+
+        assert "rollout-abc" not in ctx.unrecorded
