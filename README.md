@@ -85,7 +85,7 @@ on Bearer endpoints.
 Set `OLLAMA_BASE_URL` to route `claude-code-ollama` dispatches through a local Ollama instance instead of the Anthropic API. If Ollama is unreachable at dispatch time, the engine falls back to `claude-code` with a comment posted to the GTD item.
 
 ```bash
-export OLLAMA_BASE_URL="http://192.168.1.52:11434"   # root URL — no /v1 suffix
+export OLLAMA_BASE_URL="http://<ollama-host>:11434"   # root URL — no /v1 suffix
 export OLLAMA_DEFAULT_MODEL="qwen3.6:35b"            # default if omitted
 ```
 

@@ -13,14 +13,14 @@ object is the CLI result envelope — pipe the output through ``jq`` to read it.
 
 Example (SSH to dispatch host)::
 
-    ssh dispatch@pironman01 \\
+    ssh dispatch@<host> \\
         'python -m agent_gtd_dispatch.show_run_transcript abc123def456'
 
 Or for a manage-mode run, whose workspace is ``repos-{run_id}`` (see
 ``dispatch.prepare_manage_workspace``) — the same ``repos-`` prefix build runs
 use, not the long-gone ``wave-manager-`` one::
 
-    ssh dispatch@pironman01 \\
+    ssh dispatch@<host> \\
         'cat /home/dispatch/workspace/repos-abc123/transcript.txt'
 """
 

@@ -202,7 +202,7 @@ OLLAMA_CLOUD_MODEL: str = "glm-5.3:cloud"
 # TALOS_BIN env var when the binary lives at a non-default path on the host.
 TALOS_BIN: str = "talos"
 # Talos gate-command timeout. Talos' own default is 300 s; 900 s is chosen to
-# survive a COLD fmt+clippy+nextest gate run on the Pi (pironman01).
+# survive a COLD fmt+clippy+nextest gate run on a Pi-class host.
 TALOS_GATE_TIMEOUT_SECS: int = 900
 # Fleet-wide talos KB memory mode, passed as `talos run --memory <mode>` when not 'off'.
 TALOS_MEMORY_MODES = frozenset({"off", "annotate", "deny-once"})

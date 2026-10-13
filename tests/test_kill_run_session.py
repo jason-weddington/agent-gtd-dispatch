@@ -3,7 +3,7 @@
 ``kill_run_session`` exists because the worker launches every agent and gate
 subprocess as ``sudo -u dispatch -H <cmd>``; sudo cannot relay SIGKILL to its
 child, so killing the sudo wrapper's pid orphaned the agent and every command
-it had spawned (one such tree ran 19 hours on jason-precision).  The fix is to
+it had spawned (one such tree ran 19 hours on one host).  The fix is to
 launch the wrapper as a NEW SESSION LEADER (``start_new_session=True``) and,
 on timeout/cancel, signal every process in that session by session id.
 """

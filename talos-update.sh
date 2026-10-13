@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# talos-update.sh — Pull the published talos binary from pi-04 to the dispatch fleet.
+# talos-update.sh — Pull the published talos binary from the artifact host to the dispatch fleet.
 #
 # Resolves the target version from <TALOS_ARTIFACT_BASE>/latest (or --version <TOKEN>),
 # checks the currently installed version on each host, and downloads + installs the
@@ -11,12 +11,11 @@ set -euo pipefail
 # so the next run picks up the new binary automatically.  Do NOT restart dispatch-api here.
 #
 # Environment variables:
-#   DISPATCH_HOSTS        Space-separated SSH targets (default: "pironman01 r7-research r7-server jason-precision")
+#   DISPATCH_HOSTS        Space-separated SSH targets (default: derived from the GTD
+#                         host registry, see scripts/fleet-hosts.sh)
 #   DISPATCH_HOST         Single SSH target — if set, overrides DISPATCH_HOSTS (back-compat)
-#   TALOS_ARTIFACT_BASE   Base URL of the talos artifact tree served by pi-04's Caddy.
-#                         PROVISIONAL default: https://artifacts.lab.jasonweddington.com
-#                         The exact URL is being finalised (pypi.lab vs talos.lab subdomain);
-#                         override via this env var until the canonical URL is pinned.
+#   TALOS_ARTIFACT_BASE   REQUIRED. Base URL of the talos artifact tree (layout below
+#                         in --help).
 #   AGENT_USER            OS user that owns the talos binary (default: dispatch)
 #   AGENT_GROUP           OS group for the installed binary (default: same as AGENT_USER)
 #
@@ -26,8 +25,8 @@ set -euo pipefail
 # Defaults
 # ---------------------------------------------------------------------------
 
-# pi-04 Caddy serves /srv/talos at the root of this subdomain (artifacts.lab).
-TALOS_ARTIFACT_BASE="${TALOS_ARTIFACT_BASE:-https://artifacts.lab.jasonweddington.com}"
+# No default: the artifact host is deployment-specific. Checked after argument
+# parsing so --help works without it.
 
 AGENT_USER="${AGENT_USER:-dispatch}"
 AGENT_GROUP="${AGENT_GROUP:-${AGENT_USER}}"
@@ -62,7 +61,7 @@ usage() {
     cat <<'USAGE'
 Usage: ./talos-update.sh [--version <TOKEN>]
 
-Pull the published talos binary from pi-04 to the dispatch fleet.
+Pull the published talos binary from the artifact host to the dispatch fleet.
 Checks the installed version on each host; downloads only when stale.
 
 Options:
@@ -71,13 +70,13 @@ Options:
   -h, --help         Show this help text.
 
 Environment variables:
-  DISPATCH_HOSTS        Space-separated SSH targets       (default: "pironman01 r7-research r7-server jason-precision")
+  DISPATCH_HOSTS        Space-separated SSH targets       (default: derived from the GTD host registry)
   DISPATCH_HOST         Single SSH target (overrides DISPATCH_HOSTS)
-  TALOS_ARTIFACT_BASE   Artifact base URL served by pi-04 (provisional default: pypi.lab URL)
+  TALOS_ARTIFACT_BASE   REQUIRED. Artifact base URL
   AGENT_USER            OS user that owns the talos binary (default: dispatch)
   AGENT_GROUP           OS group for the installed binary  (default: same as AGENT_USER)
 
-Pi-04 artifact layout:
+Artifact layout:
   <BASE>/latest            → one-line file: the current version token
   <BASE>/<TOKEN>/<arch>/talos  → the binary  (arch ∈ {x86_64, aarch64})
 
@@ -105,6 +104,9 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+[ -n "${TALOS_ARTIFACT_BASE:-}" ] \
+    || die "TALOS_ARTIFACT_BASE must be set to the base URL of the talos artifact tree"
 
 # ---------------------------------------------------------------------------
 # Resolve target version (fetch <BASE>/latest unless --version was given)

@@ -53,16 +53,19 @@ class TestTextGuards:
     def test_install_is_unpinned_and_forced(self) -> None:
         text = SETUP_SCRIPT.read_text()
         assert "uv tool install --force --from '${_hook_src}' personal-kb-hook" in text
-        # The default source carries no @<sha> pin.
-        assert (
-            "PERSONAL_KB_HOOK_SRC_DEFAULT="
-            '"git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb'
-            '#subdirectory=packages/personal-kb-hook"' in text
-        )
+        # No baked-in source: the deployment supplies it (and pins nothing).
+        assert "PERSONAL_KB_HOOK_SRC_DEFAULT" not in text
+        assert '_hook_src="${PERSONAL_KB_HOOK_SRC:-}"' in text
 
     def test_hook_src_read_from_service_env(self) -> None:
         text = SETUP_SCRIPT.read_text()
-        assert 'PERSONAL_KB_HOOK_SRC="$(_read_env_var PERSONAL_KB_HOOK_SRC)"' in text
+        assert '_v="$(_read_env_var PERSONAL_KB_HOOK_SRC)"' in text
+
+    def test_step_skipped_loudly_when_unconfigured(self) -> None:
+        text = SETUP_SCRIPT.read_text()
+        assert '_hook_missing="${_hook_missing} PERSONAL_KB_HOOK_SRC"' in text
+        assert '_hook_missing="${_hook_missing} PERSONAL_KB_URL"' in text
+        assert 'warn "SKIPPING personal-kb-hook:' in text
 
     def test_absolute_binary_path(self) -> None:
         text = SETUP_SCRIPT.read_text()

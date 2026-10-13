@@ -81,7 +81,7 @@ class TestPlanModeEngineSwap:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
@@ -137,7 +137,7 @@ class TestPlanModeEngineSwap:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
@@ -189,7 +189,7 @@ class TestPlanModeEngineSwap:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
@@ -242,7 +242,7 @@ class TestPlanModeEngineSwap:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
@@ -295,7 +295,7 @@ class TestManageModeEngineSwap:
             return_value={
                 "id": "proj1",
                 "name": "WaveProject",
-                "git_origin": "git@ubuntu-vm01:repos/wave-project",
+                "git_origin": "git@git.example.com:repos/wave-project",
             }
         )
         mock_client.post_comment = AsyncMock()

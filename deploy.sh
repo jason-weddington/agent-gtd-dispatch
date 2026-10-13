@@ -3,35 +3,37 @@ set -euo pipefail
 
 # deploy.sh — Deploy the latest agent-gtd-dispatch wheel to one or more hosts.
 #
-# Runs `uv tool install --force agent-gtd-dispatch --index <homelab>` as the
+# Runs `uv tool install --force agent-gtd-dispatch --index <DISPATCH_INDEX>` as the
 # service user on each host, then restarts the systemd unit and probes /health.
-# Hosts consume the wheel published to the homelab index (pi-04 pypi.lab) by
-# release.sh; no working copy on the host, no source-tree state.
+# Hosts consume the wheel published to the private index named by
+# DISPATCH_INDEX; no working copy on the host, no source-tree state.
 # It also refreshes /etc/sudoers.d/dispatch-svc via scripts/sudoers-refresh.sh
 # before the wheel install.
 # It also refreshes the agent user's agent-gtd/personal-kb/team-kb registrations via scripts/kb-mcp-refresh.sh and probes agent-gtd with templates/mcp-probe.py (non-fatal).
 #
-# The homelab index is passed via `--index` (NOT `--index-url`) so it is
+# The private index is passed via `--index` (NOT `--index-url`) so it is
 # ADDED to the default PyPI list; uv resolves fastapi/uvicorn/anthropic/etc.
 # from public PyPI while pulling agent-gtd-dispatch and agent-gtd-dispatch-protocol
-# from the homelab. Both wheels must already be on the index; release.sh publishes
-# them before this script runs.
+# from the private index. Both wheels must already be on the index (the
+# maintainer-local release.local.sh hook publishes them before deploying).
 #
 # Environment variables:
-#   DISPATCH_HOSTS  Space-separated SSH targets (default: "pironman01 r7-research r7-server jason-precision")
+#   DISPATCH_HOSTS  Space-separated SSH targets (default: derived from the GTD host
+#                   registry, see scripts/fleet-hosts.sh)
 #   DISPATCH_HOST   Single SSH target — if set, overrides DISPATCH_HOSTS (back-compat)
 #   SERVICE_USER    Service account owning the tool install (default: dispatch-svc)
 #   AGENT_USER      Agent subprocess user whose Claude Code, lefthook, dev toolchain
 #                   (Rust tools + gitleaks, Step 4.9) and Playwright browsers
 #                   (Step 4.11) are refreshed (default: dispatch)
 #   SERVICE_NAME    Systemd service unit name (default: dispatch-api)
-#   DISPATCH_INDEX  Homelab wheel index URL (default: https://pypi.lab.jasonweddington.com/simple/)
+#   DISPATCH_INDEX  REQUIRED. Private wheel index URL (PEP 503 simple/ root)
 #   RUST_DEFAULT_TOOLCHAIN  Rust toolchain pointed at by 'rustup default' when the agent
 #                   user has rustup but no usable default (default: stable)
-#   PERSONAL_KB_HOOK_SRC  Source for the personal-kb-hook uv tool refresh (setup-
-#                   dispatch-host.sh Step 4.10). Deliberately unpinned by default —
-#                   see the PINNING ASYMMETRY note in Step 4.10 of setup-dispatch-host.sh.
-#                   (default: git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb#subdirectory=packages/personal-kb-hook)
+#   PERSONAL_KB_HOOK_SRC  REQUIRED. uv source spec for the personal-kb-hook tool refresh
+#                   (setup-dispatch-host.sh Step 4.10), e.g.
+#                   git+ssh://git@git.example.com/repos/personal_kb#subdirectory=packages/personal-kb-hook.
+#                   Deliberately unpinned — see the PINNING ASYMMETRY note in Step 4.10
+#                   of setup-dispatch-host.sh.
 #
 # Exit code: 0 if every host succeeded. Non-zero on first failure (other hosts skipped).
 
@@ -40,9 +42,9 @@ resolve_fleet_hosts || exit 1
 SERVICE_USER="${SERVICE_USER:-dispatch-svc}"
 AGENT_USER="${AGENT_USER:-dispatch}"
 SERVICE_NAME="${SERVICE_NAME:-dispatch-api}"
-DISPATCH_INDEX="${DISPATCH_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
+DISPATCH_INDEX="${DISPATCH_INDEX:?DISPATCH_INDEX must be set to the private wheel index URL (PEP 503 simple/ root)}"
 RUST_DEFAULT_TOOLCHAIN="${RUST_DEFAULT_TOOLCHAIN:-stable}"
-PERSONAL_KB_HOOK_SRC="${PERSONAL_KB_HOOK_SRC:-git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb#subdirectory=packages/personal-kb-hook}"
+PERSONAL_KB_HOOK_SRC="${PERSONAL_KB_HOOK_SRC:?PERSONAL_KB_HOOK_SRC must be set to the uv source spec for personal-kb-hook}"
 
 # --- Dev toolchain data (single source of truth: templates/dev-toolchain.sh) ---
 # deploy.sh runs LOCALLY from a repo checkout, so the tool list is sourced here and
@@ -110,7 +112,7 @@ if ! sudo bash "${_stage}/sudoers-refresh.sh" --template "${_stage}/sudoers-disp
 if sudo test -f /home/${SERVICE_USER}/.env; then if ! sudo bash "${_stage}/kb-mcp-refresh.sh" --env-file /home/${SERVICE_USER}/.env --agent-user ${AGENT_USER} --probe "${_stage}/mcp-probe.py" 2>&1 | sed "s/^/[${host}] /"; then echo "[WARN] MCP refresh failed on ${host} — agent-gtd/KB registrations may be stale" >&2; fi; else echo "[SKIP] MCP refresh: /home/${SERVICE_USER}/.env not present on ${host}"; fi
 rm -rf "${_stage}"
 
-# Install/refresh the wheel from the homelab index.
+# Install/refresh the wheel from the private index.
 # -H sets HOME=/home/${SERVICE_USER} so uv installs the tool under the service
 # user's ~/.local (not root's HOME); without it the entry point lands in the
 # wrong place and the systemd ExecStart path is missing.
@@ -174,7 +176,7 @@ _cargo="/home/${AGENT_USER}/.cargo/bin/cargo"
 _rustup="/home/${AGENT_USER}/.cargo/bin/rustup"
 
 # Self-heal: a host can have rustup installed with toolchains present but no
-# default set (e.g. r7-research, 2026-09-17) — every cargo invocation then
+# default set (seen on an x86_64 host) — every cargo invocation then
 # fails. If cargo is unusable but rustup exists, point the default at
 # RUST_DEFAULT_TOOLCHAIN before deciding whether to skip the refresh below.
 if ! sudo -u ${AGENT_USER} -H "\$_cargo" --version >/dev/null 2>&1 && [ -x "\$_rustup" ]; then

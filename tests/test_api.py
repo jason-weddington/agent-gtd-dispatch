@@ -113,7 +113,7 @@ class TestDispatch:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_client.post_comment = AsyncMock()
@@ -149,7 +149,7 @@ class TestDispatch:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_client.post_comment = AsyncMock()
@@ -208,7 +208,7 @@ class TestDispatch:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
@@ -244,7 +244,7 @@ class TestDispatch:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
@@ -282,7 +282,7 @@ class TestDispatch:
             return_value={
                 "id": "proj1",
                 "name": "WaveProject",
-                "git_origin": "git@ubuntu-vm01:repos/wave-project",
+                "git_origin": "git@git.example.com:repos/wave-project",
             }
         )
         mock_dispatch.prepare_manage_workspace.return_value = None
@@ -320,7 +320,7 @@ class TestDispatch:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
@@ -355,7 +355,7 @@ class TestDispatch:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
@@ -429,7 +429,7 @@ class TestDispatch:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
@@ -481,7 +481,7 @@ class TestDispatchCallbackToken:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_client.post_comment = AsyncMock()
@@ -527,7 +527,7 @@ class TestDispatchCallbackToken:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_client.post_comment = AsyncMock()
@@ -560,7 +560,7 @@ class TestDispatchCallbackToken:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
@@ -593,7 +593,7 @@ class TestDispatchCallbackToken:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
 
@@ -644,7 +644,7 @@ class TestMaxConcurrentRunsEnforcement:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/abc123-test-item"
@@ -727,7 +727,7 @@ class TestMaxConcurrentRunsEnforcement:
             return_value={
                 "id": "proj1",
                 "name": "WaveProject",
-                "git_origin": "git@ubuntu-vm01:repos/wave-project",
+                "git_origin": "git@git.example.com:repos/wave-project",
             }
         )
 
@@ -772,7 +772,7 @@ class TestBurstDispatch:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/item-burst"
@@ -820,7 +820,7 @@ class TestBurstDispatch:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/item-queued"
@@ -969,7 +969,7 @@ class TestDispatchManageMode:
             return_value={
                 "id": "proj1",
                 "name": "WaveProject",
-                "git_origin": "git@ubuntu-vm01:repos/wave-project",
+                "git_origin": "git@git.example.com:repos/wave-project",
             }
         )
         mock_client.post_comment = AsyncMock()
@@ -1385,7 +1385,7 @@ class TestWorkspaceDispatch:
             return_value={
                 "id": "proj1",
                 "name": "MonorepoProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
                 # no repo_mode key at all
             }
         )
@@ -1418,7 +1418,7 @@ class TestWorkspaceDispatch:
             return_value={
                 "id": "proj1",
                 "name": "SomeProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
                 "repo_mode": "something-else",  # unknown value → monorepo
             }
         )
@@ -1677,7 +1677,7 @@ class TestPreflightItemFetch:
             return_value={
                 "id": "proj1",
                 "name": "TestProject",
-                "git_origin": "git@ubuntu-vm01:repos/test",
+                "git_origin": "git@git.example.com:repos/test",
             }
         )
         mock_dispatch.branch_name_for_item.return_value = "feat/item-pf-ok"

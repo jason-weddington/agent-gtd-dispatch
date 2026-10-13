@@ -9,7 +9,7 @@ second run still yields exactly four personal-kb-hook blocks, not eight.
 
 Events wired: SessionStart, UserPromptSubmit and Stop (no matcher), plus
 PostToolUse with matcher `mcp__personal-kb__kb_get|mcp__team-kb__team_kb_get`
-(copied verbatim from jason-desktop's settings.json).
+(copied verbatim from a working workstation settings.json).
 
 Usage:
     personal-kb-hook-settings.py <settings_file> <hook_bin> <key_file> <url>

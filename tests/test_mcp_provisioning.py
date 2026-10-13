@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 
+from tests.test_no_lab_specifics import LAB_PATTERN
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -88,7 +90,7 @@ class TestTextGuards:
         assert "-e ANTHROPIC_API_KEY=" not in text
         assert "KB_ANTHROPIC_API_KEY" not in text
         assert "KB_DATABASE_URL" not in text
-        assert "ubuntu-vm01" not in text
+        assert not LAB_PATTERN.search(text)
         assert "PERSONAL_KB_MCP_SRC" not in text
         for token in ("warn ", "info ", "die ", "would "):
             assert token not in text

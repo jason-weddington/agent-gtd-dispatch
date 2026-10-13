@@ -54,12 +54,14 @@ cd agent-gtd-dispatch
 cp templates/dispatch-env.tmpl /tmp/dispatch.env
 $EDITOR /tmp/dispatch.env    # set AGENT_GTD_*  (DISPATCH_API_KEY is auto-minted by Step 3.5 if you leave it empty)
 
-# 3. Run the installer
-sudo ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
+# 3. Run the installer, naming the wheel index that serves agent-gtd-dispatch
+sudo DISPATCH_WHEEL_INDEX=https://<your-index>/simple/ ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
 
 # 4. (Optional) run smoke test
-sudo ./setup-dispatch-host.sh --env-file /tmp/dispatch.env --smoke
+sudo DISPATCH_WHEEL_INDEX=https://<your-index>/simple/ ./setup-dispatch-host.sh --env-file /tmp/dispatch.env --smoke
 ```
+
+`DISPATCH_WHEEL_INDEX` is required and has no default: the service is installed as a uv tool from that PEP 503 index (added alongside public PyPI, so only the two `agent-gtd-dispatch*` wheels need to be on it), and the installer exits before touching the host when it is unset. The other deployment-specific inputs are optional and skip their step with a `[WARN]` when absent: `PERSONAL_KB_HOOK_SRC` + `PERSONAL_KB_URL` (Step 4.10, the KB hook) and `HARNESS_DESIGN_REPO_URL`, which is required only with `--with-talos`. The examples below omit `DISPATCH_WHEEL_INDEX` for brevity.
 
 The installer is idempotent — re-running it on a configured host prints
 `[SKIP] already configured` for every completed step and exits 0.
@@ -165,10 +167,9 @@ The SSH key now exists, so the installer skips key generation, copies it to
 
 ---
 
-## Migration — pironman01 (two-user split)
+## Migration — single-account host to the two-user split
 
-pironman01 previously ran the service as the `dispatch` user. The two-user
-split (`998544ac`) introduces `dispatch-svc` as the service account and
+A host installed before the two-user split ran the service as the `dispatch` user. The split (`998544ac`) introduces `dispatch-svc` as the service account and
 demotes `dispatch` to an unprivileged agent subprocess user.
 
 ```bash
@@ -337,7 +338,7 @@ env file.
 > these vars; it attempts the run and lets the binary authenticate however it normally
 > does. The trade-off: on a host where the binary is *not* externally authenticated and
 > neither var is set, the engine still reports available and the run fails at exec time —
-> so for a plain homelab install, set `CLAUDE_CODE_OAUTH_TOKEN` as below. If your wrapper
+> so for a plain self-hosted install, set `CLAUDE_CODE_OAUTH_TOKEN` as below. If your wrapper
 > authenticates via its own environment variables, those are not forwarded to the agent
 > subprocess by default (only the keys in `engines.py::COMMON_ENV_KEYS` / the engine's
 > `env_keys` are) — file an issue if you need a passthrough allowlist.
@@ -459,7 +460,7 @@ Add `--with-talos` when you want to dispatch `talos-*` engines on this host. Ski
 
 ### Prerequisites
 
-- The agent user's SSH key must be authorised on the git host that serves `HARNESS_DESIGN_REPO_URL` (default: `git@ubuntu-vm01:repos/harness-design`). If the key is not yet authorised the installer fails with a clear `[ERROR]` and instructions before touching anything.
+- The agent user's SSH key must be authorised on the git host that serves `HARNESS_DESIGN_REPO_URL` (required with `--with-talos`; there is no default). If the key is not yet authorised the installer fails with a clear `[ERROR]` and instructions before touching anything.
 - Internet access for `rustup` and `cargo-binstall` installers (or pre-install Rust for the agent user manually before running).
 
 ### What the step does
@@ -478,7 +479,7 @@ Seven sub-steps, all idempotent:
 
 ### Environment variable override
 
-`HARNESS_DESIGN_REPO_URL` controls the git remote for the harness-design clone. Default: `git@ubuntu-vm01:repos/harness-design`. Override on the installer command line:
+`HARNESS_DESIGN_REPO_URL` sets the git remote for the harness-design clone. It is required with `--with-talos` (the installer exits early without it) and has no default. Pass it on the installer command line:
 
 ```bash
 sudo HARNESS_DESIGN_REPO_URL=git@your-git-host:path/harness-design \
@@ -602,9 +603,9 @@ Registration is **per-host and per-user** using `--scope user`, which writes to
 user is your own login account, so `--scope user` writes to YOUR `~/.claude.json`.**
 
 > ⚠️ **Adapt this to your environment.** The entries in `templates/mcp-servers.sh`
-> hardcode homelab-specific values: `uvx` sources pointing at
+> hardcode environment-specific values: `uvx` sources pointing at
 > `git+ssh://git@<your-git-host>/home/git/repos/...` and KB identities
-> (`KB_CONTRIBUTOR=jason`, `KB_TEAM=grit-mile`). On any other environment these need
+> (`KB_CONTRIBUTOR=<you>`, `KB_TEAM=grit-mile`). On any other environment these need
 > your own git host and KB identities (or trim the array to just the servers you
 > need) — Step 4.6 now runs a real MCP `initialize` + `tools/list` handshake against
 > each registered server (`templates/mcp-probe.py`), so a misconfigured entry is
@@ -776,7 +777,7 @@ sudo -u dispatch -H bash -lc 'cd /tmp && rm -rf hook-probe && git init hook-prob
 
 # (e) OPTIONAL — a fresh clone has the shims. Step (d)'s local `git init` probe is the
 #     canonical check; this one additionally proves clone-over-SSH works. The example
-#     uses the homelab git server — replace with any repo on your git host that
+#     uses a self-hosted git server — replace with any repo on your git host that
 #     contains .pre-commit-config.yaml (requires the dispatch key authorized there):
 sudo -u dispatch -H bash -lc 'cd /tmp && rm -rf agent_gtd_probe && git clone git@<your-git-host>:repos/agent_gtd agent_gtd_probe && ls agent_gtd_probe/.git/hooks/'
 # → contains pre-commit, commit-msg, pre-push
@@ -804,7 +805,7 @@ The step runs `uv tool install lefthook` as the agent user, creating a symlink a
 
 ### Architecture support (aarch64 + x86_64)
 
-PyPI ships `lefthook` as manylinux_2_17 wheels for both aarch64 and x86_64 (each wheel bundles a static Go binary), verified with lefthook 2.1.14 on pironman01 (aarch64) and an x86_64 host.
+PyPI ships `lefthook` as manylinux_2_17 wheels for both aarch64 and x86_64 (each wheel bundles a static Go binary), verified with lefthook 2.1.14 on an aarch64 Pi 5 and an x86_64 host.
 
 ### Deploy refresh
 
@@ -878,8 +879,8 @@ GITLEAKS_VERSION="8.30.1"
 
 | `uname -m` | gitleaks asset token | Hosts |
 |---|---|---|
-| `x86_64` | `x64` | r7-research, r7-server |
-| `aarch64` | `arm64` | pironman01 (Raspberry Pi 5) |
+| `x86_64` | `x64` | x86_64 hosts |
+| `aarch64` | `arm64` | Raspberry Pi 5-class hosts |
 
 Any other architecture prints a `[WARN]` and skips gitleaks rather than guessing an asset name.
 
@@ -928,7 +929,7 @@ sudo -u dispatch -H bash -lc 'gitleaks version' || echo "MISSING: gitleaks"
 error: rustup could not choose a version of cargo to run, because one wasn't specified explicitly, and no default is configured.
 ```
 
-**Hit on r7-research, 2026-09-17**, while provisioning: `rustup` was installed with toolchains present (`stable`, `1.96.0`, `1.97.0`) but **no default set**, so `rustup show active-toolchain` reported "no active toolchain" and every `cargo ...` invocation failed. `pironman01` and `r7-server` were unaffected — their `rustup` was installed by Step 4.5b, which sets a default as part of the same install run.
+**Seen while provisioning an x86_64 host**: `rustup` was installed with toolchains present (`stable`, `1.96.0`, `1.97.0`) but **no default set**, so `rustup show active-toolchain` reported "no active toolchain" and every `cargo ...` invocation failed. Hosts whose `rustup` was installed by Step 4.5b are unaffected — it sets a default as part of the same install run.
 
 **Manual fix** (if you hit this before re-provisioning):
 
@@ -948,11 +949,11 @@ Step 4.10 installs the `personal-kb-hook` Claude Code hook for the `dispatch` (a
 
 ### Why this matters
 
-Telemetry from the KB side: 2,067 map-push rows since June, with `build_engine` **NULL on every one** — no dispatched agent has ever received a map directory, which is exactly the audience that needs one most (a build agent landing cold in an unfamiliar repo). The lead installed and wired the hook by hand on `pironman01`, `r7-research` and `r7-server` on 2026-09-18 so the fleet works today; this step is what keeps a re-run of `setup-dispatch-host.sh` from clobbering that hand-config on those hosts, and gets the same wiring onto every new host automatically — the same failure mode that hit the KB MCP registration on 2026-09-17.
+A dispatched build agent lands cold in an unfamiliar repo, which makes it exactly the audience that most needs a KB map directory — and without this step no dispatched agent receives one. Wiring the hook by hand on a host works until the next re-run of `setup-dispatch-host.sh` clobbers it; this step makes the wiring part of provisioning, so it survives re-runs and reaches every new host automatically.
 
 ### What the step does
 
-1. Installs `personal-kb-hook` as the agent user: `uv tool install --force --from '<SRC>' personal-kb-hook`, where `<SRC>` defaults to `git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb#subdirectory=packages/personal-kb-hook`, overridable via `PERSONAL_KB_HOOK_SRC` in the service env. `--force` is both the install and the upgrade path — every run reinstalls from the current source. Non-fatal: a failed install warns and provisioning continues.
+1. Installs `personal-kb-hook` as the agent user: `uv tool install --force --from '<SRC>' personal-kb-hook`, where `<SRC>` is `PERSONAL_KB_HOOK_SRC` from the service env or the installer's environment (e.g. `git+ssh://git@<your-git-host>/repos/personal_kb#subdirectory=packages/personal-kb-hook`). There is no default: when `PERSONAL_KB_HOOK_SRC` or `PERSONAL_KB_URL` is unset the whole step is skipped with a `[WARN] SKIPPING personal-kb-hook: ...` line naming the missing variable(s). `--force` is both the install and the upgrade path — every run reinstalls from the current source. Non-fatal: a failed install warns and provisioning continues.
 2. Writes the hook's API key file at `/home/dispatch/.personal_kb_hook_key` (owner `dispatch`, mode `0600`) from the **existing** `PERSONAL_KB_API_KEY` in the service env — the same key this host already uses for its `personal-kb` MCP registration (Step 4.6 writes the same key file). No separate hook-specific key is minted, required, or documented.
 3. Merges four hook blocks into `/home/dispatch/.claude/settings.json` — a read-modify-write of the parsed JSON via `templates/personal-kb-hook-settings.py`, never a wholesale overwrite, so any other settings already in that file survive:
    - `SessionStart`, `UserPromptSubmit`, `Stop` — no matcher.
@@ -962,7 +963,7 @@ Telemetry from the KB side: 2,067 map-push rows since June, with `build_engine` 
    ```
    PERSONAL_KB_LISTENER=1 PERSONAL_KB_URL=<url> PERSONAL_KB_API_KEY=$(cat /home/dispatch/.personal_kb_hook_key 2>/dev/null) /home/dispatch/.local/bin/personal-kb-hook --format=claude-json
    ```
-   The `--format=claude-json` flag and the `PostToolUse` matcher are copied verbatim from jason-desktop's settings.json. The one deliberate deviation from that desktop copy: the binary is referenced by **absolute path** (`/home/dispatch/.local/bin/personal-kb-hook`), not bare name, so hook execution does not depend on whatever `PATH` the hook process inherits. The key is referenced via `$(cat ...)` shell indirection — the literal key value never appears in `settings.json`.
+   The `--format=claude-json` flag and the `PostToolUse` matcher are copied verbatim from a working workstation settings.json. The one deliberate deviation from that copy: the binary is referenced by **absolute path** (`/home/dispatch/.local/bin/personal-kb-hook`), not bare name, so hook execution does not depend on whatever `PATH` the hook process inherits. The key is referenced via `$(cat ...)` shell indirection — the literal key value never appears in `settings.json`.
 4. Re-running the step is idempotent: any pre-existing hook block whose command mentions `personal-kb-hook` is **replaced**, never appended, so a second run still yields exactly four blocks, not eight.
 5. Verifies the install **as the agent user**, not as root: `runuser -l dispatch -c 'personal-kb-hook --help'` (absolute path). A binary on root's `PATH` proves nothing about the user that actually runs Claude Code. Failure only warns — the hook is additive, and a failed hook must never block provisioning a host.
 
@@ -972,7 +973,7 @@ Telemetry from the KB side: 2,067 map-push rows since June, with `build_engine` 
 
 ### Key reuse — no separate key
 
-The hook reads the same `PERSONAL_KB_API_KEY` this host already has configured for its `personal-kb` MCP registration (Step 4.6). It does not mint, require, or document a second hook-specific key — a second key on a LAN-only KB is toil, not security (Jason, 2026-09-18).
+The hook reads the same `PERSONAL_KB_API_KEY` this host already has configured for its `personal-kb` MCP registration (Step 4.6). It does not mint, require, or document a second hook-specific key — a second key on a LAN-only KB is toil, not security (maintainer decision, 2026-09-18).
 
 ### Silent-degradation warning
 
@@ -1014,7 +1015,7 @@ Step 4.11 provisions the Playwright browser builds — currently the bundled Chr
 
 ### Why this matters
 
-Dispatched repos run Playwright e2e suites — camera-profiles `apps/desktop` pins `@playwright/test` 1.63.0 with a project using `devices['Desktop Chrome']`, which launches Playwright's bundled Chromium build. Two properties of dispatch make this a provisioning problem rather than a repo problem: dispatched agents run as the unprivileged `dispatch` user and **cannot install anything**, and even when a run tries `npx playwright install` anyway it dies at Playwright's **30-second download-connection cap** — a cap the homelab's links and the aarch64 Pi routinely exceed. Before this step existed, one agent on `jason-precision` worked around both by curling Chrome-for-Testing zips into a private browsers-path cache of its own — a cache no other dispatched repo could see, and one the next provisioning run could clobber. Provisioning the browsers here, into the default cache, is the same "tools the repo shells out to belong on the host" premise as Step 4.9.
+Dispatched repos run Playwright e2e suites — camera-profiles `apps/desktop` pins `@playwright/test` 1.63.0 with a project using `devices['Desktop Chrome']`, which launches Playwright's bundled Chromium build. Two properties of dispatch make this a provisioning problem rather than a repo problem: dispatched agents run as the unprivileged `dispatch` user and **cannot install anything**, and even when a run tries `npx playwright install` anyway it dies at Playwright's **30-second download-connection cap** — a cap slower home-network links and an aarch64 Pi routinely exceed. Before this step existed, one agent on a workstation host worked around both by curling Chrome-for-Testing zips into a private browsers-path cache of its own — a cache no other dispatched repo could see, and one the next provisioning run could clobber. Provisioning the browsers here, into the default cache, is the same "tools the repo shells out to belong on the host" premise as Step 4.9.
 
 ### Where versions are pinned
 
@@ -1022,7 +1023,7 @@ Dispatched repos run Playwright e2e suites — camera-profiles `apps/desktop` pi
 
 ### What the step does
 
-1. Resolves the agent user's `npx` via `runuser -l dispatch -c 'command -v npx'` — a **login** shell, because the dispatch user's node lives in `~/.local/bin` on some hosts (`r7-server` runs `/home/dispatch/.local/bin/node` v20; the rest use `/usr/bin/node` v22) and a non-login shell may not see it. If `npx` is missing the step **WARNs and skips** (never `die`) — the rest of provisioning continues.
+1. Resolves the agent user's `npx` via `runuser -l dispatch -c 'command -v npx'` — a **login** shell, because the dispatch user's node lives in `~/.local/bin` on some hosts (a user-local `~/.local/bin/node` on one, the system `/usr/bin/node` on another) and a non-login shell may not see it. If `npx` is missing the step **WARNs and skips** (never `die`) — the rest of provisioning continues.
 2. For each version `V` in `PLAYWRIGHT_VERSIONS`, runs `<npx> --yes playwright@V install-deps <browsers>` **as root** — `install-deps` installs the system libraries (fonts, shared libraries, X/NSS bits) via apt, and only root can. This is exactly why the step exists in the root-run installer rather than in `deploy.sh`'s agent-user context alone.
 3. Then runs `PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=600000 <npx> --yes playwright@V install <browsers>` **as the agent user**, so the browser revisions land in `/home/dispatch/.cache/ms-playwright` owned by the agent. The 600000 ms timeout lifts Playwright's 30s download-connection cap.
 4. Every failure is a non-fatal `[WARN]` naming the version and the sub-action, collected into a single end-of-step summary WARN in the Step 4.9 style; nothing in this step can abort provisioning.
@@ -1031,7 +1032,7 @@ Dispatched repos run Playwright e2e suites — camera-profiles `apps/desktop` pi
 
 ### Architecture support (aarch64)
 
-`pironman01` is a Raspberry Pi 5 (`aarch64`) and Playwright publishes **linux-arm64** Chromium builds, so the same `PLAYWRIGHT_VERSIONS` list works across the whole fleet with no per-host branching — unlike the gitleaks asset-name mapping in Step 4.9, no architecture table is needed here. As of 2026-09-30 the x86_64 hosts (`r7-research`, `r7-server`, `jason-precision`) carry hand-installed `chromium-1243` + `chromium_headless_shell-1243` from the 1.63.0 pin, and `pironman01` has none; this step is what makes both facts converge on "provisioned, not hand-installed".
+A Raspberry Pi 5 is `aarch64`, and Playwright publishes **linux-arm64** Chromium builds, so the same `PLAYWRIGHT_VERSIONS` list works across a mixed fleet with no per-host branching — unlike the gitleaks asset-name mapping in Step 4.9, no architecture table is needed here. Hosts that carry hand-installed browsers from an earlier pin converge on "provisioned, not hand-installed" through this step.
 
 ---
 
@@ -1345,7 +1346,7 @@ The installer will detect the mismatch and reinstall the correct fragment.
 
 **Symptom**: Step 2 (Repos) fails with `Host key verification failed` or `The authenticity of host '<git-host>' can't be established`.
 
-**Cause**: The `dispatch-svc` user's `~/.ssh/known_hosts` is missing your git server's host key — the new service account has not connected to it before. The installer seeds `known_hosts` for the host(s) derived from `DISPATCH_REPO_URL` / `AGENT_GTD_REPO_URL`, so this usually means those overrides weren't set (the clone pointed at the homelab default) or the host uses a non-standard SSH port.
+**Cause**: The `dispatch-svc` user's `~/.ssh/known_hosts` is missing your git server's host key — the new service account has not connected to it before. The installer seeds `known_hosts` for the host(s) derived from `DISPATCH_REPO_URL` / `AGENT_GTD_REPO_URL`, so this usually means those overrides weren't set (the clone pointed at the default remote) or the host uses a non-standard SSH port.
 
 **Fix**: Re-run the installer with the correct `DISPATCH_REPO_URL` / `AGENT_GTD_REPO_URL` — it seeds `known_hosts` for whatever host they resolve to. For a non-standard SSH port, seed it manually:
 ```bash
@@ -1505,7 +1506,7 @@ sudo chown dispatch:dispatch /home/dispatch/workspace/dispatch.db
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ pironman01                                              │
+│ dispatch host                                           │
 │                                                         │
 │  dispatch-svc (service account)                         │
 │    /home/dispatch-svc/agent-gtd-dispatch/   ← working   │

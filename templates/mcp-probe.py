@@ -407,7 +407,7 @@ def probe(
     # Closing stdin immediately (plain communicate(input=...)) makes the server
     # see EOF and shut down; on a slower host — or in HTTP mode, which starts
     # slower — it exits before answering tools/list, and the probe reports a
-    # bogus tools-error. Reproduced on pironman01 (aarch64): identical probe
+    # bogus tools-error. Reproduced on an aarch64 Pi host: identical probe
     # passes when stdin is held open, fails when it is closed at once.
     stdout_chunks: list[str] = []
     reader = threading.Thread(

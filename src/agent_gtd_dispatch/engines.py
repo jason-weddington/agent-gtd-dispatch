@@ -638,7 +638,7 @@ def is_engine_available(engine: Engine) -> bool:
     login, or per-user config under ~/.claude. We therefore do NOT gate on
     CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY; if neither is set and the
     binary is *not* externally authenticated, the run fails at exec time —
-    that is the operator's responsibility (in the homelab case, set
+    that is the operator's responsibility (in a self-hosted install, set
     CLAUDE_CODE_OAUTH_TOKEN in the host env). Kiro requires KIRO_API_KEY.
     The Ollama-routed Claude engine requires OLLAMA_BASE_URL to be configured.
     """

@@ -182,7 +182,7 @@ def kill_run_session(proc: subprocess.Popen[bytes], sig: int) -> None:
     Killing only ``proc`` (the sudo wrapper's pid) orphans the agent and every
     command it spawned: SIGKILL cannot be relayed by sudo, so the children are
     reparented to init and keep running inside a clone that is then deleted
-    (kb-03965 — one such tree ran 19 hours on jason-precision).  talos
+    (kb-03965 — one such tree ran 19 hours on one host).  talos
     >= 0.15.0-11 puts each of its own commands in a separate process group, so
     a process-group kill is not enough either; this kills by SESSION id, which
     reaches the whole tree.  Requires the Popen to have used
@@ -255,7 +255,7 @@ def repo_dir_from_url(url: str) -> str:
 
         repo_dir_from_url('git@host:org/repo.git')          → 'repo'
         repo_dir_from_url('https://host/org/repo.git')      → 'repo'
-        repo_dir_from_url('ssh://git@ubuntu-vm01/~/repos/agent_gtd') → 'agent_gtd'
+        repo_dir_from_url('ssh://git@git.example.com/~/repos/agent_gtd') → 'agent_gtd'
         repo_dir_from_url('git@host:repo.git')              → 'repo'  (SCP, no slash)
     """
     # Tolerate a single trailing slash (e.g. from user copy-paste)

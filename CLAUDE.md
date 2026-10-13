@@ -149,11 +149,18 @@ Every filesystem read of an agent-created path and every git invocation added he
 - Branch from main: `git checkout -b feat/description` (or `fix/`, `chore/`)
 - Conventional commits enforced on main (hook). Feature branches are free-form.
 - Squash merge to main: `git checkout main && git merge --squash feat/x && git commit`
-- Push to origin freely; `./deploy.sh` deploys current main to all dispatch hosts (`DISPATCH_HOSTS`, default: `pironman01 r7-research r7-server`; set `DISPATCH_HOST` to target a single host).
-- `./release.sh` cuts a version (semantic-release), pushes main + tags to origin and github, then deploys.
+- Push to origin freely.
+- `./release.sh` cuts a version (semantic-release), builds both wheels into `dist/`, runs the maintainer-local publish hook, then pushes main + tags to origin and github. See "Release, publish and deploy" below.
 - Pre-push hook runs full test suite with coverage (threshold from `[tool.coverage.report]` in `pyproject.toml`).
 - All `uv run` in hooks uses `--frozen` to avoid rebuilding mid-hook.
 - Pre-commit hooks CHECK; they never mutate files. Agents FIX. A mutating hook (e.g. `ruff --fix`, `end-of-file-fixer`) would silently destroy a talos worker's single commit attempt, since talos has no retry loop the way Claude Code's commit-retry does. See kb-03099.
+
+## Release, publish and deploy
+
+This repo is mirrored publicly, so it carries no home-lab specifics: no host names, LAN addresses, private domains or private git URLs (`tests/test_no_lab_specifics.py` enforces this for every tracked file except `CHANGELOG.md`). Deploy and publish glue for the maintainer's fleet lives outside this repo and is invoked through the gitignored `release.local.sh` hook.
+
+- `./release.sh` calls `./release.local.sh <version> <absolute-dist-dir>` after the version bump and both wheel builds, and before any push. Exit 0 = published (and deployed), exit 10 = published but deploy incomplete (tags are pushed, the release exits 3), anything else = nothing published (the local tag and release commit are dropped). With no hook the release aborts unless `--no-publish` is given. An optional `release.post.local.sh <version>` runs after the push.
+- The scripts in this repo take hosts, the wheel index and URLs from env vars and have no lab defaults: `deploy.sh` requires `DISPATCH_INDEX` and `PERSONAL_KB_HOOK_SRC`, `talos-update.sh` requires `TALOS_ARTIFACT_BASE`, `scripts/publish-wheel.sh` requires `DISPATCH_PYPI_HOST`, and `setup-dispatch-host.sh` requires `DISPATCH_WHEEL_INDEX` (plus `HARNESS_DESIGN_REPO_URL` with `--with-talos`). Fleet hosts come from `DISPATCH_HOSTS` / `DISPATCH_HOST` or the GTD host registry (`scripts/fleet-hosts.sh`).
 
 ## Coverage
 
@@ -162,8 +169,7 @@ Every filesystem read of an agent-created path and every git invocation added he
 
 ## Deployment hosts & env files (two-user split)
 
-Runs on two hosts (`pironman01`, `r7-research`; `ubuntu-pi-01` was removed from the
-rotation 2026-06-10 — too slow). On each: the API
+On each dispatch host (the production layout is the two-user split) the API
 runs as **`dispatch-svc`**; it launches the Claude Code agent as **`dispatch`** via
 `sudo -u dispatch -H`.
 
@@ -266,7 +272,7 @@ sudo ./setup-dispatch-host.sh --without-postgres
 ## talos-update.sh — fast binary bump for the dispatch fleet
 
 `talos-update.sh` is the **operator-run fast bump channel** for the `talos` engine binary.
-It pulls a versioned, pre-built binary from pi-04's artifact store and installs it on every
+It pulls a versioned, pre-built binary from an artifact store (`TALOS_ARTIFACT_BASE`) and installs it on every
 dispatch host, per-arch and version-checked.  No cargo build, no Rust toolchain required.
 
 ### What it does
@@ -281,7 +287,7 @@ dispatch host, per-arch and version-checked.  No cargo build, no Rust toolchain 
 8. **Does NOT restart dispatch-api** — talos is a fresh subprocess per dispatch run,
    so the new binary is picked up automatically on the next run.
 
-### Pi-04 artifact contract
+### Artifact contract
 
 ```
 <BASE>/latest                       → one-line file: current version token (e.g. 0.1.0-ga1b2c3d)
@@ -294,9 +300,9 @@ dispatch host, per-arch and version-checked.  No cargo build, no Rust toolchain 
 
 | Variable              | Default                                        | Notes |
 |-----------------------|------------------------------------------------|-------|
-| `DISPATCH_HOSTS`      | `pironman01 r7-research r7-server`                       | Space-separated SSH targets |
+| `DISPATCH_HOSTS`      | *(derived from the GTD host registry)*         | Space-separated SSH targets |
 | `DISPATCH_HOST`       | *(unset)*                                      | Single-host override (back-compat) |
-| `TALOS_ARTIFACT_BASE` | `https://pypi.lab.jasonweddington.com/talos`   | **PROVISIONAL** — update once the pi-04 Caddy URL is finalised (pypi.lab vs talos.lab) |
+| `TALOS_ARTIFACT_BASE` | *(required, no default)*                       | Base URL of the artifact tree |
 | `AGENT_USER`          | `dispatch`                                     | OS user that owns the binary |
 | `AGENT_GROUP`         | *(same as AGENT_USER)*                         | OS group for the binary |
 
@@ -305,8 +311,8 @@ dispatch host, per-arch and version-checked.  No cargo build, no Rust toolchain 
 ```bash
 ./talos-update.sh                          # bump all hosts to latest
 ./talos-update.sh --version 0.1.0-ga1b2c3d  # pin a specific version
-DISPATCH_HOST=pironman01 ./talos-update.sh   # single host
-TALOS_ARTIFACT_BASE=https://talos.lab.jasonweddington.com ./talos-update.sh
+DISPATCH_HOST=host-a ./talos-update.sh       # single host
+TALOS_ARTIFACT_BASE=https://artifacts.example.com/talos ./talos-update.sh
 ```
 
 ### Relationship to setup-dispatch-host.sh --with-talos
@@ -316,14 +322,13 @@ TALOS_ARTIFACT_BASE=https://talos.lab.jasonweddington.com ./talos-update.sh
 binary (works on a fresh host with no artifacts pre-published).
 
 `talos-update.sh` is the **fast bump channel**: operator runs it after a new talos version
-is published to pi-04 (by the harness-design CI).  No Rust toolchain, no source clone,
+is published to the artifact store (by the harness-design CI).  No Rust toolchain, no source clone,
 no cargo build — just a curl + install.  Use `setup-dispatch-host.sh --with-talos` for
 initial provisioning or as a fallback if the artifact server is unreachable.
 
 ### Verification caveat
 
-End-to-end testing requires a binary to be published on pi-04 (harness-design item
-953fd927).  Until artifacts exist, verify the script locally with:
+End-to-end testing requires a binary to be published to the artifact store.  Without one, verify the script locally with:
 ```bash
 bash -n talos-update.sh          # syntax check
 shellcheck talos-update.sh       # static analysis

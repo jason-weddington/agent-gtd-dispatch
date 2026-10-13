@@ -58,7 +58,7 @@ def project_fixture() -> dict:
         "id": "22222222-2222-2222-2222-222222222222",
         "name": "agent-gtd-dev",
         "repo_mode": "monorepo",
-        "git_origin": "git@ubuntu-vm01:repos/agent_gtd",
+        "git_origin": "git@git.example.com:repos/agent_gtd",
         "workspace_repos": [],
         "gate_command": "uv run pytest && uv run ruff check",
     }
@@ -1094,7 +1094,7 @@ def _mk_project(
         "name": "agent-gtd-dev",
         "repo_mode": repo_mode,
         "workspace_repos": workspace_repos or [],
-        "git_origin": "git@ubuntu-vm01:repos/agent_gtd",
+        "git_origin": "git@git.example.com:repos/agent_gtd",
         "gate_command": gate_command,
     }
 

@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from tests.test_no_lab_specifics import LAB_PATTERN
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -450,12 +452,9 @@ def test_script_static() -> None:
         "bash -c",
         "bash -lc",
         "runuser -l",
-        "jasonweddington",
-        "ubuntu-vm01",
-        "pironman",
-        "r7-",
     ):
         assert bad not in s
+    assert not LAB_PATTERN.search(s)
     code = "\n".join(ln for ln in s.splitlines() if not ln.lstrip().startswith("#"))
     assert "aws-documentation-mcp-server" not in code
 

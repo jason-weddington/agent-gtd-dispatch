@@ -37,11 +37,11 @@ REPO_NAME="agent-gtd-dispatch"
 # that carries it.
 GIT_REMOTE_URL="${DISPATCH_REPO_URL:-https://github.com/jason-weddington/${REPO_NAME}}"
 AGENT_GTD_REMOTE_URL="${AGENT_GTD_REPO_URL:-https://github.com/jason-weddington/agent-gtd}"
-HARNESS_DESIGN_REPO_URL="${HARNESS_DESIGN_REPO_URL:-git@ubuntu-vm01:repos/harness-design}"
+# No default: required only with --with-talos (checked after argument parsing).
+HARNESS_DESIGN_REPO_URL="${HARNESS_DESIGN_REPO_URL:-}"
 
 # Derive the git host(s) to seed into known_hosts from the configured remotes,
-# so this works against any git server (homelab, GitHub, enterprise) — not just
-# the homelab default. Handles scp-style (git@host:path) and ssh:// URLs.
+# so this works against any git server (self-hosted, GitHub, enterprise). Handles scp-style (git@host:path) and ssh:// URLs.
 git_host_from_url() {
     local url="$1"
     # http(s):// URLs authenticate via TLS — no SSH host key needed; return empty
@@ -131,8 +131,14 @@ Options:
 Environment variables:
   DISPATCH_REPO_URL        Git remote for agent-gtd-dispatch repo
   AGENT_GTD_REPO_URL       Git remote for agent_gtd repo
-  HARNESS_DESIGN_REPO_URL  Git remote for harness-design repo (used with --with-talos;
-                           default: git@ubuntu-vm01:repos/harness-design)
+  DISPATCH_WHEEL_INDEX     REQUIRED. Wheel index URL (PEP 503 simple/ root) that serves
+                           agent-gtd-dispatch and agent-gtd-dispatch-protocol
+  HARNESS_DESIGN_REPO_URL  Git remote for the harness-design repo. REQUIRED with
+                           --with-talos; unused otherwise
+  PERSONAL_KB_HOOK_SRC     uv source spec for personal-kb-hook (Step 4.10). Optional:
+                           when it or PERSONAL_KB_URL is unset (in the environment
+                           and in the service env file) Step 4.10 is skipped with a WARN
+  PERSONAL_KB_URL          Hosted personal-KB service URL the hook talks to (Step 4.10)
   DISPATCH_SINGLE_USER   Set to '1' for single-user mode (no sudoers, no user split;
                          see docs/install.md ## Single-user mode for details)
 
@@ -140,7 +146,7 @@ Examples:
   # Fresh install (interactive .env generation from template):
   sudo ./setup-dispatch-host.sh
 
-  # Migrate pironman01 (provide existing .env with DISPATCH_AGENT_SUBPROCESS_USER added):
+  # Migrate an existing host (provide its .env with DISPATCH_AGENT_SUBPROCESS_USER added):
   sudo ./setup-dispatch-host.sh --env-file /tmp/dispatch.env
 
   # Preview all changes without applying them:
@@ -267,6 +273,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Required configuration with no safe default. Checked here, before any step
+# mutates the host, so a missing value fails before a half-provisioned host.
+[[ -n "${DISPATCH_WHEEL_INDEX:-}" ]] \
+    || die "DISPATCH_WHEEL_INDEX must be set to the wheel index URL (PEP 503 simple/ root) that serves agent-gtd-dispatch — the service cannot be installed without it."
+if $WITH_TALOS && [[ -z "$HARNESS_DESIGN_REPO_URL" ]]; then
+    die "--with-talos requires HARNESS_DESIGN_REPO_URL (git remote of the harness-design repo that talos is built from)."
+fi
+
 # Extend GIT_HOSTS to include the harness-design origin when --with-talos is set,
 # so the harness host is keyscanned into known_hosts on a fresh host.
 if $WITH_TALOS; then
@@ -358,7 +372,7 @@ printf "${GREEN}========================================${RESET}\n"
 echo ""
 echo "  Agent user:   ${AGENT_USER}  (${AGENT_HOME})"
 echo "  Service user: ${SERVICE_USER}  (${SERVICE_HOME})"
-echo "  Wheel index:  ${DISPATCH_WHEEL_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
+echo "  Wheel index:  ${DISPATCH_WHEEL_INDEX}"
 echo "  Service unit: ${SYSTEMD_UNIT}"
 $DRY_RUN && echo "  Mode:         DRY RUN — no mutations"
 if $SINGLE_USER; then
@@ -600,7 +614,7 @@ fi
 echo ""
 echo "--- Step 2: Agent target repo ---"
 
-# The dispatch service itself is installed from the homelab wheel index in
+# The dispatch service itself is installed from the DISPATCH_WHEEL_INDEX wheel index in
 # Step 4 (uv tool install), after uv is provisioned. No dispatch source tree
 # lives on the host.  What remains here is the agent's target repo (agent_gtd)
 # — the workspace the spawned agent operates on, not the dispatch service tree.
@@ -835,8 +849,8 @@ fi
 echo ""
 echo "--- Step 4: Dependencies ---"
 
-# Homelab wheel index the service is installed from (pi-04 pypi.lab).
-DISPATCH_WHEEL_INDEX="${DISPATCH_WHEEL_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
+# DISPATCH_WHEEL_INDEX (the index the service is installed from) was validated
+# right after argument parsing.
 
 _ensure_uv() {
     local user="$1" user_home="$2"
@@ -917,12 +931,11 @@ fi
 # identity"). Email follows the existing `{engine}@agent-gtd-dispatch`
 # convention from engines.py, generalised to the neutral fallback name.
 #
-# r7-research and pironman01 each carry a stale identity today (drifted
-# independently per host: "Claude Agent" / "Claude Haiku 4.5"); r7-server
-# (provisioned 2026-09-13) has NO user.name/user.email configured at all. So
-# this step is a genuine fix on r7-server and a deliberate overwrite (to the
-# neutral fallback) on the other two. It always writes the same value, so
-# re-running is idempotent in effect.
+# Hosts drift here independently: some carry a stale identity left by an
+# earlier setup ("Claude Agent" / "Claude Haiku 4.5"), a freshly provisioned
+# one has NO user.name/user.email at all. This step fixes the latter and
+# deliberately overwrites the former (to the neutral fallback). It always
+# writes the same value, so re-running is idempotent in effect.
 echo ""
 echo "--- Step 4.5a: Agent git identity (agent user) ---"
 
@@ -970,8 +983,8 @@ ensure_rustup() {
 }
 
 # Guarantee AGENT_USER has a usable `rustup default` toolchain. A host can have
-# rustup installed with toolchains present but no default set (e.g. r7-research,
-# 2026-09-17) — every `cargo ...` invocation then fails with "rustup could not
+# rustup installed with toolchains present but no default set (seen on an
+# x86_64 host) — every `cargo ...` invocation then fails with "rustup could not
 # choose a version of cargo to run". Probes cargo directly (the binary that
 # actually failed), not `rustup show active-toolchain`'s exit code, since that
 # varies across rustup releases (this fleet runs rustup 1.29.0).
@@ -1918,9 +1931,13 @@ fi
 # hook events. Telemetry finding that motivated this step: 2,067 map-push rows since
 # June with build_engine NULL on every one — no dispatched agent has ever received a
 # map directory, which is exactly the audience that needs one (a build agent landing
-# cold in an unfamiliar repo). This step is what keeps the hand-wiring the lead did on
-# pironman01/r7-research/r7-server (2026-09-18) from being clobbered the next time
-# this script runs on those hosts, and gets it onto every new host automatically.
+# cold in an unfamiliar repo). This step keeps hand-wiring on existing hosts from
+# being clobbered the next time this script runs, and gets it onto every new host
+# automatically.
+#
+# OPTIONAL: the hook source and KB URL are deployment-specific and have no default.
+# When either is unset (in the environment and in the service env file) the step is
+# skipped with a WARN rather than failing provisioning — the hook is additive.
 #
 # PINNING ASYMMETRY (deliberate — do not "fix" by pinning): this hook's source is unpinned by
 # design. It is changing rapidly upstream, is purely additive, and degrades silently
@@ -1935,25 +1952,28 @@ fi
 echo ""
 echo "--- Step 4.10: personal-kb-hook (agent user) ---"
 
-PERSONAL_KB_HOOK_SRC_DEFAULT="git+ssh://git@ubuntu-vm01/home/git/repos/personal_kb#subdirectory=packages/personal-kb-hook"
-# Default hosted personal-KB service URL used across the homelab fleet when the
-# service env doesn't override it — same default host as the KB MCP servers.
-PERSONAL_KB_HOOK_URL_DEFAULT="https://kb.lab.jasonweddington.com"
 HOOK_BIN="${AGENT_HOME}/.local/bin/personal-kb-hook"
 HOOK_KEY_FILE="${AGENT_HOME}/.personal_kb_hook_key"
 HOOK_SETTINGS_DIR="${AGENT_HOME}/.claude"
 HOOK_SETTINGS="${HOOK_SETTINGS_DIR}/settings.json"
 HOOK_MERGE_SCRIPT="${TMPL_DIR}/personal-kb-hook-settings.py"
 
+# A value in the service env file wins; otherwise the caller's environment is kept
+# (an empty read must not clobber a value the operator passed in).
 if [[ -f "$SERVICE_ENV" ]]; then
-    PERSONAL_KB_HOOK_SRC="$(_read_env_var PERSONAL_KB_HOOK_SRC)"; export PERSONAL_KB_HOOK_SRC
-    PERSONAL_KB_URL="$(_read_env_var PERSONAL_KB_URL)";           export PERSONAL_KB_URL
+    _v="$(_read_env_var PERSONAL_KB_HOOK_SRC)"; [[ -n "$_v" ]] && PERSONAL_KB_HOOK_SRC="$_v"
+    _v="$(_read_env_var PERSONAL_KB_URL)";      [[ -n "$_v" ]] && PERSONAL_KB_URL="$_v"
     PERSONAL_KB_API_KEY="$(_read_env_var PERSONAL_KB_API_KEY)";   export PERSONAL_KB_API_KEY
 fi
-_hook_src="${PERSONAL_KB_HOOK_SRC:-$PERSONAL_KB_HOOK_SRC_DEFAULT}"
-_hook_url="${PERSONAL_KB_URL:-$PERSONAL_KB_HOOK_URL_DEFAULT}"
+_hook_src="${PERSONAL_KB_HOOK_SRC:-}"
+_hook_url="${PERSONAL_KB_URL:-}"
+_hook_missing=""
+[[ -z "$_hook_src" ]] && _hook_missing="${_hook_missing} PERSONAL_KB_HOOK_SRC"
+[[ -z "$_hook_url" ]] && _hook_missing="${_hook_missing} PERSONAL_KB_URL"
 
-if $DRY_RUN; then
+if [[ -n "$_hook_missing" ]]; then
+    warn "SKIPPING personal-kb-hook: not set in the environment or ${SERVICE_ENV}:${_hook_missing} — dispatched agents on this host get NO KB map push"
+elif $DRY_RUN; then
     would "runuser -l ${AGENT_USER} -- uv tool install --force --from '${_hook_src}' personal-kb-hook"
     would "write ${HOOK_KEY_FILE} (owner ${AGENT_USER}, mode 0600) from PERSONAL_KB_API_KEY in ${SERVICE_ENV}"
     would "merge SessionStart/UserPromptSubmit/Stop/PostToolUse personal-kb-hook blocks into ${HOOK_SETTINGS}, preserving other settings"
@@ -1978,7 +1998,7 @@ else
     # telemetry, no error) — a broken install is indistinguishable from no install.
     # Reuse the host's EXISTING PERSONAL_KB_API_KEY (the same key this host already
     # uses for its KB MCP server) rather than minting a second, hook-specific key —
-    # a second key on a LAN-only KB is toil, not security (Jason, 2026-09-18).
+    # a second key on a LAN-only KB is toil, not security (maintainer decision, 2026-09-18).
     if [[ -z "${PERSONAL_KB_API_KEY:-}" ]]; then
         warn "PERSONAL_KB_API_KEY not set in ${SERVICE_ENV} — personal-kb-hook will be installed but not wired; it degrades SILENTLY (no roster, no telemetry, no error), so this would look exactly like a working install"
     else
@@ -2029,7 +2049,7 @@ fi
 # DEFAULT cache (~/.cache/ms-playwright). The browsers land where every dispatched
 # repo finds them with no configuration — the default cache is deliberately NOT
 # overridden with a private browsers-path env var (a private path is what forced
-# one agent on jason-precision into a hand-rolled curl workaround no other repo
+# one agent on a workstation host into a hand-rolled curl workaround no other repo
 # could see).
 #
 # The version list is data, not code: see templates/dev-toolchain.sh (sourced in
@@ -2039,8 +2059,8 @@ fi
 # WARNs, is collected into the failed list reported once below, and provisioning
 # continues — a missing browser must never leave a host without sudoers/systemd
 # (Steps 5a–8). A missing npx for the agent user also only WARNs: node exists for
-# the dispatch user on every host under a LOGIN shell (r7-server's node is
-# /home/dispatch/.local/bin/node v20, the rest /usr/bin/node v22), so `runuser -l`
+# the dispatch user on every host under a LOGIN shell (on one host it may be
+# a user-local ~/.local/bin/node, on another the system /usr/bin/node), so `runuser -l`
 # is how it is resolved; a non-login shell may not see it.
 # ===========================================================================
 echo ""
@@ -2058,13 +2078,13 @@ else
             would "run '${_pw_npx}' --yes playwright@${_pw_ver} install-deps ${PLAYWRIGHT_BROWSERS} (as root)"
         else
             # Root runs the AGENT's npx, whose `#!/usr/bin/env node` would otherwise
-            # resolve root's node (system v18 on r7-server; Playwright needs >= 20).
+            # resolve root's node (an old system node; Playwright needs >= 20).
             env PATH="$(dirname "${_pw_npx}"):${PATH}" "${_pw_npx}" --yes "playwright@${_pw_ver}" install-deps ${PLAYWRIGHT_BROWSERS} \
                 || { warn "playwright@${_pw_ver} install-deps failed for ${AGENT_USER} — continuing"; _pw_failed+=("${_pw_ver} install-deps"); }
         fi
         # Sub-action B: the browsers themselves, downloaded AS the agent user into
         # the agent's default cache. PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT lifts
-        # Playwright's 30s download-connection cap, which the homelab's slower links
+        # Playwright's 30s download-connection cap, which slower home-network links
         # (and the aarch64 Pi) routinely exceed.
         if $DRY_RUN; then
             would "runuser -l ${AGENT_USER} -c \"PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=600000 '${_pw_npx}' --yes playwright@${_pw_ver} install ${PLAYWRIGHT_BROWSERS}\""
@@ -2427,7 +2447,7 @@ printf "${_banner_color}========================================${RESET}\n"
 echo ""
 echo "  Agent user:   ${AGENT_USER}  (${AGENT_HOME})"
 echo "  Service user: ${SERVICE_USER}  (${SERVICE_HOME})"
-echo "  Wheel index:  ${DISPATCH_WHEEL_INDEX:-https://pypi.lab.jasonweddington.com/simple/}"
+echo "  Wheel index:  ${DISPATCH_WHEEL_INDEX}"
 echo "  Env file:     ${SERVICE_ENV}"
 echo "  Service:      ${SERVICE_NAME}  (port ${API_PORT})"
 echo "  Env freshness: ${ENV_FRESHNESS_STATE}"

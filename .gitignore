@@ -10,3 +10,5 @@ data/
 .claude/
 system_prompt.md
 .kiro
+release.local.sh
+release.post.local.sh

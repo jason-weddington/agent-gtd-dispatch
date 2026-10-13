@@ -1429,8 +1429,8 @@ class TestWorkerGateIntegration:
                     "name": "TestProject",
                     "repo_mode": "workspace",
                     "workspace_repos": [
-                        "git@ubuntu-vm01:repos/agent_gtd",
-                        "git@ubuntu-vm01:repos/agent-gtd-dispatch",
+                        "git@git.example.com:repos/agent_gtd",
+                        "git@git.example.com:repos/agent-gtd-dispatch",
                     ],
                 }
             )

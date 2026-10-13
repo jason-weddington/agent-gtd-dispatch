@@ -40,7 +40,7 @@
 #
 # NOTE: `cargo binstall` downloads a prebuilt release binary when the crate publishes
 # one for the host triple and falls back to `cargo install` (source build) otherwise,
-# so every entry works on both x86_64 and aarch64 (pironman01 is a Pi 5).
+# so every entry works on both x86_64 and aarch64 (a Pi 5 host is aarch64).
 
 DEV_TOOLCHAIN_CARGO_PKGS=(
   "cargo-nextest|cargo-nextest"   # test runner (harness-design lefthook + gate)
@@ -79,8 +79,8 @@ GITLEAKS_URL_TEMPLATE="https://github.com/gitleaks/gitleaks/releases/download/v{
 # Only the two architectures the fleet runs are listed; anything else is reported as
 # unsupported and gitleaks is skipped (non-fatal) rather than guessed at.
 GITLEAKS_ARCH_MAP=(
-  "x86_64|x64"     # r7-research, r7-server
-  "aarch64|arm64"  # pironman01 (Raspberry Pi 5)
+  "x86_64|x64"     # x86_64 hosts
+  "aarch64|arm64"  # Pi 5-class hosts
 )
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ GITLEAKS_ARCH_MAP=(
 # @playwright/test 1.63.0, project devices['Desktop Chrome'] = bundled chromium).
 # Dispatched agents run as the unprivileged `dispatch` user and CANNOT install
 # anything, and `npx playwright install` from inside a run dies at Playwright's
-# 30s download-connection cap — on jason-precision one agent worked around this
+# 30s download-connection cap — on one host an agent worked around this
 # by curling Chrome-for-Testing zips into a private PLAYWRIGHT_BROWSERS_PATH,
 # which no other repo can find. Provisioning the browsers here puts them in the
 # agent's DEFAULT cache (~/.cache/ms-playwright), where every dispatched repo

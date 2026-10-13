@@ -76,12 +76,12 @@ def _dispatch_sudo_available() -> bool:
 
 class TestRepoNameFromOrigin:
     def test_scp_style(self) -> None:
-        origin = "git@ubuntu-vm01:repos/agent_gtd"
+        origin = "git@git.example.com:repos/agent_gtd"
         assert repo_name_from_origin(origin) == "repos-agent_gtd"
 
     def test_ssh_url(self) -> None:
         assert (
-            repo_name_from_origin("ssh://git@ubuntu-vm01/home/git/repos/agent_gtd")
+            repo_name_from_origin("ssh://git@git.example.com/home/git/repos/agent_gtd")
             == "repos-agent_gtd"
         )
 
@@ -2490,7 +2490,7 @@ class TestOllamaConfig:
             "AGENT_GTD_API_KEY": "k",
             "ANTHROPIC_API_KEY": "k",
             "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
-            "OLLAMA_BASE_URL": "http://192.168.1.52:11434",
+            "OLLAMA_BASE_URL": "http://ollama-host:11434",
         }
         with patch.dict(os.environ, env, clear=True):
             config.load()  # must not raise
@@ -2514,7 +2514,7 @@ class TestOllamaConfig:
             "AGENT_GTD_API_KEY": "k",
             "ANTHROPIC_API_KEY": "k",
             "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
-            "OLLAMA_BASE_URL": "192.168.1.52",
+            "OLLAMA_BASE_URL": "ollama-host",
         }
         with (
             patch.dict(os.environ, env, clear=True),
@@ -2552,7 +2552,8 @@ class TestRepoDirFromUrl:
 
     def test_ssh_url_multi_segment(self) -> None:
         assert (
-            repo_dir_from_url("ssh://git@ubuntu-vm01/~/repos/agent_gtd") == "agent_gtd"
+            repo_dir_from_url("ssh://git@git.example.com/~/repos/agent_gtd")
+            == "agent_gtd"
         )
 
     def test_scp_style_no_slash(self) -> None:

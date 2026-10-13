@@ -65,7 +65,7 @@ the mode-mismatch guards.
 | Variable | Description |
 |---|---|
 | `DISPATCH_API_KEY` | Bearer token that callers must supply to the REST API |
-| `AGENT_GTD_URL` | Agent GTD API base URL — replace with your own Agent GTD instance, e.g. `https://<your-agent-gtd-host>:8443` (the maintainer's deployment uses `https://r7-research:8443`) |
+| `AGENT_GTD_URL` | Agent GTD API base URL — replace with your own Agent GTD instance, e.g. `https://<your-agent-gtd-host>:8443` |
 | `AGENT_GTD_API_KEY` | Agent GTD API key (`agtd_…` prefix) |
 
 > **Where to obtain `CLAUDE_CODE_OAUTH_TOKEN` and `AGENT_GTD_API_KEY`**: see
@@ -151,8 +151,8 @@ uv run pre-commit run --all-files
 - Commit messages must follow Conventional Commits on main (`feat:`, `fix:`, `chore:`, etc.)
 - Feature branches are free-form (hook is enforced only on merge to main)
 - Squash merge to main: `git checkout main && git merge --squash feat/x && git commit`
-- Push to origin freely; `./deploy.sh` deploys current main to all dispatch hosts (`DISPATCH_HOSTS`, default: `pironman01 r7-research r7-server`; set `DISPATCH_HOST` to target a single host)
-- `./release.sh` cuts a semantic-release version, pushes main + tags, and deploys
+- Push to origin freely
+- `./release.sh` cuts a semantic-release version, builds both wheels, runs the gitignored `release.local.sh` publish hook (where your own publish/deploy glue lives), then pushes main + tags
 
 ---
 

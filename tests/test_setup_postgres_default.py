@@ -102,6 +102,8 @@ def host(tmp_path: Path):
             "PSHIM_LOG": str(log),
             "PSHIM_MODE": mode,
             "SETUP_TEST_PG_ONLY": "1",
+            # Required by the script's early config check; never contacted here.
+            "DISPATCH_WHEEL_INDEX": "https://pypi.example.com/simple/",
             "SETUP_TEST_SERVICE_ENV": str(env_file),
             "SERVICE_USER_PLACEHOLDER": "x",
         }
@@ -205,7 +207,7 @@ class TestVerification:
         assert "DROP DATABASE IF EXISTS kb_smoke_" in log
 
     def test_verifies_pre_existing_env_even_with_no_install_work(self, host) -> None:
-        # Host already has the keys (e.g. jason-precision): verification runs regardless.
+        # Host already has the keys (e.g. an already-provisioned host): verification runs regardless.
         r = host(env_text=_PG_ENV)
         assert "Step 4.5d" in r.stdout
 
