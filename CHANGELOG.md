@@ -2,6 +2,18 @@
 
 <!-- version list -->
 
+## v2.9.1 (2026-10-13)
+
+### Bug Fixes
+
+- **deploy**: Stop reinstalling personal-kb-hook from a branch on every deploy
+  ([`82ed1f3`](https://github.com/repos/agent-gtd-dispatch/commit/82ed1f34499e8d056689786cffb9248b9176ddf8))
+
+- **workspace**: .git/info created by the service stays group-writable, so lefthook install works in
+  rollout land gates
+  ([`4466cb5`](https://github.com/repos/agent-gtd-dispatch/commit/4466cb58532500b2b7c0a47413c59de04854b173))
+
+
 ## v2.9.0 (2026-10-13)
 
 ### Bug Fixes
