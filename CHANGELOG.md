@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.8.0 (2026-10-13)
+
+### Features
+
+- **release**: Publish through a maintainer-local release.local.sh hook and drop lab specifics
+  ([`9c00c83`](https://github.com/repos/agent-gtd-dispatch/commit/9c00c839012a569b991b6d454a9f1d8c9892269c))
+
+
 ## v2.7.1 (2026-10-12)
 
 ### Bug Fixes
