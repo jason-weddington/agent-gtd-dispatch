@@ -1979,7 +1979,7 @@ if [[ -n "$_hook_missing" ]]; then
 elif $DRY_RUN; then
     would "runuser -l ${AGENT_USER} -- uv tool install --force --from '${_hook_src}' personal-kb-hook"
     would "write ${HOOK_KEY_FILE} (owner ${AGENT_USER}, mode 0600) from PERSONAL_KB_API_KEY in ${SERVICE_ENV}"
-    would "merge SessionStart/UserPromptSubmit/Stop/PostToolUse personal-kb-hook blocks into ${HOOK_SETTINGS}, preserving other settings"
+    would "merge SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/PostToolUseFailure/Stop/SubagentStop personal-kb-hook blocks into ${HOOK_SETTINGS}, preserving other settings"
 else
     if [[ ! -f "$HOOK_MERGE_SCRIPT" ]]; then
         die "personal-kb-hook settings-merge script not found at ${HOOK_MERGE_SCRIPT}"
@@ -2024,7 +2024,7 @@ else
         python3 "$HOOK_MERGE_SCRIPT" "$HOOK_SETTINGS" "$HOOK_BIN" "$HOOK_KEY_FILE" "$_hook_url" \
             || die "Failed to merge personal-kb-hook blocks into ${HOOK_SETTINGS}"
         chown "${AGENT_USER}:${AGENT_GROUP}" "$HOOK_SETTINGS"
-        info "Wired personal-kb-hook into ${HOOK_SETTINGS} for ${AGENT_USER} (SessionStart, UserPromptSubmit, Stop, PostToolUse) url=${_hook_url}"
+        info "Wired personal-kb-hook into ${HOOK_SETTINGS} for ${AGENT_USER} (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, Stop, SubagentStop) url=${_hook_url}"
     fi
 
     # Verify AS THE AGENT USER, not as root: a binary on root's PATH proves nothing

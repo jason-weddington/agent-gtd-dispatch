@@ -7,9 +7,10 @@ Two concerns:
      key indirection, reads PERSONAL_KB_HOOK_SRC from the service env, and is
      deliberately unpinned.
   2. A hermetic exercise of the settings-merge logic in
-     templates/personal-kb-hook-settings.py: pre-existing settings survive,
-     re-running yields exactly four personal-kb-hook blocks (never eight), and
-     the PostToolUse matcher is exact.
+     templates/personal-kb-hook-settings.py: all seven events are wired with the
+     canonical matchers/timeouts, pre-existing settings survive, re-running is
+     byte-identical (exactly seven personal-kb-hook blocks, never fourteen), and
+     deploy.sh re-applies the wiring on every host it deploys.
 """
 
 from __future__ import annotations
@@ -27,9 +28,34 @@ MERGE_SCRIPT = REPO_ROOT / "templates" / "personal-kb-hook-settings.py"
 POST_TOOL_USE_MATCHER = "mcp__personal-kb__kb_get|mcp__team-kb__team_kb_get"
 HOOK_BIN = "/home/dispatch/.local/bin/personal-kb-hook"
 KEY_FILE = "/home/dispatch/.personal_kb_hook_key"
+KB_URL = "https://kb.example.com"
+# The seven wired events with their canonical matcher and timeout
+# (upstream personal-kb-hook wiring; None means no "timeout" key).
+EXPECTED_EVENTS: dict[str, tuple[str, int | None]] = {
+    "SessionStart": ("", None),
+    "UserPromptSubmit": ("", None),
+    "PreToolUse": ("Bash", 5),
+    "PostToolUse": (POST_TOOL_USE_MATCHER, None),
+    "PostToolUseFailure": ("", 5),
+    "Stop": ("", None),
+    "SubagentStop": ("", None),
+}
 
 
-def _run_merge(settings_path: Path, url: str = "https://kb.example") -> None:
+def _hook_blocks(data: dict) -> list[tuple[str, dict]]:
+    """Return (event, block) pairs whose command mentions personal-kb-hook."""
+    blocks = []
+    for event, entries in data.get("hooks", {}).items():
+        for entry in entries:
+            if any(
+                "personal-kb-hook" in h.get("command", "")
+                for h in entry.get("hooks", [])
+            ):
+                blocks.append((event, entry))
+    return blocks
+
+
+def _run_merge(settings_path: Path, url: str = KB_URL) -> None:
     proc = subprocess.run(
         [
             sys.executable,
@@ -43,6 +69,7 @@ def _run_merge(settings_path: Path, url: str = "https://kb.example") -> None:
         text=True,
     )
     assert proc.returncode == 0, proc.stderr
+    assert "kb_realsecretvalue12345" not in settings_path.read_text()
 
 
 class TestTextGuards:
@@ -99,7 +126,11 @@ class TestTextGuards:
         text = SETUP_SCRIPT.read_text()
         assert 'would "runuser -l ${AGENT_USER} -- uv tool install --force' in text
         assert 'would "write ${HOOK_KEY_FILE}' in text
-        assert 'would "merge SessionStart/UserPromptSubmit/Stop/PostToolUse' in text
+        assert (
+            'would "merge SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/'
+            "PostToolUseFailure/Stop/SubagentStop personal-kb-hook blocks into "
+            "${HOOK_SETTINGS}, preserving other settings" in text
+        )
 
     def test_no_restart_in_step(self) -> None:
         # Step 4.10 spans from its own banner to the Step 5a banner; nothing in
@@ -110,6 +141,14 @@ class TestTextGuards:
         step_text = text[start:end]
         assert "systemctl restart" not in step_text
 
+    def test_wired_info_line_names_seven_events(self) -> None:
+        text = SETUP_SCRIPT.read_text()
+        assert (
+            "Wired personal-kb-hook into ${HOOK_SETTINGS} for ${AGENT_USER} "
+            "(SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, "
+            "PostToolUseFailure, Stop, SubagentStop) url=${_hook_url}" in text
+        )
+
     def test_deploy_script_refresh(self) -> None:
         text = DEPLOY_SCRIPT.read_text()
         assert (
@@ -118,9 +157,13 @@ class TestTextGuards:
         )
         assert "[OK]   personal-kb-hook" in text
         assert "[WARN] personal-kb-hook install failed" in text
-        # Deploy only refreshes the binary — wiring is setup-dispatch-host.sh's job.
-        assert "personal-kb-hook-settings.py" not in text
-        assert "Does NOT touch settings.json" in text
+        # Deploy re-applies the wiring on every host it deploys — provision is
+        # not the only writer, so hosts cannot drift.
+        assert "personal-kb-hook-settings.py" in text
+        assert "[OK]   personal-kb-hook wiring: 7 events" in text
+        assert "[WARN] personal-kb-hook wiring skipped:" in text
+        assert "Does NOT touch settings.json" not in text
+        assert "sudo python3" in text
 
 
 class TestSettingsMerge:
@@ -154,38 +197,135 @@ class TestSettingsMerge:
         data = json.loads(settings_path.read_text())
         assert "hooks" in data
 
-    def test_four_blocks_after_one_run(self, tmp_path: Path) -> None:
-        settings_path = tmp_path / "settings.json"
-        settings_path.write_text("{}")
-        _run_merge(settings_path)
-        data = json.loads(settings_path.read_text())
-        count = sum(
-            1
-            for entries in data["hooks"].values()
-            for e in entries
-            if any(
-                "personal-kb-hook" in h.get("command", "") for h in e.get("hooks", [])
-            )
-        )
-        assert count == 4
+    # --- AC-7(a): from {} the merge produces exactly the seven canonical events ---
 
-    def test_still_four_blocks_after_two_runs(self, tmp_path: Path) -> None:
+    def test_seven_blocks_after_one_run(self, tmp_path: Path) -> None:
         settings_path = tmp_path / "settings.json"
         settings_path.write_text("{}")
         _run_merge(settings_path)
+        data = json.loads(settings_path.read_text())
+        blocks = _hook_blocks(data)
+        assert len(blocks) == 7
+        assert sorted(event for event, _ in blocks) == sorted(EXPECTED_EVENTS)
+        for event, entry in blocks:
+            matcher, timeout = EXPECTED_EVENTS[event]
+            assert entry["matcher"] == matcher, event
+            assert "timeout" not in entry, event  # never at entry level
+            (hook,) = entry["hooks"]
+            if timeout is None:
+                assert "timeout" not in hook, event
+            else:
+                assert hook["timeout"] == timeout, event
+
+    def test_no_async_key_anywhere(self, tmp_path: Path) -> None:
+        # PreToolUse must stay synchronous so it can deny; PostToolUseFailure must
+        # stay synchronous so its additionalContext lands on the same turn.
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text("{}")
+        _run_merge(settings_path)
+        rendered = settings_path.read_text()
+        assert "async" not in rendered
+
+    # --- AC-7(b): only PostToolUseFailure carries the failure-cue prefix ---
+
+    def test_failure_context_prefix_on_post_tool_use_failure_only(
+        self, tmp_path: Path
+    ) -> None:
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text("{}")
         _run_merge(settings_path)
         data = json.loads(settings_path.read_text())
-        count = sum(
-            1
-            for entries in data["hooks"].values()
-            for e in entries
-            if any(
-                "personal-kb-hook" in h.get("command", "") for h in e.get("hooks", [])
+        for event, entry in _hook_blocks(data):
+            command = entry["hooks"][0]["command"]
+            if event == "PostToolUseFailure":
+                assert command.startswith("KB_FAILURE_CONTEXT=1 ")
+                assert "PERSONAL_KB_LISTENER=1 PERSONAL_KB_URL=" in command
+            else:
+                assert "KB_FAILURE_CONTEXT" not in command
+                assert command.startswith("PERSONAL_KB_LISTENER=1 PERSONAL_KB_URL=")
+
+    # --- AC-7(c): old four-event wiring + hand-added blocks collapses to seven ---
+
+    def test_replaces_old_wiring_and_hand_added_blocks(self, tmp_path: Path) -> None:
+        def hook_command() -> str:
+            return (
+                f"PERSONAL_KB_LISTENER=1 PERSONAL_KB_URL={KB_URL} "
+                f"PERSONAL_KB_API_KEY=$(cat {KEY_FILE} 2>/dev/null) "
+                f"{HOOK_BIN} --format=claude-json"
+            )
+
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "theme": "dark",
+                    "hooks": {
+                        "SessionStart": [
+                            {"hooks": [{"type": "command", "command": hook_command()}]}
+                        ],
+                        "UserPromptSubmit": [
+                            {"hooks": [{"type": "command", "command": hook_command()}]}
+                        ],
+                        "Stop": [
+                            {"hooks": [{"type": "command", "command": hook_command()}]}
+                        ],
+                        "PostToolUse": [
+                            {
+                                "matcher": POST_TOOL_USE_MATCHER,
+                                "hooks": [
+                                    {"type": "command", "command": hook_command()}
+                                ],
+                            }
+                        ],
+                        # A hand-added PreToolUse block with a different shape.
+                        "PreToolUse": [
+                            {
+                                "matcher": "Bash",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": hook_command() + " extra-arg",
+                                    }
+                                ],
+                            },
+                            # An unrelated, non-hook PreToolUse block: must survive.
+                            {
+                                "matcher": "Bash",
+                                "hooks": [{"type": "command", "command": "echo other"}],
+                            },
+                        ],
+                    },
+                }
             )
         )
-        assert count == 4
-        for event in ("SessionStart", "UserPromptSubmit", "Stop", "PostToolUse"):
+        _run_merge(settings_path)
+        data = json.loads(settings_path.read_text())
+        blocks = _hook_blocks(data)
+        assert len(blocks) == 7
+        assert sorted(event for event, _ in blocks) == sorted(EXPECTED_EVENTS)
+        assert any(
+            h.get("command") == "echo other"
+            for e in data["hooks"]["PreToolUse"]
+            for h in e.get("hooks", [])
+        )
+        assert data["theme"] == "dark"
+
+    # --- AC-7(d): running the merge twice is byte-identical ---
+
+    def test_two_runs_are_byte_identical(self, tmp_path: Path) -> None:
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text("{}")
+        _run_merge(settings_path)
+        first = settings_path.read_bytes()
+        _run_merge(settings_path)
+        second = settings_path.read_bytes()
+        assert first == second
+        data = json.loads(second)
+        assert len(_hook_blocks(data)) == 7
+        for event in EXPECTED_EVENTS:
             assert len(data["hooks"][event]) == 1
+
+    # --- Command shape guards ---
 
     def test_post_tool_use_matcher_exact(self, tmp_path: Path) -> None:
         settings_path = tmp_path / "settings.json"
@@ -194,14 +334,6 @@ class TestSettingsMerge:
         data = json.loads(settings_path.read_text())
         matchers = [e.get("matcher") for e in data["hooks"]["PostToolUse"]]
         assert matchers == [POST_TOOL_USE_MATCHER]
-
-    def test_no_matcher_events_have_none(self, tmp_path: Path) -> None:
-        settings_path = tmp_path / "settings.json"
-        settings_path.write_text("{}")
-        _run_merge(settings_path)
-        data = json.loads(settings_path.read_text())
-        for event in ("SessionStart", "UserPromptSubmit", "Stop"):
-            assert "matcher" not in data["hooks"][event][0]
 
     def test_key_indirection_no_literal_key_value(self, tmp_path: Path) -> None:
         settings_path = tmp_path / "settings.json"
