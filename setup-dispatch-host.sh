@@ -1595,13 +1595,16 @@ else
     #   TEAM_KB_URL / TEAM_KB_API_KEY → hosted team-KB service URL + API key, consumed
     #     by scripts/kb-mcp-refresh.sh the same way. team-kb is skipped when either
     #     TEAM_KB_URL or TEAM_KB_API_KEY is unset.
+    # The env file wins only where it has a value: a blank or missing line must
+    # not wipe out a value the caller passed in (e.g. from an operator env file).
     if [[ -f "$SERVICE_ENV" ]]; then
-        AGENT_GTD_URL="$(_read_env_var AGENT_GTD_URL)";                 export AGENT_GTD_URL
-        AGENT_GTD_API_KEY="$(_read_env_var AGENT_GTD_API_KEY)";         export AGENT_GTD_API_KEY
-        PERSONAL_KB_URL="$(_read_env_var PERSONAL_KB_URL)";             export PERSONAL_KB_URL
-        PERSONAL_KB_API_KEY="$(_read_env_var PERSONAL_KB_API_KEY)";     export PERSONAL_KB_API_KEY
-        TEAM_KB_URL="$(_read_env_var TEAM_KB_URL)";                     export TEAM_KB_URL
-        TEAM_KB_API_KEY="$(_read_env_var TEAM_KB_API_KEY)";             export TEAM_KB_API_KEY
+        _fv="$(_read_env_var AGENT_GTD_URL)"; [[ -n "$_fv" ]] && AGENT_GTD_URL="$_fv"; export AGENT_GTD_URL
+        _fv="$(_read_env_var AGENT_GTD_API_KEY)"; [[ -n "$_fv" ]] && AGENT_GTD_API_KEY="$_fv"; export AGENT_GTD_API_KEY
+        _fv="$(_read_env_var PERSONAL_KB_URL)"; [[ -n "$_fv" ]] && PERSONAL_KB_URL="$_fv"; export PERSONAL_KB_URL
+        _fv="$(_read_env_var PERSONAL_KB_API_KEY)"; [[ -n "$_fv" ]] && PERSONAL_KB_API_KEY="$_fv"; export PERSONAL_KB_API_KEY
+        _fv="$(_read_env_var TEAM_KB_URL)"; [[ -n "$_fv" ]] && TEAM_KB_URL="$_fv"; export TEAM_KB_URL
+        _fv="$(_read_env_var TEAM_KB_API_KEY)"; [[ -n "$_fv" ]] && TEAM_KB_API_KEY="$_fv"; export TEAM_KB_API_KEY
+        unset _fv
     fi
     # agent-gtd warnings are elevated (LOAD-BEARING for step-4 verification)
     [[ -z "${AGENT_GTD_URL:-}" ]]     && warn "AGENT_GTD_URL not set in ${SERVICE_ENV} — agent-gtd cannot be registered as an HTTP /mcp server; Step 4 verification will fail"
