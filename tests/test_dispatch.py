@@ -4356,6 +4356,15 @@ class TestSetupGitExclude:
         assert "transcript.txt" in text
         assert ".dispatch/" in text
 
+    def test_created_info_dir_and_exclude_are_group_writable(self, tmp_path) -> None:
+        # Two-user split: the service creates .git/info, the agent user later
+        # writes into it (lefthook's checksum). Created paths must be g+w.
+        (tmp_path / ".git").mkdir()
+        dispatch._setup_git_exclude(tmp_path)
+        info = tmp_path / ".git" / "info"
+        assert info.stat().st_mode & 0o7777 == 0o2775
+        assert (info / "exclude").stat().st_mode & 0o777 == 0o664
+
     def test_monorepo_existing_lines_kept(self, tmp_path) -> None:
         exclude = tmp_path / ".git" / "info" / "exclude"
         exclude.parent.mkdir(parents=True)

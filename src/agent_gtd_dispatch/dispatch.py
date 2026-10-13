@@ -1051,10 +1051,18 @@ def _append_exclude_lines(git_exclude: Path, lines: Sequence[str]) -> None:
 def _exclude_repo(repo: Path, lines: Sequence[str]) -> None:
     """Ensure ``<repo>/.git/info/exclude`` exists, then append ``lines``."""
     repo_exclude = repo / ".git" / "info" / "exclude"
+    info_dir = repo_exclude.parent
     try:
-        repo_exclude.parent.mkdir(parents=True, exist_ok=True)
+        # The service may run as a different user from the agent (two-user
+        # split). Whatever it creates here must stay group-writable, or the
+        # agent cannot write .git/info later (lefthook install puts its
+        # checksum there and fails with "permission denied").
+        if not info_dir.exists():
+            info_dir.mkdir(parents=True)
+            info_dir.chmod(0o2775)
         if not repo_exclude.exists():
             repo_exclude.write_text("")
+            repo_exclude.chmod(0o664)
     except OSError as exc:
         logger.warning("git exclude: cannot create %s: %s", repo_exclude, exc)
         return
