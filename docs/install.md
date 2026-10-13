@@ -953,7 +953,7 @@ A dispatched build agent lands cold in an unfamiliar repo, which makes it exactl
 
 ### What the step does
 
-1. Installs `personal-kb-hook` as the agent user: `uv tool install --force --from '<SRC>' personal-kb-hook`, where `<SRC>` is `PERSONAL_KB_HOOK_SRC` from the service env or the installer's environment (e.g. `git+ssh://git@<your-git-host>/repos/personal_kb#subdirectory=packages/personal-kb-hook`). There is no default: when `PERSONAL_KB_HOOK_SRC` or `PERSONAL_KB_URL` is unset the whole step is skipped with a `[WARN] SKIPPING personal-kb-hook: ...` line naming the missing variable(s). `--force` is both the install and the upgrade path — every run reinstalls from the current source. Non-fatal: a failed install warns and provisioning continues.
+1. Installs `personal-kb-hook` as the agent user: `uv tool install --force --from '<SRC>' personal-kb-hook`, where `<SRC>` is `PERSONAL_KB_HOOK_SRC` from the service env or the installer's environment (e.g. `git+ssh://git@<your-git-host>/repos/personal_kb@vX.Y.Z#subdirectory=packages/personal-kb-hook`, pinned to a release tag). There is no default: when `PERSONAL_KB_HOOK_SRC` or `PERSONAL_KB_URL` is unset the whole step is skipped with a `[WARN] SKIPPING personal-kb-hook: ...` line naming the missing variable(s). `--force` is both the install and the upgrade path — every run reinstalls from the current source. Non-fatal: a failed install warns and provisioning continues.
 2. Writes the hook's API key file at `/home/dispatch/.personal_kb_hook_key` (owner `dispatch`, mode `0600`) from the **existing** `PERSONAL_KB_API_KEY` in the service env — the same key this host already uses for its `personal-kb` MCP registration (Step 4.6 writes the same key file). No separate hook-specific key is minted, required, or documented.
 3. Merges four hook blocks into `/home/dispatch/.claude/settings.json` — a read-modify-write of the parsed JSON via `templates/personal-kb-hook-settings.py`, never a wholesale overwrite, so any other settings already in that file survive:
    - `SessionStart`, `UserPromptSubmit`, `Stop` — no matcher.
@@ -989,7 +989,7 @@ Nothing in this step restarts `dispatch-api` or requires one. Claude Code reads 
 
 ### Deploy refresh
 
-Every `./deploy.sh` re-runs `uv tool install --force --from '<PERSONAL_KB_HOOK_SRC>' personal-kb-hook` as the agent user, non-fatally, printing `[OK]   personal-kb-hook (dispatch): <version-or-present>` or a `[WARN]` line with the last 5 lines of output. Deploy only refreshes the binary — it does **not** touch `settings.json` (wiring is `setup-dispatch-host.sh`'s job) and does **not** restart the service.
+Every `./deploy.sh` re-applies the `settings.json` wiring (all seven events) through `templates/personal-kb-hook-settings.py`, non-fatally, so a host provisioned before an event was added cannot drift. It does **not** reinstall the hook binary and does **not** restart the service. Hook upgrades are pinned to personal_kb release tags and come from the KB release process, so set `PERSONAL_KB_HOOK_SRC` to a tag-pinned spec (`git+...personal_kb@vX.Y.Z#subdirectory=packages/personal-kb-hook`) when provisioning.
 
 ### Verifying
 

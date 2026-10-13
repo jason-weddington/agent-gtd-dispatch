@@ -1942,10 +1942,10 @@ fi
 # When either is unset (in the environment and in the service env file) the step is
 # skipped with a WARN rather than failing provisioning — the hook is additive.
 #
-# PINNING ASYMMETRY (deliberate — do not "fix" by pinning): this hook's source is unpinned by
-# design. It is changing rapidly upstream, is purely additive, and degrades silently
-# rather than breaking a run — so tracking the branch head is the lower-risk choice. `--force` on `uv tool install` is both the initial install AND the upgrade
-# path: every re-run reinstalls from whatever the branch head currently is.
+# PINNING: pass a PERSONAL_KB_HOOK_SRC pinned to a personal_kb release tag (git+...@vX.Y.Z#subdirectory=...),
+# never a branch. Production hook installs track release tags, and the KB release upgrades
+# them; deploy.sh does not reinstall the binary. `--force` makes a re-run reinstall whatever
+# PERSONAL_KB_HOOK_SRC names.
 #
 # NO SERVICE RESTART: Claude Code reads the agent user's settings.json when each
 # agent launches (unlike a systemd EnvironmentFile var, which is read once at service
@@ -1985,7 +1985,7 @@ else
         die "personal-kb-hook settings-merge script not found at ${HOOK_MERGE_SCRIPT}"
     fi
 
-    # Install (also the upgrade path — see PINNING ASYMMETRY note above). Non-fatal:
+    # Install (also the upgrade path — see the PINNING note above). Non-fatal:
     # the hook is additive, so a failed install must not abort provisioning of an
     # otherwise-healthy host.
     _hook_install_rc=0

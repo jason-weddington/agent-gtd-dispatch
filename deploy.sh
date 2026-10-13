@@ -32,11 +32,6 @@ set -euo pipefail
 #   DISPATCH_INDEX  REQUIRED. Private wheel index URL (PEP 503 simple/ root)
 #   RUST_DEFAULT_TOOLCHAIN  Rust toolchain pointed at by 'rustup default' when the agent
 #                   user has rustup but no usable default (default: stable)
-#   PERSONAL_KB_HOOK_SRC  REQUIRED. uv source spec for the personal-kb-hook tool refresh
-#                   (setup-dispatch-host.sh Step 4.10), e.g.
-#                   git+ssh://git@git.example.com/repos/personal_kb#subdirectory=packages/personal-kb-hook.
-#                   Deliberately unpinned — see the PINNING ASYMMETRY note in Step 4.10
-#                   of setup-dispatch-host.sh.
 #
 # Exit code: 0 if every host succeeded. Non-zero on first failure (other hosts skipped).
 
@@ -47,7 +42,6 @@ AGENT_USER="${AGENT_USER:-dispatch}"
 SERVICE_NAME="${SERVICE_NAME:-dispatch-api}"
 DISPATCH_INDEX="${DISPATCH_INDEX:?DISPATCH_INDEX must be set to the private wheel index URL (PEP 503 simple/ root)}"
 RUST_DEFAULT_TOOLCHAIN="${RUST_DEFAULT_TOOLCHAIN:-stable}"
-PERSONAL_KB_HOOK_SRC="${PERSONAL_KB_HOOK_SRC:?PERSONAL_KB_HOOK_SRC must be set to the uv source spec for personal-kb-hook}"
 
 # --- Dev toolchain data (single source of truth: templates/dev-toolchain.sh) ---
 # deploy.sh runs LOCALLY from a repo checkout, so the tool list is sourced here and
@@ -275,24 +269,11 @@ else
     done
 fi
 
-# Refresh personal-kb-hook for the agent user (setup-dispatch-host.sh Step 4.10).
-# --force is both the install and the upgrade path, so this always reinstalls from
-# whatever PERSONAL_KB_HOOK_SRC currently resolves to — deliberately UNPINNED (see
-# the PINNING ASYMMETRY note in Step 4.10 of setup-dispatch-host.sh: this hook is
-# additive and degrades silently rather than breaking a run, so tracking the
-# branch head is the lower-risk choice). Non-fatal:
-# a failed refresh leaves the agent on its current binary (if any) and must not
-# abort the deploy. The wiring block right below re-applies the settings.json
-# blocks on every deploy so hosts cannot drift (provision is no longer the only
-# writer of that file). Does NOT restart the service.
-if HOOK_OUT=\$(sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/uv tool install --force --from '${PERSONAL_KB_HOOK_SRC}' personal-kb-hook 2>&1); then
-    HOOK_VER=\$(sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/personal-kb-hook --version 2>/dev/null || echo present)
-    echo "[OK]   personal-kb-hook (${AGENT_USER}): \${HOOK_VER}"
-else
-    echo "[WARN] personal-kb-hook install failed for ${AGENT_USER} — agent keeps its current binary (if any). Last output:" >&2
-    printf '%s\n' "\$HOOK_OUT" | tail -n 5 | sed 's/^/[WARN]   /' >&2
-fi
-
+# personal-kb-hook's BINARY is deliberately not reinstalled here. Production hook
+# installs are pinned to a personal_kb release tag by the KB release's own
+# post-release step; reinstalling from a branch on every deploy would ship
+# unreleased code and undo that pin. Deploy only re-applies the settings.json
+# wiring below, so hosts cannot drift. Does NOT restart the service.
 # Re-apply the personal-kb-hook wiring into the agent user's settings.json
 # (setup-dispatch-host.sh Step 4.10 writes it at provision time; deploy re-merges
 # it so hosts provisioned before an event was added cannot drift). The merge is a

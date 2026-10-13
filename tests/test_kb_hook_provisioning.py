@@ -151,12 +151,10 @@ class TestTextGuards:
 
     def test_deploy_script_refresh(self) -> None:
         text = DEPLOY_SCRIPT.read_text()
-        assert (
-            "uv tool install --force --from '${PERSONAL_KB_HOOK_SRC}' personal-kb-hook"
-            in text
-        )
-        assert "[OK]   personal-kb-hook" in text
-        assert "[WARN] personal-kb-hook install failed" in text
+        # Deploy never reinstalls the hook binary: production installs are pinned
+        # to a release tag by the KB release, and a branch reinstall would undo it.
+        assert "--from '${PERSONAL_KB_HOOK_SRC}'" not in text
+        assert "PERSONAL_KB_HOOK_SRC" not in text
         # Deploy re-applies the wiring on every host it deploys — provision is
         # not the only writer, so hosts cannot drift.
         assert "personal-kb-hook-settings.py" in text
