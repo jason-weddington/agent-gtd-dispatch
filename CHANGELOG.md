@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.7.1 (2026-10-12)
+
+### Bug Fixes
+
+- **72e83fa0**: Kill the whole run session on timeout and cancel, not just the sudo wrapper
+  ([`5fab8bb`](https://github.com/repos/agent-gtd-dispatch/commit/5fab8bb943a9c6ee06454ced9f1ce110de791ee4))
+
+
 ## v2.7.0 (2026-10-11)
 
 ### Bug Fixes
