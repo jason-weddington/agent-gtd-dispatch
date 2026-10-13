@@ -14,7 +14,7 @@
 #   4. Push main + tags to origin and (if configured) github.
 #   5. Run the optional post-push hook.
 #
-# Usage: ./release.sh [--no-publish]
+# Usage: ./release.sh [--no-publish] [--no-guard]
 #
 # Maintainer-local publish hook
 # -----------------------------
@@ -42,11 +42,13 @@
 set -euo pipefail
 
 publish=1
+guard=1
 for arg in "$@"; do
   case "$arg" in
     --no-publish) publish=0 ;;
+    --no-guard) guard=0 ;;
     *)
-      echo "Unknown argument: $arg (usage: ./release.sh [--no-publish])" >&2
+      echo "Unknown argument: $arg (usage: ./release.sh [--no-publish] [--no-guard])" >&2
       exit 2
       ;;
   esac
@@ -60,6 +62,21 @@ fi
 if [ "$(git rev-parse --abbrev-ref HEAD)" != "main" ]; then
   echo "error: must be on main branch." >&2
   exit 1
+fi
+
+# Leak guard: a maintainer-local scan of everything this release would publish
+# to github (tracked tree, plus commits, messages and paths github lacks). It
+# lives outside the repo so its denylist is never published. Fails closed when
+# a github remote exists; --no-guard skips it loudly.
+if git remote get-url github >/dev/null 2>&1; then
+  if [ "$guard" = "0" ]; then
+    echo "!!! --no-guard: release guard SKIPPED; nothing checked what github will receive. !!!" >&2
+  elif [ -x ./release.guard.local.sh ]; then
+    ./release.guard.local.sh || { rc=$?; echo "error: release guard failed (exit $rc); nothing released." >&2; exit 1; }
+  else
+    echo "error: a github remote is configured but no executable ./release.guard.local.sh exists. It is a maintainer-local scan (exit 0 clean, 1 hits, 2 could not run). Create it, or re-run with --no-guard to release without it." >&2
+    exit 1
+  fi
 fi
 
 # 1. Bump version + build the dispatch wheel (semantic-release's build_command
