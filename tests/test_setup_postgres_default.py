@@ -14,6 +14,7 @@ script needs plus the shims) — never a prepended PATH, so nothing real leaks.
 
 from __future__ import annotations
 
+import getpass
 import os
 import shutil
 import subprocess
@@ -111,7 +112,13 @@ def host(tmp_path: Path):
                 "--agent-user",
                 "agentx",
                 "--service-user",
-                os.environ.get("USER", "nobody"),
+                # Service user must be a REAL user on this host (install -o/-g
+                # below needs its uid/primary group). USER is not exported in
+                # every environment this suite runs in, so fall back through
+                # getpass.getuser()'s LOGNAME/pwd chain rather than hardcoding
+                # "nobody" — whose matching *group* does not exist on every
+                # host (Debian calls it "nogroup"), which made install -g fail.
+                os.environ.get("USER") or getpass.getuser(),
                 *flags,
             ],
             capture_output=True,

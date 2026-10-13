@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -39,7 +40,12 @@ from . import (
     talos,
 )
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
-from .dispatch import LandGitError, LandGitTimeout
+from .dispatch import (
+    LandGitError,
+    LandGitTimeout,
+    kill_run_session,
+    run_session_has_members,
+)
 from .engines import (
     COMMON_ENV_KEYS,
     Engine,
@@ -6313,15 +6319,18 @@ async def cancel_run(
     if task is not None:
         task.cancel()
 
-    # Terminate the subprocess: SIGTERM, grace period, then SIGKILL
+    # Terminate the subprocess: SIGTERM, grace period, then SIGKILL.
+    # Signal the whole SESSION, not just the sudo wrapper's pid — sudo cannot
+    # relay signals to the agent user's child, so terminate/kill on proc alone
+    # would orphan the agent and every command it spawned inside a clone that
+    # is about to be deleted (kb-03965).  The wrapper was launched with
+    # start_new_session=True, so proc.pid is the session id.
     proc = _active_subprocesses.get(run_id)
     if proc is not None:
-        with contextlib.suppress(ProcessLookupError):
-            proc.terminate()
+        kill_run_session(proc, signal.SIGTERM)
         await asyncio.sleep(config.CANCEL_GRACE_SECONDS)
-        if proc.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+        if proc.poll() is None or run_session_has_members(proc):
+            kill_run_session(proc, signal.SIGKILL)
 
     # Update DB to cancelled
     completed = datetime.now(UTC).isoformat()

@@ -194,6 +194,30 @@ def test_render_only() -> None:
     assert "svc-x" in r.stdout and "agent-y" in r.stdout
 
 
+def test_template_allows_pkill_as_agent_user(e: Env) -> None:
+    """AC (kb-03965): the NOPASSWD rule must additionally allow dispatch-svc
+    to run /usr/bin/pkill as the agent user — kill_run_session signals the
+    run's whole session via `sudo -n -u <agent> pkill -<SIG> -s <sid>` and
+    sudo cannot relay SIGKILL to its child, so without this entry every
+    timeout/cancel orphans the agent tree."""
+    rule = next(
+        line
+        for line in e.render().splitlines()
+        if "NOPASSWD:" in line and not line.lstrip().startswith("#")
+    )
+    assert "/usr/bin/pkill" in rule, (
+        "/usr/bin/pkill missing from the sudoers NOPASSWD rule — "
+        "kill_run_session would be DENIED on provisioned hosts"
+    )
+    # The rendered fragment (including the pkill entry) must survive the same
+    # visudo -c validation path as any other change.
+    r = e.run("--create")
+    assert r.returncode == 0
+    assert "/usr/bin/pkill" in e.live.read_text()
+    lines = e.visudo_lines()
+    assert any("-c -f" in ln for ln in lines) and "-c" in lines
+
+
 def test_usage_and_template_errors(tmp_path: Path) -> None:
     r = subprocess.run(
         [str(SCRIPT), "--template", str(tmp_path / "nope")], capture_output=True

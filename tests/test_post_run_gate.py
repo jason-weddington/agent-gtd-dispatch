@@ -191,12 +191,23 @@ class TestRunGateCommandMocked:
             created["proc"] = proc
             return proc
 
-        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen", side_effect=_effect):
+        with (
+            patch("agent_gtd_dispatch.dispatch.subprocess.Popen", side_effect=_effect),
+            patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_pkill,
+        ):
             result = dispatch.run_gate_command(tmp_path, "sleep 999", 1, CLAUDE)
 
         assert result.returncode is None
         assert result.timed_out is True
         assert result.output == "partial"
+        # Timeout now kills the whole run SESSION by id (kb-03965), not just
+        # the sudo wrapper's pid — assert both halves of that contract.
+        assert mock_pkill.call_args.args[0] == [
+            "pkill",
+            "-KILL",
+            "-s",
+            str(created["proc"].pid),
+        ]
         created["proc"].kill.assert_called_once()
 
     def test_popen_oserror_gives_launch_error(self, tmp_path) -> None:

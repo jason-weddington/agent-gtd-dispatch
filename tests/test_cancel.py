@@ -202,6 +202,49 @@ class TestCancelRun:
         mock_proc.kill.assert_not_called()  # no SIGKILL needed
 
     # ------------------------------------------------------------------
+    # AC (kb-03965): SIGKILL escalation fires when the WRAPPER has exited
+    # but the session still has members (agent tree orphaned under sudo).
+    # ------------------------------------------------------------------
+
+    async def test_cancel_sigkills_when_session_outlives_wrapper(
+        self, client, auth_headers
+    ) -> None:
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.main import (
+            _active_processes,
+            _active_subprocesses,
+            _run_event_queues,
+        )
+
+        await db.init_db()
+        run = _make_run(status="running")
+        await db.insert_run(run)
+
+        # Mock subprocess: wrapper exited during grace (poll() != None) but
+        # the session it led still has live members.
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        _active_subprocesses[run.id] = mock_proc
+        _active_processes[run.id] = MagicMock(spec=asyncio.Task)
+        _run_event_queues[run.id] = asyncio.Queue()
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.asyncio.sleep", new=AsyncMock()),
+            patch(
+                "agent_gtd_dispatch.main.run_session_has_members",
+                return_value=True,
+            ),
+        ):
+            mock_gtd.post_comment = AsyncMock()
+            resp = client.post(f"/runs/{run.id}/cancel", headers=auth_headers)
+
+        assert resp.status_code == 200
+        mock_proc.terminate.assert_called_once()
+        # The wrapper is dead, but the session was not — SIGKILL must fire.
+        mock_proc.kill.assert_called_once()
+
+    # ------------------------------------------------------------------
     # AC-4: comment posted to item_id
     # ------------------------------------------------------------------
 

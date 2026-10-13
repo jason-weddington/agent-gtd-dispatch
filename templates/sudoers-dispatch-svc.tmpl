@@ -68,4 +68,11 @@ Defaults:{{SERVICE_USER}} secure_path="/home/{{AGENT_USER}}/.cargo/bin:/home/{{A
 # talos is installed to /home/{{AGENT_USER}}/.local/bin/talos (copy, not symlink) by
 # setup-dispatch-host.sh --with-talos; it must be authorised here so the
 # dispatch-svc→dispatch sudo-wrapped invocation (talos.py _sudo_wrap) is not DENIED.
-{{SERVICE_USER}} ALL=({{AGENT_USER}}) NOPASSWD: /usr/bin/git, /home/{{AGENT_USER}}/.local/bin/uv, /home/{{AGENT_USER}}/.local/bin/claude, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash, /usr/bin/mkdir, /home/{{AGENT_USER}}/.local/bin/talos
+# /usr/bin/pkill is required by dispatch.py kill_run_session: agent/gate
+# subprocesses are launched with start_new_session=True under sudo, and sudo
+# cannot relay SIGKILL to its child — so on timeout/cancel the worker must
+# signal the run's whole session AS the agent user (`sudo -n -u dispatch
+# pkill -KILL -s <sid>`) or the agent tree is orphaned inside a deleted clone
+# (kb-03965). Without this entry every timeout and cancel silently degrades to
+# killing only the sudo wrapper.
+{{SERVICE_USER}} ALL=({{AGENT_USER}}) NOPASSWD: /usr/bin/git, /home/{{AGENT_USER}}/.local/bin/uv, /home/{{AGENT_USER}}/.local/bin/claude, /usr/local/bin/claude, /usr/bin/rm, /usr/bin/python3, /bin/bash, /usr/bin/mkdir, /home/{{AGENT_USER}}/.local/bin/talos, /usr/bin/pkill

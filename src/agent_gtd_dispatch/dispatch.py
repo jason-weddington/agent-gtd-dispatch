@@ -7,6 +7,7 @@ import concurrent.futures
 import json
 import logging
 import re
+import signal
 import subprocess
 import tempfile
 import textwrap
@@ -134,6 +135,81 @@ def _sudo_wrap(cmd: list[str]) -> list[str]:
     if config.AGENT_SUBPROCESS_USER:
         return ["sudo", "-u", config.AGENT_SUBPROCESS_USER, "-H", *cmd]
     return cmd
+
+
+def _pkill_session_argv(proc: subprocess.Popen[bytes], args: list[str]) -> list[str]:
+    """Build the pkill argv that targets proc's session, crossing the sudo boundary.
+
+    Every agent/gate subprocess is launched with ``start_new_session=True`` and
+    (in the two-user split) under ``sudo -u <agent user> -H``, so the sudo
+    wrapper leads the session and the agent user owns every process in it.
+    sudo cannot relay signals to its child, so the session must be signalled
+    AS the agent user — hence ``sudo -n -u <user> pkill`` when
+    ``AGENT_SUBPROCESS_USER`` is set, plain ``pkill`` in single-user mode.
+    """
+    pkill = ["pkill", *args, "-s", str(proc.pid)]
+    if config.AGENT_SUBPROCESS_USER:
+        return ["sudo", "-n", "-u", config.AGENT_SUBPROCESS_USER, *pkill]
+    return pkill
+
+
+def _run_pkill_quietly(argv: list[str]) -> int:
+    """Run a pkill argv, returning its exit code; failures are logged, not raised."""
+    try:
+        result = subprocess.run(argv, check=True, timeout=10, capture_output=True)
+        return result.returncode
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 1:
+            # pkill exit 1 = no process matched — the session is already gone,
+            # which is the normal case for an exited run.  Not an error.
+            return 1
+        logger.warning(
+            "pkill of run session failed (rc=%s): %s",
+            exc.returncode,
+            (exc.stderr or b"").decode("utf-8", errors="replace").strip(),
+        )
+        return exc.returncode
+    except subprocess.TimeoutExpired:
+        logger.warning("pkill of run session timed out after 10s: %s", argv)
+    except OSError as exc:
+        logger.warning("could not run pkill for run session: %s", exc)
+    return -1
+
+
+def kill_run_session(proc: subprocess.Popen[bytes], sig: int) -> None:
+    """Signal every process in the run's session, then the wrapper itself.
+
+    Killing only ``proc`` (the sudo wrapper's pid) orphans the agent and every
+    command it spawned: SIGKILL cannot be relayed by sudo, so the children are
+    reparented to init and keep running inside a clone that is then deleted
+    (kb-03965 — one such tree ran 19 hours on jason-precision).  talos
+    >= 0.15.0-11 puts each of its own commands in a separate process group, so
+    a process-group kill is not enough either; this kills by SESSION id, which
+    reaches the whole tree.  Requires the Popen to have used
+    ``start_new_session=True`` so the wrapper's pid IS the session id.
+    """
+    # pkill wants the signal name WITHOUT the SIG prefix (-KILL, not -SIGKILL).
+    signame = signal.Signals(sig).name.removeprefix("SIG")
+    _run_pkill_quietly(_pkill_session_argv(proc, [f"-{signame}"]))
+    # The wrapper itself may have escaped the pkill (e.g. it already exited its
+    # session, or pkill could not see it); signal it directly as well.
+    try:
+        if sig == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+    except ProcessLookupError:
+        pass
+
+
+def run_session_has_members(proc: subprocess.Popen[bytes]) -> bool:
+    """True if any process still runs in the session led by ``proc.pid``.
+
+    Used by the cancel path to decide whether a SIGKILL escalation is needed
+    even after the wrapper itself has exited (``pkill -0`` probes without
+    signalling).
+    """
+    return _run_pkill_quietly(_pkill_session_argv(proc, ["-0"])) == 0
 
 
 def init_executor() -> None:
@@ -536,6 +612,11 @@ def run_gate_command(
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=subprocess.STDOUT,
+                # The sudo wrapper must lead its own session so that on
+                # timeout/cancel the WHOLE tree (agent + its commands, each in
+                # its own process group since talos 0.15.0-11) can be killed
+                # by session id — see kill_run_session (kb-03965).
+                start_new_session=True,
             )
         except OSError as exc:
             return GateResult(
@@ -557,7 +638,10 @@ def run_gate_command(
         try:
             proc.wait(timeout=timeout_seconds + 2 * config.CANCEL_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            # Kill the whole session, not just the sudo wrapper: sudo cannot
+            # relay SIGKILL, so proc.kill() alone would orphan the gate's
+            # command tree (kb-03965).
+            kill_run_session(proc, signal.SIGKILL)
             proc.wait()
             return GateResult(
                 returncode=None,
@@ -4158,13 +4242,20 @@ async def run_agent(
                 env=env,
                 stdout=f,
                 stderr=subprocess.STDOUT,
+                # Session leader: the sudo wrapper's pid is then the session
+                # id, so kill_run_session can reach the agent and its whole
+                # command tree on timeout/cancel (kb-03965).
+                start_new_session=True,
             )
             if popen_callback is not None:
                 popen_callback(proc)
             try:
                 proc.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                # Kill the whole session, not just the sudo wrapper: SIGKILL
+                # cannot be relayed by sudo, so proc.kill() alone orphans the
+                # agent and every command it spawned (kb-03965).
+                kill_run_session(proc, signal.SIGKILL)
                 proc.wait()
                 raise
         return subprocess.CompletedProcess(cmd, proc.returncode, stdout="", stderr="")
