@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v2.9.0 (2026-10-13)
+
+### Bug Fixes
+
+- **setup**: A blank service env value no longer wipes a value passed in for the MCP registration
+  vars
+  ([`6d623e2`](https://github.com/repos/agent-gtd-dispatch/commit/6d623e2b3171f1e1f2dde23a55ca40009da25db4))
+
+### Features
+
+- **provisioning**: Dispatch hosts wire all seven personal-kb-hook events, and every deploy
+  re-applies the wiring
+  ([`0cb71ee`](https://github.com/repos/agent-gtd-dispatch/commit/0cb71eedba5a145db208a6ac58ce91345cef1987))
+
+
 ## v2.8.0 (2026-10-13)
 
 ### Features
