@@ -50,6 +50,7 @@ DEV_TOOLCHAIN_CARGO_PKGS=(
   "typos-cli|typos"               # spell check (crate name != binary name)
   "cargo-sort|cargo-sort"         # Cargo.toml key ordering
   "cargo-release|cargo-release"   # release automation
+  "cargo-mutants|cargo-mutants"   # mutation testing (poolhouse gate)
   "cocogitto|cog"                 # conventional-commit linting (crate name != binary name)
 )
 
