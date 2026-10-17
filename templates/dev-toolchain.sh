@@ -108,5 +108,5 @@ GITLEAKS_ARCH_MAP=(
 # To ADD a version or browser: edit ONE line below. Re-run setup-dispatch-host.sh
 #   (Step 4.11) or ./deploy.sh to provision it on every host. Nothing else needs
 #   editing — both consumers read this file as data.
-PLAYWRIGHT_VERSIONS=("1.63.0")  # camera-profiles apps/desktop @playwright/test pin
+PLAYWRIGHT_VERSIONS=("1.63.0" "1.64.1")  # 1.63.0: camera-profiles apps/desktop; 1.64.1: poolhouse ui (current playwright@1)
 PLAYWRIGHT_BROWSERS="chromium"   # devices['Desktop Chrome'] uses the bundled chromium build
