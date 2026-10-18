@@ -112,10 +112,13 @@ After a `merge` verdict, and before anything is recorded on the board, the worke
 1. Takes a per-remote lock for every repo in the workspace, keyed by (normalized origin URL, default branch), in sorted order, and holds them through any fix relaunch until the final push or halt. Two lands to the same remote branch on one host are serialized, so they can never both pass the gate against the same old `main`. The lock is per host only; there is no cross-host lock service.
 2. Fetches origin and runs a reviewer-pushed guard: a commit for this item that reached origin after the review started halts the rollout with nothing pushed.
 3. Reads the landing set from git, not from the reviewer: the repos exactly one trailer-bearing commit ahead of `origin/<default_branch>`, with HEAD on the default branch.
-4. Rebases every not-yet-pushed landing repo onto the freshly fetched `origin/<default_branch>`. In a workspace project, every repo NOT in the landing set is reset to its origin, so the compound gate sees current siblings.
-5. Runs the project's gate install step (hook managers) once, then the `gate_command` from the workspace root on that exact tree, and records the gated sha of each landing repo.
-6. Pushes exactly the gated sha (`git push --no-verify origin <gated_sha>:refs/heads/<default_branch>`; `--no-verify` because the land gate just judged that sha). It never forces. A project with no `gate_command` skips the gate and pushes with the repo's own hooks instead.
-7. Audits each push with `git ls-remote`, deletes the feature branch (best effort), posts one `Landed <sha> on <repo>/<branch> ...` comment on the item, and only then records the item complete.
+4. Runs the conflict guard. The reviewer may resolve a squash-merge conflict when every conflicting path is documentation, and reports those paths in the verdict's `resolved_conflict_paths`; any other conflict it aborts and reports as `merge_conflict`. The worker does not trust that claim. For each landing repo it recomputes the reviewer's squash-merge conflicts with `git merge-tree --write-tree`, merging the feature branch (local, else `origin/<branch>`) into the squash commit's parent (`<default_branch>~1`, what the reviewer merged onto, not the freshly fetched origin). It halts with nothing pushed if any non-documentation path conflicted, if the reviewer reported resolving a non-documentation path, or if conflict markers (`<<<<<<<`, `|||||||`, `>>>>>>>` lines) remain in a conflicted documentation file. Documentation means a path ending in `.md`, `.mdx`, `.rst` or `.txt`, case-insensitive, at any depth (`dispatch.DOCUMENTATION_EXTENSIONS`). A documentation conflict the reviewer did not report is logged as `land-conflict-unreported` and the land proceeds. Every repo checked logs one `rollout-loop: land-conflict-check ...` line with its `decision` (`clean`, `doc_only`, `non_doc_halt`, `markers_halt`), and a land that saw documentation conflicts says so in its item comment.
+5. Rebases every not-yet-pushed landing repo onto the freshly fetched `origin/<default_branch>`. In a workspace project, every repo NOT in the landing set is reset to its origin, so the compound gate sees current siblings.
+6. Runs the project's gate install step (hook managers) once, then the `gate_command` from the workspace root on that exact tree, and records the gated sha of each landing repo.
+7. Pushes exactly the gated sha (`git push --no-verify origin <gated_sha>:refs/heads/<default_branch>`; `--no-verify` because the land gate just judged that sha). It never forces. A project with no `gate_command` skips the gate and pushes with the repo's own hooks instead.
+8. Audits each push with `git ls-remote`, deletes the feature branch (best effort), posts one `Landed <sha> on <repo>/<branch> ...` comment on the item, and only then records the item complete.
+
+The conflict guard needs git >= 2.38 (`git merge-tree --write-tree`) on every dispatch host. On older git every land halts with `land bad local state` naming merge-tree.
 
 A non-fast-forward rejection (another host pushed first) re-fetches, re-rebases, resets the siblings and re-gates before pushing again, bounded by `MAX_LAND_PUSH_ATTEMPTS` (3) rejections. This push rejection plus regate is the only cross-host race protection.
 
@@ -128,6 +131,8 @@ Every halt reason from the land starts with one of these prefixes:
 - `commit for item <item_id> appeared on origin during review, before the worker's land` — the reviewer pushed.
 - `land bad local state for item <item_id>` — not exactly one trailer-bearing commit ahead, HEAD off the default branch, a squash the rebase emptied, or HEAD moved during the gate.
 - `merge verdict but no local squash commit for item <item_id>` — nothing to land in any repo.
+- `land refused for item <item_id>` — the conflict guard found a non-documentation conflict (outcome code `non_doc_conflict`) or leftover conflict markers (outcome code `conflict_markers`); nothing is pushed.
+- `land conflict check failed for item <item_id>` — the verdict names no feature branch, or the branch exists neither locally nor on origin (outcome code `conflict_check_failed`); nothing is pushed.
 - `land gate install failed for item <item_id>`
 - `land gate failed for item <item_id>: ` — followed by the TAIL of the gate output.
 - `land gate timed out for item <item_id>`

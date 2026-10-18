@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 
-
 if TYPE_CHECKING:
     from collections.abc import Iterator
 

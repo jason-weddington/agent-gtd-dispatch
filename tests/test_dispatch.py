@@ -5752,6 +5752,44 @@ class TestReviewPromptContract:
         assert "git status --porcelain" in prompt
         assert "attempt, detect, abort cleanly, report" in prompt.lower()
 
+    def test_conflict_contract_allows_documentation_only_resolution(self) -> None:
+        for workspace_mode in (True, False):
+            prompt = self._prompt(workspace_mode=workspace_mode)
+            norm = " ".join(prompt.split())
+            assert "`.md`, `.mdx`, `.rst`, `.txt`" in norm
+            assert "resolved_conflict_paths" in norm
+            assert "git diff --name-only --diff-filter=U" in norm
+            assert (
+                "git grep -nE '^(<<<<<<<|>>>>>>>|\\|\\|\\|\\|\\|\\|\\|)( |$)'"
+            ) in norm
+            for phrase in (
+                "attempt, detect, abort cleanly, report",
+                "git merge --abort",
+                "git status --porcelain",
+                "merge_conflict",
+                "Never improvise a resolution of a conflict that touches a "
+                "non-documentation path",
+            ):
+                assert phrase in norm, phrase
+            for gone in (
+                "You do NOT resolve conflicts.",
+                "Never improvise a resolution.",
+                "Claude",
+            ):
+                assert gone not in norm, gone
+            assert '"resolved_conflict_paths": []' in prompt
+
+    def test_workspace_contract_reports_resolved_repos_committed(self) -> None:
+        norm = " ".join(self._prompt(workspace_mode=True).split())
+        assert (
+            "A repo whose documentation-only conflict was resolved and committed "
+            'under (b) reports `repo_states[<repo>] = "committed"`'
+        ) in norm
+
+    def test_conflict_contract_docstring_drops_never_resolve(self) -> None:
+        doc = dispatch._review_conflict_contract_block.__doc__ or ""
+        assert "never to resolve" not in doc
+
     def test_workspace_mode_states_the_partial_merge_behaviour(self) -> None:
         prompt = self._prompt(workspace_mode=True)
         assert (
@@ -6641,3 +6679,35 @@ class TestFindLandedCommitSubjects:
             subjects, failed = dispatch.find_landed_commit_subjects(ws, _GROOMED_ID)
         assert subjects == {}
         assert failed == ["repo-a", "repo-b"]
+
+
+class TestIsDocumentationPath:
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            ("README.md", True),
+            ("docs/deep/guide.MDX", True),
+            ("a/b/notes.TXT", True),
+            ("x.rst", True),
+            ("fixtures/README.md", True),
+            ("CHANGELOG.md", True),
+            ("src/app.py", False),
+            ("config.json", False),
+            ("docs/sample.yaml", False),
+            ("README", False),
+            ("tmpl.md.j2", False),
+            (".md", False),
+            ("", False),
+        ],
+    )
+    def test_pinned_results(self, path: str, expected: bool) -> None:
+        assert dispatch.is_documentation_path(path) is expected
+
+    def test_filters_the_non_documentation_paths(self) -> None:
+        paths = ["README.md", "src/app.py"]
+        assert [p for p in paths if not dispatch.is_documentation_path(p)] == [
+            "src/app.py"
+        ]
+
+    def test_extension_list(self) -> None:
+        assert dispatch.DOCUMENTATION_EXTENSIONS == (".md", ".mdx", ".rst", ".txt")

@@ -2367,6 +2367,9 @@ class ReviewVerdict(NamedTuple):
     branch_name: str = ""  # the feature branch reviewed; the land step deletes it
     # The reviewer's per-repo claim (diagnostic only; the land reads git).
     repo_states: tuple[tuple[str, str], ...] = ()
+    # Paths whose squash-merge conflict the reviewer reports resolving (only
+    # documentation is allowed; the land step's conflict guard re-checks).
+    resolved_conflict_paths: tuple[str, ...] = ()
 
 
 def _completed_build_item_ids(
@@ -2685,13 +2688,30 @@ async def _launch_reviewer(
         states = ", ".join(f"{k}={v}" for k, v in sorted(repo_states.items()))
         detail = f"{detail} [repo states: {states}]" if detail else f"[{states}]"
 
+    raw_resolved = verdict_blob.get("resolved_conflict_paths")
+    resolved: tuple[str, ...] = ()
+    if isinstance(raw_resolved, list) and all(isinstance(p, str) for p in raw_resolved):
+        resolved = tuple(raw_resolved)
+    elif raw_resolved is not None and verdict == "merge":
+        # A merge whose conflict claim cannot be read is not landed on a guess.
+        verdict = "halt"
+        rationale = "reviewer returned a malformed resolved_conflict_paths"
+        detail = f"malformed resolved_conflict_paths: {raw_resolved!r}"[:200]
+    if resolved:
+        detail = f"{detail} [resolved doc conflicts: {', '.join(resolved)}]"
+    completion: dict[str, Any] = {
+        "verdict": verdict,
+        "rationale": rationale,
+        "detail": detail,
+    }
+    if resolved:
+        completion["resolved_conflict_paths"] = list(resolved)
+
     await db.update_run(
         reviewer_run.id,
         status=RunStatus.succeeded,
         completed_at=datetime.now(UTC).isoformat(),
-        completion=json.dumps(
-            {"verdict": verdict, "rationale": rationale, "detail": detail}
-        ),
+        completion=json.dumps(completion),
     )
     logger.info(
         "rollout-loop: reviewer verdict rollout_id=%s item_id=%s run_id=%s "
@@ -2716,6 +2736,7 @@ async def _launch_reviewer(
             if isinstance(repo_states, dict)
             else ()
         ),
+        resolved,
     )
 
 
@@ -3371,6 +3392,10 @@ class _Lander:
         self.gate_rc = "-"
         self.gate_secs = 0.0
         self.step = "Land: starting"
+        # Conflict guard results per landing repo (see _conflict_guard).
+        self.conflict_found: dict[str, list[str]] = {}
+        self.conflict_reported: dict[str, list[str]] = {}
+        self.conflict_unreported: dict[str, list[str]] = {}
 
     # -- plumbing ---------------------------------------------------------
 
@@ -3537,6 +3562,144 @@ class _Lander:
                 f"{prefix}: the squash commit carries no 'Item: {self.item_id}' "
                 "trailer",
             )
+
+    def _log_conflict_check(
+        self,
+        repo: str,
+        *,
+        base: str,
+        base_sha: str,
+        tip_ref: str,
+        tip_sha: str,
+        paths: list[str],
+        reported: list[str],
+        decision: str,
+    ) -> None:
+        logger.info(
+            "rollout-loop: land-conflict-check rollout_id=%s item_id=%s repo=%s "
+            "base=%s base_sha=%s tip_ref=%s tip_sha=%s conflict_paths=%s "
+            "reported_resolved=%s decision=%s",
+            self.rollout_id,
+            self.item_id,
+            repo,
+            base,
+            base_sha or "-",
+            tip_ref,
+            tip_sha or "-",
+            ",".join(paths) or "-",
+            ",".join(reported) or "-",
+            decision,
+        )
+
+    async def _conflict_guard(self) -> None:
+        """Fail closed on the reviewer's squash-merge conflict resolution.
+
+        The reviewer may resolve a squash conflict only when every conflicting
+        path is documentation.  The worker does not trust that claim: it
+        recomputes the conflicts with ``git merge-tree`` against the squash
+        commit's parent (what the reviewer merged onto) and the feature
+        branch, and halts on a non-documentation conflict or a leftover
+        conflict marker.  Runs before anything is pushed.
+        """
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        resolved = list(self.outcome.resolved_conflict_paths)
+        bad = [p for p in resolved if not dispatch.is_documentation_path(p)]
+        if bad:
+            raise _LandHalt(
+                "non_doc_conflict",
+                f"land refused for item {self.item_id}: the reviewer reported "
+                f"resolving non-documentation conflict paths: {', '.join(bad)}",
+            )
+        branch_name = self.outcome.branch_name
+        if not branch_name:
+            raise _LandHalt(
+                "conflict_check_failed",
+                f"land conflict check failed for item {self.item_id}: the verdict "
+                "names no feature branch",
+            )
+        for repo in self.landing:
+            path = self._path(repo)
+            tip_ref = f"refs/heads/{branch_name}"
+            tip = await self._git(
+                repo, dispatch.land_resolve_ref, path, tip_ref, timeout
+            )
+            if not tip:
+                tip_ref = f"refs/remotes/origin/{branch_name}"
+                tip = await self._git(
+                    repo, dispatch.land_resolve_ref, path, tip_ref, timeout
+                )
+            if not tip:
+                raise _LandHalt(
+                    "conflict_check_failed",
+                    f"land conflict check failed for item {self.item_id}: repo "
+                    f"{repo}: feature branch {branch_name} not found locally or "
+                    "on origin",
+                )
+            base = f"{self.branches[repo]}~1"
+            base_sha = await self._git(
+                repo, dispatch.land_resolve_ref, path, base, timeout
+            )
+            paths = await self._git(
+                repo, dispatch.land_conflict_paths, path, base, tip, timeout
+            )
+            if self.workspace.workspace_mode:
+                reported = [
+                    p.removeprefix(f"{repo}/")
+                    for p in resolved
+                    if p.startswith(f"{repo}/")
+                ]
+            else:
+                reported = list(resolved)
+
+            log = functools.partial(
+                self._log_conflict_check,
+                repo,
+                base=base,
+                base_sha=base_sha,
+                tip_ref=tip_ref,
+                tip_sha=tip,
+                paths=paths,
+                reported=reported,
+            )
+            non_doc = [p for p in paths if not dispatch.is_documentation_path(p)]
+            if non_doc:
+                log(decision="non_doc_halt")
+                raise _LandHalt(
+                    "non_doc_conflict",
+                    f"land refused for item {self.item_id}: repo {repo}: the "
+                    "squash merge conflicts on non-documentation paths: "
+                    f"{', '.join(non_doc)}",
+                )
+            if paths:
+                markers = await self._git(
+                    repo,
+                    dispatch.land_conflict_markers,
+                    path,
+                    self.branches[repo],
+                    paths,
+                    timeout,
+                )
+                if markers:
+                    log(decision="markers_halt")
+                    raise _LandHalt(
+                        "conflict_markers",
+                        f"land refused for item {self.item_id}: repo {repo}: "
+                        f"conflict markers remain in: {', '.join(markers)}",
+                    )
+            unreported = sorted(set(paths) - set(reported))
+            if unreported:
+                logger.warning(
+                    "rollout-loop: land-conflict-unreported rollout_id=%s "
+                    "item_id=%s repo=%s unreported=%s",
+                    self.rollout_id,
+                    self.item_id,
+                    repo,
+                    ",".join(unreported),
+                )
+            log(decision="doc_only" if paths else "clean")
+            self.conflict_found[repo] = list(paths)
+            self.conflict_reported[repo] = reported
+            self.conflict_unreported[repo] = unreported
 
     async def _landing_set(self, *, report_disagreement: bool) -> list[str]:
         timeout = config.LAND_GIT_TIMEOUT_SECONDS
@@ -3812,6 +3975,7 @@ class _Lander:
             await self._fetch(repo)
         await self._reviewer_pushed_guard()
         self.landing = await self._landing_set(report_disagreement=True)
+        await self._conflict_guard()
 
         gate_on = bool(self.gate_command)
         if gate_on:
@@ -3932,6 +4096,25 @@ class _Lander:
             f"fix relaunch: {fix_text})"
             for repo in self.landing
         ]
+        for repo in self.landing:
+            found = self.conflict_found.get(repo) or []
+            if not found:
+                continue
+            reported = self.conflict_reported.get(repo) or []
+            line = (
+                f"Conflict check ({repo}): worker found documentation conflicts in "
+                f"{', '.join(found)}; reviewer reported resolving "
+                f"{', '.join(reported) if reported else 'none'}"
+            )
+            unreported = self.conflict_unreported.get(repo) or []
+            if unreported:
+                line += f" (mismatch: unreported {', '.join(unreported)})"
+            lines.append(line)
+        if self.outcome.resolved_conflict_paths:
+            lines.append(
+                "Reviewer resolved documentation-only merge conflicts in: "
+                + ", ".join(self.outcome.resolved_conflict_paths)
+            )
         try:
             await gtd_client.post_comment(
                 self.item_id,

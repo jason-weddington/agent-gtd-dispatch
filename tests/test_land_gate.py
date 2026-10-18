@@ -91,6 +91,7 @@ def _squash(
     content: str = "feature\n",
     subject: str = "fix(996b308e): Add X",
     trailer: bool = True,
+    branch: str = "feat/996b308e-add-x",
 ) -> str:
     (clone / filename).write_text(content)
     _git(clone, "add", "-A")
@@ -98,7 +99,68 @@ def _squash(
     if trailer:
         msg += f"\n\nRollout: {ROLLOUT}\nItem: {item_id}"
     _git(clone, "commit", "-m", msg)
+    # The land's conflict guard needs the verdict's feature branch to exist;
+    # pointing it at the squash commit makes the squash merge trivially clean.
+    _git(clone, "branch", "-f", branch, "HEAD")
     return _git(clone, "rev-parse", "HEAD")
+
+
+FEATURE = "feat/996b308e-add-x"
+_MARKER_LINE = "<<<<<<< HEAD\n"
+
+
+def _conflict_squash(
+    clone: Path,
+    files: dict[str, tuple[str, str, str]],
+    item_id: str = ITEM,
+) -> str:
+    """Fabricate a reviewer's squash commit whose merge conflicted.
+
+    *files* maps path -> (branch content, default-branch content, resolved
+    content).  The default-branch edit is pushed to origin, so origin is the
+    squash commit's parent.
+    """
+    _git(clone, "checkout", "-q", "-b", FEATURE)
+    for name, (ours, _theirs, _resolved) in files.items():
+        (clone / name).parent.mkdir(parents=True, exist_ok=True)
+        (clone / name).write_text(ours)
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "feat: branch side")
+    _git(clone, "checkout", "-q", "main")
+    for name, (_ours, theirs, _resolved) in files.items():
+        (clone / name).parent.mkdir(parents=True, exist_ok=True)
+        (clone / name).write_text(theirs)
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "docs: default-branch side")
+    _git(clone, "push", "-q", "origin", "main")
+    merge = subprocess.run(
+        ["git", *_GIT_ID, "merge", "--squash", FEATURE],
+        cwd=clone,
+        capture_output=True,
+        check=False,
+    )
+    assert merge.returncode != 0
+    for name, (_ours, _theirs, resolved) in files.items():
+        (clone / name).write_text(resolved)
+        _git(clone, "add", name)
+    _git(
+        clone,
+        "commit",
+        "-m",
+        f"fix(996b308e): Add X\n\nRollout: {ROLLOUT}\nItem: {item_id}",
+    )
+    tree = subprocess.run(
+        ["git", "merge-tree", "--write-tree", "main~1", FEATURE],
+        cwd=clone,
+        capture_output=True,
+        check=False,
+    )
+    assert tree.returncode == 1
+    return _git(clone, "rev-parse", "HEAD")
+
+
+_README = ("branch line\n", "main line\n", "branch line\nmain line\n")
+_APP = ("x = 1\n", "x = 2\n", "x = 3\n")
 
 
 def _tip(origin: Path) -> str:
@@ -259,6 +321,62 @@ class TestHelpers:
     def test_delete_branch_failures_are_reported(self, mono) -> None:
         notes = dispatch.land_delete_feature_branch(mono.clone, "feat/nope", 30)
         assert len(notes) == 2
+
+    def test_conflict_paths_clean_is_empty(self, mono) -> None:
+        _squash(mono.clone)
+        assert dispatch.land_conflict_paths(mono.clone, "main~1", FEATURE, 30) == []
+
+    def test_conflict_paths_lists_the_conflicting_paths(self, mono) -> None:
+        _conflict_squash(mono.clone, {"README.md": _README, "src/app.py": _APP})
+        paths = dispatch.land_conflict_paths(mono.clone, "main~1", FEATURE, 30)
+        assert sorted(paths) == ["README.md", "src/app.py"]
+
+    def test_conflict_paths_other_exit_raises(self, tmp_path: Path) -> None:
+        proc = subprocess.CompletedProcess(["git"], 129, b"", b"usage")
+        with (
+            patch("agent_gtd_dispatch.dispatch.subprocess.run", return_value=proc),
+            pytest.raises(
+                dispatch.LandGitError, match="git merge-tree failed: exit 129: usage"
+            ),
+        ):
+            dispatch.land_conflict_paths(tmp_path, "main", "feat/x", 30)
+
+    def test_conflict_paths_unresolvable_side_raises(self, mono) -> None:
+        with pytest.raises(
+            dispatch.LandGitError, match="git merge-tree failed: exit 1"
+        ):
+            dispatch.land_conflict_paths(mono.clone, "main", "no-such-ref", 30)
+
+    def test_resolve_ref(self, mono) -> None:
+        head = _git(mono.clone, "rev-parse", "HEAD")
+        assert dispatch.land_resolve_ref(mono.clone, "refs/heads/main", 30) == head
+        assert dispatch.land_resolve_ref(mono.clone, "refs/heads/nope", 30) == ""
+
+    def test_conflict_markers_finds_a_leftover_marker(self, mono) -> None:
+        (mono.clone / "README.md").write_text(f"a\n{_MARKER_LINE}b\n")
+        (mono.clone / "clean.md").write_text("fine\n")
+        _git(mono.clone, "add", "-A")
+        _git(mono.clone, "commit", "-m", "m")
+        assert dispatch.land_conflict_markers(
+            mono.clone, "main", ["README.md", "clean.md"], 30
+        ) == ["README.md"]
+
+    def test_conflict_markers_ignores_a_setext_underline(self, mono) -> None:
+        (mono.clone / "README.md").write_text("Title\n=======\n\nbody\n")
+        _git(mono.clone, "add", "-A")
+        _git(mono.clone, "commit", "-m", "m")
+        assert (
+            dispatch.land_conflict_markers(mono.clone, "main", ["README.md"], 30) == []
+        )
+
+    def test_conflict_markers_empty_paths_runs_no_git(self, tmp_path: Path) -> None:
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as run:
+            assert dispatch.land_conflict_markers(tmp_path, "main", [], 30) == []
+        run.assert_not_called()
+
+    def test_conflict_markers_other_exit_raises(self, mono) -> None:
+        with pytest.raises(dispatch.LandGitError, match="git grep failed"):
+            dispatch.land_conflict_markers(mono.clone, "no-such-rev", ["a.md"], 30)
 
 
 # ---------------------------------------------------------------------------
@@ -738,6 +856,166 @@ class TestLocalStateGuards:
 # ---------------------------------------------------------------------------
 
 
+class TestConflictGuard:
+    async def test_doc_only_conflict_lands(self, mono, gtd, caplog) -> None:
+        _conflict_squash(mono.clone, {"README.md": _README})
+        pre = _pre(mono.ws)
+        outcome = _verdict(resolved_conflict_paths=("README.md",))
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, pre, outcome=outcome)
+        assert isinstance(result, ReviewVerdict)
+        gtd.halt_rollout.assert_not_awaited()
+        assert _tip(mono.origin) != pre[mono.clone.name]
+        assert f"Item: {ITEM}" in _git(mono.origin, "log", "-1", "--format=%B", "main")
+        assert _git(mono.origin, "show", "main:README.md") == "branch line\nmain line"
+        comment = gtd.post_comment.await_args.args[1]
+        assert "Reviewer resolved documentation-only merge conflicts in: README.md" in (
+            comment
+        )
+        assert (
+            f"Conflict check ({mono.clone.name}): worker found documentation "
+            "conflicts in README.md; reviewer reported resolving README.md"
+        ) in comment
+        assert "mismatch" not in comment
+        assert "land-conflict-unreported" not in caplog.text
+        checks = [
+            r.getMessage()
+            for r in caplog.records
+            if "land-conflict-check" in r.getMessage()
+        ]
+        assert len(checks) == 1
+        assert "decision=doc_only" in checks[0]
+        assert "conflict_paths=README.md reported_resolved=README.md" in checks[0]
+        assert "base=main~1" in checks[0]
+        assert f"tip_ref=refs/heads/{FEATURE}" in checks[0]
+
+    async def test_non_doc_conflict_halts(self, mono, gtd, caplog) -> None:
+        _conflict_squash(mono.clone, {"README.md": _README, "src/app.py": _APP})
+        pre = _pre(mono.ws)
+        before = _tip(mono.origin)
+        outcome = _verdict(resolved_conflict_paths=("README.md",))
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, pre, outcome=outcome)
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd) == (
+            f"land refused for item {ITEM}: repo {mono.clone.name}: the squash "
+            "merge conflicts on non-documentation paths: src/app.py"
+        )
+        assert _tip(mono.origin) == before
+        assert "decision=non_doc_halt" in caplog.text
+        assert "outcome=non_doc_conflict" in caplog.text
+
+    async def test_reported_non_doc_path_halts(self, mono, gtd) -> None:
+        _squash(mono.clone)
+        before = _tip(mono.origin)
+        outcome = _verdict(resolved_conflict_paths=("src/app.py",))
+        result = await _land(mono.ws, mono.pre, outcome=outcome)
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd).startswith(
+            f"land refused for item {ITEM}: the reviewer reported resolving "
+            "non-documentation conflict paths: src/app.py"
+        )
+        assert _tip(mono.origin) == before
+
+    async def test_missing_feature_branch_halts(self, mono, gtd) -> None:
+        _squash(mono.clone)
+        before = _tip(mono.origin)
+        result = await _land(
+            mono.ws, mono.pre, outcome=_verdict(branch_name="feat/missing")
+        )
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd).startswith(
+            f"land conflict check failed for item {ITEM}"
+        )
+        assert "feature branch feat/missing not found" in _halt_reason(gtd)
+        assert _tip(mono.origin) == before
+
+    async def test_empty_branch_name_halts(self, mono, gtd) -> None:
+        _squash(mono.clone)
+        before = _tip(mono.origin)
+        result = await _land(mono.ws, mono.pre, outcome=_verdict(branch_name=""))
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd) == (
+            f"land conflict check failed for item {ITEM}: the verdict names no "
+            "feature branch"
+        )
+        assert _tip(mono.origin) == before
+
+    async def test_branch_found_only_on_origin(self, mono, gtd, caplog) -> None:
+        _squash(mono.clone, branch="feat/remote-only")
+        _git(mono.clone, "push", "-q", "origin", "feat/remote-only")
+        _git(mono.clone, "fetch", "-q", "origin")
+        _git(mono.clone, "branch", "-D", "feat/remote-only")
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(
+                mono.ws, mono.pre, outcome=_verdict(branch_name="feat/remote-only")
+            )
+        assert isinstance(result, ReviewVerdict)
+        assert "tip_ref=refs/remotes/origin/feat/remote-only" in caplog.text
+        assert "decision=clean" in caplog.text
+
+    async def test_unreported_doc_conflict_lands_with_a_warning(
+        self, mono, gtd, caplog
+    ) -> None:
+        _conflict_squash(mono.clone, {"README.md": _README})
+        pre = _pre(mono.ws)
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, pre, outcome=_verdict())
+        assert isinstance(result, ReviewVerdict)
+        assert "land-conflict-unreported" in caplog.text
+        assert "unreported=README.md" in caplog.text
+        comment = gtd.post_comment.await_args.args[1]
+        assert (
+            f"Conflict check ({mono.clone.name}): worker found documentation "
+            "conflicts in README.md; reviewer reported resolving none "
+            "(mismatch: unreported README.md)"
+        ) in comment
+        assert "Reviewer resolved documentation-only" not in comment
+
+    async def test_leftover_markers_halt(self, mono, gtd, caplog) -> None:
+        resolved = f"branch line\n{_MARKER_LINE}main line\n"
+        _conflict_squash(
+            mono.clone, {"README.md": ("branch line\n", "main line\n", resolved)}
+        )
+        pre = _pre(mono.ws)
+        before = _tip(mono.origin)
+        outcome = _verdict(resolved_conflict_paths=("README.md",))
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, pre, outcome=outcome)
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd).startswith(
+            f"land refused for item {ITEM}: repo {mono.clone.name}: conflict "
+            "markers remain in: README.md"
+        )
+        assert _tip(mono.origin) == before
+        assert "decision=markers_halt" in caplog.text
+
+    async def test_merge_tree_failure_is_bad_local_state(
+        self, mono, gtd, monkeypatch
+    ) -> None:
+        def boom(*_a, **_kw):
+            raise dispatch.LandGitError("merge-tree", "exit 129: usage")
+
+        monkeypatch.setattr(dispatch, "land_conflict_paths", boom)
+        _squash(mono.clone)
+        before = _tip(mono.origin)
+        result = await _land(mono.ws, mono.pre)
+        assert result == main._TICK_HALTED
+        reason = _halt_reason(gtd)
+        assert "land bad local state for item" in reason
+        assert "git merge-tree failed: exit" in reason
+        assert _tip(mono.origin) == before
+
+    async def test_clean_land_comment_is_unchanged(self, mono, gtd) -> None:
+        _squash(mono.clone)
+        result = await _land(mono.ws, mono.pre)
+        assert isinstance(result, ReviewVerdict)
+        comment = gtd.post_comment.await_args.args[1]
+        assert "\n" not in comment
+        assert comment.startswith("Landed ")
+        assert "Conflict check" not in comment
+
+
 class TestConcurrentLands:
     async def test_two_lands_on_one_remote_serialize(
         self, tmp_path: Path, caplog
@@ -748,7 +1026,13 @@ class TestConcurrentLands:
         ws_a, ws_b = _mono_ws(clone_a), _mono_ws(clone_b)
         pre_a, pre_b = _pre(ws_a), _pre(ws_b)
         _squash(clone_a, ITEM, filename="a.txt")
-        _squash(clone_b, ITEM_B, filename="b.txt", subject="feat(aaaabbbb): B")
+        _squash(
+            clone_b,
+            ITEM_B,
+            filename="b.txt",
+            subject="feat(aaaabbbb): B",
+            branch="feat/b",
+        )
         record = tmp_path / "parents.log"
         gate = f'sleep 1; echo "$(pwd) $(git rev-parse HEAD~1)" >> {record}'
         with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
@@ -897,6 +1181,29 @@ class TestWorkspaceProjects:
         lines = _land_lines(caplog)
         assert len(lines) == 1
         assert "repo=repo-a" in lines[0]
+
+    async def test_doc_only_conflict_in_one_repo_lands(
+        self, two_repo, gtd, caplog
+    ) -> None:
+        _conflict_squash(two_repo.clone_a, {"README.md": _README})
+        pre = _pre(two_repo.ws)
+        outcome = _verdict(
+            repo_states=(("repo-a", "committed"),),
+            resolved_conflict_paths=("repo-a/README.md",),
+        )
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(two_repo.ws, pre, outcome=outcome)
+        assert isinstance(result, ReviewVerdict)
+        gtd.halt_rollout.assert_not_awaited()
+        assert "land-conflict-unreported" not in caplog.text
+        comment = gtd.post_comment.await_args.args[1]
+        assert (
+            "Conflict check (repo-a): worker found documentation conflicts in "
+            "README.md; reviewer reported resolving README.md"
+        ) in comment
+        assert (
+            "Reviewer resolved documentation-only merge conflicts in: repo-a/README.md"
+        ) in comment
 
     async def test_both_repos_land(self, two_repo, gtd) -> None:
         _squash(two_repo.clone_a)

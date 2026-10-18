@@ -2431,6 +2431,89 @@ class TestLaunchReviewer:
         kwargs = ctx.dispatch.build_review_prompt.call_args.kwargs
         assert kwargs["gate_failure_output"] is None
 
+    async def test_resolved_conflict_paths_are_carried(self) -> None:
+        import json
+
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "merge",
+                    "rationale": "ok",
+                    "merge_note": "n",
+                    "resolved_conflict_paths": ["README.md"],
+                },
+                reason="ok",
+            )
+        assert outcome.verdict == "merge"
+        assert outcome.resolved_conflict_paths == ("README.md",)
+        assert outcome.detail.endswith(" [resolved doc conflicts: README.md]")
+        completion = json.loads(ctx.db.update_run.await_args.kwargs["completion"])
+        assert completion["resolved_conflict_paths"] == ["README.md"]
+
+    async def test_malformed_resolved_conflict_paths_halts_a_merge(self) -> None:
+        import json
+
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "merge",
+                    "rationale": "ok",
+                    "merge_note": "n",
+                    "resolved_conflict_paths": "README.md",
+                },
+                reason="ok",
+            )
+        assert outcome.verdict == "halt"
+        assert outcome.rationale == (
+            "reviewer returned a malformed resolved_conflict_paths"
+        )
+        assert outcome.detail == "malformed resolved_conflict_paths: 'README.md'"
+        assert outcome.resolved_conflict_paths == ()
+        kwargs = ctx.db.update_run.await_args.kwargs
+        assert kwargs["status"].value == "succeeded"
+        assert json.loads(kwargs["completion"])["verdict"] == "halt"
+
+    async def test_malformed_resolved_conflict_paths_ignored_off_merge(self) -> None:
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "skip",
+                    "rationale": "not needed",
+                    "resolved_conflict_paths": "x",
+                },
+                reason="ok",
+            )
+        assert outcome.verdict == "skip"
+        assert outcome.resolved_conflict_paths == ()
+
+    async def test_empty_resolved_conflict_paths_leaves_completion_unchanged(
+        self,
+    ) -> None:
+        import json
+
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "merge",
+                    "rationale": "ok",
+                    "merge_note": "n",
+                    "resolved_conflict_paths": [],
+                },
+                reason="ok",
+            )
+        assert outcome.verdict == "merge"
+        assert outcome.resolved_conflict_paths == ()
+        completion = json.loads(ctx.db.update_run.await_args.kwargs["completion"])
+        assert "resolved_conflict_paths" not in completion
+
     async def test_gate_failure_output_reaches_the_prompt(self) -> None:
         with _loop_patch_stack() as ctx:
             await self._launch(
