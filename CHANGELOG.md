@@ -2,6 +2,26 @@
 
 <!-- version list -->
 
+## v2.10.0 (2026-10-18)
+
+### Chores
+
+- **hosts**: Provision cargo-mutants in the agent dev toolchain
+  ([`50c4b3a`](https://github.com/repos/agent-gtd-dispatch/commit/50c4b3a7350c5212405a231150a1d494f6d82b22))
+
+- **hosts**: Provision Playwright 1.64.1 chromium alongside 1.63.0
+  ([`85cef1e`](https://github.com/repos/agent-gtd-dispatch/commit/85cef1e35816a18966e7f208cca8bc4fcca304e2))
+
+- **release**: Run the maintainer-local release guard before anything is published to github
+  ([`94029ae`](https://github.com/repos/agent-gtd-dispatch/commit/94029ae1e92015362f63db5b8091793b79d67be8))
+
+### Features
+
+- **rollouts**: The reviewer resolves merge conflicts confined to documentation files, and still
+  aborts on any other conflict
+  ([`e742507`](https://github.com/repos/agent-gtd-dispatch/commit/e74250705db8e20a1149904a26938d8e156e3ffb))
+
+
 ## v2.9.1 (2026-10-13)
 
 ### Bug Fixes
