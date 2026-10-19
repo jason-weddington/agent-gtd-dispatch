@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from agent_gtd_dispatch import config, dispatch, gates, main
@@ -205,6 +206,7 @@ def _env(monkeypatch):
     gtd.post_comment = AsyncMock()
     gtd.halt_rollout = AsyncMock()
     gtd.complete_in_rollout = AsyncMock(return_value={"newly_ready": []})
+    gtd.get_item = AsyncMock(return_value={"id": "item", "title": "t"})
     monkeypatch.setattr(main, "gtd_client", gtd)
     return gtd
 
@@ -1334,3 +1336,58 @@ class TestThroughTheWaveTick:
             "original note"
         )
         assert f"Item: {ITEM}" in _git(mono.origin, "log", "-1", "--format=%B", "main")
+
+
+class TestFixRelaunchAfterABoardTimeout:
+    async def test_fix_relaunch_needs_no_board_item_read(self, mono, gtd) -> None:
+        """A board read after the first reviewer ran would re-run the tick."""
+        calls = []
+
+        async def reviewer(*_a, **kwargs):
+            # Mirrors the real _launch_reviewer: board read only without an item.
+            if kwargs.get("item") is None:
+                await gtd.get_item(ITEM, token=None)
+            calls.append(kwargs.get("gate_failure_output"))
+            if kwargs.get("gate_failure_output") is None:
+                _squash(mono.clone)
+                return _verdict()
+            (mono.clone / "fixed.txt").write_text("x")
+            _git(mono.clone, "add", "-A")
+            _git(mono.clone, "commit", "--amend", "--no-edit")
+            return ReviewVerdict("merge", "amended", "FIX NOTE", "")
+
+        gtd.get_item = AsyncMock(
+            side_effect=[
+                {"id": ITEM, "title": "t"},
+                httpx.ReadTimeout("board down"),
+            ]
+        )
+        gtd.advance_rollout = AsyncMock(
+            return_value={
+                "next_ready": [],
+                "in_progress": [ITEM],
+                "graph_complete": False,
+            }
+        )
+        gtd.get_rollout = AsyncMock(
+            return_value={"status": "running", "inFlightBuildRuns": []}
+        )
+        with (
+            patch.object(main, "_launch_reviewer", side_effect=reviewer),
+            patch.object(main, "_rollout_unrecorded_merges", {}),
+        ):
+            directive = await main._rollout_wave_tick(
+                ROLLOUT,
+                project={"name": "P", "gate_command": "test -f fixed.txt"},
+                workspace_ref=[mono.ws],
+                reviewer_engine=get_engine("claude-code-sonnet"),
+                dispatch_attempts={},
+                token=None,
+                attribution=None,
+                loop_run_id="loop-1",
+            )
+        assert directive == main._TICK_CONTINUE
+        assert len(calls) == 2
+        assert calls[1] is not None  # the second launch was the fix relaunch
+        gtd.get_item.assert_awaited_once()
+        gtd.complete_in_rollout.assert_awaited_once()

@@ -139,6 +139,14 @@ LAND_GIT_TIMEOUT_SECONDS: int = 120
 # notification to wait on.
 ROLLOUT_LOOP_POLL_SECONDS: int = 30
 
+# Wall-clock seconds the wave loop rides out a TRANSIENT board outage (a
+# transport error, or a 502/503/504) before giving up.  Measured from the first
+# error of the current consecutive streak; a clean tick resets it.  Past the
+# window the last error is re-raised and the loop run fails — and because
+# dispatch_rollout only accepts a pending rollout, the rollout then needs
+# manual recovery.
+ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS: int = 3600
+
 # Per-ITEM cap on `re-dispatch` verdicts within one rollout.
 #
 # There is no retry concept for a failed child build anywhere today: one failed
@@ -263,6 +271,7 @@ def load() -> None:
     global REVIEWER_ENGINE, REVIEW_MAX_TURNS, REVIEW_TIMEOUT_SECONDS
     global LAND_GATE_TIMEOUT_SECONDS, LAND_GIT_TIMEOUT_SECONDS
     global ROLLOUT_LOOP_POLL_SECONDS, MAX_ITEM_REDISPATCHES
+    global ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS
     global EVIDENCE_ROOT, EVIDENCE_RETENTION_DAYS, WORKSPACE_RETENTION_HOURS
     global RETENTION_INTERVAL_SECONDS
     global LOG_LEVEL
@@ -373,5 +382,8 @@ def load() -> None:
     )
     ROLLOUT_LOOP_POLL_SECONDS = int(
         os.environ.get("DISPATCH_ROLLOUT_LOOP_POLL_SECONDS", "30")
+    )
+    ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS = int(
+        os.environ.get("DISPATCH_ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS", "3600")
     )
     MAX_ITEM_REDISPATCHES = int(os.environ.get("DISPATCH_MAX_ITEM_REDISPATCHES", "1"))

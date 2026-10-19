@@ -103,6 +103,8 @@ response (`src/agent_gtd_dispatch/main.py:563-567`).
 
 `gate_command` is read from the project record snapshotted when the rollout starts; a change to a project's `gate_command` mid-rollout takes effect on the next rollout.
 
+The wave loop rides out board outages of up to `ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS` (env `DISPATCH_ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS`, default 3600). Only transient errors count: any `httpx.TransportError` (`ReadTimeout`, `ConnectTimeout`, `ConnectError`, `RemoteProtocolError`, ...) or an HTTP 502, 503 or 504 from the board, raised out of the loop's initial `get_rollout`/`get_project` reads or out of one tick. On such an error the loop logs a `rollout-loop: board-unavailable` warning (rollout id, exception class, consecutive-failure count), sleeps `ROLLOUT_LOOP_POLL_SECONDS` and re-runs the tick from the top; a clean tick ends the streak. Every other error, including any other 4xx/5xx, fails the loop run at once, as before. The window is wall-clock time from the first error of the current streak; past it the last error is re-raised and the loop run fails with `rollout_loop_error: ...`. The rollout then stays `running` with no driver and needs manual recovery, because `dispatch_rollout` is one-shot (it accepts only a `pending` rollout).
+
 ### The worker-owned land step
 
 Items that were gate-green on their own clones can still turn `main` red together when one item carries a contract another item changes (a test in one asserting state the other moves). File-overlap planning cannot see that. So the land is deterministic and owned by the worker (`_land_reviewed_merge` in `main.py`), never by the reviewer prompt.

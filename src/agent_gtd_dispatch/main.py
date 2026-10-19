@@ -25,7 +25,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
 from agent_gtd_dispatch_protocol.branches import make_branch_name
 
@@ -2495,6 +2495,7 @@ async def _launch_reviewer(
     token: str | None,
     attribution: str | None,
     gate_failure_output: str | None = None,
+    item: dict[str, Any] | None = None,
 ) -> ReviewVerdict:
     """Run ONE short-lived reviewer for ONE completed build and read its verdict.
 
@@ -2519,8 +2520,15 @@ async def _launch_reviewer(
     ``verdict="halt"``: a reviewer that did not answer does not get the benefit
     of the doubt, because merging on a guess is the one outcome that cannot be
     undone.
+
+    *item* is the board item when the caller already holds it.  The wave tick
+    fetches it once, before the first reviewer runs, and the land step's FIX
+    MODE relaunch reuses it: a board call that times out AFTER a reviewer has
+    run would make the loop re-run the tick from the top and launch a second
+    reviewer for the same build.
     """
-    item = await gtd_client.get_item(item_id, token=token)
+    if item is None:
+        item = await gtd_client.get_item(item_id, token=token)
     raw_item_type = item.get("commit_type")
     item_commit_type = ""
     if raw_item_type in dispatch.ITEM_COMMIT_TYPES:
@@ -3361,8 +3369,10 @@ class _Lander:
         loop_run_id: str,
         token: str | None,
         attribution: str | None,
+        item: dict[str, Any] | None = None,
     ) -> None:
         """Capture the land's inputs; nothing runs until :meth:`run`."""
+        self.item = item
         self.rollout_id = rollout_id
         self.item_id = item_id
         self.outcome = outcome
@@ -3840,6 +3850,7 @@ class _Lander:
             token=self.token,
             attribution=self.attribution,
             gate_failure_output=result.output,
+            item=self.item,
         )
         if fix.verdict != "merge":
             raise _LandHalt(
@@ -4219,6 +4230,7 @@ async def _land_reviewed_merge(
     loop_run_id: str,
     token: str | None,
     attribution: str | None,
+    item: dict[str, Any] | None = None,
 ) -> ReviewVerdict | str:
     """Land a reviewer-approved squash commit: fetch, rebase, gate, push.
 
@@ -4265,7 +4277,100 @@ async def _land_reviewed_merge(
         loop_run_id=loop_run_id,
         token=token,
         attribution=attribution,
+        item=item,
     ).run()
+
+
+_TRANSIENT_BOARD_STATUSES = frozenset({502, 503, 504})
+
+
+def _is_transient_board_error(exc: BaseException) -> bool:
+    """Whether *exc* is a board blip the wave loop should ride out.
+
+    Exactly: any ``httpx.TransportError`` (ReadTimeout, ConnectTimeout,
+    ConnectError, RemoteProtocolError, ...) or an ``httpx.HTTPStatusError``
+    whose status is 502, 503 or 504.  Everything else is a real answer.
+    """
+    if isinstance(exc, httpx.TransportError):
+        return True
+    return _http_status(exc) in _TRANSIENT_BOARD_STATUSES
+
+
+class _BoardOutage:
+    """Tracks one rollout loop's current streak of transient board errors.
+
+    The streak is bounded by WALL-CLOCK time, not a count:
+    ``config.ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS`` measured from the first error
+    of the streak.  A call that completes without a transient error ends it.
+    """
+
+    def __init__(self, rollout_id: str) -> None:
+        """Start with no outage in progress."""
+        self.rollout_id = rollout_id
+        self.count = 0
+        self.started_at: float | None = None
+
+    def reset(self) -> None:
+        """A clean call: the streak is over."""
+        if self.count:
+            logger.info(
+                "rollout-loop: board-outage-recovered rollout_id=%s failures=%d",
+                self.rollout_id,
+                self.count,
+            )
+        self.count = 0
+        self.started_at = None
+
+    def absorb(self, exc: BaseException) -> bool:
+        """Record a transient error. False once the outage window is exceeded."""
+        now = _monotonic()
+        if self.started_at is None:
+            self.started_at = now
+        self.count += 1
+        elapsed = now - self.started_at
+        if elapsed > config.ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS:
+            logger.error(
+                "rollout-loop: board-outage-exceeded rollout_id=%s exc=%s "
+                "consecutive=%d elapsed_secs=%.0f window_secs=%d",
+                self.rollout_id,
+                type(exc).__name__,
+                self.count,
+                elapsed,
+                config.ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS,
+            )
+            return False
+        logger.warning(
+            "rollout-loop: board-unavailable rollout_id=%s exc=%s consecutive=%d "
+            "elapsed_secs=%.0f — will retry in %ds",
+            self.rollout_id,
+            type(exc).__name__,
+            self.count,
+            elapsed,
+            config.ROLLOUT_LOOP_POLL_SECONDS,
+        )
+        return True
+
+
+async def _ride_out_board_outage[T](
+    outage: _BoardOutage, call: Callable[[], Awaitable[T]]
+) -> T:
+    """Await ``call()``, retrying it while the board is transiently unavailable.
+
+    A transient error (see :func:`_is_transient_board_error`) sleeps
+    ``config.ROLLOUT_LOOP_POLL_SECONDS`` and calls again, until the outage
+    window is exceeded — then the last error is re-raised.  Every other
+    exception propagates on its first occurrence.
+    """
+    while True:
+        try:
+            result = await call()
+        except Exception as exc:
+            if not _is_transient_board_error(exc) or not outage.absorb(exc):
+                raise
+            await asyncio.sleep(config.ROLLOUT_LOOP_POLL_SECONDS)
+            continue
+        outage.reset()
+        return result
 
 
 async def _rollout_wave_tick(
@@ -4284,6 +4389,30 @@ async def _rollout_wave_tick(
     Order is load-bearing: completed builds are reviewed BEFORE newly-ready
     items are dispatched, so a dependent item is never dispatched against a
     base its predecessor has not yet been merged into.
+
+    Re-run safety.  ``_drive_rollout`` re-runs a tick FROM THE TOP when a
+    transient board error escapes it, so every side effect taken before a
+    board call that can raise must be safe to reach again:
+
+    - Phase publishes, item comments, ``halt_rollout``, merge-note and run-list
+      reads: best effort, they swallow every error and never raise.
+    - Preparing the shared workspace: held in ``workspace_ref``, which outlives
+      the tick, so a re-run reuses it instead of preparing another.
+    - Launching the reviewer: the only board calls that can raise on the
+      review path (``get_item``, and ``advance_rollout``/``get_rollout`` above)
+      happen BEFORE it.  The item is fetched once here and handed to the land
+      step's fix relaunch, so nothing after the first reviewer can raise a
+      board error out of the tick.
+    - The land (push): followed only by best-effort board calls.
+    - Recording an outcome: ``_complete_in_rollout_with_retry`` returns its
+      error instead of raising, and ``complete_in_rollout`` is idempotent by
+      item id; a merge whose record still fails is tracked in
+      ``_rollout_unrecorded_merges`` and never re-reviewed.
+    - Re-dispatch (reset + dispatch): any error halts, so it never escapes.
+    - Dispatching a ready item: a transient error escapes and the tick is
+      re-run.  A dispatch that landed moved the item out of ``next_ready``, so
+      it is not dispatched again; items dispatched earlier in the same tick
+      are likewise reported ``in_progress``.
     """
     try:
         advance = await gtd_client.advance_rollout(rollout_id, token=token)
@@ -4376,6 +4505,10 @@ async def _rollout_wave_tick(
             )
         workspace = workspace_ref[0]
         assert workspace is not None  # noqa: S101 — just assigned above
+        # Fetched here, before any reviewer runs, and threaded through to the
+        # land step's fix relaunch: after the first reviewer has run, no board
+        # call may raise out of this tick (see _drive_rollout's outage retry).
+        review_item = await gtd_client.get_item(item_id, token=token)
         await asyncio.get_running_loop().run_in_executor(
             None, dispatch.refresh_rollout_workspace, workspace
         )
@@ -4407,6 +4540,7 @@ async def _rollout_wave_tick(
             reviewer_engine=reviewer_engine,
             token=token,
             attribution=attribution,
+            item=review_item,
         )
         dispatch_attempts.pop(item_id, None)
         if outcome.verdict == "merge":
@@ -4421,6 +4555,7 @@ async def _rollout_wave_tick(
                 loop_run_id=loop_run_id,
                 token=token,
                 attribution=attribution,
+                item=review_item,
             )
             if isinstance(landed, str):
                 return landed
@@ -4460,6 +4595,13 @@ async def _rollout_wave_tick(
                     item_id, rollout_id=rollout_id, token=token
                 )
             except Exception as exc:
+                # A transient board error is ridden out by _drive_rollout, not
+                # turned into a halt.  Re-running the tick cannot double-dispatch:
+                # a dispatch that DID land moved the item to `dispatched`, so
+                # advance_rollout no longer reports it in next_ready (and the
+                # board's wave linkage is guarded by `AND status = 'ready'`).
+                if _is_transient_board_error(exc):
+                    raise
                 return await _halt_rollout_from_loop(
                     rollout_id,
                     f"dispatch of item {item_id} failed: {type(exc).__name__}: {exc}",
@@ -4522,10 +4664,16 @@ async def _drive_rollout(
     rollout_id = run.rollout_id
     assert rollout_id is not None  # noqa: S101 — caller guarantees this
     token = run.callback_token
+    outage = _BoardOutage(rollout_id)
 
-    rollout = await gtd_client.get_rollout(rollout_id, token=token)
-    project = await gtd_client.get_project(
-        str(rollout.get("project_id") or ""), token=token
+    rollout = await _ride_out_board_outage(
+        outage, lambda: gtd_client.get_rollout(rollout_id, token=token)
+    )
+    project = await _ride_out_board_outage(
+        outage,
+        lambda: gtd_client.get_project(
+            str(rollout.get("project_id") or ""), token=token
+        ),
     )
     run.project_name = str(project.get("name") or run.project_name)
 
@@ -4559,15 +4707,22 @@ async def _drive_rollout(
     directive = _TICK_CONTINUE
     try:
         while True:
-            directive = await _rollout_wave_tick(
-                rollout_id,
-                project=project,
-                workspace_ref=workspace_ref,
-                reviewer_engine=reviewer_engine,
-                dispatch_attempts=dispatch_attempts,
-                token=token,
-                attribution=attribution,
-                loop_run_id=run.id,
+            # A transient board error re-runs the whole tick from the top.
+            # That is safe because every side effect in the tick is either
+            # re-derived from the board on the next read or is followed only by
+            # board calls that never raise (see _rollout_wave_tick).
+            directive = await _ride_out_board_outage(
+                outage,
+                lambda: _rollout_wave_tick(
+                    rollout_id,
+                    project=project,
+                    workspace_ref=workspace_ref,
+                    reviewer_engine=reviewer_engine,
+                    dispatch_attempts=dispatch_attempts,
+                    token=token,
+                    attribution=attribution,
+                    loop_run_id=run.id,
+                ),
             )
             if directive in (_TICK_DONE, _TICK_HALTED):
                 return directive

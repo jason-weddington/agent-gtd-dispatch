@@ -1709,6 +1709,7 @@ def _loop_patch_stack():
         mock_gtd.dispatch_item = AsyncMock(return_value={"id": "child-run"})
         mock_gtd.reset_rollout_item = AsyncMock(return_value={})
         mock_gtd.complete_in_rollout = AsyncMock(return_value={"newly_ready": []})
+        mock_gtd.get_item = AsyncMock(return_value={"id": "item-a", "title": "t"})
         mock_db.insert_run = AsyncMock()
         mock_db.update_run = AsyncMock()
         # Default: this host HAS a local run row for whatever rollout is under
@@ -2366,9 +2367,13 @@ class TestLaunchReviewer:
         exit_code=0,
         raises=None,
         item=None,
+        prefetched=None,
         **extra,
     ):
         from agent_gtd_dispatch.main import _launch_reviewer
+
+        if prefetched is not None:
+            extra["item"] = prefetched
 
         ctx.gtd.get_item = AsyncMock(return_value=item or self._item())
         ctx.gtd.list_runs_for_item = AsyncMock(
@@ -3896,3 +3901,339 @@ class TestDriveRolloutClearsUnrecordedMerges:
             assert await _drive_rollout(_make_run()) == _TICK_DONE
 
         assert "rollout-abc" not in ctx.unrecorded
+
+
+# ---------------------------------------------------------------------------
+# Transient board outages: the loop rides them out
+# ---------------------------------------------------------------------------
+
+
+def _read_timeout() -> httpx.ReadTimeout:
+    return httpx.ReadTimeout("", request=httpx.Request("POST", "http://gtd.test/x"))
+
+
+class TestIsTransientBoardError:
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            _read_timeout(),
+            httpx.ConnectTimeout("t"),
+            httpx.ConnectError("refused"),
+            httpx.RemoteProtocolError("eof"),
+            _http_error(502),
+            _http_error(503),
+            _http_error(504),
+        ],
+    )
+    def test_transient(self, exc) -> None:
+        from agent_gtd_dispatch.main import _is_transient_board_error
+
+        assert _is_transient_board_error(exc)
+
+    @pytest.mark.parametrize(
+        "exc",
+        [_http_error(500), _http_error(404), _http_error(422), ValueError("x")],
+    )
+    def test_not_transient(self, exc) -> None:
+        from agent_gtd_dispatch.main import _is_transient_board_error
+
+        assert not _is_transient_board_error(exc)
+
+
+class TestBoardOutageRetry:
+    @staticmethod
+    def _run() -> Run:
+        return Run(
+            project_name="p",
+            mode="manage",
+            rollout_id="rollout-abc",
+            engine="claude-code",
+        )
+
+    @staticmethod
+    def _board(ctx) -> None:
+        ctx.gtd.get_rollout = AsyncMock(return_value={"project_id": "proj-1"})
+        ctx.gtd.get_project = AsyncMock(
+            return_value={"name": "P", "workspace_repos": []}
+        )
+
+    @pytest.mark.parametrize("exc_factory", [_read_timeout, lambda: _http_error(503)])
+    async def test_transient_tick_errors_are_retried_and_the_run_succeeds(
+        self, exc_factory, caplog
+    ) -> None:
+        from agent_gtd_dispatch import config as cfg
+        from agent_gtd_dispatch.main import _TICK_DONE, _rollout_loop_worker
+
+        caplog.set_level(logging.WARNING, logger="agent_gtd_dispatch.main")
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._rollout_wave_tick",
+                new=AsyncMock(side_effect=[exc_factory(), exc_factory(), _TICK_DONE]),
+            ) as tick,
+        ):
+            self._board(ctx)
+            await _rollout_loop_worker(self._run())
+
+        assert tick.await_count == 3
+        assert [c.args for c in ctx.sleep.await_args_list] == [
+            (cfg.ROLLOUT_LOOP_POLL_SECONDS,),
+            (cfg.ROLLOUT_LOOP_POLL_SECONDS,),
+        ]
+        kw = ctx.db.update_run.await_args.kwargs
+        assert kw["status"] == RunStatus.succeeded
+        assert kw["error"] == ""
+        warnings = [
+            r.getMessage() for r in caplog.records if "board-unavailable" in r.message
+        ]
+        assert len(warnings) == 2
+        exc_name = type(exc_factory()).__name__
+        assert "rollout_id=rollout-abc" in warnings[1]
+        assert f"exc={exc_name}" in warnings[1]
+        assert "consecutive=2" in warnings[1]
+
+    @pytest.mark.parametrize("exc", [_http_error(500), ValueError("nope")])
+    async def test_other_errors_propagate_on_first_occurrence(self, exc) -> None:
+        from agent_gtd_dispatch.main import _TICK_DONE, _drive_rollout
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._rollout_wave_tick",
+                new=AsyncMock(side_effect=[exc, _TICK_DONE]),
+            ) as tick,
+        ):
+            self._board(ctx)
+            with pytest.raises(type(exc)):
+                await _drive_rollout(self._run())
+
+        assert tick.await_count == 1
+        ctx.sleep.assert_not_awaited()
+
+    async def test_non_transient_error_fails_the_loop_run_as_before(self) -> None:
+        from agent_gtd_dispatch.main import _rollout_loop_worker
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._rollout_wave_tick",
+                new=AsyncMock(side_effect=_http_error(500)),
+            ),
+        ):
+            self._board(ctx)
+            await _rollout_loop_worker(self._run())
+
+        kw = ctx.db.update_run.await_args.kwargs
+        assert kw["status"] == RunStatus.failed
+        assert kw["error"].startswith("rollout_loop_error: HTTPStatusError")
+
+    async def test_initial_fetches_ride_out_the_outage(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_DONE, _drive_rollout
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._rollout_wave_tick",
+                new=AsyncMock(return_value=_TICK_DONE),
+            ),
+        ):
+            ctx.gtd.get_rollout = AsyncMock(
+                side_effect=[_read_timeout(), {"project_id": "proj-1"}]
+            )
+            ctx.gtd.get_project = AsyncMock(
+                side_effect=[httpx.ConnectError("refused"), {"name": "P"}]
+            )
+            assert await _drive_rollout(self._run()) == _TICK_DONE
+
+        assert ctx.gtd.get_rollout.await_count == 2
+        assert ctx.gtd.get_project.await_count == 2
+        assert ctx.sleep.await_count == 2
+
+    async def test_a_persistent_outage_is_re_raised_once_the_window_elapses(
+        self, monkeypatch
+    ) -> None:
+        import itertools
+
+        from agent_gtd_dispatch import config as cfg
+        from agent_gtd_dispatch.main import _rollout_loop_worker
+
+        monkeypatch.setattr(cfg, "ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS", 100)
+        clock = itertools.count(0, 60)
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._monotonic", side_effect=lambda: next(clock)
+            ),
+            patch(
+                "agent_gtd_dispatch.main._rollout_wave_tick",
+                new=AsyncMock(side_effect=lambda *a, **k: _raise(_read_timeout())),
+            ) as tick,
+        ):
+            self._board(ctx)
+            await _rollout_loop_worker(self._run())
+
+        # t=0 starts the streak, t=60 is inside the window, t=120 exceeds it.
+        assert tick.await_count == 3
+        assert ctx.sleep.await_count == 2
+        kw = ctx.db.update_run.await_args.kwargs
+        assert kw["status"] == RunStatus.failed
+        assert kw["error"].startswith("rollout_loop_error: ReadTimeout")
+
+    async def test_a_clean_tick_resets_the_streak(self, monkeypatch) -> None:
+        import itertools
+
+        from agent_gtd_dispatch import config as cfg
+        from agent_gtd_dispatch.main import _TICK_DONE, _TICK_WAIT, _drive_rollout
+
+        monkeypatch.setattr(cfg, "ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS", 100)
+        clock = itertools.count(0, 60)
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._monotonic", side_effect=lambda: next(clock)
+            ),
+            patch(
+                "agent_gtd_dispatch.main._rollout_wave_tick",
+                new=AsyncMock(
+                    side_effect=[
+                        _read_timeout(),  # t=0, streak starts
+                        _read_timeout(),  # t=60
+                        _TICK_WAIT,  # clean: streak resets
+                        _read_timeout(),  # t=120, a NEW streak starts
+                        _read_timeout(),  # t=180: 60s into it, not 180
+                        _TICK_DONE,
+                    ]
+                ),
+            ) as tick,
+        ):
+            self._board(ctx)
+            assert await _drive_rollout(self._run()) == _TICK_DONE
+
+        assert tick.await_count == 6
+
+
+def _raise(exc: BaseException):
+    raise exc
+
+
+class TestTickIsSafeToReRunAfterATimeout:
+    """AC4 guards: a timeout after a side effect, then a re-run, never repeats it."""
+
+    async def test_transient_dispatch_error_escapes_instead_of_halting(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_WAIT
+
+        attempts: dict[str, int] = {}
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(
+                side_effect=[
+                    {
+                        "next_ready": ["item-a"],
+                        "in_progress": [],
+                        "graph_complete": False,
+                    },
+                    # The timed-out dispatch DID land: the item is now dispatched.
+                    {
+                        "next_ready": [],
+                        "in_progress": ["item-a"],
+                        "graph_complete": False,
+                    },
+                ]
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                side_effect=[
+                    {"status": "running", "inFlightBuildRuns": []},
+                    {
+                        "status": "running",
+                        "inFlightBuildRuns": [{"itemId": "item-a", "runId": "r1"}],
+                    },
+                ]
+            )
+            ctx.gtd.dispatch_item = AsyncMock(side_effect=_read_timeout())
+            with pytest.raises(httpx.ReadTimeout):
+                await _tick(ctx, dispatch_attempts=attempts)
+            ctx.gtd.halt_rollout.assert_not_awaited()
+
+            assert await _tick(ctx, dispatch_attempts=attempts) == _TICK_WAIT
+
+        ctx.gtd.dispatch_item.assert_awaited_once()
+        ctx.gtd.halt_rollout.assert_not_awaited()
+
+    async def test_non_transient_dispatch_error_still_halts(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": ["item-a"],
+                    "in_progress": [],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            ctx.gtd.dispatch_item = AsyncMock(side_effect=_http_error(500))
+            assert await _tick(ctx) == _TICK_HALTED
+
+        assert (
+            "dispatch of item item-a failed"
+            in (ctx.gtd.halt_rollout.await_args.kwargs["reason"])
+        )
+
+    async def test_review_item_is_fetched_before_the_reviewer_and_handed_on(
+        self,
+    ) -> None:
+        from agent_gtd_dispatch.main import ReviewVerdict
+
+        item = {"id": "item-a", "title": "t"}
+        verdict = ReviewVerdict("merge", "r", "note", "")
+        order: list[str] = []
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._launch_reviewer",
+                new=AsyncMock(
+                    side_effect=lambda *a, **k: order.append("reviewer") or verdict
+                ),
+            ) as reviewer,
+            patch(
+                "agent_gtd_dispatch.main._land_reviewed_merge",
+                new=AsyncMock(return_value=verdict),
+            ) as land,
+            patch(
+                "agent_gtd_dispatch.main._verify_landed_commit_type", new=AsyncMock()
+            ),
+        ):
+            ctx.gtd.get_item = AsyncMock(
+                side_effect=lambda *a, **k: order.append("get_item") or item
+            )
+            ctx.dispatch.land_origin_shas = MagicMock(return_value={})
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": [],
+                    "in_progress": ["item-a"],
+                    "graph_complete": False,
+                }
+            )
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            await _tick(ctx)
+
+        assert order == ["get_item", "reviewer"]
+        assert reviewer.await_args.kwargs["item"] is item
+        assert land.await_args.kwargs["item"] is item
+
+    async def test_launch_reviewer_with_an_item_makes_no_board_item_read(
+        self,
+    ) -> None:
+        item = TestLaunchReviewer._item()
+        with _loop_patch_stack() as ctx:
+            await TestLaunchReviewer()._launch(
+                ctx,
+                verdict_blob={"verdict": "merge", "rationale": "ok"},
+                reason="ok",
+                prefetched=item,
+            )
+            ctx.gtd.get_item.assert_not_awaited()
+        assert ctx.dispatch.build_review_prompt.call_args.args[0] is item
