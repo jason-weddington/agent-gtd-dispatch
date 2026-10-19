@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v2.10.1 (2026-10-19)
+
+### Bug Fixes
+
+- **dispatch**: A rebuild whose item branch holds an older run's commits pushes to <branch>-rN
+  instead of losing its work
+  ([`48ff84c`](https://github.com/repos/agent-gtd-dispatch/commit/48ff84c1d751a5b679eff2a2f55f68259ada03e5))
+
+- **rollouts**: The rollout loop rides out a transient board outage instead of crashing on one
+  timeout
+  ([`42d2e65`](https://github.com/repos/agent-gtd-dispatch/commit/42d2e6583e6068d70d002e999a9c0904c157506f))
+
+
 ## v2.10.0 (2026-10-18)
 
 ### Chores
