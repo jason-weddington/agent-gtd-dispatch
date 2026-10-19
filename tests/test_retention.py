@@ -236,11 +236,11 @@ class TestCaptureEvidence:
             assert argv[:4] == ["sudo", "-u", "dispatch", "-H"]
         # add/diff go through the bash wrapper that sets GIT_INDEX_FILE inline,
         # since sudo would otherwise strip an env var not in env_keep.
-        assert seen[0][4] == "bash"
+        assert seen[0][8] == "bash"
         assert "add" in seen[0] and "-A" in seen[0]
-        assert seen[1][4] == "bash"
+        assert seen[1][8] == "bash"
         assert "diff" in seen[1] and "--cached" in seen[1] and "abc" in seen[1]
-        assert seen[2][4:6] == ["rm", "-f"]
+        assert seen[2][8:10] == ["rm", "-f"]
 
     def test_diff_command_has_no_sudo_prefix_when_unset(self, monkeypatch) -> None:
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")

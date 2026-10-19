@@ -1294,6 +1294,10 @@ class TestSudoWrapping:
                 "-u",
                 "dispatch",
                 "-H",
+                "/bin/bash",
+                "-c",
+                'umask 0002; exec "$@"',
+                "agent-gtd-umask",
                 "bash",
                 "-c",
                 "true",
@@ -6711,3 +6715,35 @@ class TestIsDocumentationPath:
 
     def test_extension_list(self) -> None:
         assert dispatch.DOCUMENTATION_EXTENSIONS == (".md", ".mdx", ".rst", ".txt")
+
+
+class TestSudoWrapUmask:
+    """The launched agent-user command line carries an explicit umask 0002."""
+
+    def test_wrapped_argv_sets_umask_before_exec(self, monkeypatch) -> None:
+        from agent_gtd_dispatch.dispatch import _sudo_wrap
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        argv = _sudo_wrap(["git", "status"])
+        assert argv[:4] == ["sudo", "-u", "dispatch", "-H"]
+        assert argv[4:7] == ["/bin/bash", "-c", 'umask 0002; exec "$@"']
+        assert argv[-2:] == ["git", "status"]
+
+    def test_unwrapped_when_no_agent_user(self, monkeypatch) -> None:
+        from agent_gtd_dispatch.dispatch import _sudo_wrap
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        assert _sudo_wrap(["git", "status"]) == ["git", "status"]
+
+    def test_shim_makes_files_group_writable_under_umask_0022(self, tmp_path) -> None:
+        import os
+
+        from agent_gtd_dispatch.dispatch import _UMASK_SHIM
+
+        target = tmp_path / "f"
+        subprocess.run(
+            ["/bin/bash", "-c", _UMASK_SHIM, "agent-gtd-umask", "touch", str(target)],
+            check=True,
+            preexec_fn=lambda: os.umask(0o022),
+        )
+        assert target.stat().st_mode & 0o020

@@ -130,10 +130,29 @@ def git_output_excerpt(
     return f"{combined[:head]}\n[... {dropped} characters elided ...]\n{tail_text}"
 
 
+# Shim run via ``/bin/bash -c`` (already in the sudoers NOPASSWD list) so that
+# every agent-user command is created with umask 0002 regardless of the host's
+# sudo implementation (sudo-rs leaves 0022).  Files the agent creates are then
+# group-writable for the service user without relying on pam_umask or a
+# hand-set default ACL on the workspace.  ``exec`` keeps the real command as
+# the process, so signals and exit codes are unchanged.
+_UMASK_SHIM: str = 'umask 0002; exec "$@"'
+
+
 def _sudo_wrap(cmd: list[str]) -> list[str]:
-    """Prepend sudo -u <user> -H when AGENT_SUBPROCESS_USER is set."""
+    """Prepend sudo -u <user> -H (with an explicit umask 0002) when AGENT_SUBPROCESS_USER is set."""
     if config.AGENT_SUBPROCESS_USER:
-        return ["sudo", "-u", config.AGENT_SUBPROCESS_USER, "-H", *cmd]
+        return [
+            "sudo",
+            "-u",
+            config.AGENT_SUBPROCESS_USER,
+            "-H",
+            "/bin/bash",
+            "-c",
+            _UMASK_SHIM,
+            "agent-gtd-umask",
+            *cmd,
+        ]
     return cmd
 
 

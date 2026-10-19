@@ -309,7 +309,17 @@ class TestRunAsAgent:
         ) as mock_run:
             run_as_agent(argv, tmp_path, 30)
         called_argv = mock_run.call_args.args[0]
-        assert called_argv == ["sudo", "-u", "dispatch", "-H", *argv]
+        assert called_argv == [
+            "sudo",
+            "-u",
+            "dispatch",
+            "-H",
+            "/bin/bash",
+            "-c",
+            'umask 0002; exec "$@"',
+            "agent-gtd-umask",
+            *argv,
+        ]
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
 
     def test_no_sudo_wrap_when_subprocess_user_unset(

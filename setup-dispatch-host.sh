@@ -236,6 +236,23 @@ _smoke_test() {
         || die "Smoke test: GET /info response missing expected key 'version': ${info_body}"
     info "Smoke assertion (b) passed: GET /info → HTTP 200, 'version' key present"
 
+    # Assertion (c): a file the agent creates through the service's sudo path
+    # (same umask shim as dispatch._sudo_wrap) is appendable by the service user.
+    if $SINGLE_USER; then
+        info "Smoke assertion (c) skipped: single-user mode has no service/agent split"
+    else
+        info "Smoke test: agent-created file is writable by ${SERVICE_USER} ..."
+        local probe="${AGENT_WORKSPACE}/.smoke-umask-$$"
+        runuser -u "$SERVICE_USER" -- sudo -n -u "$AGENT_USER" -H /bin/bash -c 'umask 0002; exec "$@"' agent-gtd-umask touch "$probe" \
+            || die "Smoke test: ${SERVICE_USER} could not create ${probe} as ${AGENT_USER} via sudo"
+        if ! runuser -u "$SERVICE_USER" -- /bin/bash -c 'echo ok >> "$1"' _ "$probe"; then
+            rm -f "$probe"
+            die "Smoke test: ${SERVICE_USER} cannot append to a file ${AGENT_USER} created under ${AGENT_WORKSPACE} (group-write missing)"
+        fi
+        rm -f "$probe"
+        info "Smoke assertion (c) passed: agent-created file is group-writable by ${SERVICE_USER}"
+    fi
+
     info "Smoke test complete"
 }
 
@@ -474,6 +491,22 @@ else
         fi
     fi
     info "Agent workspace ready: ${AGENT_WORKSPACE}"
+fi
+
+# Default ACL on the workspace root: files the agent creates are group-writable
+# even when the host's sudo leaves umask 0022 (sudo-rs). Belt-and-braces with the
+# explicit `umask 0002` in dispatch._sudo_wrap — either mechanism alone suffices.
+if $DRY_RUN; then
+    would "apt-get install -y acl; setfacl -d -m u::rwx,g::rwx,o::rx ${AGENT_WORKSPACE}"
+else
+    if ! command -v setfacl &>/dev/null; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y acl
+        info "Installed acl"
+    fi
+    # setfacl -d -m is idempotent: re-applying the same entries is a no-op.
+    setfacl -d -m u::rwx,g::rwx,o::rx "$AGENT_WORKSPACE" \
+        || die "setfacl failed on ${AGENT_WORKSPACE} (does the filesystem support ACLs?)"
+    info "Default ACL set on ${AGENT_WORKSPACE}"
 fi
 
 # --- SSH key provisioning for AGENT_USER (needed for git auth on fresh box) ---
@@ -2430,6 +2463,7 @@ if ! $SMOKE; then
 elif $DRY_RUN; then
     would "GET http://localhost:${API_PORT}/health and assert HTTP 200 with 'status' key"
     would "GET http://localhost:${API_PORT}/info and assert HTTP 200 with 'version' key"
+    would "create a file as ${AGENT_USER} via ${SERVICE_USER}'s sudo path and assert ${SERVICE_USER} can append to it"
 else
     _smoke_test
 fi
