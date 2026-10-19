@@ -390,12 +390,15 @@ def get_head_sha(repo_path: Path) -> str:
 def verify_pushes(
     repos: list[tuple[str, Path, str]],
     branch_name: str,
+    branch_by_repo: dict[str, str] | None = None,
 ) -> list[RepoPushStatus]:
     """Verify that each repo has pushed its branch to origin.
 
     Args:
         repos: List of (repo_name, repo_path, base_sha) tuples.
         branch_name: The feature branch to check.
+        branch_by_repo: Per-repo override of *branch_name* — the ``-r<N>``
+            branch a repo's push fell back to (see :func:`push_with_fallback`).
 
     Returns:
         Per-repo RepoPushStatus in the same order as *repos*.
@@ -409,6 +412,7 @@ def verify_pushes(
     """
     results: list[RepoPushStatus] = []
     for repo_name, repo_path, base_sha in repos:
+        repo_branch = (branch_by_repo or {}).get(repo_name) or branch_name
         try:
             # local HEAD SHA
             local_proc = subprocess.run(
@@ -436,7 +440,7 @@ def verify_pushes(
 
             # remote SHA for the branch (empty output → branch not on remote)
             remote_proc = subprocess.run(
-                _sudo_wrap(["git", "ls-remote", "origin", f"refs/heads/{branch_name}"]),
+                _sudo_wrap(["git", "ls-remote", "origin", f"refs/heads/{repo_branch}"]),
                 cwd=repo_path,
                 check=False,
                 capture_output=True,
@@ -475,7 +479,7 @@ def verify_pushes(
             results.append(
                 RepoPushStatus(
                     repo_name=repo_name,
-                    branch=branch_name,
+                    branch=repo_branch,
                     status=PushStatus.unpushed,
                     local_sha=None,
                     remote_sha=None,
@@ -488,7 +492,7 @@ def verify_pushes(
         results.append(
             RepoPushStatus(
                 repo_name=repo_name,
-                branch=branch_name,
+                branch=repo_branch,
                 status=status,
                 local_sha=local_sha,
                 remote_sha=remote_sha,
@@ -514,9 +518,185 @@ def is_zero_commits_run(push_results: list[RepoPushStatus]) -> bool:
     )
 
 
+#: Highest ``-r<N>`` suffix :func:`push_with_fallback` will probe before giving up.
+#: A branch that has been rebuilt this many times needs a human, not another suffix.
+FALLBACK_BRANCH_MAX_SUFFIX = 50
+
+
+@dataclass(frozen=True, slots=True)
+class PushAttempt:
+    """What a worker-side push did to one repo.
+
+    ``branch`` is the remote branch the FINAL attempt targeted — the requested
+    branch, or ``<branch>-r<N>`` when the requested one already held unrelated
+    commits (``fell_back``).  ``proc`` is that final attempt's process, so a
+    caller that only checks ``proc.returncode`` keeps today's semantics.
+    """
+
+    proc: subprocess.CompletedProcess[bytes]
+    branch: str
+    fell_back: bool = False
+
+
+def _git_push_argv(branch: str, *, no_verify: bool) -> list[str]:
+    """Argv pushing the clone's HEAD to ``refs/heads/<branch>`` on origin.
+
+    ``HEAD:refs/heads/<branch>`` rather than a bare ``<branch>`` because a
+    fallback (``-r<N>``) branch never exists locally: the clone's branch keeps
+    its original name, and HEAD is exactly what push verification compares.
+    Never ``--force`` and never ``--force-with-lease``.
+    """
+    argv = ["git", "push"]
+    if no_verify:
+        argv.append("--no-verify")
+    argv += ["-u", "origin", f"HEAD:refs/heads/{branch}"]
+    return argv
+
+
+def is_non_fast_forward(
+    repo_path: Path | str, branch_name: str, timeout_seconds: float | None = None
+) -> bool:
+    """Return True when origin's ``branch_name`` exists and is NOT an ancestor of HEAD.
+
+    That is the one rejection the ``-r<N>`` fallback exists for: the branch
+    already holds an older run's commits that this clone does not contain (a
+    re-dispatch onto a fresh base reusing the deterministic item branch name).
+
+    Detection is mechanical — a fetch of that one ref, then ``git merge-base
+    --is-ancestor`` — and deliberately never parses git's English stderr. Any
+    failure to establish the fact (the fetch fails because the branch is
+    absent, auth or the network is down) returns False, so every other push
+    rejection keeps its existing behaviour.
+    """
+    try:
+        fetch = subprocess.run(
+            _sudo_wrap(
+                [
+                    "git",
+                    "fetch",
+                    "--no-tags",
+                    "origin",
+                    f"+refs/heads/{branch_name}:refs/remotes/origin/{branch_name}",
+                ]
+            ),
+            cwd=repo_path,
+            timeout=timeout_seconds,
+            capture_output=True,
+            check=False,
+        )
+        if fetch.returncode != 0:
+            return False
+        ancestor = subprocess.run(
+            _sudo_wrap(
+                [
+                    "git",
+                    "merge-base",
+                    "--is-ancestor",
+                    f"refs/remotes/origin/{branch_name}",
+                    "HEAD",
+                ]
+            ),
+            cwd=repo_path,
+            timeout=timeout_seconds,
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.exception("non-fast-forward detection failed in %s", repo_path)
+        return False
+    return ancestor.returncode != 0
+
+
+def next_free_fallback_branch(
+    repo_path: Path | str, branch_name: str, timeout_seconds: float | None = None
+) -> str | None:
+    """Return the first ``<branch_name>-r<N>`` (N >= 2) that does not exist on origin.
+
+    Probed with ``git ls-remote origin refs/heads/<candidate>`` — an empty
+    answer means free.  Returns None when origin cannot be queried or every
+    candidate up to :data:`FALLBACK_BRANCH_MAX_SUFFIX` is taken.
+    """
+    for n in range(2, FALLBACK_BRANCH_MAX_SUFFIX + 1):
+        candidate = f"{branch_name}-r{n}"
+        try:
+            probe = subprocess.run(
+                _sudo_wrap(["git", "ls-remote", "origin", f"refs/heads/{candidate}"]),
+                cwd=repo_path,
+                timeout=timeout_seconds,
+                capture_output=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            logger.exception("ls-remote probe failed in %s", repo_path)
+            return None
+        if probe.returncode != 0:
+            return None
+        if not probe.stdout.strip():
+            return candidate
+    return None
+
+
+def push_with_fallback(
+    repo_path: Path | str,
+    branch_name: str,
+    *,
+    no_verify: bool,
+    timeout_seconds: float | None = None,
+) -> PushAttempt:
+    """Push HEAD to ``branch_name``; on a non-fast-forward, push it to ``-r<N>``.
+
+    A re-dispatched item reuses its deterministic branch name, and when the
+    earlier run's branch was never deleted the rebuild's push is rejected — as
+    is the rescue's — and gate-green work survives only in the clone.  So when
+    the push fails AND :func:`is_non_fast_forward` confirms origin's branch is
+    not an ancestor of HEAD, the same HEAD goes to the smallest free
+    ``<branch_name>-r<N>``.  The existing branch is never force-pushed,
+    deleted or rewritten.  Any other rejection (auth, hook, network) returns
+    the original failed attempt unchanged.
+    """
+    proc = subprocess.run(
+        _sudo_wrap(_git_push_argv(branch_name, no_verify=no_verify)),
+        cwd=repo_path,
+        timeout=timeout_seconds,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode == 0:
+        return PushAttempt(proc, branch_name)
+    if not is_non_fast_forward(repo_path, branch_name, timeout_seconds):
+        return PushAttempt(proc, branch_name)
+    fallback = next_free_fallback_branch(repo_path, branch_name, timeout_seconds)
+    if fallback is None:
+        logger.warning(
+            "push fallback: %s in %s is non-fast-forward but no free -rN branch"
+            " could be found",
+            branch_name,
+            repo_path,
+        )
+        return PushAttempt(proc, branch_name)
+    logger.warning(
+        "push fallback: %s on origin holds commits not in HEAD (%s); pushing to %s",
+        branch_name,
+        repo_path,
+        fallback,
+    )
+    retry = subprocess.run(
+        _sudo_wrap(_git_push_argv(fallback, no_verify=no_verify)),
+        cwd=repo_path,
+        timeout=timeout_seconds,
+        capture_output=True,
+        check=False,
+    )
+    if retry.returncode != 0:
+        # Report the fallback's failure, but keep the requested name: nothing
+        # reached the fallback branch, so it is not the run's branch.
+        return PushAttempt(retry, branch_name)
+    return PushAttempt(retry, fallback, fell_back=True)
+
+
 def push_unpushed_repo(
     repo_path: Path, branch_name: str, timeout_seconds: float
-) -> subprocess.CompletedProcess[bytes]:
+) -> PushAttempt:
     """Backstop push: complete a push the agent started but never finished.
 
     Runs synchronously and may block for the full pre-push hook duration (e.g. a
@@ -524,14 +704,13 @@ def push_unpushed_repo(
     ``loop.run_in_executor(_executor, ...)``, never inline on the event loop.
 
     Hooks stay ENABLED (never ``--no-verify``) — this is the same push the agent
-    would have run, just completed by the worker after the agent exited.
+    would have run, just completed by the worker after the agent exited.  A
+    non-fast-forward rejection falls back to ``<branch>-r<N>`` (see
+    :func:`push_with_fallback`); the returned :class:`PushAttempt` names the
+    branch that was actually pushed.
     """
-    return subprocess.run(
-        _sudo_wrap(["git", "push", "-u", "origin", branch_name]),
-        cwd=repo_path,
-        timeout=timeout_seconds,
-        capture_output=True,
-        check=False,
+    return push_with_fallback(
+        repo_path, branch_name, no_verify=False, timeout_seconds=timeout_seconds
     )
 
 
@@ -852,6 +1031,9 @@ class RescueResult:
     committed: bool
     #: Operator-facing failure text; empty when nothing went wrong.
     error: str = ""
+    #: The remote branch the rescue pushed to — the run's branch, or its
+    #: ``-r<N>`` fallback when that branch held an older run's commits.
+    branch: str = ""
 
 
 def _repo_has_unrescued_work(repo_path: Path, branch_name: str) -> tuple[bool, bool]:
@@ -909,7 +1091,7 @@ def rescue_abandoned_work(
 
     Hooks are SKIPPED (``--no-verify``) on both the commit and the push. This is the deliberate opposite of :func:`main._commit_with_retry`, which must run hooks so fixer hooks can fix, and the two paths must NOT be merged. The difference is what is being committed: the normal path commits work an agent declared finished, where a hook rejection is a real signal worth acting on. This path commits work that is by definition INCOMPLETE and will usually fail a hook — and a blocked commit here does not produce a cleaner tree, it produces no tree at all. Preserving the evidence beats enforcing a standard on something nobody is going to merge as-is.
 
-    It only ever writes to the run's OWN ``feat/*`` branch — the same branch the dispatch worker already pushes to on its success path — so it is a retry of an access that already exists, not a new one. It must never push to a default branch, and never force-push.
+    It only ever writes to the run's OWN ``feat/*`` branch — the same branch the dispatch worker already pushes to on its success path — so it is a retry of an access that already exists, not a new one. It must never push to a default branch, and never force-push. When that branch already holds an older run's commits (a non-fast-forward rejection), the work goes to ``<branch>-r<N>`` instead, exactly as on the success path (:func:`push_with_fallback`).
 
     A redundant rescue costs nothing: if the worker already pushed, git refuses the ref update and the result simply records it.
     """
@@ -973,21 +1155,25 @@ def rescue_abandoned_work(
         # fall through to the push, which is the part that matters.
         committed = commit.returncode == 0
 
-    push = subprocess.run(
-        _sudo_wrap(["git", "push", "--no-verify", "-u", "origin", branch_name]),
-        cwd=repo_path,
-        check=False,
-        capture_output=True,
-    )
-    if push.returncode != 0:
+    attempt = push_with_fallback(repo_path, branch_name, no_verify=True)
+    if attempt.proc.returncode != 0:
         return RescueResult(
             repo_name,
             attempted=True,
             pushed=False,
             committed=committed,
-            error=f"git push failed in {repo_name}: {git_output_excerpt(push)}",
+            error=(
+                f"git push failed in {repo_name}: {git_output_excerpt(attempt.proc)}"
+            ),
+            branch=branch_name,
         )
-    return RescueResult(repo_name, attempted=True, pushed=True, committed=committed)
+    return RescueResult(
+        repo_name,
+        attempted=True,
+        pushed=True,
+        committed=committed,
+        branch=attempt.branch,
+    )
 
 
 def cleanup_workspace(workspace: Path) -> None:

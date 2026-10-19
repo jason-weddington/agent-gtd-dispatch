@@ -1590,7 +1590,8 @@ class TestRunTalosWorkerBranch:
             for j in joined
         ), joined
         assert any(
-            "git push --no-verify -u origin feat/x-do-thing" in j for j in joined
+            "git push --no-verify -u origin HEAD:refs/heads/feat/x-do-thing" in j
+            for j in joined
         ), joined
         # Sudo wrapping applied
         for cmd in commands:
@@ -2684,7 +2685,8 @@ class TestRunTalosWorkerBranch:
             for j in joined
         ), joined
         assert any(
-            "git push --no-verify -u origin feat/x-do-thing" in j for j in joined
+            "git push --no-verify -u origin HEAD:refs/heads/feat/x-do-thing" in j
+            for j in joined
         ), joined
         # Sudo wrapping applied
         for cmd in commands:

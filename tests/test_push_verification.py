@@ -899,7 +899,9 @@ class TestPushUnpushedRepo:
             mock_run.return_value = _make_completed(0)
             push_unpushed_repo(tmp_path, "feat/x", 120.0)
 
-        mock_wrap.assert_called_once_with(["git", "push", "-u", "origin", "feat/x"])
+        mock_wrap.assert_called_once_with(
+            ["git", "push", "-u", "origin", "HEAD:refs/heads/feat/x"]
+        )
 
     def test_never_passes_no_verify(self, tmp_path) -> None:
         from agent_gtd_dispatch.dispatch import push_unpushed_repo

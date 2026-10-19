@@ -1384,6 +1384,8 @@ async def _run_talos(
             # workspace talos path does NOT route through `dispatch.verify_pushes`.
             committed: list[str] = []
             skipped: list[str] = []
+            original_branch = branch_name
+            talos_fallbacks: dict[str, str] = {}
 
             for repo_dir in workspace_repo_dirs:
                 repo_path = workspace / repo_dir
@@ -1509,14 +1511,13 @@ async def _run_talos(
                             )
                         return
 
-                push_rc = subprocess.run(
-                    dispatch._sudo_wrap(
-                        ["git", "push", "--no-verify", "-u", "origin", branch_name]
-                    ),
-                    cwd=str(repo_path),
-                    check=False,
-                    capture_output=True,
+                _push = dispatch.push_with_fallback(
+                    str(repo_path), original_branch, no_verify=True
                 )
+                push_rc = _push.proc
+                _fb = _fallback_branch_of(_push)
+                if _fb is not None:
+                    talos_fallbacks[repo_dir] = _fb
                 if push_rc.returncode != 0:
                     _err = dispatch.git_output_excerpt(push_rc)
                     await db.update_run(
@@ -1566,6 +1567,10 @@ async def _run_talos(
                 except Exception:
                     logger.warning("Failed to post no-changes comment for %s", run.id)
                 return
+
+            if talos_fallbacks:
+                await _record_pushed_branch(run, talos_fallbacks)
+                branch_name = run.branch_name or branch_name
 
             # At least one repo committed+pushed — mark run succeeded, set item
             # status best-effort, then post ONE summary comment naming committed
@@ -1687,14 +1692,12 @@ async def _run_talos(
                 run.id,
             )
 
-        push_rc = subprocess.run(
-            dispatch._sudo_wrap(
-                ["git", "push", "--no-verify", "-u", "origin", branch_name]
-            ),
-            cwd=str(workspace),
-            check=False,
-            capture_output=True,
-        )
+        _push = dispatch.push_with_fallback(str(workspace), branch_name, no_verify=True)
+        push_rc = _push.proc
+        _fb = _fallback_branch_of(_push)
+        if _fb is not None:
+            await _record_pushed_branch(run, {"repo": _fb})
+            branch_name = _fb
         if push_rc.returncode != 0:
             _err = dispatch.git_output_excerpt(push_rc)
             await db.update_run(
@@ -1893,6 +1896,8 @@ def build_completion_comment(
             f"- {r.repo_name}: {r.status.value}"
             f" ({r.commits_ahead} commit(s), {(r.local_sha or '')[:8]})"
         )
+        if r.branch and r.branch != branch_name:
+            line += f" on `{r.branch}`"
         if r.dirty:
             line += " [dirty working tree]"
         lines.append(line)
@@ -1948,11 +1953,91 @@ class _RescueOutcome:
         return all(r.pushed for r in self.attempted)
 
 
+def _fallback_branch_of(attempt: object) -> str | None:
+    """Return the ``-r<N>`` branch a :class:`dispatch.PushAttempt` fell back to, else None.
+
+    Duck-typed on purpose: the worker tests replace the whole ``dispatch``
+    module with a mock, so an ``isinstance`` against ``dispatch.PushAttempt``
+    would raise there rather than answer.
+    """
+    branch = getattr(attempt, "branch", None)
+    if getattr(attempt, "fell_back", False) is True and isinstance(branch, str):
+        return branch
+    return None
+
+
+async def _record_pushed_branch(run: Run, branch_by_repo: dict[str, str]) -> None:
+    """Make the branch a fallback push actually reached the run's recorded branch.
+
+    Everything downstream reads the run's ``branch_name``: the completion and
+    gate comments, ``RunResponse.branch_name`` (which the board copies into its
+    run row's ``feature_branch`` at terminal) and from there the
+    ``branch_name`` the rollout reviewer is handed.  Recording the dispatched
+    name after a ``-r<N>`` fallback would point all of them at the older run's
+    commits.
+
+    A workspace run falls back per repo, independently, so its repos can end on
+    different branches; the run records the first fallback branch and the
+    per-repo branches stay visible in ``push_results``.
+    """
+    if not branch_by_repo:
+        return
+    chosen = next(iter(branch_by_repo.values()))
+    distinct = sorted(set(branch_by_repo.values()))
+    if len(distinct) > 1:
+        logger.warning(
+            "push fallback: run %s repos fell back to different branches %s;"
+            " recording %s",
+            run.id,
+            distinct,
+            chosen,
+        )
+    if run.branch_name == chosen:
+        return
+    logger.warning(
+        "push fallback: run %s recorded branch %s -> %s (%s)",
+        run.id,
+        run.branch_name,
+        chosen,
+        ", ".join(f"{k}={v}" for k, v in branch_by_repo.items()),
+    )
+    run.branch_name = chosen
+    try:
+        await db.update_run(run.id, branch_name=chosen)
+    except Exception:
+        logger.exception("could not record fallback branch for run %s", run.id)
+
+
+def _retained_path(
+    run: Run,
+    db_run: Run | None,
+    repos: list[tuple[str, Path, str | None]],
+) -> str:
+    """Return where a retained workspace actually is, never ``None``.
+
+    The db row is authoritative (the worker writes ``workspace_path`` as soon
+    as the clone exists); the in-memory Run is the next best; failing both,
+    the clone directory the repos live in — the repo itself for a monorepo
+    run, their common parent for a workspace run.
+    """
+    for candidate in (db_run.workspace_path if db_run else None, run.workspace_path):
+        if candidate:
+            return candidate
+    paths = [p for _n, p, _b in repos]
+    if len(paths) == 1:
+        return str(paths[0])
+    parents = {str(p.parent) for p in paths}
+    if len(parents) == 1:
+        return parents.pop()
+    return ", ".join(str(p) for p in paths)
+
+
 async def _rescue_before_teardown(
     run: Run,
     repos: list[tuple[str, Path, str | None]],
     *,
     attribution: str | None,
+    branch_by_repo: dict[str, str] | None = None,
 ) -> _RescueOutcome | None:
     """Push anything the agent left behind, then report it on the item.
 
@@ -1971,7 +2056,12 @@ async def _rescue_before_teardown(
 
     loop = asyncio.get_event_loop()
     results: list[dispatch.RescueResult] = []
+    _requested: dict[str, str] = {}
     for _name, _path, _base in repos:
+        _repo_branch = (branch_by_repo or {}).get(_name) or branch
+        if not _repo_branch.startswith("feat/"):
+            continue
+        _requested[_name] = _repo_branch
         try:
             results.append(
                 await loop.run_in_executor(
@@ -1979,7 +2069,7 @@ async def _rescue_before_teardown(
                     dispatch.rescue_abandoned_work,
                     _name,
                     _path,
-                    branch,
+                    _repo_branch,
                     run.id,
                 )
             )
@@ -1993,10 +2083,31 @@ async def _rescue_before_teardown(
 
     _pushed = [r for r in outcome.attempted if r.pushed]
     _failed = [r for r in outcome.attempted if not r.pushed]
+    # The rescue falls back to ``<branch>-r<N>`` on a non-fast-forward exactly
+    # like the success path; record the branch the work actually reached.
+    _fallbacks = {
+        r.repo_name: r.branch
+        for r in _pushed
+        if isinstance(r.branch, str)
+        and r.branch
+        and r.branch != _requested.get(r.repo_name, branch)
+    }
+    if _fallbacks:
+        await _record_pushed_branch(run, _fallbacks)
+    _pushed_to = sorted(
+        {
+            (r.branch if isinstance(r.branch, str) and r.branch else None)
+            or _requested.get(r.repo_name, branch)
+            for r in _pushed
+        }
+    )
+    _branch_text = (
+        ", ".join(f"`{b}`" for b in _pushed_to) if _pushed_to else f"`{branch}`"
+    )
     logger.warning(
         "rescue: run_id=%s branch=%s pushed=%s failed=%s",
         run.id,
-        branch,
+        _branch_text,
         ",".join(r.repo_name for r in _pushed) or None,
         ",".join(r.repo_name for r in _failed) or None,
     )
@@ -2010,7 +2121,8 @@ async def _rescue_before_teardown(
                 run.id,
                 error=(
                     f"{_prefix}rescue_push_failed: unpushed work remains in the"
-                    f" workspace, which has been RETAINED at {run.workspace_path}"
+                    " workspace, which has been RETAINED at"
+                    f" {_retained_path(run, _existing, repos)}"
                     f" — {_detail}"
                 )[:ERROR_TEXT_MAX_CHARS],
             )
@@ -2021,7 +2133,7 @@ async def _rescue_before_teardown(
         if _pushed:
             _body = (
                 f"Unreviewed partial work from run `{run.id}` was pushed to"
-                f" `{branch}` by the dispatch worker at teardown"
+                f" {_branch_text} by the dispatch worker at teardown"
                 f" ({', '.join(r.repo_name for r in _pushed)})."
                 " The agent left it behind; it is incomplete, hooks were skipped"
                 " and it has passed no quality gate. It was pushed only so it"
@@ -2031,8 +2143,9 @@ async def _rescue_before_teardown(
         else:
             _body = (
                 f"Run `{run.id}` left unpushed work behind and the dispatch"
-                f" worker could NOT rescue it to `{branch}`. The workspace has"
-                " been retained so the work still exists on the dispatch host."
+                f" worker could NOT rescue it to {_branch_text}. The workspace has"
+                " been retained so the work still exists on the dispatch host"
+                f" at {_retained_path(run, None, repos)}."
                 f" Details: {_detail}"
             )
         try:
@@ -2485,6 +2598,36 @@ def _gate_result_summary(run_row: dict[str, Any]) -> str:
     return f"the run recorded a failure: `{error_msg[:1000]}`"
 
 
+async def _review_branch_name(
+    item_id: str, item: dict[str, Any], run_row: dict[str, Any]
+) -> str:
+    """Return the branch the reviewer must review for the build in *run_row*.
+
+    The build's own dispatch record wins when this host has it: a build whose
+    push fell back to ``<branch>-r<N>`` (the item branch already held an older
+    run's commits) records that name as its ``branch_name``, and the board's
+    ``feature_branch`` only catches up at terminal sync.  Then the board's
+    ``feature_branch``, then the deterministic item branch name.
+    """
+    remote_run_id = str(run_row.get("remote_run_id") or "")
+    if remote_run_id:
+        try:
+            build_run = await db.get_run(remote_run_id)
+        except Exception:
+            logger.warning(
+                "rollout-loop: could not read build run %s for item %s",
+                remote_run_id,
+                item_id,
+            )
+            build_run = None
+        if build_run is not None and build_run.branch_name:
+            return build_run.branch_name
+    branch_name = str(run_row.get("feature_branch") or "")
+    if branch_name:
+        return branch_name
+    return make_branch_name(item_id, str(item.get("title") or ""))
+
+
 async def _launch_reviewer(
     rollout_id: str,
     item_id: str,
@@ -2541,9 +2684,7 @@ async def _launch_reviewer(
             raw_item_type,
         )
     run_row = await _latest_run_for_item(item_id, rollout_id, token=token)
-    branch_name = str(run_row.get("feature_branch") or "")
-    if not branch_name:
-        branch_name = make_branch_name(item_id, str(item.get("title") or ""))
+    branch_name = await _review_branch_name(item_id, item, run_row)
 
     try:
         merge_notes = await gtd_client.get_rollout_merge_notes(
@@ -4951,6 +5092,11 @@ async def _dispatch_worker(
     # the try so the teardown `finally` can capture evidence on every path,
     # including ones that raise before workspace prep finishes.
     _verify_repos: list[tuple[str, Path, str]] | None = None
+    # Per-repo remote branch a worker push fell back to (``<branch>-r<N>``)
+    # because the item branch already held an older run's commits. Repos absent
+    # here pushed (or will be rescued) to the dispatched branch name.
+    _dispatched_branch = run.branch_name or ""
+    _branch_by_repo: dict[str, str] = {}
     # For manage mode: preserve workspace on failure for debugging.
     # For build/plan mode: always clean up.
     should_cleanup = True
@@ -5063,6 +5209,7 @@ async def _dispatch_worker(
                     workspace_repos, run.id
                 )
                 await db.update_run(run.id, workspace_path=str(workspace))
+                run.workspace_path = str(workspace)
                 workspace_repo_dirs = [
                     dispatch.repo_dir_from_url(url) for url in workspace_repos
                 ]
@@ -5073,6 +5220,7 @@ async def _dispatch_worker(
                     raise ValueError(f"Project '{project['name']}' has no git_origin")
                 workspace = dispatch.prepare_manage_workspace(git_origin, run.id)
                 await db.update_run(run.id, workspace_path=str(workspace))
+                run.workspace_path = str(workspace)
             attachments = []
         elif is_workspace_mode:
             # Multi-repo workspace path
@@ -5085,6 +5233,7 @@ async def _dispatch_worker(
                 workspace_repos, run.id, run.branch_name
             )
             await db.update_run(run.id, workspace_path=str(workspace))
+            run.workspace_path = str(workspace)
             workspace_repo_dirs = [
                 dispatch.repo_dir_from_url(url) for url in workspace_repos
             ]
@@ -5118,6 +5267,7 @@ async def _dispatch_worker(
                 git_origin, run.id, run.branch_name or ""
             )
             await db.update_run(run.id, workspace_path=str(workspace))
+            run.workspace_path = str(workspace)
             # Capture base SHA for BUILD mode verification — BEFORE stage_attachments
             if mode == DispatchMode.BUILD:
                 _verify_repos = [
@@ -5488,13 +5638,16 @@ async def _dispatch_worker(
                                 continue
                             _attempted_names.add(_r.repo_name)
                             try:
-                                await _loop.run_in_executor(
+                                _attempt = await _loop.run_in_executor(
                                     dispatch._executor,
                                     dispatch.push_unpushed_repo,
                                     _repo_path,
-                                    run.branch_name or "",
+                                    _dispatched_branch,
                                     _remaining,
                                 )
+                                _fb = _fallback_branch_of(_attempt)
+                                if _fb is not None:
+                                    _branch_by_repo[_r.repo_name] = _fb
                             except Exception:
                                 logger.exception(
                                     "push backstop: attempt failed for repo %s"
@@ -5502,10 +5655,15 @@ async def _dispatch_worker(
                                     _r.repo_name,
                                     run.id,
                                 )
-                        # Re-classify after the backstop attempt(s).
+                        # Re-classify after the backstop attempt(s), against
+                        # the branch each repo was actually pushed to.
                         push_results_list = dispatch.verify_pushes(
-                            _verify_repos, run.branch_name or ""
+                            _verify_repos,
+                            _dispatched_branch,
+                            _branch_by_repo or None,
                         )
+                        if _branch_by_repo:
+                            await _record_pushed_branch(run, _branch_by_repo)
                         _status_by_name = {r.repo_name: r for r in push_results_list}
                         _rescued_repos = [
                             _old
@@ -5922,6 +6080,13 @@ async def _dispatch_worker(
                 _rescue_bullets = "\n".join(
                     f"- {r.repo_name}: pushed by worker"
                     f" ({r.commits_ahead} commit(s), {(r.local_sha or '')[:8]})"
+                    + (
+                        f" to `{_branch_by_repo[r.repo_name]}` — `{_dispatched_branch}`"
+                        " already held an older run's commits, which were left"
+                        " untouched"
+                        if r.repo_name in _branch_by_repo
+                        else ""
+                    )
                     for r in _rescued_repos
                 )
                 try:
@@ -6035,7 +6200,7 @@ async def _dispatch_worker(
             # already pushed its work.  verify_pushes is fail-closed — any error
             # yields PushStatus.unpushed so it never misclassifies a real timeout.
             push_results_list = dispatch.verify_pushes(
-                _verify_repos, run.branch_name or ""
+                _verify_repos, _dispatched_branch, _branch_by_repo or None
             )
             unpushed = [r for r in push_results_list if r.status == PushStatus.unpushed]
             if not unpushed:
@@ -6130,7 +6295,13 @@ async def _dispatch_worker(
         # the work exists anywhere. Runs regardless of the recorded terminal —
         # a failed run is exactly the case where unpushed work is most likely.
         _rescued = await _rescue_before_teardown(
-            run, _evidence_repos, attribution=attribution
+            run,
+            _evidence_repos,
+            attribution=attribution,
+            branch_by_repo={
+                _n: _branch_by_repo.get(_n, _dispatched_branch)
+                for _n, _p, _b in _evidence_repos
+            },
         )
         if _rescued is not None and not _rescued.ok:
             # Rescue could not get the work to origin. The workspace is the only

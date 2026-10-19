@@ -339,6 +339,14 @@ the worker:
    not propagated.
 3. Re-runs `dispatch.verify_pushes()` to get the post-backstop classification.
 
+If a worker push (this backstop, the talos push or the teardown rescue) is rejected because
+origin's branch already holds an older run's commits — a re-dispatch reusing the item's
+branch name, detected by a fetch plus `git merge-base --is-ancestor origin/<branch> HEAD`
+failing, never by parsing git's stderr — the same HEAD is pushed to the first free
+`<branch>-r<N>` (N ≥ 2) instead, the old branch is never forced or deleted, and that name
+becomes the run's recorded `branch_name` (and so the board's `feature_branch` and the
+branch the rollout reviewer is handed); a workspace run falls back per repo.
+
 If **any** repo is (still) `unpushed` after the backstop attempt (or after it was skipped):
 
 - The run is flipped to `RunStatus.failed` with error `"push verification failed: ..."`.

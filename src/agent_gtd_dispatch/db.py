@@ -240,8 +240,14 @@ async def update_run(
     engine_actual: str | None = None,
     push_results: str | None = None,
     completion: str | None = None,
+    branch_name: str | None = None,
 ) -> None:
-    """Update fields on an existing run."""
+    """Update fields on an existing run.
+
+    ``branch_name`` is rewritten only when a push fell back to ``<branch>-r<N>``
+    (see :func:`dispatch.push_with_fallback`): the run records the branch that
+    was actually pushed, not the one it was dispatched with.
+    """
     parts: list[str] = []
     values: list[object] = []
     if status is not None:
@@ -268,6 +274,9 @@ async def update_run(
     if push_results is not None:
         parts.append("push_results = ?")
         values.append(push_results)
+    if branch_name is not None:
+        parts.append("branch_name = ?")
+        values.append(branch_name)
     if completion is not None:
         parts.append("completion = ?")
         values.append(completion)

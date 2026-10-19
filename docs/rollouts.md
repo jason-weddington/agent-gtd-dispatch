@@ -86,7 +86,9 @@ response (`src/agent_gtd_dispatch/main.py:563-567`).
   child of a rollout — see the manage flow below).
 - **Workspace:** fresh clone on a feature branch named
   `feat/<item_id_short>-<title_slug>` (see
-  `agent_gtd_dispatch_protocol.branches.make_branch_name`).
+  `agent_gtd_dispatch_protocol.branches.make_branch_name`). If that branch
+  already holds an older run's commits, the worker and the teardown rescue
+  push to `feat/<...>-r<N>` instead, and the reviewer is handed that name.
 - **Job:** implement the item per its acceptance criteria, run tests, push the
   feature branch, post a final comment, set item status to `review`.
 - **Output:** a pushed feature branch waiting for review/merge. The build

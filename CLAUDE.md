@@ -97,7 +97,7 @@ The invariant behind all of it: **a zero-commit BUILD run is never `succeeded`.*
 
 A dispatch clone is deleted at run exit, so anything the agent finished but did not push — self-made commits it never pushed, or work still in the working tree — is destroyed at that moment regardless of the run's recorded status. `main._rescue_before_teardown` runs in the teardown `finally`, before `cleanup_workspace`, on EVERY terminal path (the failure paths most of all: that is where unpushed work is likeliest).
 
-Per repo, `dispatch.rescue_abandoned_work` detects unpushed commits or a dirty tree, then `git add -A`, `git commit --no-verify`, `git push --no-verify -u origin <branch>`. One terse GTD comment names the branch and says plainly that this is unreviewed partial work. **If the push fails the workspace is RETAINED** and the run's `error` says so — the clone is then the only copy left.
+Per repo, `dispatch.rescue_abandoned_work` detects unpushed commits or a dirty tree, then `git add -A`, `git commit --no-verify`, `git push --no-verify -u origin <branch>`. If `<branch>` on origin already holds an older run's commits (non-fast-forward, detected by fetch + `merge-base --is-ancestor`), the push goes to the first free `<branch>-r<N>` instead (`dispatch.push_with_fallback`, shared with the worker's success-path pushes) and that name is recorded as the run's branch. One terse GTD comment names the branch and says plainly that this is unreviewed partial work. **If the push fails the workspace is RETAINED** and the run's `error` says so, with the real retained path — the clone is then the only copy left.
 
 Three properties make it safe to run unattended:
 
