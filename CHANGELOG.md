@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.10.2 (2026-10-20)
+
+### Bug Fixes
+
+- **dispatch**: The agent's workspace files are group-writable whatever the host's sudo umask
+  ([`7de07ca`](https://github.com/repos/agent-gtd-dispatch/commit/7de07ca95bdec7935b64edbeb82533ac25b5176c))
+
+
 ## v2.10.1 (2026-10-19)
 
 ### Bug Fixes
