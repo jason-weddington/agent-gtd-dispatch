@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.10.3 (2026-10-21)
+
+### Bug Fixes
+
+- **rollouts**: Retire the resident-manager keep-alive machinery
+  ([`ed04f2c`](https://github.com/repos/agent-gtd-dispatch/commit/ed04f2c5ae8996bb8a22387d633023e6d9c47006))
+
+
 ## v2.10.2 (2026-10-20)
 
 ### Bug Fixes
