@@ -45,18 +45,31 @@ TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
 #
 # The single source of truth for the manage timeout is the GTD-side app setting
 # ``dispatch.manager_default_timeout_minutes`` (seeded from
-# ``agent_gtd.dispatch_constants.MANAGER_DEFAULT_TIMEOUT_MINUTES``, 240 min).
-# The dispatch worker resolves it and sends it on the wire as
+# ``agent_gtd.dispatch_constants.MANAGER_DEFAULT_TIMEOUT_MINUTES``).  The
+# dispatch worker resolves it and sends it on the wire as
 # ``DispatchRequest.timeout_minutes``, which wins whenever it is present.
 #
 # This value only applies to a manage dispatch that arrives with NO explicit
 # ``timeout_minutes`` at all, and must stay numerically equal to the
-# authoritative one (240 min = 14400 s).  It used to be one of three
-# independent manage-timeout sources; the third — a duplicate fallback inside
-# ``dispatch.run_agent`` — is gone, and both remaining call sites now route
-# through ``timeout_seconds_for_mode`` below.
-MANAGE_TIMEOUT_SECONDS: int = 4 * 60 * 60  # 4 hours; == MANAGER_DEFAULT_TIMEOUT_MINUTES
-MAX_MANAGE_RETRIES: int = 2  # max auto-recovery relaunches for manage mode
+# authoritative one.  Both route through ``timeout_seconds_for_mode`` below.
+#
+# SIZED FOR A SHORT-LIVED REVIEWER, not a resident manager: 45 min, equal to
+# ``REVIEW_TIMEOUT_SECONDS``.  It used to be 4 hours because a resident
+# manager babysat a whole wave; nothing that long-lived exists any more.
+MANAGE_TIMEOUT_SECONDS: int = 45 * 60  # == MANAGER_DEFAULT_TIMEOUT_MINUTES (45)
+
+# THE RESIDENT-MANAGER ERA IS OVER (item 7baf77d0).  The worker drives the wave
+# loop itself and launches one short-lived reviewer per completed build, so the
+# keep-alive machinery that existed only to resurrect a resident manager agent
+# is gone, and so are its knobs: MAX_MANAGE_RETRIES, MAX_MANAGE_FREE_RELAUNCHES,
+# MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS, MANAGE_STALE_THRESHOLD_SECONDS,
+# WATCHDOG_INTERVAL_SECONDS and MANAGE_RETRY_BACKOFF_SECONDS.  Do not
+# reintroduce a relaunch cap, a staleness watchdog or a heartbeat threshold by
+# analogy: the loop owns liveness, the reviewer is bounded by
+# REVIEW_TIMEOUT_SECONDS, and a restart is covered by the re-adoption sweep,
+# which resumes ONLY rollouts this host holds a MANAGE run row for.  A
+# fleet-wide staleness scan relaunching rollouts it never owned is exactly how
+# rollout fe1e828d ended up with two loops landing the same item.
 MAX_CONCURRENT_RUNS: int = 32  # thread-pool ceiling for run_in_executor
 CANCEL_GRACE_SECONDS: int = 5  # seconds between SIGTERM and SIGKILL on cancel
 
@@ -81,27 +94,6 @@ POST_RUN_GATE_MIN_SECONDS: int = 600
 # hook-dir lookup, or `.agent-gtd/setup`). See gates.py.
 GATE_INSTALL_TIMEOUT_SECONDS: int = 300
 
-# Watchdog (manage-agent staleness detection)
-# Set above the longest build a manager may wait on: a manager has no polling
-# heartbeat, so its state timestamp only advances on real progress. Too low and
-# the watchdog kills a healthy manager mid-wait, burning MAX_MANAGE_RETRIES.
-# Must stay < MANAGE_TIMEOUT_SECONDS.
-MANAGE_STALE_THRESHOLD_SECONDS: int = 2100  # 35 min
-WATCHDOG_INTERVAL_SECONDS: int = 180  # scan every 3 min
-
-# Minimum agent-subprocess uptime (seconds) a manage run must have reached before
-# its exit is eligible for a "free" (uncounted) relaunch. Below this, the manager
-# is treated as crash-looping and the relaunch counts toward MAX_MANAGE_RETRIES —
-# this is the crash-loop protection that keeps the free-relaunch exemption from
-# masking a manager that dies immediately on every launch.
-MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS: int = 120
-
-# Lifetime cap (per rollout) on free (uncounted) manage relaunches granted while a
-# child build run is healthy and still in flight. Bounds the free-relaunch
-# exemption so a single stuck item cannot relaunch the manager forever without
-# ever counting toward MAX_MANAGE_RETRIES.
-MAX_MANAGE_FREE_RELAUNCHES: int = 25
-
 # --- Worker-driven rollout wave loop + short-lived merge reviewer -----------
 #
 # The worker owns the wave loop; a REVIEW-mode agent is launched per completed
@@ -121,9 +113,9 @@ REVIEWER_ENGINE: str = "claude-code-sonnet"
 REVIEW_MAX_TURNS: int = 40
 
 # Wall-clock ceiling for one reviewer. Generous enough for a cold gate run on
-# the Pi (the project gate command is the expensive part, not the model), far
-# below the 4-hour manage backstop it replaces: a reviewer that has not
-# finished one build in this long is wedged, not slow.
+# the Pi (the project gate command is the expensive part, not the model), and
+# far below the 4-hour resident-manager backstop it replaced: a reviewer that
+# has not finished one build in this long is wedged, not slow.
 REVIEW_TIMEOUT_SECONDS: int = 45 * 60
 
 # The worker's land step (fetch, rebase onto current origin, gate the exact
@@ -220,7 +212,7 @@ TALOS_MEMORY: str = "off"
 # uvicorn's own loggers and leaves the root logger alone, so before 2026-09-19
 # every `logger.info(...)` in this package went nowhere: the journal carried
 # uvicorn access lines and nothing else.  That made the gate-install decisions,
-# the post-run gate, the manage-recovery ladder and the rescue WARNING
+# the post-run gate, the rollout loop's decisions and the rescue WARNING
 # invisible in production — all of them precisely the things you need when a
 # dispatch misbehaves.  See `main.configure_logging`.
 LOG_LEVEL: str = "INFO"
@@ -266,8 +258,6 @@ def load() -> None:
     global OLLAMA_CLOUD_API_KEY, OLLAMA_CLOUD_BASE_URL, OLLAMA_CLOUD_MODEL
     global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS, TALOS_MEMORY
     global AGENT_SUBPROCESS_USER
-    global MANAGE_STALE_THRESHOLD_SECONDS, WATCHDOG_INTERVAL_SECONDS
-    global MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS, MAX_MANAGE_FREE_RELAUNCHES
     global REVIEWER_ENGINE, REVIEW_MAX_TURNS, REVIEW_TIMEOUT_SECONDS
     global LAND_GATE_TIMEOUT_SECONDS, LAND_GIT_TIMEOUT_SECONDS
     global ROLLOUT_LOOP_POLL_SECONDS, MAX_ITEM_REDISPATCHES
@@ -313,7 +303,7 @@ def load() -> None:
     MAX_TURNS = int(os.environ.get("DISPATCH_MAX_TURNS", "100"))
     TIMEOUT_SECONDS = int(os.environ.get("DISPATCH_TIMEOUT_SECONDS", "1800"))
     MANAGE_TIMEOUT_SECONDS = int(
-        os.environ.get("DISPATCH_MANAGE_TIMEOUT_SECONDS", "14400")
+        os.environ.get("DISPATCH_MANAGE_TIMEOUT_SECONDS", "2700")
     )
     MAX_CONCURRENT_RUNS = int(os.environ.get("DISPATCH_MAX_CONCURRENT_RUNS", "32"))
     OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "")
@@ -354,18 +344,6 @@ def load() -> None:
     )
     POST_RUN_GATE_MIN_SECONDS = int(
         os.environ.get("DISPATCH_POST_RUN_GATE_MIN_SECONDS", "600")
-    )
-    MANAGE_STALE_THRESHOLD_SECONDS = int(
-        os.environ.get("DISPATCH_MANAGE_STALE_THRESHOLD_SECONDS", "2100")
-    )
-    WATCHDOG_INTERVAL_SECONDS = int(
-        os.environ.get("DISPATCH_WATCHDOG_INTERVAL_SECONDS", "180")
-    )
-    MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS = int(
-        os.environ.get("DISPATCH_MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS", "120")
-    )
-    MAX_MANAGE_FREE_RELAUNCHES = int(
-        os.environ.get("DISPATCH_MAX_MANAGE_FREE_RELAUNCHES", "25")
     )
     REVIEWER_ENGINE = (
         os.environ.get("DISPATCH_REVIEWER_ENGINE", "").strip() or "claude-code-sonnet"

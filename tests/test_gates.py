@@ -1520,7 +1520,6 @@ class TestWorkerGateManageHalt:
             )
             mock_gtd.post_comment = AsyncMock()
             mock_gtd.halt_rollout = AsyncMock()
-            mock_gtd.relaunch_manage_rollout = AsyncMock()
 
             mock_dispatch.prepare_manage_workspace.return_value = tmp_path
             mock_dispatch.repo_name_from_origin = MagicMock(return_value="repo")
@@ -1539,7 +1538,6 @@ class TestWorkerGateManageHalt:
             in kwargs["reason"]
         )
 
-        mock_gtd.relaunch_manage_rollout.assert_not_called()
         mock_dispatch.cleanup_workspace.assert_called_once_with(tmp_path)
 
     @pytest.mark.asyncio

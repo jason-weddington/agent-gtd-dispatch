@@ -553,18 +553,6 @@ class TestCallbackTokenAuthHeader:
         assert kwargs["headers"] == {"Authorization": "Bearer jwt-cir"}
 
     @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
-    async def test_relaunch_manage_rollout_token_explicit(self, mock_cls) -> None:
-        from agent_gtd_dispatch.gtd_client import relaunch_manage_rollout
-
-        mock_client, _ = _make_client_mock({"manage_retry_count": 1})
-        mock_cls.return_value.__aenter__.return_value = mock_client
-
-        await relaunch_manage_rollout("r1", token="jwt-rmr")
-
-        _, kwargs = mock_client.request.call_args
-        assert kwargs["headers"] == {"Authorization": "Bearer jwt-rmr"}
-
-    @patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient")
     async def test_halt_rollout_token_explicit(self, mock_cls) -> None:
         from agent_gtd_dispatch.gtd_client import halt_rollout
 

@@ -166,10 +166,10 @@ squash-merge passing branches, and complete items in the rollout.
   workspace projects the prompt is workspace-aware: per-repo merge semantics and per-repo
   halt conditions.
 - Only `claude-code` (Opus) is allowed; `claude-code-ollama` is swapped to `claude-code`.
-- Timeout: `MANAGE_TIMEOUT_SECONDS` (default 4 hours).
+- Timeout: `MANAGE_TIMEOUT_SECONDS` (default 45 minutes, sized for a short-lived reviewer).
 - On failure: workspace is **preserved** (not cleaned up) for post-mortem debugging.
-- Auto-recovery: if the manage agent exits before the rollout reaches a terminal state,
-  the service relaunches it (see Manage Recovery below).
+- No auto-relaunch: the worker drives the wave loop itself, so there is no resident
+  manager to resurrect (see Rollout Liveness below).
 - **Gate install**: after clone and before launch, the worker installs and verifies each
   repo's hook manager (or runs its `.agent-gtd/setup`); failure → run `failed` before the
   agent starts and the rollout is halted
@@ -246,29 +246,24 @@ See [docs/rollouts.md](rollouts.md) for the full rollout orchestration protocol.
 
 ---
 
-## Manage Recovery Semantics
+## Rollout Liveness
 
-Manage-mode agents can time out or crash before a rollout reaches a terminal state. The
-dispatch service detects this and automatically relaunches:
+A manage dispatch runs the worker-driven wave loop inside the dispatch service; a
+short-lived REVIEW-mode agent reviews and merges each completed build. Nothing relaunches
+a manager, because there is no resident manager. The relaunch ladder, the staleness
+watchdog, their in-memory tallies and the `MAX_MANAGE_RETRIES` / free-relaunch caps were
+retired in item 7baf77d0. The `autonomous_rollouts.manage_retry_count` column still exists
+on the GTD side but nothing writes it.
 
-| Parameter | Default | Config var |
-|---|---|---|
-| Max auto-relaunches | 2 | `MAX_MANAGE_RETRIES` constant in `config.py` (**not** env-configurable — `config.load()` never reads an env var for it) |
-| Backoff between relaunches | 30 seconds | `MANAGE_RETRY_BACKOFF_SECONDS` (hardcoded) |
-| Free-relaunch minimum agent uptime | 120 seconds | `MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS` (`DISPATCH_MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS` env) |
-| Free-relaunch lifetime cap per rollout | 25 | `MAX_MANAGE_FREE_RELAUNCHES` (`DISPATCH_MAX_MANAGE_FREE_RELAUNCHES` env) |
-
-**Relaunch flow** (in `_maybe_relaunch_manage()`):
-
-1. Fetch the rollout from the GTD API.
-2. If the rollout is already in `completed`, `halted`, or `cancelled`: nothing to do.
-3. Otherwise walk an ordered decision ladder (see [docs/rollouts.md](rollouts.md) for the full 8-value ladder). If the manager exited while a healthy child build is still in flight (`manager_phase == "polling"` with a non-terminal `inFlightBuildRuns` entry), and the agent ran for at least `MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS`, and `manager_state_updated_at` is fresh enough to be under the `MANAGE_TIMEOUT_SECONDS` backstop, and the rollout's lifetime free-relaunch tally is below `MAX_MANAGE_FREE_RELAUNCHES`: this is a **free relaunch** — skip straight to step 5 without calling `relaunch_manage_rollout()`, so `manage_retry_count` stays unchanged; post a GTD comment on the in-flight item noting the free relaunch. The free-relaunch tally resets whenever the rollout's count of terminal (no-longer-in-flight) items increases, so a long multi-item wave is bounded per stuck item rather than per wave.
-4. Otherwise (a `counted-*` decision — including a run that timed out, a non-polling manager, no build in flight, too-short uptime, an unreadable or too-old `manager_state_updated_at`, or an exhausted free-relaunch tally): call `relaunch_manage_rollout()` to atomically increment `manage_retry_count`. If `manage_retry_count > MAX_MANAGE_RETRIES`: call `halt_rollout()` with reason `"manage_relaunch_cap_exceeded"` and stop.
-5. Otherwise: sleep 30 s, create a new Run record, spawn a new `_dispatch_worker` with `is_recovery=True` and `manage_retry_count` injected into the system prompt as a recovery warning (a free relaunch renders the warning with `manage_retry_count` still at its prior value, worded to say no retry was consumed).
+- **Liveness:** the loop polls every `ROLLOUT_LOOP_POLL_SECONDS` while builds are in
+  flight and halts as "stalled" only when nothing is in flight, so it never strands a
+  running build.
+- **Restart:** the startup re-adoption sweep resumes only rollouts this host holds a local
+  MANAGE run row for.
 
 **Orphan reconciliation** (on startup): any run stuck in `pending` or `running` at
-startup is marked `failed`. For manage runs, this triggers the relaunch check the next time
-the rollout is advanced (the manage agent's caller handles that).
+startup is marked `failed`. A running rollout this host was driving is then resumed by the
+re-adoption sweep.
 
 ---
 

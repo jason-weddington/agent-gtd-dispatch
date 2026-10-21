@@ -40,7 +40,6 @@ src/agent_gtd_dispatch/
   agent_discovery.py     # /agents endpoint backing — runs list_agents.sh
   rollout_planner.py     # POST /plan — in-process Anthropic call that builds rollout DAGs
   show_run_transcript.py # CLI helper to dump a run's transcript
-  wave_manager/          # Manage-mode wave loop (rollout driving, recovery, watchdog)
 
 packages/protocol/       # agent_gtd_dispatch_protocol — wire-contract models shared
                          #   with callers (RunStatus, DispatchMode, DispatchRequest,
@@ -49,7 +48,7 @@ packages/protocol/       # agent_gtd_dispatch_protocol — wire-contract models 
 
 tests/
   test_*.py              # One file per subsystem (api, dispatch, gtd_client, branches,
-                         #   cancel, rollout_planner, manage_recovery, manage_watchdog,
+                         #   cancel, rollout_planner, manage_recovery (the rollout loop),
                          #   push_verification, protocol_exports, ...)
 ```
 

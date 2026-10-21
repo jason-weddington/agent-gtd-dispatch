@@ -82,11 +82,9 @@ the mode-mismatch guards.
 | `DISPATCH_WORKSPACE_ROOT` | `~/workspace` (relative to agent user) | Override the workspace root directory |
 | `DISPATCH_MAX_TURNS` | `100` | Default turn cap for agent subprocesses |
 | `DISPATCH_TIMEOUT_SECONDS` | `1800` | Build/plan agent wall-clock timeout in seconds (30 minutes) |
-| `DISPATCH_MANAGE_TIMEOUT_SECONDS` | `14400` | Manage agent wall-clock timeout in seconds (4 hours) |
+| `DISPATCH_MANAGE_TIMEOUT_SECONDS` | `2700` | Manage-mode wall-clock backstop in seconds (45 minutes, sized for a short-lived reviewer; only used when a manage dispatch carries no `timeout_minutes`) |
 | `DISPATCH_CANCEL_GRACE_SECONDS` | `5` | Seconds between SIGTERM and SIGKILL on cancel |
 | `DISPATCH_POST_RUN_GATE_MIN_SECONDS` | `600` | Minimum seconds granted to the post-run gate even when the build used most of its timeout |
-| `DISPATCH_MANAGE_STALE_THRESHOLD_SECONDS` | `2100` | Manage-watchdog staleness threshold (35 minutes) — a manage run with no activity for this long is considered stale. Must stay below `DISPATCH_MANAGE_TIMEOUT_SECONDS`. |
-| `DISPATCH_WATCHDOG_INTERVAL_SECONDS` | `180` | How often the manage watchdog scans for stale manage runs (3 minutes) |
 | `DISPATCH_GATE_INSTALL_TIMEOUT_SECONDS` | `300` | Per-subprocess timeout for the pre-launch gate install (hook-manager install, hook-dir lookup, or `.agent-gtd/setup`) |
 
 ### Optional — Concurrency

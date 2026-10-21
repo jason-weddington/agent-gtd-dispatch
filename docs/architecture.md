@@ -503,30 +503,25 @@ running. The endpoint reads the tail of the file (default 200 lines, configurabl
 
 ---
 
-## Manage-Mode Auto-Recovery
+## Rollout Liveness (no manager to relaunch)
 
-When a manage-mode `_dispatch_worker` exits (for any reason except human cancellation), the
-`_maybe_relaunch_manage()` function:
+A manage dispatch starts the worker-driven wave loop (`_start_rollout_loop`) in this
+service; it launches one short-lived REVIEW-mode agent per completed build. There is no
+resident manager agent, so there is nothing to relaunch:
 
-1. Fetches the rollout status from the GTD API.
-2. If the rollout is already in a terminal state (`completed`, `halted`, `cancelled`) — does nothing.
-3. Otherwise, walks an ordered decision ladder (full 8-value ladder in [docs/rollouts.md](rollouts.md)) that first checks whether this is a *free* relaunch — the manager exited while a healthy child build is still in flight — bounded by three limits: a minimum agent uptime (`MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS`, default 120 s, so a crash-looping manager still counts toward the cap), the `MANAGE_TIMEOUT_SECONDS` backstop anchored on `manager_state_updated_at` (so a genuinely-wedged build can't defer recovery forever), and a lifetime `MAX_MANAGE_FREE_RELAUNCHES` cap per rollout (default 25) that resets when the rollout makes real progress — a terminal build outcome — rather than on a manager heartbeat alone.
-4. A free relaunch (decision `free-relaunch-build-in-flight`) does NOT call `relaunch_manage_rollout()`, so it never consumes `MAX_MANAGE_RETRIES` budget and can never halt the rollout on its own — it posts a GTD comment on the in-flight item, then spawns a new `_dispatch_worker`.
-5. Every other (`counted-*`) decision calls `relaunch_manage_rollout()` to atomically increment `manage_retry_count` exactly as before this feature: if the new count exceeds `MAX_MANAGE_RETRIES` (default 2) the rollout halts with reason `"manage_relaunch_cap_exceeded"`, otherwise it sleeps `MANAGE_RETRY_BACKOFF_SECONDS` (30 s) then spawns a new `_dispatch_worker` with `manage_retry_count` set so the recovery prompt includes a warning header.
+- **The loop owns liveness.** While builds are in flight a tick returns `_TICK_WAIT` and the
+  loop sleeps `ROLLOUT_LOOP_POLL_SECONDS`. Its only liveness halt ("rollout stalled")
+  requires nothing to be in flight, so it never strands a running build. A crashed loop fails
+  its own run and does not halt the rollout.
+- **The reviewer is bounded** by `REVIEW_TIMEOUT_SECONDS` (45 min).
+- **A restart is covered by the re-adoption sweep** (`_readopt_running_rollouts`), which runs
+  once at startup and resumes ONLY rollouts this host holds a local MANAGE run row for.
 
-### Stale-Manager Watchdog
-
-Exit-path recovery alone cannot catch a manage agent that is alive but stuck. `lifespan`
-also starts a background `_manage_watchdog()` task that scans every
-`WATCHDOG_INTERVAL_SECONDS` (default 180 s, `DISPATCH_WATCHDOG_INTERVAL_SECONDS` env) for
-manage runs whose rollout state has not advanced in `MANAGE_STALE_THRESHOLD_SECONDS`
-(default 2100 s / 35 min, `DISPATCH_MANAGE_STALE_THRESHOLD_SECONDS` env). When it finds a
-stale manager it kills the task/subprocess and routes into the shared
-`_do_manage_recovery()` — the same path used by `_maybe_relaunch_manage()` on exit — so
-watchdog-triggered relaunches count against the same `MAX_MANAGE_RETRIES` cap. The stale
-threshold is deliberately set above the longest build a manager may legitimately wait on
-(its state timestamp only advances on real progress) and must stay below
-`MANAGE_TIMEOUT_SECONDS`. See `tests/test_manage_watchdog.py`.
+The resident-manager keep-alive machinery (exit-path relaunch ladder `_maybe_relaunch_manage`,
+shared `_do_manage_recovery`, the staleness watchdog, its in-memory tallies and the
+`MAX_MANAGE_RETRIES` / free-relaunch caps) was retired in item 7baf77d0. The watchdog scanned
+every running rollout fleet-wide and relaunched any whose heartbeat was stale, including
+rollouts another host's loop was still driving (rollout fe1e828d landed one item twice).
 
 See [docs/rollouts.md](rollouts.md) for the full rollout orchestration protocol.
 
@@ -551,10 +546,11 @@ uvicorn start
       → dispatch.init_executor() # size ThreadPoolExecutor
       → db.init_db()            # create/migrate dispatch.db
       → db.reconcile_orphans()  # mark stuck runs as failed
-      → asyncio.create_task(_manage_watchdog())  # stale-manager scan loop
+      → asyncio.create_task(_retention_loop())            # age-based pruning
+      → asyncio.create_task(_readopt_running_rollouts())  # resume this host's loops
   → yield  (service accepting requests)
   → lifespan.__aexit__
-      → cancel the watchdog task
+      → cancel the retention and re-adoption tasks
       → cancel all _active_processes tasks
 ```
 

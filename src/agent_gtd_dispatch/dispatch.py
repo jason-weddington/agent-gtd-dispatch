@@ -1446,19 +1446,11 @@ def build_system_prompt(
     attachments: list[dict[str, Any]] | None = None,
     run_id: str = "",
     rollout_id: str | None = None,
-    manage_retry_count: int = 0,
     workspace_repo_dirs: list[str] | None = None,
-    is_recovery: bool = False,
     workspace: Path | None = None,
-    resume_context: list[dict[str, Any]] | None = None,
     merge_notes: list[dict[str, Any]] | None = None,
 ) -> str:
     """Build the headless agent system prompt.
-
-    ``resume_context`` is the manage-recovery resume context: the in-flight
-    build runs (``{runId, itemId, status}``) the dispatcher already knew about
-    when it relaunched the manager. When absent the recovery block renders
-    exactly as it did before this parameter existed.
 
     ``merge_notes`` is the rollout's most recent merge notes (newest first);
     manage mode renders up to ``MERGE_NOTE_CONTEXT_LIMIT`` of them so the
@@ -1485,10 +1477,7 @@ def build_system_prompt(
             rollout_id or "",
             project,
             max_turns,
-            manage_retry_count=manage_retry_count,
             workspace_repo_dirs=workspace_repo_dirs,
-            is_recovery=is_recovery,
-            resume_context=resume_context,
             merge_notes=merge_notes,
         )
     return _build_build_prompt(
@@ -1900,40 +1889,17 @@ def _turn_discipline_block() -> str:
     return _indent_prompt_block(_TURN_DISCIPLINE_BODY)
 
 
-def _manage_warmup_skip_block(rollout_id: str) -> str:
-    """Recovery-path warm-up skip + verify-before-first-merge rule.
+def _manage_wait_step(rollout_id: str, gate_exception: str) -> str:
+    """Step 3 — wait for each dispatched run, in the FOREGROUND.
 
-    Prompt-only: a relaunched manager already calls ``advance_rollout``, whose
-    ``in_progress`` list is the signal that a previous manager's wave is still
-    executing and warm-up must be deferred rather than re-run.
+    Deliberately short.  The fuller version (``_manage_step3_block``, with the
+    warm-up-skip block beside it) existed to keep a RESIDENT manager alive
+    across relaunches; both were retired with that machinery (item 7baf77d0).
+    The invariant they encoded survives here and in the shared turn-discipline
+    block: never wait on a run by backgrounding it (item 3889efbb).
     """
-    return _indent_prompt_block(
-        f"""\
-**SKIP Phase 1 when work is already in flight.** Before you run a single
-warm-up command, call `mcp__agent-gtd__advance_rollout(rollout_id="{rollout_id}")`
-(Phase 2 Step 1). If its `in_progress` list is NOT empty, a previous manager
-already dispatched those items and their build runs may still be executing.
-Do NOT re-run warm-up: go straight to Phase 2 Step 3 and wait on those runs in
-the foreground. Warm-up takes minutes you do not have, and re-running it is the
-single biggest reason a replacement manager dies before it reaches the wait.
-
-**Deferred, not discarded — verify before your FIRST merge.** A manager that
-skipped Phase 1 has NOT recorded default branches, NOT installed dependencies
-and NOT verified that anything is green. Before you merge ANYTHING (Step 6),
-run the skipped Phase 1 steps for every repo you are about to merge into:
-record the default branch, install dependencies, establish the merge bar (the
-**Merge bar** warm-up step below says which one applies), and verify that the
-default branch passes it. If that verification fails, halt exactly as Phase 1's
-green check says.
-Merging onto an unverified base is a worse bug than the one this rule avoids.
-"""
-    )
-
-
-def _manage_step3_block(rollout_id: str, gate_exception: str) -> str:
-    """Step 3 — foreground run wait — shared by both manage prompt variants."""
     body = f"""\
-**Step 3 — Wait for each run to finish (FOREGROUND, one run at a time)**
+**Step 3 — Wait for each run to finish (FOREGROUND)**
 
 Publish polling state:
 ```
@@ -1944,44 +1910,17 @@ mcp__agent-gtd__update_rollout_state(
 )
 ```
 
-Then wait on the dispatched runs SEQUENTIALLY, in the foreground, using the
-CLI's native blocking waiter — one run_id at a time, in dispatch order:
+Wait on each dispatched run in the FOREGROUND, one at a time:
 
 ```bash
 agent-gtd run-status <run_id> --wait --timeout 540
 ```
 
-Waiting on runs one at a time is correct and costs you nothing: a run that
-finishes while you are blocked on a different one simply returns its terminal
-status immediately when its turn comes.
+Exit `0` is success and `2` is a terminal failure. Exit `124` means the run is
+STILL RUNNING: re-issue the same command. Never background this wait — see
+**Turn Discipline** above. Once a wait returns terminal, confirm it with
+`mcp__agent-gtd__get_run_status(<run_id>)` and continue with Step 4 for THAT run.
 
-Exit codes — this is the CLI contract, act on them:
-
-- `0` — terminal SUCCESS for that run.
-- `2` — terminal FAILURE (`failed` / `cancelled` / `error` / `timeout`).
-- `124` — the client `--timeout` elapsed. The run is **STILL RUNNING**. This is
-  NOT a failure.
-- `1` — operational error (auth / network / run-not-found). Retry the same
-  command up to 3 times; if it still fails, fall back to
-  `mcp__agent-gtd__get_run_status(<run_id>)`.
-
-**Exit 124 means re-arm, not give up.** A build legitimately runs far longer
-than any single foreground tool call can last. When the waiter exits 124,
-immediately re-issue the EXACT same command for the SAME run_id, and keep
-re-issuing it until the command exits 0, 2 or 1. Treating 124 as a failure
-would turn a 30-minute build into an apparent failure at 9 minutes. Keep
-`--timeout 540` — it sits below your own Bash tool timeout ceiling, which is
-what makes the blocking call survivable.
-
-Never background this wait, and never end your turn while a run is still in
-flight — see **Turn Discipline** above for why that is fatal.
-
-Once a wait returns terminal (exit 0 or 2), confirm the outcome with
-`mcp__agent-gtd__get_run_status(<run_id>)`, then continue with Step 4 (AC
-reconciliation) and onward for THAT run before you start waiting on the next
-one.
-
-Process each item as it completes — don't wait for all before acting on any.
 If a run ended with `failed`, `timed_out`, or `cancelled`: treat as a halt
 candidate (see Halt path) with reason
 `"build agent <status>: run <run_id> for item <item_id>"`.
@@ -2023,9 +1962,8 @@ def _build_manage_workspace_main_prompt(
             '`"post-run gate failure: run <run_id> for item <item_id>"`.'
         )
 
-    step3 = _manage_step3_block(rollout_id, gate_exception)
+    step3 = _manage_wait_step(rollout_id, gate_exception)
     turn_discipline = _turn_discipline_block()
-    warmup_skip = _manage_warmup_skip_block(rollout_id)
     merge_bar = _manage_merge_bar_block(_gate, "3", workspace=True)
     recent_notes = _manage_recent_merge_notes_block(merge_notes)
     merge_note_step = _manage_merge_note_block()
@@ -2046,7 +1984,7 @@ def _build_manage_workspace_main_prompt(
         **Rollout ID:** {rollout_id}
         **Project ID:** {project_id}
         **Turns remaining:** {max_turns}
-        **Time budget:** {config.MANAGE_TIMEOUT_SECONDS // 3600} hours ({config.MANAGE_TIMEOUT_SECONDS // 60} min) of wall-clock time. Up to {config.MAX_MANAGE_RETRIES} automatic relaunches — and they are NOT free: exiting while any build run is still in flight is itself a failure mode and it consumes the relaunch budget exactly as a timeout does. Each relaunch rebuilds context from rollout state. Stay alive and complete as many waves as possible per run.
+        **Time budget:** {config.MANAGE_TIMEOUT_SECONDS // 60} min of wall-clock time. Nothing relaunches you: exiting while any build run is still in flight strands it.
 
         This rollout ID is your primary anchor. Every action you take is scoped to it.
         Your workspace is a **workspace root** containing one git clone per repo listed above, each checked out on its own default branch (auto-detected).
@@ -2069,8 +2007,6 @@ def _build_manage_workspace_main_prompt(
         IMPORTANT: Dispatch all wave-1 items first (Phase 2 Step 1 below), THEN run
         warm-up steps while waiting for those builds to complete. Warm-up happens
         concurrently with wave-1 builds — not before them.
-
-        {warmup_skip}
 
         At the start of warm-up, publish your state:
         ```
@@ -2494,10 +2430,7 @@ def _build_manage_prompt(
     rollout_id: str,
     project: dict[str, Any],
     max_turns: int,
-    manage_retry_count: int = 0,
     workspace_repo_dirs: list[str] | None = None,
-    is_recovery: bool = False,
-    resume_context: list[dict[str, Any]] | None = None,
     merge_notes: list[dict[str, Any]] | None = None,
 ) -> str:
     """System prompt for manage mode — run the rollout-manager executor loop.
@@ -2510,48 +2443,8 @@ def _build_manage_prompt(
     git_origin = project.get("git_origin", "")
     project_id = project.get("id", "")
 
-    recovery_block = ""
-    if is_recovery or manage_retry_count > 0:
-        if manage_retry_count > 0:
-            _retry_clause = (
-                f"(retry attempt {manage_retry_count} of {config.MAX_MANAGE_RETRIES})"
-            )
-        else:
-            _retry_clause = (
-                "(this relaunch did not consume a retry — a build run is still "
-                "in flight)"
-            )
-        recovery_block = textwrap.dedent(
-            f"""\
-            ## ⚠️ Recovery Context
-
-            You are a *recovery* manage agent — a previous manager for this rollout exited unexpectedly
-            {_retry_clause}. The rollout is already in `running`
-            state. Read its current state via `advance_rollout` and continue normally. Items already terminal
-            may have unmerged work waiting; process those first before dispatching new ones.
-
-            """
-        )
-        if resume_context:
-            _rows = "\n".join(
-                f"- run `{r.get('runId')}` → item `{r.get('itemId')}` "
-                f"(status `{r.get('status')}`)"
-                for r in resume_context
-            )
-            recovery_block += (
-                "### Work already in flight — do NOT rediscover it\n\n"
-                "These build runs were still executing at the moment you were "
-                "launched:\n\n"
-                f"{_rows}\n\n"
-                "SKIP Phase 1 warm-up. Go straight to Phase 2 Step 3 and wait on each "
-                "run_id above in the FOREGROUND with `agent-gtd run-status <run_id> "
-                "--wait --timeout 540`, re-arming the same command on exit 124. Run "
-                "Phase 1's dependency install and test/lint verification later, before "
-                "your first merge.\n\n"
-            )
-
     if workspace_repo_dirs:
-        return recovery_block + _build_manage_workspace_main_prompt(
+        return _build_manage_workspace_main_prompt(
             rollout_id, project, max_turns, workspace_repo_dirs, merge_notes
         )
 
@@ -2573,9 +2466,8 @@ def _build_manage_prompt(
             'reason `"post-run gate failure: run <run_id> for item <item_id>"`.'
         )
 
-    step3 = _manage_step3_block(rollout_id, gate_exception)
+    step3 = _manage_wait_step(rollout_id, gate_exception)
     turn_discipline = _turn_discipline_block()
-    warmup_skip = _manage_warmup_skip_block(rollout_id)
     merge_bar = _manage_merge_bar_block(_gate, "2", workspace=False)
     recent_notes = _manage_recent_merge_notes_block(merge_notes)
     merge_note_step = _manage_merge_note_block()
@@ -2595,7 +2487,7 @@ def _build_manage_prompt(
         **Rollout ID:** {rollout_id}
         **Project ID:** {project_id}
         **Turns remaining:** {max_turns}
-        **Time budget:** {config.MANAGE_TIMEOUT_SECONDS // 3600} hours ({config.MANAGE_TIMEOUT_SECONDS // 60} min) of wall-clock time. Up to {config.MAX_MANAGE_RETRIES} automatic relaunches — and they are NOT free: exiting while any build run is still in flight is itself a failure mode and it consumes the relaunch budget exactly as a timeout does. Each relaunch rebuilds context from rollout state. Stay alive and complete as many waves as possible per run.
+        **Time budget:** {config.MANAGE_TIMEOUT_SECONDS // 60} min of wall-clock time. Nothing relaunches you: exiting while any build run is still in flight strands it.
 
         This rollout ID is your primary anchor. Every action you take is scoped to it.
         Your workspace is a git clone of the project's default branch (auto-detected).
@@ -2618,8 +2510,6 @@ def _build_manage_prompt(
         IMPORTANT: Dispatch all wave-1 items first (Phase 2 Step 1 below), THEN run
         warm-up steps while waiting for those builds to complete. Warm-up happens
         concurrently with wave-1 builds — not before them.
-
-        {warmup_skip}
 
         At the start of warm-up, publish your state:
         ```
@@ -2972,7 +2862,7 @@ def _build_manage_prompt(
     """
     )
 
-    return recovery_block + main_prompt
+    return main_prompt
 
 
 # ---------------------------------------------------------------------------

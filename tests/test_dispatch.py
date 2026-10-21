@@ -1518,118 +1518,6 @@ class TestBuildManagePrompt:
         assert "decision_rule" in prompt
         assert "agent-judgment" in prompt
 
-    # -----------------------------------------------------------------------
-    # Recovery prompt rendering
-    # -----------------------------------------------------------------------
-
-    def test_no_recovery_block_at_count_zero(self) -> None:
-        """manage_retry_count=0 (default) must NOT inject recovery context."""
-        prompt = build_system_prompt(
-            item={"id": "item-1", "title": "ignored"},
-            project=self._project,
-            branch_name=None,
-            max_turns=self._max_turns,
-            mode="manage",
-            rollout_id=self._rollout_id,
-            manage_retry_count=0,
-        )
-        assert "Recovery Context" not in prompt
-        assert "recovery" not in prompt.lower() or "non-recoverable" in prompt.lower()
-
-    def test_recovery_block_is_recovery_zero_retry_count(self) -> None:
-        """is_recovery=True with manage_retry_count=0 renders the free-relaunch wording."""
-        prompt = build_system_prompt(
-            item={"id": "item-1", "title": "ignored"},
-            project=self._project,
-            branch_name=None,
-            max_turns=self._max_turns,
-            mode="manage",
-            rollout_id=self._rollout_id,
-            manage_retry_count=0,
-            is_recovery=True,
-        )
-        assert "## ⚠️ Recovery Context" in prompt
-        assert "this relaunch did not consume a retry" in prompt
-        assert "retry attempt" not in prompt
-
-    def test_recovery_block_is_recovery_with_retry_count(self) -> None:
-        """is_recovery=True with manage_retry_count=1 still shows the retry-attempt clause."""
-        prompt = build_system_prompt(
-            item={"id": "item-1", "title": "ignored"},
-            project=self._project,
-            branch_name=None,
-            max_turns=self._max_turns,
-            mode="manage",
-            rollout_id=self._rollout_id,
-            manage_retry_count=1,
-            is_recovery=True,
-        )
-        assert "retry attempt 1 of 2" in prompt
-
-    def test_no_recovery_block_not_recovery_zero_retry_count(self) -> None:
-        """is_recovery=False (default) with manage_retry_count=0 renders no block."""
-        prompt = build_system_prompt(
-            item={"id": "item-1", "title": "ignored"},
-            project=self._project,
-            branch_name=None,
-            max_turns=self._max_turns,
-            mode="manage",
-            rollout_id=self._rollout_id,
-            manage_retry_count=0,
-            is_recovery=False,
-        )
-        assert "## ⚠️ Recovery Context" not in prompt
-        assert "this relaunch did not consume a retry" not in prompt
-        assert "retry attempt" not in prompt
-
-    def test_recovery_block_at_count_one(self) -> None:
-        """manage_retry_count=1 should prepend the recovery context block."""
-        prompt = build_system_prompt(
-            item={"id": "item-1", "title": "ignored"},
-            project=self._project,
-            branch_name=None,
-            max_turns=self._max_turns,
-            mode="manage",
-            rollout_id=self._rollout_id,
-            manage_retry_count=1,
-        )
-        assert "Recovery Context" in prompt
-        assert "retry attempt 1 of 2" in prompt
-        assert "recovery" in prompt.lower()
-
-    def test_recovery_block_at_count_two(self) -> None:
-        """manage_retry_count=2 (max) should show 'attempt 2 of 2'."""
-        prompt = build_system_prompt(
-            item={"id": "item-1", "title": "ignored"},
-            project=self._project,
-            branch_name=None,
-            max_turns=self._max_turns,
-            mode="manage",
-            rollout_id=self._rollout_id,
-            manage_retry_count=2,
-        )
-        assert "Recovery Context" in prompt
-        assert "retry attempt 2 of 2" in prompt
-
-    def test_recovery_block_appears_before_main_prompt(self) -> None:
-        """Recovery context must appear before Phase 1 content."""
-        prompt = build_system_prompt(
-            item={"id": "item-1", "title": "ignored"},
-            project=self._project,
-            branch_name=None,
-            max_turns=self._max_turns,
-            mode="manage",
-            rollout_id=self._rollout_id,
-            manage_retry_count=1,
-        )
-        recovery_idx = prompt.find("Recovery Context")
-        phase1_idx = prompt.find("Phase 1")
-        assert recovery_idx != -1
-        assert phase1_idx != -1
-        assert recovery_idx < phase1_idx, (
-            "Recovery Context block must appear before Phase 1 content"
-        )
-
     def test_branch_delete_on_squash_merge(self) -> None:
         prompt = self._prompt()
         assert "git push origin --delete" in prompt, (
@@ -3501,7 +3389,6 @@ class TestWorkspaceManagePrompt:
     def _ws_prompt(
         self,
         repo_dirs: list[str] | None = None,
-        manage_retry_count: int = 0,
     ) -> str:
         return build_system_prompt(
             item={"id": "item-1", "title": "ignored for manage mode"},
@@ -3511,7 +3398,6 @@ class TestWorkspaceManagePrompt:
             mode="manage",
             rollout_id=self._rollout_id,
             workspace_repo_dirs=repo_dirs if repo_dirs is not None else self._repo_dirs,
-            manage_retry_count=manage_retry_count,
         )
 
     def _mono_prompt(self) -> str:
@@ -3711,16 +3597,6 @@ class TestWorkspaceManagePrompt:
         # The first_repo directory reference should appear near the cleanup
         nearby = prompt[max(0, cleanup_idx - 200) : cleanup_idx + 200]
         assert first_repo in nearby
-
-    # --- Recovery block in workspace mode (AC-9) ---
-
-    def test_recovery_block_renders_in_workspace_mode(self) -> None:
-        prompt = self._ws_prompt(manage_retry_count=1)
-        assert "Recovery Context" in prompt
-        assert "retry attempt 1" in prompt
-        assert prompt.find("Recovery Context") < prompt.find("Phase 1"), (
-            "Recovery block must appear before Phase 1"
-        )
 
     # --- AC-2 workspace variant must lack monorepo-only tokens ---
 
@@ -5178,29 +5054,11 @@ class TestManagePromptForegroundWait:
         assert "agent-gtd run-status <run_id> --wait --timeout 540" in region
         assert "FOREGROUND" in region
 
-    def test_step3_states_sequential_waiting_is_correct(
-        self, workspace_repo_dirs
-    ) -> None:
-        region = _step3_region(_manage_prompt(workspace_repo_dirs))
-        assert "SEQUENTIALLY" in region
-        assert "one run_id at a time" in region
-        assert "status immediately when its turn comes" in region
-
-    def test_step3_documents_waiter_exit_codes(self, workspace_repo_dirs) -> None:
-        region = _step3_region(_manage_prompt(workspace_repo_dirs))
-        assert "`0` — terminal SUCCESS" in region
-        assert "`2` — terminal FAILURE" in region
-        assert "`124` — the client `--timeout` elapsed" in region
-        assert "`1` — operational error" in region
-
-    def test_step3_exit_124_is_not_a_failure_and_re_arms(
-        self, workspace_repo_dirs
-    ) -> None:
+    def test_step3_exit_124_re_arms(self, workspace_repo_dirs) -> None:
         region = _step3_region(_manage_prompt(workspace_repo_dirs))
         assert "STILL RUNNING" in region
-        assert "NOT a failure" in region
-        assert "re-issue the EXACT same command for the SAME run_id" in region
-        assert "keep" in region and "until the command exits 0, 2 or 1" in region
+        assert "re-issue the same command" in region
+        assert "Never background this wait" in region
 
     def test_turn_discipline_sentence_present(self, workspace_repo_dirs) -> None:
         """The manage prompts render the SHARED turn-discipline block.
@@ -5218,94 +5076,18 @@ class TestManagePromptForegroundWait:
         assert "`claude --print`" in prompt
         assert "Your\nprocess IS your turn." in prompt
 
-    def test_time_budget_line_no_longer_says_on_timeout(
-        self, workspace_repo_dirs
-    ) -> None:
+    def test_time_budget_line_promises_no_relaunch(self, workspace_repo_dirs) -> None:
         prompt = _manage_prompt(workspace_repo_dirs)
-        assert "automatic relaunches on timeout" not in prompt
-        assert "consumes the relaunch budget" in prompt
-        assert "exiting while any build run is still in flight is itself a failure" in (
-            prompt
-        )
-
-    def test_warm_up_skip_instruction_present(self, workspace_repo_dirs) -> None:
-        prompt = _manage_prompt(workspace_repo_dirs)
-        assert "**SKIP Phase 1 when work is already in flight.**" in prompt
-        assert 'mcp__agent-gtd__advance_rollout(rollout_id="wr-abc123")' in prompt
-        assert "`in_progress` list is NOT empty" in prompt
-
-    def test_warm_up_skip_defers_but_does_not_drop_verification(
-        self, workspace_repo_dirs
-    ) -> None:
-        prompt = _manage_prompt(workspace_repo_dirs)
-        assert "Deferred, not discarded — verify before your FIRST merge." in prompt
-        assert "Before you merge ANYTHING" in prompt
-        assert "Merging onto an unverified base" in prompt
+        assert "automatic relaunches" not in prompt
+        assert "relaunch budget" not in prompt
+        assert "Nothing relaunches you" in prompt
+        assert "Recovery Context" not in prompt
+        assert "SKIP Phase 1 when work is already in flight" not in prompt
 
     def test_polling_state_publish_preserved(self, workspace_repo_dirs) -> None:
         region = _step3_region(_manage_prompt(workspace_repo_dirs))
         assert 'phase="polling"' in region
         assert "mcp__agent-gtd__update_rollout_state(" in region
-
-
-_EXPECTED_RECOVERY_BLOCK = (
-    "## ⚠️ Recovery Context\n"
-    "\n"
-    "You are a *recovery* manage agent — a previous manager for this rollout "
-    "exited unexpectedly\n"
-    "(retry attempt 1 of 2). The rollout is already in `running`\n"
-    "state. Read its current state via `advance_rollout` and continue normally. "
-    "Items already terminal\n"
-    "may have unmerged work waiting; process those first before dispatching new "
-    "ones.\n"
-    "\n"
-)
-
-
-@pytest.mark.parametrize("workspace_repo_dirs", _MANAGE_VARIANTS)
-class TestManageResumeContext:
-    """The dispatcher's in-flight list must reach the recovery prompt verbatim."""
-
-    _IN_FLIGHT: ClassVar[list[dict[str, str]]] = [
-        {"runId": "32c0a2b7", "itemId": "item-a", "status": "running"},
-        {"runId": "db7f8e53", "itemId": "item-b", "status": "running"},
-    ]
-
-    def test_in_flight_runs_and_items_named(self, workspace_repo_dirs) -> None:
-        prompt = _manage_prompt(
-            workspace_repo_dirs,
-            manage_retry_count=1,
-            is_recovery=True,
-            resume_context=self._IN_FLIGHT,
-        )
-        for entry in self._IN_FLIGHT:
-            assert f"run `{entry['runId']}`" in prompt
-            assert f"item `{entry['itemId']}`" in prompt
-        assert "do NOT rediscover it" in prompt
-        assert "SKIP Phase 1 warm-up" in prompt
-
-    def test_absent_resume_context_renders_block_unchanged(
-        self, workspace_repo_dirs
-    ) -> None:
-        """No resume context → the recovery block is byte-identical to before."""
-        without = _manage_prompt(
-            workspace_repo_dirs, manage_retry_count=1, is_recovery=True
-        )
-        explicit_none = _manage_prompt(
-            workspace_repo_dirs,
-            manage_retry_count=1,
-            is_recovery=True,
-            resume_context=None,
-        )
-        empty = _manage_prompt(
-            workspace_repo_dirs,
-            manage_retry_count=1,
-            is_recovery=True,
-            resume_context=[],
-        )
-        assert without == explicit_none == empty
-        assert without.startswith(_EXPECTED_RECOVERY_BLOCK)
-        assert "do NOT rediscover it" not in without
 
 
 # ---------------------------------------------------------------------------
@@ -5636,8 +5418,11 @@ class TestManageTimeoutSingleSource:
         assert config.timeout_seconds_for_mode("plan") == 1800
 
     def test_manage_backstop_matches_the_authoritative_gtd_default(self) -> None:
-        """config.MANAGE_TIMEOUT_SECONDS derives from the GTD-side 240 minutes."""
-        assert config.MANAGE_TIMEOUT_SECONDS == 240 * 60
+        """config.MANAGE_TIMEOUT_SECONDS derives from the GTD-side 45 minutes.
+
+        Sized for a short-lived reviewer since the resident manager was retired.
+        """
+        assert config.MANAGE_TIMEOUT_SECONDS == 45 * 60
 
     def test_run_agent_resolves_through_the_helper(self, tmp_path) -> None:
         """run_agent no longer carries its own mode branch."""

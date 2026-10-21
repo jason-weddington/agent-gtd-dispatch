@@ -275,9 +275,6 @@ class TestConstants:
         assert main.MAX_LAND_FIX_RELAUNCHES == 1
         assert main.LAND_HEARTBEAT_SECONDS == 300
 
-    def test_heartbeat_is_below_the_watchdog_threshold(self) -> None:
-        assert main.LAND_HEARTBEAT_SECONDS < config.MANAGE_STALE_THRESHOLD_SECONDS
-
     def test_config_defaults_and_env(self, monkeypatch) -> None:
         monkeypatch.setenv("DISPATCH_API_KEY", "k")
         monkeypatch.setenv("AGENT_GTD_URL", "http://x")
@@ -1078,43 +1075,26 @@ class TestConcurrentLands:
 # ---------------------------------------------------------------------------
 
 
-class TestWatchdogHeartbeat:
-    async def test_long_gate_never_looks_stale(
-        self, mono, gtd, monkeypatch, caplog
+class TestLandHeartbeat:
+    async def test_long_gate_keeps_publishing_the_heartbeat(
+        self, mono, gtd, monkeypatch
     ) -> None:
-        monkeypatch.setattr(config, "MANAGE_STALE_THRESHOLD_SECONDS", 1)
+        """A long land keeps the rollout's "last update" moving.
+
+        Nothing reads the heartbeat for liveness any more (the staleness
+        watchdog was retired), but the rollout monitor still shows it.
+        """
         monkeypatch.setattr(main, "LAND_HEARTBEAT_SECONDS", 0.2)
-        monkeypatch.setattr(main, "_watchdog_acted", {})
         stamps: list[str] = []
 
         async def record(*_a, **_kw):
             stamps.append(datetime.now(UTC).isoformat())
 
         gtd.update_rollout_state = AsyncMock(side_effect=record)
-        recovery = AsyncMock()
-        monkeypatch.setattr(main, "_do_manage_recovery", recovery)
         _squash(mono.clone)
 
-        async def watch() -> None:
-            for _ in range(4):
-                await asyncio.sleep(0.6)
-                await main._watchdog_evaluate_rollout(
-                    {
-                        "status": "running",
-                        "manager_phase": "merging",
-                        "manager_state_updated_at": stamps[-1],
-                    },
-                    ROLLOUT,
-                    datetime.now(UTC),
-                )
-
-        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
-            result, _ = await asyncio.gather(
-                _land(mono.ws, mono.pre, gate="sleep 3"), watch()
-            )
+        result = await _land(mono.ws, mono.pre, gate="sleep 3")
         assert isinstance(result, ReviewVerdict)
-        recovery.assert_not_awaited()
-        assert "triggering-recovery" not in caplog.text
         assert len(stamps) > 5
 
 

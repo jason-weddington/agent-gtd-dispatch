@@ -146,38 +146,16 @@ class _PendingDispatch(NamedTuple):
 
 _pending_queue: list[_PendingDispatch] = []
 
-# Watchdog state
-_rollout_to_run: dict[str, Run] = {}  # rollout_id → active manage-mode Run
-_watchdog_task: asyncio.Task[None] | None = None  # handle for clean shutdown
 _retention_task: asyncio.Task[None] | None = None  # handle for clean shutdown
-# One-shot disposition-classifier reachability probe (see lifespan). Held only
-# so shutdown can cancel it — nothing awaits its result.
-_watchdog_acted: dict[str, float] = {}  # rollout_id → monotonic() of last action
 
-# rollout_id -> lifetime count of UNCOUNTED (free) manage relaunches granted while
-# a child build run is healthy and still in flight. A lifetime tally: it is NEVER
-# reset by manager progress alone (see _manage_last_terminal_count below), and is
-# cleared only by (a) a counted recovery and (b) the clean-exit early return. A
-# progress-reset tally keyed on the manager heartbeat alone would be unbounded,
-# because a manager that refreshes manager_state_updated_at once per cycle and
-# then dies would reset it every cycle.
-_manage_free_relaunches: dict[str, int] = {}
-
-# rollout_id -> last-seen count of items that have reached a terminal build
-# outcome (left the rollout's in-flight-build set after having been observed
-# there). GET /api/rollouts/{id} does not carry a `done_count` field (that is
-# only computed by the project-active-rollout and list endpoints), so this is
-# the "equivalent terminal-item count" derived from the field that IS already
-# on the rollout dict `_maybe_relaunch_manage` holds: inFlightBuildRuns. Used to
-# reset `_manage_free_relaunches` on real wave progress — bounding the free-relaunch
-# budget per stuck item rather than per wave. Cleared together with
-# `_manage_free_relaunches`.
-_manage_last_terminal_count: dict[str, int] = {}
-
-# rollout_id -> set of item_ids ever observed in the rollout's in-flight-build set.
-# Bookkeeping for computing `_manage_last_terminal_count` above; cleared together
-# with it.
-_manage_seen_in_flight_item_ids: dict[str, frozenset[str]] = {}
+# rollout_id -> the MANAGE Run whose worker-driven wave loop is live on THIS
+# host.  Ownership only: it stops the startup re-adoption sweep (which runs as
+# a background task, so a dispatch can start a loop before the sweep reaches
+# that rollout) from starting a second loop for a rollout already driven here.
+# It is NOT relaunch bookkeeping — the resident-manager keep-alive machinery
+# that used to share this map (relaunch ladder, staleness watchdog, free-
+# relaunch tallies, retry caps) was retired once the worker owned the loop.
+_rollout_loops: dict[str, Run] = {}
 
 
 def _publish_run_event(run_id: str, status: str, completed_at: str | None) -> None:
@@ -194,26 +172,9 @@ def _publish_run_event(run_id: str, status: str, completed_at: str | None) -> No
         )
 
 
-# Manage subprocess auto-recovery settings
-MAX_MANAGE_RETRIES = config.MAX_MANAGE_RETRIES  # re-exported for tests
-MANAGE_RETRY_BACKOFF_SECONDS = 30
-
 # The single budget for operator-facing run error strings, shared with the
 # git/hook excerpts in dispatch.py so the two truncation layers cannot drift.
 ERROR_TEXT_MAX_CHARS: int = dispatch.ERROR_TEXT_MAX_CHARS
-
-# Frozenset of rollout statuses that indicate a clean/terminal manage exit
-_CLEAN_EXIT_STATUSES: frozenset[str] = frozenset({"completed", "halted", "cancelled"})
-
-# `_maybe_relaunch_manage` decisions logged at WARNING (crash-loop / cap / backstop
-# signals an operator should notice) rather than INFO (routine).
-_ABNORMAL_DECISIONS: frozenset[str] = frozenset(
-    {
-        "counted-free-cap-exhausted",
-        "counted-backstop-exceeded",
-        "counted-run-timed-out",
-    }
-)
 
 
 def _in_flight_build_runs(rollout: dict[str, Any]) -> list[Any]:
@@ -223,34 +184,6 @@ def _in_flight_build_runs(rollout: dict[str, Any]) -> list[Any]:
     pre-filters this field to non-terminal runs only — no dispatch-side filtering needed.
     """
     return rollout.get("inFlightBuildRuns") or []
-
-
-async def _fresh_in_flight_build_runs(
-    rollout_id: str, fallback: list[dict[str, Any]] | None
-) -> list[Any]:
-    """Re-read the rollout and return its in-flight build runs RIGHT NOW.
-
-    The cap-exceeded halt decision must never be made from a copy of the
-    rollout fetched before the relaunch call: minutes of backoff, HTTP and
-    subprocess teardown can pass in between, and a build that was in flight
-    then may be terminal now (or vice versa). Halting on a stale read is
-    exactly how running builds get stranded.
-
-    On a fetch failure we fall back to ``fallback`` (the caller's in-hand
-    copy, or None on the watchdog path). That biases towards DEFERRING the
-    halt when we last saw a build running — the watchdog resolves a deferred
-    halt later, whereas a wrongly-issued halt strands the build permanently.
-    """
-    try:
-        rollout = await gtd_client.get_rollout(rollout_id)
-    except Exception:
-        logger.exception(
-            "Failed to re-read rollout %s for the in-flight check — falling back "
-            "to the in-hand copy",
-            rollout_id,
-        )
-        return list(fallback or [])
-    return _in_flight_build_runs(rollout)
 
 
 security = HTTPBearer()
@@ -267,7 +200,7 @@ def _verify_api_key(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Initialize config and DB on startup, cancel tasks on shutdown."""
-    global _watchdog_task, _retention_task
+    global _retention_task
     global _readoption_task
     config.load()
     # Before config.load() there is no LOG_LEVEL to honour, and after this line
@@ -283,16 +216,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             logger.warning("Reconciled orphaned run: %s", run_id)
     else:
         logger.info("No orphaned runs found on startup")
-    _watchdog_task = asyncio.create_task(_manage_watchdog())
     _retention_task = asyncio.create_task(_retention_loop())
     # Re-adoption sweep: the wave loop lives inside THIS service, so a routine
     # deploy restart would otherwise silently stop every running rollout from
     # advancing. Backgrounded so startup never blocks on the GTD API.
     _readoption_task = asyncio.create_task(_readopt_running_rollouts())
     yield
-    # Cancel watchdog, retention and active dispatch tasks on shutdown
-    if _watchdog_task is not None:
-        _watchdog_task.cancel()
+    # Cancel retention, re-adoption and active dispatch tasks on shutdown
     if _retention_task is not None:
         _retention_task.cancel()
     if _readoption_task is not None:
@@ -363,7 +293,7 @@ def configure_logging(level: str | None = None) -> None:
     else: every `logger.info(...)` in this package was dropped on the floor, and
     warnings reached stderr only via logging's lastResort fallback, unformatted
     and without the logger name.  Gate-install decisions, post-run gate results,
-    the manage-recovery ladder and the unasserted-run WARNING were all invisible
+    the rollout loop's decisions and the unasserted-run WARNING were all invisible
     in production — the exact signals needed to debug a misbehaving dispatch.
 
     Configures the package logger rather than the root logger so that uvicorn's
@@ -405,641 +335,10 @@ def start() -> None:  # pragma: no cover
 # --- Background dispatch worker ---
 
 
-async def _comment_on_in_flight_items(
-    rollout_id: str,
-    in_flight: list[dict[str, Any]] | None,
-    render: Callable[[dict[str, Any]], str],
-    *,
-    log_label: str,
-) -> None:
-    """Post one comment per in-flight build run, on that run's own item.
-
-    Fans out across every entry rather than ``in_flight[0]``: in a multi-item
-    wave, commenting only on the first item leaves the other items' reviewers
-    with no record that their build was left running without a manager.
-    A failure to comment on one item must not suppress the others.
-    """
-    for entry in in_flight or []:
-        item_id = entry.get("itemId")
-        if not item_id:
-            continue
-        try:
-            await gtd_client.post_comment(
-                str(item_id), render(entry), created_by="agent-gtd-dispatch"
-            )
-        except Exception:
-            logger.exception(
-                "Failed to post %s comment for rollout %s item %s",
-                log_label,
-                rollout_id,
-                item_id,
-            )
-
-
-async def _do_manage_recovery(
-    rollout_id: str,
-    run: Run | None,
-    max_turns: int,
-    engine: Engine,
-    timeout_seconds: int,
-    attribution: str | None,
-    *,
-    halt_reason: str,
-    count_toward_cap: bool = True,
-    known_retry_count: int = 0,
-    resume_context: list[dict[str, Any]] | None = None,
-) -> None:
-    """Shared manage-recovery: kill stale subprocess (if any), increment retry, relaunch or halt.
-
-    When the incremented retry count exceeds ``MAX_MANAGE_RETRIES`` the halt is
-    DEFERRED (not cancelled) if a freshly-read child build run is still in
-    flight — halting there would strand a running build with no manager to
-    review or merge it. The deferred halt is resolved by
-    ``_watchdog_evaluate_rollout`` once those builds reach terminal. Deferring
-    never launches a replacement manager: the cap really is exhausted.
-
-    Called from both _maybe_relaunch_manage (exit-path, run already finished) and
-    _manage_watchdog (stale-detection path, run still alive). When the existing run
-    is still in _active_processes the task is cancelled and its subprocess terminated
-    before spawning the replacement.
-
-    Args:
-        rollout_id: The rollout to recover.
-        run: The Run object for the stale/exited manage worker, or None if unknown.
-        max_turns: Forwarded to the new _dispatch_worker.
-        engine: Forwarded to the new _dispatch_worker.
-        timeout_seconds: Forwarded to the new _dispatch_worker.
-        attribution: Forwarded to the new _dispatch_worker.
-        halt_reason: Reason string for halt_rollout when cap is exceeded.
-        count_toward_cap: When False, this is a "free" relaunch granted while a
-            healthy child build is still in flight — it does not call
-            relaunch_manage_rollout, does not evaluate the retry cap, and never
-            halts. When True (default), behaves exactly as before this feature.
-        known_retry_count: retry_count to report/forward when count_toward_cap
-            is False (relaunch_manage_rollout is not called on that path, so
-            the caller must supply the rollout's current manage_retry_count).
-        resume_context: The rollout's in-flight build runs
-            (``{runId, itemId, status}``) as known at decision time. Threaded
-            into the replacement manager's prompt so it does not have to
-            rediscover the wave, and used to make a cap-exceeded halt legible
-            by commenting on every stranded item. None on the watchdog path.
-    """
-    source = "watchdog" if halt_reason == "manage_watchdog_stale" else "exit-path"
-    run_id = run.id if run is not None else "none"
-
-    # Kill stale task/subprocess if still active (watchdog path)
-    run_killed = False
-    if run is not None:
-        existing_task = _active_processes.pop(run.id, None)
-        if existing_task is not None:
-            existing_task.cancel()
-            run_killed = True
-        existing_proc = _active_subprocesses.pop(run.id, None)
-        if existing_proc is not None:
-            with contextlib.suppress(ProcessLookupError):
-                existing_proc.terminate()
-            run_killed = True
-
-    logger.info(
-        "manage-recovery: entry rollout_id=%s run_id=%s source=%s run_killed=%s "
-        "count_toward_cap=%s",
-        rollout_id,
-        run_id,
-        source,
-        run_killed,
-        count_toward_cap,
-    )
-
-    if count_toward_cap:
-        # Clear the free-relaunch tally at this shared choke point so a
-        # watchdog-triggered counted recovery also resets it, without editing
-        # _watchdog_evaluate_rollout.
-        _manage_free_relaunches.pop(rollout_id, None)
-        _manage_last_terminal_count.pop(rollout_id, None)
-        _manage_seen_in_flight_item_ids.pop(rollout_id, None)
-
-        # manage-recovery deliberately uses the static service key: it can fire
-        # from the watchdog (no owning user/run) or from the post-exit relaunch
-        # path, and we want recovery to succeed even when the original Run's
-        # callback_token has expired. Do NOT thread a per-run token here.
-        try:
-            updated = await gtd_client.relaunch_manage_rollout(rollout_id)
-        except Exception:
-            logger.exception(
-                "Failed to increment manage_retry_count for rollout %s — skipping recovery",
-                rollout_id,
-            )
-            return
-
-        retry_count = int(updated["manage_retry_count"])
-        logger.info(
-            "manage-recovery: retry_count rollout_id=%s run_id=%s retry_count=%d cap=%d",
-            rollout_id,
-            run_id,
-            retry_count,
-            MAX_MANAGE_RETRIES,
-        )
-
-        if retry_count > MAX_MANAGE_RETRIES:
-            # Never halt on top of a running build. Stranding an in-flight
-            # build is the worst outcome this system can produce: the build
-            # finishes, pushes its branch, and then sits there with no manager
-            # to review, gate or merge it. The cap decision is DEFERRED (not
-            # cancelled) until those builds reach terminal — at which point
-            # _watchdog_evaluate_rollout issues the same halt.
-            #
-            # Deferring is not a retry: no replacement manager is launched
-            # here either. The run simply ends, leaving the rollout `running`
-            # with its builds finishing under no manager.
-            live_in_flight = await _fresh_in_flight_build_runs(
-                rollout_id, resume_context
-            )
-            if live_in_flight:
-                live_run_ids = (
-                    ",".join(str(r.get("runId")) for r in live_in_flight) or "none"
-                )
-                logger.warning(
-                    "manage-recovery: cap-exceeded halt DEFERRED rollout_id=%s "
-                    "retry_count=%d cap=%d in_flight_builds=%d "
-                    "in_flight_build_run_ids=%s decision=deferred-halt-build-in-flight",
-                    rollout_id,
-                    retry_count,
-                    MAX_MANAGE_RETRIES,
-                    len(live_in_flight),
-                    live_run_ids,
-                )
-                await _comment_on_in_flight_items(
-                    rollout_id,
-                    live_in_flight,
-                    lambda r: (
-                        "⏸️ Rollout manager relaunch cap exhausted "
-                        f"(manage_retry_count={retry_count} > cap "
-                        f"{MAX_MANAGE_RETRIES}) — the halt has been DEFERRED "
-                        f"because build run `{r.get('runId')}` for item "
-                        f"`{r.get('itemId')}` is still executing (status "
-                        f"`{r.get('status')}`). The rollout has been left "
-                        "`running` so the build can finish rather than being "
-                        "stranded mid-flight, and NO replacement manager will "
-                        "be started. Once every build in this wave reaches a "
-                        "terminal state the watchdog halts the rollout with "
-                        "`manage_relaunch_cap_exceeded`. A human must review "
-                        "and merge the result."
-                    ),
-                    log_label="cap-exceeded halt deferred",
-                )
-                return
-
-            logger.warning(
-                "Manage retry cap exceeded for rollout %s (count=%d) — halting",
-                rollout_id,
-                retry_count,
-            )
-            try:
-                await gtd_client.halt_rollout(rollout_id, reason=halt_reason)
-            except Exception:
-                logger.exception(
-                    "Failed to halt rollout %s after cap exceeded", rollout_id
-                )
-            # Make the consequence legible: any build that was in flight when
-            # the ladder decided (and has since gone terminal — the fresh read
-            # above proves nothing is still running) is now orphaned, with no
-            # manager to review or merge it. Comment on EVERY such item, not
-            # just the first.
-            await _comment_on_in_flight_items(
-                rollout_id,
-                resume_context,
-                lambda r: (
-                    f"\U0001f6d1 Rollout halted — `{halt_reason}` "
-                    f"(manage_retry_count={retry_count} > cap {MAX_MANAGE_RETRIES}). "
-                    f"Build run `{r.get('runId')}` for item `{r.get('itemId')}` was "
-                    "in flight when the manager relaunch cap was exhausted and has "
-                    "since reached a terminal state with NO rollout manager attached "
-                    "to it. Nobody reviewed, gated or merged its branch — this item "
-                    "needs manual review and merge by a lead."
-                ),
-                log_label="cap-exceeded halt",
-            )
-            return
-
-        logger.info(
-            "Relaunching manage agent for rollout %s (retry %d/%d) after %ds",
-            rollout_id,
-            retry_count,
-            MAX_MANAGE_RETRIES,
-            MANAGE_RETRY_BACKOFF_SECONDS,
-        )
-    else:
-        retry_count = known_retry_count
-        logger.info(
-            "manage-recovery: free-relaunch rollout_id=%s run_id=%s retry_count=%d "
-            "cap=%d counted=false",
-            rollout_id,
-            run_id,
-            retry_count,
-            MAX_MANAGE_RETRIES,
-        )
-
-    await asyncio.sleep(MANAGE_RETRY_BACKOFF_SECONDS)
-
-    new_run = Run(
-        item_id=run.item_id if run else None,
-        project_name=run.project_name if run else "",
-        mode=DispatchMode.MANAGE,
-        rollout_id=rollout_id,
-        engine=run.engine if run else engine.name,
-        agent_name=run.agent_name if run else None,
-        callback_token=run.callback_token if run else None,
-    )
-    await db.insert_run(new_run)
-    logger.info(
-        "manage-recovery: relaunched rollout_id=%s prior_run_id=%s new_run_id=%s "
-        "counted=%s retry_count=%d",
-        rollout_id,
-        run_id,
-        new_run.id,
-        count_toward_cap,
-        retry_count,
-    )
-    # The ladder's "relaunch" is now a loop RESUMPTION: the replacement drives
-    # the same worker-owned wave loop, which reads its frontier from
-    # `advance_rollout` plus the in-flight query and therefore needs no
-    # resume_context of its own. The ladder, its tallies and its caps are
-    # untouched — this is only what they relaunch INTO.
-    _start_rollout_loop(new_run, attribution=attribution)
-
-
-async def _maybe_relaunch_manage(
-    run: Run,
-    max_turns: int,
-    engine: Engine,
-    timeout_seconds: int,
-    attribution: str | None,
-    *,
-    manager_uptime_seconds: float,
-    run_timed_out: bool,
-) -> None:
-    """Check rollout status on manage exit and relaunch or halt as appropriate.
-
-    Called from _dispatch_worker's finally block (skipped when human-cancelled).
-    - If rollout is in a clean terminal state: do nothing.
-    - Otherwise, walk the ordered decision ladder below (first match wins) to
-      decide whether this exit is a "free" relaunch (a manager that exited
-      while a healthy child build is still in flight — does not consume
-      MAX_MANAGE_RETRIES budget) or must count toward the cap as before.
-
-    Args:
-        run: The Run for the manage worker that just exited.
-        max_turns: Forwarded to the (possible) new _dispatch_worker.
-        engine: Forwarded to the (possible) new _dispatch_worker.
-        timeout_seconds: Forwarded to the (possible) new _dispatch_worker.
-        attribution: Forwarded to the (possible) new _dispatch_worker.
-        manager_uptime_seconds: Wall-clock seconds between the agent subprocess
-            launch and this exit (0.0 if the agent never launched).
-        run_timed_out: True if this run ended via subprocess.TimeoutExpired.
-    """
-    assert run.rollout_id is not None  # noqa: S101 — caller guarantees this
-    rollout_id = run.rollout_id
-    # manage-recovery probe: deliberately on the static key (callback_token may
-    # have expired by the time we relaunch). See _do_manage_recovery comment.
-    try:
-        rollout = await gtd_client.get_rollout(rollout_id)
-    except Exception:
-        logger.exception(
-            "Failed to fetch rollout %s for relaunch check — skipping recovery",
-            rollout_id,
-        )
-        return
-
-    if rollout["status"] in _CLEAN_EXIT_STATUSES:
-        logger.info(
-            "manage-recovery: clean-exit rollout_id=%s run_id=%s rollout_status=%s",
-            rollout_id,
-            run.id,
-            rollout["status"],
-        )
-        _manage_free_relaunches.pop(rollout_id, None)
-        _manage_last_terminal_count.pop(rollout_id, None)
-        _manage_seen_in_flight_item_ids.pop(rollout_id, None)
-        return  # clean exit — nothing to do
-
-    in_flight = _in_flight_build_runs(rollout)
-    in_flight_ids = frozenset(str(r.get("itemId")) for r in in_flight)
-
-    # Progress reset: an item that was in flight and has since left the
-    # in-flight set has reached a terminal build outcome (completed/failed/
-    # cancelled) — real forward progress, unlike a manager heartbeat which
-    # only proves *a* manager is alive. Reset the free-relaunch tally whenever
-    # this rollout's terminal-item count increases, so a long multi-item wave
-    # is bounded per stuck item (max MAX_MANAGE_FREE_RELAUNCHES hand-offs
-    # waiting on any single item) rather than per wave.
-    previously_in_flight = _manage_seen_in_flight_item_ids.get(rollout_id, frozenset())
-    newly_terminal = previously_in_flight - in_flight_ids
-    last_terminal_count = _manage_last_terminal_count.get(rollout_id, 0)
-    current_terminal_count = last_terminal_count + len(newly_terminal)
-    if current_terminal_count > last_terminal_count:
-        _manage_free_relaunches[rollout_id] = 0
-    _manage_last_terminal_count[rollout_id] = current_terminal_count
-    _manage_seen_in_flight_item_ids[rollout_id] = in_flight_ids
-
-    manager_phase = rollout.get("manager_phase")
-    manager_current_step = rollout.get("manager_current_step")
-    updated_at_str: str | None = rollout.get("manager_state_updated_at")
-    manager_state_age_seconds: str | int = "unknown"
-    age_seconds: float | None = None
-    if updated_at_str:
-        try:
-            updated_at = datetime.fromisoformat(updated_at_str)
-        except ValueError:
-            age_seconds = None
-        else:
-            age_seconds = (datetime.now(UTC) - updated_at).total_seconds()
-    if age_seconds is not None:
-        manager_state_age_seconds = int(age_seconds)
-
-    free_relaunches = _manage_free_relaunches.get(rollout_id, 0)
-
-    decision: str
-    if run_timed_out:
-        decision = "counted-run-timed-out"
-    elif manager_phase != "polling":
-        decision = "counted-not-polling"
-    elif not in_flight:
-        decision = "counted-no-build-in-flight"
-    elif manager_uptime_seconds < config.MANAGE_FREE_RELAUNCH_MIN_UPTIME_SECONDS:
-        decision = "counted-short-uptime"
-    elif age_seconds is None:
-        decision = "counted-unknown-manager-state-age"
-    elif age_seconds > config.MANAGE_TIMEOUT_SECONDS:
-        decision = "counted-backstop-exceeded"
-    elif free_relaunches >= config.MAX_MANAGE_FREE_RELAUNCHES:
-        decision = "counted-free-cap-exhausted"
-    else:
-        decision = "free-relaunch-build-in-flight"
-
-    in_flight_build_run_ids = ",".join(str(r.get("runId")) for r in in_flight) or "none"
-    log_fmt = (
-        "manage-recovery: exit-path rollout_id=%s run_id=%s rollout_status=%s "
-        "manager_phase=%s manager_current_step=%s in_flight_builds=%d "
-        "in_flight_build_run_ids=%s uptime_seconds=%.0f manager_state_age_seconds=%s "
-        "free_relaunches=%d decision=%s"
-    )
-    log_args = (
-        rollout_id,
-        run.id,
-        rollout["status"],
-        manager_phase,
-        manager_current_step,
-        len(in_flight),
-        in_flight_build_run_ids,
-        manager_uptime_seconds,
-        manager_state_age_seconds,
-        free_relaunches,
-        decision,
-    )
-    if decision in _ABNORMAL_DECISIONS:
-        logger.warning(log_fmt, *log_args)
-    else:
-        logger.info(log_fmt, *log_args)
-
-    if decision == "free-relaunch-build-in-flight":
-        new_free_relaunches = free_relaunches + 1
-        _manage_free_relaunches[rollout_id] = new_free_relaunches
-        # Mark acted-on so a watchdog tick within MANAGE_STALE_THRESHOLD_SECONDS
-        # takes its existing skipped-idempotency branch instead of killing the
-        # warming-up replacement manager and burning a counted retry — the same
-        # mark-before-await pattern the watchdog itself uses.
-        _watchdog_acted[rollout_id] = time.monotonic()
-
-        _current_retry_count = int(rollout.get("manage_retry_count", 0))
-        await _comment_on_in_flight_items(
-            rollout_id,
-            in_flight,
-            lambda r: (
-                "manage-recovery: free relaunch — the rollout manager exited while "
-                f"build run `{r.get('runId')}` is still in flight. "
-                f"`manage_retry_count` is unchanged at {_current_retry_count}; "
-                f"free relaunch {new_free_relaunches}/"
-                f"{config.MAX_MANAGE_FREE_RELAUNCHES}; "
-                f"manager uptime {manager_uptime_seconds:.0f}s."
-            ),
-            log_label="free-relaunch",
-        )
-
-        await _do_manage_recovery(
-            rollout_id,
-            run,
-            max_turns,
-            engine,
-            timeout_seconds,
-            attribution,
-            halt_reason="manage_relaunch_cap_exceeded",
-            count_toward_cap=False,
-            known_retry_count=_current_retry_count,
-            resume_context=in_flight,
-        )
-        return
-
-    await _do_manage_recovery(
-        rollout_id,
-        run,
-        max_turns,
-        engine,
-        timeout_seconds,
-        attribution,
-        halt_reason="manage_relaunch_cap_exceeded",
-        resume_context=in_flight,
-    )
-
-
-async def _watchdog_evaluate_rollout(
-    rollout: dict[str, Any], rollout_id: str, now: datetime
-) -> None:
-    """Evaluate one rollout for staleness and run recovery if needed.
-
-    Skips rollouts in clean terminal states or with a fresh timestamp.
-    Idempotency: rollouts acted on within the current staleness window are skipped.
-    """
-    status: str = rollout.get("status", "")
-    manager_phase: str = rollout.get("manager_phase", "unknown")
-    if status in _CLEAN_EXIT_STATUSES:
-        logger.info(
-            "watchdog: rollout_id=%s manager_phase=%s status=%s decision=skipped-terminal",
-            rollout_id,
-            manager_phase,
-            status,
-        )
-        return
-
-    updated_at_str: str | None = rollout.get("manager_state_updated_at")
-    if not updated_at_str:
-        return
-
-    try:
-        updated_at = datetime.fromisoformat(updated_at_str)
-    except ValueError:
-        return
-
-    age_seconds = (now - updated_at).total_seconds()
-    if age_seconds <= config.MANAGE_STALE_THRESHOLD_SECONDS:
-        logger.info(
-            "watchdog: rollout_id=%s manager_phase=%s age_seconds=%.0f threshold=%d decision=fresh",
-            rollout_id,
-            manager_phase,
-            age_seconds,
-            config.MANAGE_STALE_THRESHOLD_SECONDS,
-        )
-        return  # fresh enough
-
-    # Polling + in-flight build short-circuit: a manager in the 'polling' phase
-    # with at least one non-terminal child build run is presumed to be healthily
-    # waiting on that build. The build's real status (which we own) — not the
-    # manager's heartbeat (which we don't) — is the signal, so a stale
-    # manager_state_updated_at does NOT mean stuck. Skip recovery regardless of
-    # timestamp age, bounded only by MANAGE_TIMEOUT_SECONDS as the absolute
-    # backstop (anchored on manager_state age) so a genuinely-wedged build can't
-    # defer recovery forever. Non-polling phases fall straight through to the
-    # existing timestamp-staleness recovery path below.
-    if manager_phase == "polling":
-        in_flight = _in_flight_build_runs(rollout)
-        if in_flight:
-            if age_seconds <= config.MANAGE_TIMEOUT_SECONDS:
-                logger.info(
-                    "watchdog: rollout_id=%s manager_phase=polling age_seconds=%.0f "
-                    "in_flight_builds=%d decision=skipped-build-in-flight",
-                    rollout_id,
-                    age_seconds,
-                    len(in_flight),
-                )
-                return  # healthily waiting on a still-running build
-            logger.warning(
-                "watchdog: rollout_id=%s manager_phase=polling age_seconds=%.0f "
-                "in_flight_builds=%d exceeds MANAGE_TIMEOUT_SECONDS=%d "
-                "decision=backstop-recovery",
-                rollout_id,
-                age_seconds,
-                len(in_flight),
-                config.MANAGE_TIMEOUT_SECONDS,
-            )
-            # Absolute backstop exceeded — fall through to recovery below.
-
-    # Idempotency guard: skip if we already acted within the staleness window
-    last_acted = _watchdog_acted.get(rollout_id, 0.0)
-    if time.monotonic() - last_acted < config.MANAGE_STALE_THRESHOLD_SECONDS:
-        logger.info(
-            "watchdog: rollout_id=%s manager_phase=%s age_seconds=%.0f decision=skipped-idempotency",
-            rollout_id,
-            manager_phase,
-            age_seconds,
-        )
-        return
-
-    # Resolve a DEFERRED cap-exceeded halt (see _do_manage_recovery). A rollout
-    # whose manage_retry_count is already past the cap has exhausted its manager
-    # budget and will never get another manager; the exit path deliberately left
-    # it `running` rather than stranding a build that was still executing. Halt
-    # it here, but only once every child build has reached terminal.
-    #
-    # Deliberately placed AFTER the polling/in-flight short-circuit above (so
-    # `decision=skipped-build-in-flight` still wins for a polling manager with a
-    # live build) and after the idempotency guard (so a concurrent tick cannot
-    # double-act). Rollouts already in a terminal status returned at the top of
-    # this function, so a halted rollout is never halted twice.
-    if int(rollout.get("manage_retry_count") or 0) > MAX_MANAGE_RETRIES:
-        cap_in_flight = _in_flight_build_runs(rollout)
-        if cap_in_flight:
-            logger.info(
-                "watchdog: rollout_id=%s manager_phase=%s age_seconds=%.0f "
-                "in_flight_builds=%d decision=deferred-halt-build-in-flight",
-                rollout_id,
-                manager_phase,
-                age_seconds,
-                len(cap_in_flight),
-            )
-            return  # still waiting for the stranded-build window to close
-        logger.warning(
-            "watchdog: rollout_id=%s manager_phase=%s age_seconds=%.0f "
-            "retry_count=%s cap=%d decision=deferred-halt-resolved",
-            rollout_id,
-            manager_phase,
-            age_seconds,
-            rollout.get("manage_retry_count"),
-            MAX_MANAGE_RETRIES,
-        )
-        # Mark acted-on BEFORE awaiting the halt, same as the recovery path.
-        _watchdog_acted[rollout_id] = time.monotonic()
-        try:
-            await gtd_client.halt_rollout(
-                rollout_id, reason="manage_relaunch_cap_exceeded"
-            )
-        except Exception:
-            logger.exception(
-                "Failed to halt rollout %s when resolving the deferred "
-                "cap-exceeded halt",
-                rollout_id,
-            )
-        return
-
-    logger.warning(
-        "Watchdog: rollout %s stale (age=%.0fs) — triggering recovery",
-        rollout_id,
-        age_seconds,
-    )
-    logger.info(
-        "watchdog: rollout_id=%s manager_phase=%s age_seconds=%.0f threshold=%d decision=triggering-recovery",
-        rollout_id,
-        manager_phase,
-        age_seconds,
-        config.MANAGE_STALE_THRESHOLD_SECONDS,
-    )
-
-    # Mark acted-on BEFORE awaiting recovery (prevents a concurrent tick from double-acting)
-    _watchdog_acted[rollout_id] = time.monotonic()
-
-    existing_run = _rollout_to_run.get(rollout_id)
-    await _do_manage_recovery(
-        rollout_id,
-        existing_run,
-        config.MAX_TURNS,
-        get_engine("claude-code"),
-        config.MANAGE_TIMEOUT_SECONDS,
-        None,  # attribution unknown from watchdog context
-        halt_reason="manage_watchdog_stale",
-    )
-
-
-async def _watchdog_tick() -> None:
-    """One pass of the watchdog: scan running rollouts and recover stale ones.
-
-    Exposed at module level for direct invocation in tests.
-    """
-    # Watchdog deliberately uses the static service key: it has no owning user
-    # or run, and must function for all rollouts regardless of who dispatched them.
-    try:
-        rollouts = await gtd_client.list_running_rollouts()
-    except Exception:
-        logger.exception("Watchdog failed to fetch running rollouts — skipping tick")
-        return
-
-    count = len(rollouts)
-    logger.info("watchdog: tick start rollout_count=%d", count)
-    now = datetime.now(UTC)
-    for rollout in rollouts:
-        rollout_id: str | None = rollout.get("id")
-        if not rollout_id:
-            continue
-        try:
-            await _watchdog_evaluate_rollout(rollout, rollout_id, now)
-        except Exception:
-            logger.exception(
-                "Watchdog failed to evaluate rollout %s — continuing", rollout_id
-            )
-    logger.info("watchdog: tick done rollout_count=%d", count)
-
-
 async def _retention_loop() -> None:
     """Background coroutine: age-prune workspaces and retained run evidence.
 
-    One bad tick must never kill the loop — same shape as ``_manage_watchdog``.
+    One bad tick must never kill the loop.
     """
     while True:
         await asyncio.sleep(config.RETENTION_INTERVAL_SECONDS)
@@ -1049,16 +348,6 @@ async def _retention_loop() -> None:
             )
         except Exception:
             logger.exception("Retention sweep failed — continuing")
-
-
-async def _manage_watchdog() -> None:
-    """Background coroutine: periodically scan for stale manage-agent rollouts."""
-    while True:
-        await asyncio.sleep(config.WATCHDOG_INTERVAL_SECONDS)
-        try:
-            await _watchdog_tick()
-        except Exception:
-            logger.exception("Watchdog scan iteration failed — continuing")
 
 
 def _try_start_pending() -> None:
@@ -2392,15 +1681,26 @@ async def _complete_rollout_item_skipped(
 # ``already_satisfied`` skip-and-advance) had already been ported to worker code
 # precisely to stop relying on the LLM for it.  This generalises that precedent.
 #
-# The relaunch ladder, ``_do_manage_recovery``, the watchdog and the in-memory
-# tallies above are deliberately left in place: they are torn down by a
-# follow-up item once this loop is proven.
+# The resident manager's keep-alive machinery (the exit-path relaunch ladder,
+# ``_do_manage_recovery``, the staleness watchdog, its in-memory tallies and
+# retry caps) was retired once this loop was proven (item 7baf77d0): the loop
+# owns liveness, the reviewer is bounded by its own timeout, and a startup
+# re-adoption sweep resumes this host's own loops after a restart.  Two
+# invariants that machinery encoded still hold here, by construction:
+#
+# * NEVER HALT WHILE A CHILD BUILD IS IN FLIGHT FOR LACK OF A DRIVER.  The
+#   loop's only liveness halt ("rollout stalled") fires only when nothing is in
+#   flight; with builds in flight a tick returns ``_TICK_WAIT`` and the loop
+#   keeps polling.  A crashed loop fails its own run and does not halt.
+# * NEVER WAIT ON A RUN BY BACKGROUNDING IT.  The loop awaits each poll
+#   interval and each reviewer in the foreground of its own task; every agent
+#   prompt carries the shared turn-discipline block.
 
 # Re-exported for tests (and so the cap has one name, not a literal).
 MAX_ITEM_REDISPATCHES: int = config.MAX_ITEM_REDISPATCHES
 
 # rollout_id -> item_id -> number of `re-dispatch` verdicts already honoured.
-# In-memory like the manage tallies above: a dispatch-service restart resets
+# In-memory: a dispatch-service restart resets
 # the count, which errs toward giving an item one more chance rather than
 # halting a rollout that a restart happened to interrupt.
 _rollout_redispatches: dict[str, dict[str, int]] = {}
@@ -2421,8 +1721,9 @@ _TICK_HALTED = "halted"  # the loop halted the rollout (or it was halted)
 MAX_LAND_PUSH_ATTEMPTS: int = 3
 # Reviewer FIX MODE relaunches allowed per land after a red land gate.
 MAX_LAND_FIX_RELAUNCHES: int = 1
-# Watchdog heartbeat cadence while a land waits on locks or a gate.  Must stay
-# below config.MANAGE_STALE_THRESHOLD_SECONDS.
+# Heartbeat cadence (``manager_state_updated_at``) while a land waits on
+# locks or a gate.  Nothing in the service reads the heartbeat for liveness
+# any more; it keeps the rollout monitor's "last update" honest.
 LAND_HEARTBEAT_SECONDS: int = 300
 
 # (normalized origin URL, default branch) -> lock.  Serializes lands to one
@@ -2646,17 +1947,11 @@ async def _launch_reviewer(
     the land step: the worker's land gate failed on the rebased squash commit,
     and the reviewer may amend that commit (see ``dispatch.build_review_prompt``).
 
-    The reviewer run carries ``mode=DispatchMode.REVIEW``.  That is the chosen
-    mechanism for keeping a reviewer's exit away from the manage relaunch
-    ladder: the ladder fires on ``run.mode == MANAGE and run.rollout_id`` and
-    exists to resurrect a RESIDENT manager, whereas a reviewer exiting is normal
-    completion.  A distinct mode makes a reviewer structurally ineligible
-    without disabling the ladder for anything else — the resident-manager path
-    still exists until the follow-up item removes it — and it simultaneously
+    The reviewer run carries ``mode=DispatchMode.REVIEW``.  A distinct mode
     buys the env withholding (``_MANAGE_EXECUTOR_ENV_KEYS`` is granted only for
-    MANAGE) and the reviewer's own turn budget.  An explicit marker on a
-    manage-mode run would have bought none of those and would have left the
-    ladder one ``if`` away from firing on a reviewer.
+    MANAGE) and the reviewer's own turn budget.  (It was originally chosen to
+    keep a reviewer's exit away from the manage relaunch ladder; that ladder
+    has since been retired.)
 
     Returns a :class:`ReviewVerdict`.  Every failure path — launch error,
     non-zero exit, missing or malformed verdict artifact — returns
@@ -4890,7 +4185,7 @@ async def _rollout_loop_worker(run: Run, *, attribution: str | None = None) -> N
     started = datetime.now(UTC).isoformat()
     await db.update_run(run.id, status=RunStatus.running, started_at=started)
     _publish_run_event(run.id, "running", None)
-    _rollout_to_run[run.rollout_id] = run
+    _rollout_loops[run.rollout_id] = run
     try:
         directive = await _drive_rollout(run, attribution=attribution)
         finished = datetime.now(UTC).isoformat()
@@ -4923,7 +4218,7 @@ async def _rollout_loop_worker(run: Run, *, attribution: str | None = None) -> N
         _active_processes.pop(run.id, None)
         _try_start_pending()
         _run_event_queues.pop(run.id, None)
-        _rollout_to_run.pop(run.rollout_id, None)
+        _rollout_loops.pop(run.rollout_id, None)
         logger.info(
             "rollout-loop: exit rollout_id=%s run_id=%s", run.rollout_id, run.id
         )
@@ -4941,7 +4236,7 @@ async def _readopt_running_rollouts() -> None:
     REQUIRED, not a follow-up.  The wave loop now lives INSIDE the dispatch
     service, whose own ``deploy.sh`` restarts it — so a routine deploy used to
     mean "the monitor lies" and would now mean "the wave silently stops
-    advancing" without this.  Largely a relocation of the watchdog's existing
+    advancing" without this.  Largely a relocation of the retired watchdog's
     scan shape: list running rollouts, and for each one that no live loop owns,
     start one.  The loop itself resumes from the persisted frontier, because
     every tick re-reads ``advance_rollout`` plus the in-flight query rather than
@@ -4956,7 +4251,7 @@ async def _readopt_running_rollouts() -> None:
     THIS HOST'S ROLLOUTS ONLY.  ``list_running_rollouts`` is a FLEET-WIDE query:
     it returns every running rollout the lead can see, on any host.  The only
     thing that ever stopped this loop adopting another host's rollout was
-    ``_rollout_to_run``, which is in-process memory and therefore empty in
+    ``_rollout_loops``, which is in-process memory and therefore empty in
     exactly the situation this sweep runs in — process start.  So any host
     coming up would adopt every running rollout in the fleet, and since a
     manager owns the squash-merge and the ``git push origin main``, two managers
@@ -4996,7 +4291,7 @@ async def _readopt_running_rollouts() -> None:
                 rollout_id,
             )
             continue
-        if not rollout_id or rollout_id in _rollout_to_run:
+        if not rollout_id or rollout_id in _rollout_loops:
             continue
         run = Run(
             project_name=str(rollout.get("project_name") or ""),
@@ -5027,9 +4322,6 @@ async def _dispatch_worker(
     timeout_seconds: int,
     *,
     attribution: str | None = None,
-    manage_retry_count: int = 0,
-    is_recovery: bool = False,
-    resume_context: list[dict[str, Any]] | None = None,
 ) -> None:
     """Background task that executes a dispatch run."""
     _run_start_dt: datetime = datetime.now(UTC)
@@ -5037,15 +4329,12 @@ async def _dispatch_worker(
     await db.update_run(run.id, status=RunStatus.running, started_at=now)
     _publish_run_event(run.id, "running", None)
 
-    # Register manage-mode run so the watchdog can find it
     if run.mode == DispatchMode.MANAGE and run.rollout_id:
-        _rollout_to_run[run.rollout_id] = run
         logger.info(
-            "manage: spawn rollout_id=%s run_id=%s engine=%s retry_count=%d",
+            "manage: spawn rollout_id=%s run_id=%s engine=%s",
             run.rollout_id,
             run.id,
             engine.name,
-            manage_retry_count,
         )
 
     # --- Ollama health check + fallback ---
@@ -5102,8 +4391,6 @@ async def _dispatch_worker(
     should_cleanup = True
     _human_cancelled = False
     _exit_code: int | None = None
-    _run_timed_out = False
-    _agent_start_dt: datetime | None = None
 
     try:
         # Fetch item and project.
@@ -5430,11 +4717,8 @@ async def _dispatch_worker(
             attachments=attachments,
             run_id=run.id,
             rollout_id=run.rollout_id,
-            manage_retry_count=manage_retry_count,
             workspace_repo_dirs=workspace_repo_dirs,
-            is_recovery=is_recovery,
             workspace=workspace,
-            resume_context=resume_context,
             merge_notes=merge_notes,
         )
 
@@ -5523,7 +4807,6 @@ async def _dispatch_worker(
             )
             return
 
-        _agent_start_dt = datetime.now(UTC)
         result = await dispatch.run_agent(
             engine_used,
             workspace,
@@ -6192,7 +5475,6 @@ async def _dispatch_worker(
     except subprocess.TimeoutExpired:
         # manage runs never take the _linger_success branch below — _verify_repos
         # is None for non-build modes.
-        _run_timed_out = True
         _timed_out_at = datetime.now(UTC).isoformat()
         _linger_success = False
         if _verify_repos is not None:
@@ -6270,7 +5552,6 @@ async def _dispatch_worker(
         _active_subprocesses.pop(run.id, None)
         _run_event_queues.pop(run.id, None)
         if run.mode == DispatchMode.MANAGE and run.rollout_id:
-            _rollout_to_run.pop(run.rollout_id, None)
             logger.info(
                 "manage: exit rollout_id=%s run_id=%s exit_code=%s human_cancelled=%s",
                 run.rollout_id,
@@ -6310,20 +5591,6 @@ async def _dispatch_worker(
 
         if workspace is not None and should_cleanup:
             dispatch.cleanup_workspace(workspace)
-        if run.mode == DispatchMode.MANAGE and run.rollout_id and not _human_cancelled:
-            await _maybe_relaunch_manage(
-                run,
-                max_turns,
-                engine_used,
-                timeout_seconds,
-                attribution,
-                manager_uptime_seconds=(
-                    0.0
-                    if _agent_start_dt is None
-                    else (datetime.now(UTC) - _agent_start_dt).total_seconds()
-                ),
-                run_timed_out=_run_timed_out,
-            )
 
 
 # --- Endpoints ---
@@ -6719,9 +5986,8 @@ async def dispatch_item(
     if run.mode == DispatchMode.MANAGE and run.rollout_id:
         # A manage dispatch no longer spawns a resident manager agent: the
         # WORKER drives the wave loop and launches a short-lived reviewer per
-        # completed build. The resident-manager prompt, the relaunch ladder,
-        # `_do_manage_recovery` and the watchdog all remain in place — a
-        # follow-up item tears them down once this loop is proven.
+        # completed build.  Nothing relaunches a manager any more — the loop
+        # owns liveness and the re-adoption sweep resumes it after a restart.
         _start_rollout_loop(run, attribution=body.attribution)
     else:
         task = asyncio.create_task(

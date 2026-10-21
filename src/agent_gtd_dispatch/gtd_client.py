@@ -171,23 +171,10 @@ async def get_rollout_merge_notes(
 async def get_rollout(rollout_id: str, *, token: str | None = None) -> dict[str, Any]:
     """GET /api/rollouts/{rollout_id}.
 
-    Returns rollout dict including status and manage_retry_count.
+    Returns the rollout dict, including status and inFlightBuildRuns.
     """
     result: dict[str, Any] = await _request(
         "GET", f"/rollouts/{rollout_id}", token=token
-    )
-    return result
-
-
-async def relaunch_manage_rollout(
-    rollout_id: str, *, token: str | None = None
-) -> dict[str, Any]:
-    """POST /api/rollouts/{rollout_id}/relaunch-manage.
-
-    Atomically increments manage_retry_count and returns the updated rollout.
-    """
-    result: dict[str, Any] = await _request(
-        "POST", f"/rollouts/{rollout_id}/relaunch-manage", token=token
     )
     return result
 
@@ -252,6 +239,12 @@ async def list_running_rollouts(*, token: str | None = None) -> list[dict[str, A
 
     Passes status=running as a query param; also filters client-side as a
     safety net in case the endpoint ignores the parameter.
+
+    FLEET-WIDE: it returns every running rollout the caller can see, on any
+    host.  Its one caller is the startup re-adoption sweep, which filters to
+    rollouts this host holds a MANAGE run row for.  (Its former caller, the
+    staleness watchdog, did not filter, and that is what put two loops on one
+    rollout.)
     """
     result: list[dict[str, Any]] = await _request(
         "GET", "/rollouts", token=token, params={"status": "running"}

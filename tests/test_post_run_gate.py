@@ -409,7 +409,6 @@ class TestManagePromptGateException:
             50,
             mode=DispatchMode.MANAGE,
             rollout_id="wr-1",
-            manage_retry_count=0,
             workspace_repo_dirs=workspace_repo_dirs,
         )
 
