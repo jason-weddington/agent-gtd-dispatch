@@ -22,6 +22,7 @@ functions the worker composes:
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING, Any
 
 from . import config
@@ -30,6 +31,8 @@ from .models import RunStatus
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +229,40 @@ def _engine_env_overlay(engine_name: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def build_talos_argv(workspace_dir: Path, task_id: str, attempt: int) -> list[str]:
+# Wall-clock budget derivation. The worker hard-kills talos at the run's
+# resolved ``timeout_seconds`` (project override > app setting > 30 min), which
+# varies per run, so the talos ``--wall-clock-secs`` budget is derived from it
+# rather than hardcoded. The margin between budget and hard kill must cover
+# finishing the current iteration, running the gate if mid-gate, and writing the
+# RunSummary: roughly constant work, hence a flat floor (300s, the slack talos's
+# own 1500s-vs-1800s default was sized with) that scales at 10% for long
+# timeouts (e.g. 180 min -> 18 min) where an iteration/gate can take longer.
+TALOS_WIND_DOWN_MIN_SECS = 300
+TALOS_WIND_DOWN_FRACTION = 0.10
+# Below this budget a graceful wind-down is not useful: omit the flag.
+TALOS_WIND_DOWN_MIN_BUDGET_SECS = 300
+
+
+def derive_wall_clock_secs(timeout_seconds: int) -> int | None:
+    """Return the talos ``--wall-clock-secs`` budget for a hard-kill timeout.
+
+    ``timeout_seconds - max(MIN_SECS, timeout_seconds * FRACTION)`` as an int,
+    or ``None`` when the budget would be under
+    ``TALOS_WIND_DOWN_MIN_BUDGET_SECS`` (flag omitted).
+    """
+    margin = max(TALOS_WIND_DOWN_MIN_SECS, timeout_seconds * TALOS_WIND_DOWN_FRACTION)
+    budget = int(timeout_seconds - margin)
+    if budget < TALOS_WIND_DOWN_MIN_BUDGET_SECS:
+        return None
+    return budget
+
+
+def build_talos_argv(
+    workspace_dir: Path,
+    task_id: str,
+    attempt: int,
+    timeout_seconds: int | None = None,
+) -> list[str]:
     """Return the sudo-wrapped ``talos run …`` argv for the subprocess launch.
 
     - Uses ``config.TALOS_BIN`` (default ``'talos'``, PATH-resolved).
@@ -246,6 +282,10 @@ def build_talos_argv(workspace_dir: Path, task_id: str, attempt: int) -> list[st
     - Passes ``--memory <mode>`` from TALOS_MEMORY when it is not ``off`` (KB
       access additionally needs PERSONAL_KB_URL plus a talos KB key; see
       talos_env_overlay).
+    - Passes ``--wall-clock-secs`` derived from ``timeout_seconds`` (see
+      :func:`derive_wall_clock_secs`) so talos winds down and emits a RunSummary
+      before the worker's hard kill; omitted (with a WARNING) when the timeout
+      is too short, or when ``timeout_seconds`` is None.
     - Sudo-wrapped like every other subprocess so the clone owner (dispatch,
       under the two-user split) runs it.
     """
@@ -261,6 +301,17 @@ def build_talos_argv(workspace_dir: Path, task_id: str, attempt: int) -> list[st
         "--gate-timeout-secs",
         str(config.TALOS_GATE_TIMEOUT_SECS),
     ]
+    if timeout_seconds is not None:
+        wall_clock = derive_wall_clock_secs(timeout_seconds)
+        if wall_clock is None:
+            logger.warning(
+                "talos run %s: timeout %ss is too short for a graceful wind-down; "
+                "omitting --wall-clock-secs",
+                task_id,
+                timeout_seconds,
+            )
+        else:
+            argv += ["--wall-clock-secs", str(wall_clock)]
     if config.TALOS_MEMORY != "off":
         argv += ["--memory", config.TALOS_MEMORY]
     argv.append("--transcript")

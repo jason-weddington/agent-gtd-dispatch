@@ -665,6 +665,44 @@ class TestBuildTalosArgv:
             "--transcript",
         ]
 
+    def test_wall_clock_derived_30_and_180_minutes(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import build_talos_argv
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        for timeout, expected in ((1800, "1500"), (10800, "9720")):
+            argv = build_talos_argv(Path("/w"), "t", attempt=1, timeout_seconds=timeout)
+            i = argv.index("--wall-clock-secs")
+            assert argv[i + 1] == expected
+            assert int(expected) < timeout
+            # the rest of the invocation is unchanged
+            rest = argv[:i] + argv[i + 2 :]
+            assert rest == [
+                "talos",
+                "run",
+                "--workspace",
+                "/w",
+                "--task-id",
+                "t",
+                "--attempt",
+                "1",
+                "--gate-timeout-secs",
+                "900",
+                "--transcript",
+            ]
+
+    def test_wall_clock_omitted_and_warns_when_too_short(
+        self, monkeypatch, caplog
+    ) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import build_talos_argv
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        with caplog.at_level("WARNING"):
+            argv = build_talos_argv(Path("/w"), "t", attempt=1, timeout_seconds=480)
+        assert "--wall-clock-secs" not in argv
+        assert "too short" in caplog.text
+
     def test_argv_sudo_wrapped_when_user_set(self, monkeypatch) -> None:
         from agent_gtd_dispatch import config
         from agent_gtd_dispatch.talos import build_talos_argv

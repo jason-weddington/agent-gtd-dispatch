@@ -540,7 +540,9 @@ async def _run_talos(
         env["AGENT_GTD_AGENT_NAME"] = attribution
     env["HEADLESS_BUILD_ENGINE"] = engine.name
 
-    argv = talos.build_talos_argv(workspace, item_id, attempt=1)
+    argv = talos.build_talos_argv(
+        workspace, item_id, attempt=1, timeout_seconds=timeout_seconds
+    )
 
     stdout_text = ""
     stderr_text = ""
