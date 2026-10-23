@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.10.4 (2026-10-23)
+
+### Bug Fixes
+
+- **rollouts**: The land conflict check fetches the feature branch itself instead of relying on refs
+  the reviewer left
+  ([`380cf7a`](https://github.com/repos/agent-gtd-dispatch/commit/380cf7a6eaa196cba66985d95e020123a3cd40da))
+
+
 ## v2.10.3 (2026-10-21)
 
 ### Bug Fixes
