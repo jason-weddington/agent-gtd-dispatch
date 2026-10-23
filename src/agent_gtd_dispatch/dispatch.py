@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import os
 import re
 import signal
 import subprocess
@@ -14,7 +15,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
@@ -304,6 +305,7 @@ def prepare_workspace(origin: str, run_id: str, branch_name: str) -> Path:
 
     config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
     # Remove any stale workspace from a prior crashed run before cloning fresh.
+    # Pre-clean: teardown owns reaping, so no process scan here.
     cleanup_workspace(workspace)
     subprocess.run(
         _sudo_wrap(["git", "clone", origin, str(workspace)]),
@@ -360,6 +362,8 @@ def prepare_workspace_multi(
 
     # Launch-time check-and-clean: remove any stale workspace root from a prior
     # crashed run before cloning fresh (mirrors prepare_workspace guarantee).
+    # Pre-clean of a stale dir: reaping is left to teardown (the owning run reaps
+    # its own workspace), so no process scan here.
     cleanup_workspace(root)
 
     # Create workspace root via subprocess so the agent user owns it
@@ -1210,6 +1214,185 @@ def rescue_abandoned_work(
         committed=committed,
         branch=attempt.branch,
     )
+
+
+REAP_TERM_GRACE_SECS = 3.0
+_REAP_CMDLINE_MAX_CHARS = 200
+
+# Run as the agent user (python3 is in the sudoers NOPASSWD list, pkill cannot
+# select by pid): print "<pid>\t<cmdline>" for every process whose exe or cwd
+# lies under argv[1]. Self-contained: the agent user cannot import this package.
+_SCAN_SCRIPT = (
+    "import os,sys\n"
+    "from pathlib import Path\n"
+    "w=Path(sys.argv[1])\n"
+    "for d in os.listdir('/proc'):\n"
+    "  if not d.isdigit(): continue\n"
+    "  for l in ('exe','cwd'):\n"
+    "    try: t=Path(os.path.realpath('/proc/'+d+'/'+l))\n"
+    "    except OSError: continue\n"
+    "    if t.is_relative_to(w):\n"
+    "      try: c=open('/proc/'+d+'/cmdline','rb').read().replace(b'\\0',b' ').decode('replace')\n"
+    "      except OSError: c=''\n"
+    "      print(d+'\\t'+c.strip()); break\n"
+)
+_KILL_SCRIPT = "import os,sys; os.kill(int(sys.argv[1]), int(sys.argv[2]))"
+
+
+@dataclass(frozen=True)
+class ReapedProcess:
+    """One process reaped from a run's workspace at teardown."""
+
+    pid: int
+    cmdline: str
+    killed_with: Literal["SIGTERM", "SIGKILL"]
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    text = raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    return text[:_REAP_CMDLINE_MAX_CHARS]
+
+
+def _proc_is_live(pid: int) -> bool:
+    """True when pid exists and is not a zombie."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    # state is the first field after the ``(comm)`` which may itself contain spaces
+    state = stat.rsplit(")", 1)[-1].split()[:1]
+    return bool(state) and state[0] not in ("Z", "X")
+
+
+def _ancestor_pids() -> set[int]:
+    pids = {os.getpid()}
+    pid = os.getppid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat.rsplit(")", 1)[-1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return pids
+
+
+def _scan_workspace_pids(workspace: Path) -> dict[int, str]:
+    """Map pid -> cmdline for processes whose exe or cwd is under workspace.
+
+    Path-component match (``is_relative_to``), never a string prefix. Entries
+    that vanish or are unreadable are skipped.
+    """
+    found: dict[int, str] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        for link in ("exe", "cwd"):
+            try:
+                target = Path(os.path.realpath(f"/proc/{entry}/{link}"))
+            except OSError:
+                continue
+            if target.is_relative_to(workspace):
+                found[int(entry)] = _proc_cmdline(int(entry))
+                break
+    return found
+
+
+def _scan_as_agent_user(workspace: Path) -> dict[int, str]:
+    """Scan /proc as the agent user, whose processes the service user cannot inspect."""
+    try:
+        proc = subprocess.run(
+            _sudo_wrap(["python3", "-c", _SCAN_SCRIPT, str(workspace)]),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    found: dict[int, str] = {}
+    for line in proc.stdout.splitlines():
+        pid_s, _, cmd = line.partition("\t")
+        if pid_s.isdigit():
+            found[int(pid_s)] = cmd[:_REAP_CMDLINE_MAX_CHARS]
+    return found
+
+
+def _signal_pid(pid: int, sig: signal.Signals) -> None:
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        if not config.AGENT_SUBPROCESS_USER:
+            return
+        subprocess.run(
+            _sudo_wrap(["python3", "-c", _KILL_SCRIPT, str(pid), str(int(sig))]),
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+
+def reap_workspace_processes(
+    workspace: Path, *, term_grace_secs: float = REAP_TERM_GRACE_SECS
+) -> list[ReapedProcess]:
+    """Kill processes left running from a run's workspace; never raises.
+
+    Agents that verify by running the product can leave detached daemons (own
+    session, so killing the agent tree misses them). Selects processes whose
+    ``/proc/<pid>/exe`` or ``cwd`` is the workspace or beneath it — by path only,
+    never by name, so other runs' workspaces are untouched (``/ws/repos-a`` does
+    not match ``/ws/repos-ab``). The worker and its ancestors are never signalled,
+    and a workspace outside ``config.WORKSPACE_ROOT`` is ignored (same guard as
+    ``cleanup_workspace``). SIGTERM, poll up to ``term_grace_secs``, then SIGKILL
+    survivors; zombies do not count as survivors.
+
+    With ``AGENT_SUBPROCESS_USER`` set the agent's processes belong to another
+    user and are invisible to ``/proc/<pid>/{exe,cwd}`` here, so the scan is also
+    run as that user (``sudo python3``) and signals that hit EPERM are relayed
+    the same way. Unreadable /proc entries are skipped, not fatal.
+    """
+    try:
+        workspace = Path(workspace)
+        if config.WORKSPACE_ROOT not in workspace.parents:
+            return []
+        found = _scan_workspace_pids(workspace)
+        if config.AGENT_SUBPROCESS_USER:
+            found.update(_scan_as_agent_user(workspace))
+        for pid in _ancestor_pids():
+            found.pop(pid, None)
+        found = {p: c for p, c in found.items() if _proc_is_live(p)}
+        if not found:
+            return []
+        for pid in found:
+            _signal_pid(pid, signal.SIGTERM)
+        deadline = time.monotonic() + term_grace_secs
+        alive = set(found)
+        while alive and time.monotonic() < deadline:
+            alive = {p for p in alive if _proc_is_live(p)}
+            if alive:
+                time.sleep(0.05)
+        alive = {p for p in alive if _proc_is_live(p)}
+        for pid in alive:
+            _signal_pid(pid, signal.SIGKILL)
+        if alive:
+            time.sleep(0.2)
+        return [
+            ReapedProcess(p, c, "SIGKILL" if p in alive else "SIGTERM")
+            for p, c in found.items()
+        ]
+    except Exception:
+        logger.exception("reap_workspace_processes failed for %s", workspace)
+        return []
 
 
 def cleanup_workspace(workspace: Path) -> None:

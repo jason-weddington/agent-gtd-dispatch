@@ -1324,6 +1324,45 @@ def _retained_path(
     return ", ".join(str(p) for p in paths)
 
 
+async def _reap_leaked_processes(run: Run, workspace: Path) -> None:
+    """Kill processes left running from the run's workspace; log and record them.
+
+    Best-effort and never raises (runs in the teardown ``finally``). Recorded by
+    appending to the run's ``error`` text, which does not change its status.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        reaped = list(
+            await loop.run_in_executor(
+                dispatch._executor, dispatch.reap_workspace_processes, workspace
+            )
+        )
+        if not reaped:
+            return
+        for r in reaped:
+            logger.warning(
+                "reaped leaked process: run_id=%s pid=%s cmdline=%r (%s)",
+                run.id,
+                r.pid,
+                r.cmdline,
+                r.killed_with,
+            )
+        detail = "; ".join(
+            f"pid {r.pid} `{r.cmdline}` ({r.killed_with})" for r in reaped
+        )
+        _existing = await db.get_run(run.id)
+        _prefix = (_existing.error + " | ") if _existing and _existing.error else ""
+        await db.update_run(
+            run.id,
+            error=(
+                f"{_prefix}reaped {len(reaped)} leaked process(es) from workspace:"
+                f" {detail}"
+            )[:ERROR_TEXT_MAX_CHARS],
+        )
+    except Exception:
+        logger.exception("reaping leaked processes failed for run %s", run.id)
+
+
 async def _rescue_before_teardown(
     run: Run,
     repos: list[tuple[str, Path, str | None]],
@@ -4184,6 +4223,14 @@ async def _drive_rollout(
         # halted rollout keeps it: the tree is the evidence a human needs.
         if ws is not None and directive == _TICK_DONE:
             with contextlib.suppress(Exception):
+                for _rp in dispatch.reap_workspace_processes(ws.root):
+                    logger.warning(
+                        "reaped leaked process from rollout workspace: pid=%s %s (%s)",
+                        _rp.pid,
+                        _rp.cmdline,
+                        _rp.killed_with,
+                    )
+            with contextlib.suppress(Exception):
                 dispatch.cleanup_workspace(ws.root)
 
 
@@ -5600,6 +5647,12 @@ async def _dispatch_worker(
             # Rescue could not get the work to origin. The workspace is the only
             # copy left, so keep it and say so where an operator will see it.
             should_cleanup = False
+
+        # Reap daemons the agent left running from this workspace (detached,
+        # own session, so killing the agent tree missed them). After the rescue,
+        # before deletion, and even when the workspace is kept.
+        if workspace is not None:
+            await _reap_leaked_processes(run, workspace)
 
         if workspace is not None and should_cleanup:
             dispatch.cleanup_workspace(workspace)

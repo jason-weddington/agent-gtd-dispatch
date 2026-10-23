@@ -143,6 +143,16 @@ directory structure (and, for manage, per-repo merge/halt semantics).
 Removes the workspace directory after a run completes. Guards against escaping the workspace
 root with a `config.WORKSPACE_ROOT in workspace.parents` check before deleting.
 
+### `reap_workspace_processes()`
+
+Called from the run teardown `finally` after the rescue commit/push and before
+`cleanup_workspace()` (also when the workspace is kept), and from rollout-workspace teardown.
+Scans `/proc` for processes whose `exe` or `cwd` lies under the workspace (path-component
+match only, never by name), sends SIGTERM, waits up to a grace period, then SIGKILLs
+survivors. The worker and its ancestors are never signalled. Each reaped process is logged
+and appended to the run's `error` text without changing its status. This catches detached
+daemons (own session) that killing the agent's process tree misses.
+
 ---
 
 ## Gate Install (Build + Manage Modes)
