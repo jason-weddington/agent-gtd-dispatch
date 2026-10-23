@@ -3065,12 +3065,15 @@ class _Lander:
             )
         for repo in self.landing:
             path = self._path(repo)
-            tip_ref = f"refs/heads/{branch_name}"
+            await self._git(
+                repo, dispatch.land_fetch_feature_branch, path, branch_name, timeout
+            )
+            tip_ref = f"refs/remotes/origin/{branch_name}"
             tip = await self._git(
                 repo, dispatch.land_resolve_ref, path, tip_ref, timeout
             )
             if not tip:
-                tip_ref = f"refs/remotes/origin/{branch_name}"
+                tip_ref = f"refs/heads/{branch_name}"
                 tip = await self._git(
                     repo, dispatch.land_resolve_ref, path, tip_ref, timeout
                 )

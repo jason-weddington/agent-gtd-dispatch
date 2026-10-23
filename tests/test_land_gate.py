@@ -346,6 +346,17 @@ class TestHelpers:
         ):
             dispatch.land_conflict_paths(mono.clone, "main", "no-such-ref", 30)
 
+    def test_fetch_feature_branch_reports_presence(self, mono) -> None:
+        _git(mono.seed, "push", "-q", "origin", "HEAD:refs/heads/feat/x")
+        assert dispatch.land_fetch_feature_branch(mono.clone, "feat/x", 30) is True
+        assert _git(mono.clone, "rev-parse", "refs/remotes/origin/feat/x")
+        assert dispatch.land_fetch_feature_branch(mono.clone, "feat/no", 30) is False
+
+    def test_fetch_feature_branch_other_failure_raises(self, mono) -> None:
+        _git(mono.clone, "remote", "set-url", "origin", "/nonexistent/origin.git")
+        with pytest.raises(dispatch.LandGitError, match="git fetch origin failed"):
+            dispatch.land_fetch_feature_branch(mono.clone, "feat/x", 30)
+
     def test_resolve_ref(self, mono) -> None:
         head = _git(mono.clone, "rev-parse", "HEAD")
         assert dispatch.land_resolve_ref(mono.clone, "refs/heads/main", 30) == head
@@ -952,6 +963,74 @@ class TestConflictGuard:
         assert isinstance(result, ReviewVerdict)
         assert "tip_ref=refs/remotes/origin/feat/remote-only" in caplog.text
         assert "decision=clean" in caplog.text
+
+    async def test_shallow_single_branch_clone_fetches_the_feature(
+        self, mono, gtd, tmp_path, caplog
+    ) -> None:
+        shallow = tmp_path / "shallow"
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--depth=50",
+                "--single-branch",
+                f"file://{mono.origin}",
+                str(shallow),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        _git(shallow, "config", "user.name", "t")
+        _git(shallow, "config", "user.email", "t@t")
+        tip = _squash(shallow)
+        _git(shallow, "push", "-q", "origin", f"HEAD:refs/heads/{FEATURE}")
+        _git(shallow, "branch", "-D", FEATURE)
+        missing = subprocess.run(
+            ["git", "rev-parse", "--verify", "-q", f"refs/remotes/origin/{FEATURE}"],
+            cwd=shallow,
+            capture_output=True,
+            check=False,
+        )
+        assert missing.returncode != 0
+        ws = _mono_ws(shallow)
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(ws, _pre(ws))
+        assert isinstance(result, ReviewVerdict)
+        gtd.halt_rollout.assert_not_awaited()
+        assert f"tip_ref=refs/remotes/origin/{FEATURE}" in caplog.text
+        assert f"tip_sha={tip}" in caplog.text
+
+    async def test_origin_copy_wins_over_a_stale_local_branch(
+        self, mono, gtd, caplog
+    ) -> None:
+        tip = _squash(mono.clone)
+        _git(mono.clone, "push", "-q", "origin", f"HEAD:refs/heads/{FEATURE}")
+        _git(mono.clone, "branch", "-f", FEATURE, "main~1")
+        stale = _git(mono.clone, "rev-parse", FEATURE)
+        assert stale != tip
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, mono.pre)
+        assert isinstance(result, ReviewVerdict)
+        assert f"tip_ref=refs/remotes/origin/{FEATURE}" in caplog.text
+        assert f"tip_sha={tip}" in caplog.text
+        assert f"tip_sha={stale}" not in caplog.text
+
+    async def test_fetch_failure_is_bad_local_state(
+        self, mono, gtd, monkeypatch
+    ) -> None:
+        def boom(*_a, **_kw):
+            raise dispatch.LandGitError("fetch origin", "unreachable")
+
+        monkeypatch.setattr(dispatch, "land_fetch_feature_branch", boom)
+        _squash(mono.clone)
+        before = _tip(mono.origin)
+        result = await _land(mono.ws, mono.pre)
+        assert result == main._TICK_HALTED
+        reason = _halt_reason(gtd)
+        assert "land bad local state for item" in reason
+        assert "git fetch origin failed: unreachable" in reason
+        assert "not found" not in reason
+        assert _tip(mono.origin) == before
 
     async def test_unreported_doc_conflict_lands_with_a_warning(
         self, mono, gtd, caplog

@@ -3307,6 +3307,30 @@ def land_fetch(repo: Path, branch: str, timeout: int) -> None:
     _land_git_ok(repo, ["fetch", "origin", branch], timeout)
 
 
+def land_fetch_feature_branch(repo: Path, branch_name: str, timeout: int) -> bool:
+    """Fetch the feature branch from origin into its full-name tracking ref.
+
+    Works in a shallow single-branch clone whose configured refspec covers
+    only the default branch.  True on success; False when origin has no such
+    branch; other failures raise like the other helpers.
+    """
+    proc = _land_git(
+        repo,
+        [
+            "fetch",
+            "origin",
+            f"+refs/heads/{branch_name}:refs/remotes/origin/{branch_name}",
+        ],
+        timeout,
+    )
+    if proc.returncode == 0:
+        return True
+    excerpt = git_output_excerpt(proc)
+    if "couldn't find remote ref" in excerpt.lower():
+        return False
+    raise LandGitError("fetch origin", excerpt)
+
+
 def land_rev_parse(repo: Path, ref: str, timeout: int) -> str:
     """``git rev-parse <ref>``; raises on failure or timeout."""
     return _land_git_ok(repo, ["rev-parse", ref], timeout)
