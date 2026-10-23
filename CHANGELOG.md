@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.10.6 (2026-10-23)
+
+### Bug Fixes
+
+- **rollouts**: A reviewer that exits without a verdict reports the agent's own result text in the
+  halt reason
+  ([`7e38b13`](https://github.com/repos/agent-gtd-dispatch/commit/7e38b13ac728aceff91b25e12a0fa938a97a8a24))
+
+
 ## v2.10.5 (2026-10-23)
 
 ### Bug Fixes
