@@ -1625,6 +1625,8 @@ def _build_workspace_layout_section_build(
 def _build_workspace_layout_section_plan(workspace_repo_dirs: list[str]) -> str:
     """'## Workspace Layout' section for plan-mode workspace runs (read-only)."""
     repo_bullets = "\n".join(f"- `{d}/`" for d in workspace_repo_dirs)
+    example_dirs = ", ".join(f"`{d}/`" for d in workspace_repo_dirs)
+    first = workspace_repo_dirs[0]
     return textwrap.dedent(
         f"""\
         ## Workspace Layout
@@ -1633,7 +1635,12 @@ def _build_workspace_layout_section_plan(workspace_repo_dirs: list[str]) -> str:
 
         {repo_bullets}
 
-        Explore across all of them as needed to understand the codebase."""
+        Explore across all of them as needed to understand the codebase.
+
+        **Path prefix rule:** every `files_to_modify` path MUST be prefixed with its
+        repo directory ({example_dirs}), e.g. `{first}/src/foo.py`, not `src/foo.py`.
+        The implementer's working directory is the workspace root, so unprefixed
+        paths are ambiguous. Use the repo directories listed above."""
     )
 
 
@@ -1762,6 +1769,9 @@ def _build_plan_prompt(
         """
     )
 
+    example_path = (
+        f"{workspace_repo_dirs[0]}/src/foo.py" if workspace_repo_dirs else "src/foo.py"
+    )
     prompt += textwrap.dedent(
         f"""\
 
@@ -1773,7 +1783,7 @@ def _build_plan_prompt(
            - `acceptance_criteria`: list of testable AC strings, e.g.
              `acceptance_criteria=["AC-1: the widget renders", "AC-2: tests pass"]`
            - `files_to_modify`: list of dicts with `"path"` and `"change"` keys, e.g.
-             `files_to_modify=[{{"path": "src/foo.py", "change": "add error handling"}}, ...]`
+             `files_to_modify=[{{"path": "{example_path}", "change": "add error handling"}}, ...]`
            - `scope_out`: list of things explicitly out of scope, e.g.
              `scope_out=["Do NOT change the API surface", "Do NOT touch unrelated modules"]`
            - `commit_type`: exactly one of `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore` — the conventional-commit type the squash commit will carry (feat = new observable capability, fix = corrects wrong behaviour, perf = faster with no behaviour change, refactor = no observable change, test = only tests, docs = only docs, chore = anything else). plan_rollout rejects an item without it, e.g. `commit_type="fix"`

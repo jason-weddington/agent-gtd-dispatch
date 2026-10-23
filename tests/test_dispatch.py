@@ -3114,6 +3114,31 @@ class TestWorkspacePrompts:
         # branch_name is not a param of _build_plan_prompt — must not appear
         assert self._branch not in prompt
 
+    def test_plan_workspace_prefix_rule_and_example(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="plan",
+            workspace_repo_dirs=self._repo_dirs,
+        )
+        assert "MUST be prefixed with its" in prompt
+        assert '"path": "repo-a/src/foo.py"' in prompt
+        assert '"path": "src/foo.py"' not in prompt
+
+    def test_plan_monorepo_has_no_prefix_rule(self) -> None:
+        prompt = build_system_prompt(
+            self._item,
+            self._project,
+            branch_name=None,
+            max_turns=self._max_turns,
+            mode="plan",
+            workspace_repo_dirs=None,
+        )
+        assert "MUST be prefixed with its" not in prompt
+        assert '"path": "src/foo.py"' in prompt
+
     # --- None → no workspace section (regression) ---
 
     def test_build_no_workspace_section_when_none(self) -> None:
