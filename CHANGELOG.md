@@ -2,6 +2,38 @@
 
 <!-- version list -->
 
+## v2.11.0 (2026-10-23)
+
+### Bug Fixes
+
+- **536414a2**: Talos worker: derive a --wall-clock-secs budget from the run's resolved timeout so a
+  run self-terminates instead of being hard-killed
+  ([`676269c`](https://github.com/repos/agent-gtd-dispatch/commit/676269c3c390e68974eb741cac281e7cd6dcc874))
+
+- **85641b54**: A talos run that deliberately self-terminates is reported as `stalled / no
+  convergence`
+  ([`9f3ad09`](https://github.com/repos/agent-gtd-dispatch/commit/9f3ad096e2cff0ca293bb95ce21b52622e3ffe2b))
+
+- **b21e51e0**: Plan mode on workspace projects writes files_to_modify paths without the repo-dir
+  prefix
+  ([`8ff31d2`](https://github.com/repos/agent-gtd-dispatch/commit/8ff31d21b4eb289779ca6b71dcdea881114d1133))
+
+- **f467a982**: Dispatch worker: kill processes left running from a run's workspace at teardown
+  (leaked a kb-service daemon on a dev laptop)
+  ([`d25f32b`](https://github.com/repos/agent-gtd-dispatch/commit/d25f32bd608eac4dfd8d869b2bd36062e321ea82))
+
+### Features
+
+- **2e656b68**: Export BuildEngine as the shared engine-identifier enum; guard the dispatch engine
+  registry and agent_gtd's engine-name copies with parity tests (agent_gtd's import switch is a
+  follow-up after the dispatch release)
+  ([`fcd8eea`](https://github.com/repos/agent-gtd-dispatch/commit/fcd8eeab2ac84d1f9f20fc33d31a860a2a7ab46c))
+
+- **e6abaa09**: Rollouts: resume relaunches the rollout loop on its owning host after a halt, and a
+  host refuses a second loop for the same rollout
+  ([`b4049c6`](https://github.com/repos/agent-gtd-dispatch/commit/b4049c6a3bc4e1aa83327e03ee1c2c490b1db6fb))
+
+
 ## v2.10.6 (2026-10-23)
 
 ### Bug Fixes
