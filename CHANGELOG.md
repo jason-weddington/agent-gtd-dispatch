@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.10.5 (2026-10-23)
+
+### Bug Fixes
+
+- **dispatch**: The teardown rescue leaves an untouched workspace repo alone
+  ([`d684e8a`](https://github.com/repos/agent-gtd-dispatch/commit/d684e8ac39b4794a03902c94c8da112fbaeae71e))
+
+
 ## v2.10.4 (2026-10-23)
 
 ### Bug Fixes
