@@ -40,6 +40,7 @@ from . import (
     talos,
 )
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
+from .completion import agent_output_summary
 from .dispatch import (
     LandGitError,
     LandGitTimeout,
@@ -2078,6 +2079,12 @@ async def _launch_reviewer(
 
     if verdict_blob is None:
         detail = failure or f"verdict artifact {reason} (reviewer exit={exit_code})"
+        # Only when run_agent returned: it truncates transcript.txt on launch,
+        # so before that the file still holds the PREVIOUS reviewer's output.
+        if exit_code is not None:
+            agent_said = agent_output_summary(Path(workspace.root) / "transcript.txt")
+            if agent_said:
+                detail = f"{detail}; agent said: {agent_said}"
         await db.update_run(
             reviewer_run.id,
             status=RunStatus.failed,

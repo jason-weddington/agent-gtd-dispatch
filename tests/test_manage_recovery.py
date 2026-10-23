@@ -696,6 +696,7 @@ class TestLaunchReviewer:
         raises=None,
         item=None,
         prefetched=None,
+        workspace=None,
         **extra,
     ):
         from agent_gtd_dispatch.main import _launch_reviewer
@@ -739,7 +740,7 @@ class TestLaunchReviewer:
             "rollout-abc",
             "item-a",
             project={"name": "P"},
-            workspace=_fake_workspace(),
+            workspace=workspace or _fake_workspace(),
             reviewer_engine=SimpleNamespace(name="claude-code-sonnet"),
             token=None,
             attribution=None,
@@ -1021,6 +1022,47 @@ class TestLaunchReviewer:
         assert outcome.verdict == "halt"
         assert "absent" in outcome.detail
         assert ctx.db.update_run.await_args.kwargs["status"].value == "failed"
+
+    async def _no_verdict_detail(self, tmp_path, transcript: str | None) -> str:
+        if transcript is not None:
+            (tmp_path / "transcript.txt").write_text(transcript)
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx,
+                verdict_blob=None,
+                reason="absent",
+                exit_code=1,
+                workspace=SimpleNamespace(
+                    **{**vars(_fake_workspace()), "root": tmp_path}
+                ),
+            )
+            err = ctx.db.update_run.await_args.kwargs["error"]
+        assert outcome.detail in err
+        return outcome.detail
+
+    async def test_no_verdict_reports_envelope_result_text(self, tmp_path) -> None:
+        import json
+
+        msg = "You've hit your weekly limit · resets 12am (America/New_York)"
+        env = json.dumps({"type": "result", "is_error": True, "result": msg})
+        detail = await self._no_verdict_detail(tmp_path, env + "\n")
+        assert "verdict artifact absent (reviewer exit=1)" in detail
+        assert f"; agent said: {msg}" in detail
+
+    async def test_no_verdict_reports_plain_output_tail(self, tmp_path) -> None:
+        detail = await self._no_verdict_detail(tmp_path, "boom: plain failure\n")
+        assert detail.endswith("; agent said: boom: plain failure")
+
+    async def test_no_verdict_without_output_is_unchanged(self, tmp_path) -> None:
+        detail = await self._no_verdict_detail(tmp_path, None)
+        assert detail == "verdict artifact absent (reviewer exit=1)"
+
+    async def test_no_verdict_result_text_truncated_to_300(self, tmp_path) -> None:
+        import json
+
+        env = json.dumps({"type": "result", "is_error": True, "result": "x" * 500})
+        detail = await self._no_verdict_detail(tmp_path, env)
+        assert detail.endswith("; agent said: " + "x" * 300)
 
     async def test_subprocess_failure_is_treated_as_halt(self) -> None:
         with _loop_patch_stack() as ctx:

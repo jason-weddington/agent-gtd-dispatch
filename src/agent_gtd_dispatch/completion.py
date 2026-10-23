@@ -112,6 +112,32 @@ def parse_result_envelope(transcript_path: Path) -> ResultEnvelope | None:
     return found
 
 
+AGENT_SAID_MAX_CHARS: int = 300
+
+
+def agent_output_summary(transcript_path: Path) -> str:
+    """Return the agent's own words from a transcript, for a failure detail.
+
+    Prefers the result envelope's ``result`` text; falls back to the last
+    ``AGENT_SAID_MAX_CHARS`` characters of the transcript.  Returns ``""`` when
+    neither exists.  Only the agent CLI's output is read — never the process
+    environment or the prompt.
+    """
+    env = parse_result_envelope(transcript_path)
+    if env is not None and env.result and env.result.strip():
+        return env.result.strip()[:AGENT_SAID_MAX_CHARS]
+    try:
+        with transcript_path.open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 4 * AGENT_SAID_MAX_CHARS))
+            raw = fh.read()
+    except OSError:
+        return ""
+    text = raw.decode("utf-8", errors="replace").strip()
+    return text[-AGENT_SAID_MAX_CHARS:]
+
+
 def envelope_verdict(env: ResultEnvelope | None) -> str:
     """Classify a result envelope into exactly one verdict literal.
 
