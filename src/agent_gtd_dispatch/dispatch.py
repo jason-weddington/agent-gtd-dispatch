@@ -1096,7 +1096,24 @@ def _repo_has_unrescued_work(repo_path: Path, branch_name: str) -> tuple[bool, b
         return True, dirty
     remote_line = remote.stdout.decode("utf-8", errors="replace").strip()
     remote_sha = remote_line.split("\t")[0] if remote_line else ""
-    return (dirty or remote_sha != local_sha), dirty
+    if remote_sha:
+        return (dirty or remote_sha != local_sha), dirty
+    # The run's branch is absent on origin. HEAD alone proves nothing: an
+    # untouched repo sits on the base commit, which is already on a remote.
+    # Only commits reachable from no remote-tracking ref are real work.
+    count = subprocess.run(
+        _sudo_wrap(["git", "rev-list", "--count", "HEAD", "--not", "--remotes"]),
+        cwd=repo_path,
+        check=False,
+        capture_output=True,
+    )
+    if count.returncode != 0:
+        return True, dirty
+    try:
+        unpushed = int(count.stdout.decode("utf-8", errors="replace").strip() or "0")
+    except ValueError:
+        return True, dirty
+    return (dirty or unpushed > 0), dirty
 
 
 def rescue_abandoned_work(

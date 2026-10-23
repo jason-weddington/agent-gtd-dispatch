@@ -5934,6 +5934,27 @@ class TestRescueAbandonedWork:
         assert result.pushed is True
         assert self._remote_sha(origin, "feat/x") != ""
 
+    def test_untouched_repo_is_not_rescued_and_two_repo_workspace(
+        self, tmp_path
+    ) -> None:
+        """A clean repo with no commits of its own gets no push and no attempt."""
+        changed_dir = tmp_path / "a"
+        changed_dir.mkdir()
+        idle_dir = tmp_path / "b"
+        idle_dir.mkdir()
+        changed, changed_origin = self._repo_with_origin(changed_dir)
+        idle, idle_origin = self._repo_with_origin(idle_dir)
+        (changed / "new.py").write_text("z = 3\n")
+
+        r_changed = dispatch.rescue_abandoned_work("changed", changed, "feat/x", "r1")
+        r_idle = dispatch.rescue_abandoned_work("idle", idle, "feat/x", "r1")
+
+        assert r_changed.attempted is True and r_changed.pushed is True
+        assert self._remote_sha(changed_origin, "feat/x") != ""
+        assert r_idle.attempted is False
+        assert r_idle.pushed is False
+        assert self._remote_sha(idle_origin, "feat/x") == ""
+
     def test_committed_but_unpushed_work_is_pushed_without_a_new_commit(
         self, tmp_path
     ) -> None:
