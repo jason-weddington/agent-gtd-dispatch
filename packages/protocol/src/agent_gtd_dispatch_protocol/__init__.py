@@ -8,12 +8,14 @@ agent-gtd) should depend on this package rather than duplicating models.
 from __future__ import annotations
 
 from agent_gtd_dispatch_protocol.branches import make_branch_name as make_branch_name
+from agent_gtd_dispatch_protocol.models import BuildEngine as BuildEngine
 from agent_gtd_dispatch_protocol.models import DispatchMode as DispatchMode
 from agent_gtd_dispatch_protocol.models import DispatchRequest as DispatchRequest
 from agent_gtd_dispatch_protocol.models import RunResponse as RunResponse
 from agent_gtd_dispatch_protocol.models import RunStatus as RunStatus
 
 __all__ = [
+    "BuildEngine",
     "DispatchMode",
     "DispatchRequest",
     "RunResponse",

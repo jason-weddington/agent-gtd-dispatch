@@ -40,6 +40,26 @@ class DispatchMode(StrEnum):
     REVIEW = "review"
 
 
+class BuildEngine(StrEnum):
+    """Canonical build-engine identifiers shared by the board and the dispatch service.
+
+    The talos-* members are build-mode only.
+    """
+
+    CLAUDE_CODE = "claude-code"
+    CLAUDE_CODE_OLLAMA = "claude-code-ollama"
+    CLAUDE_CODE_GLM = "claude-code-glm"
+    CLAUDE_CODE_SONNET = "claude-code-sonnet"
+    CLAUDE_CODE_HAIKU = "claude-code-haiku"
+    KIRO = "kiro"
+    TALOS_HAIKU = "talos-haiku"
+    TALOS_SONNET = "talos-sonnet"
+    TALOS_OPUS = "talos-opus"
+    TALOS_QWEN = "talos-qwen"
+    TALOS_GLM = "talos-glm"
+    TALOS_GLM_FLASH = "talos-glm-flash"
+
+
 class DispatchRequest(BaseModel):
     """Request body for the /dispatch endpoint."""
 
@@ -77,6 +97,7 @@ class RunResponse(BaseModel):
 
 __all__ = [
     "UTC",
+    "BuildEngine",
     "DispatchMode",
     "DispatchRequest",
     "RunResponse",

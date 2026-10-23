@@ -37,3 +37,22 @@ class TestProtocolExports:
             created_at=datetime.now(UTC),
         )
         assert resp.id == "x"
+
+    def test_build_engine(self) -> None:
+        from agent_gtd_dispatch_protocol import BuildEngine
+
+        assert [m.value for m in BuildEngine] == [
+            "claude-code",
+            "claude-code-ollama",
+            "claude-code-glm",
+            "claude-code-sonnet",
+            "claude-code-haiku",
+            "kiro",
+            "talos-haiku",
+            "talos-sonnet",
+            "talos-opus",
+            "talos-qwen",
+            "talos-glm",
+            "talos-glm-flash",
+        ]
+        assert BuildEngine("talos-glm-flash") is BuildEngine.TALOS_GLM_FLASH

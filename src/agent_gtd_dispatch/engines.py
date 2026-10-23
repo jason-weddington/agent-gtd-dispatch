@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agent_gtd_dispatch_protocol.models import DispatchMode
+from agent_gtd_dispatch_protocol.models import BuildEngine, DispatchMode
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -551,14 +551,7 @@ ENGINES: dict[str, Engine] = {
 # family. get_engine() must still succeed for all six so the /dispatch endpoint's
 # up-front get_engine(effective_engine_name) call resolves before the branch.
 TALOS_ENGINES: frozenset[str] = frozenset(
-    {
-        "talos-haiku",
-        "talos-sonnet",
-        "talos-opus",
-        "talos-qwen",
-        "talos-glm",
-        "talos-glm-flash",
-    }
+    m.value for m in BuildEngine if m.value.startswith("talos-")
 )
 
 
