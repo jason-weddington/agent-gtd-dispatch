@@ -2942,3 +2942,146 @@ class TestSurvivingManageBehaviour:
         assert config.MANAGE_TIMEOUT_SECONDS == 45 * 60
         assert config.MANAGE_TIMEOUT_SECONDS == config.REVIEW_TIMEOUT_SECONDS
         assert config.timeout_seconds_for_mode("manage") == 45 * 60
+
+
+# ---------------------------------------------------------------------------
+# One loop per rollout per host: the _start_rollout_loop choke point
+# ---------------------------------------------------------------------------
+
+
+class TestOneLoopPerRolloutGuard:
+    async def test_choke_point_registers_synchronously_and_refuses_a_duplicate(
+        self,
+    ) -> None:
+        from agent_gtd_dispatch import main
+
+        never_finish = asyncio.Event()
+
+        async def _fake_worker(run, *, attribution=None):
+            await never_finish.wait()
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_rollout_loop_worker", _fake_worker),
+        ):
+            first = _make_run()
+            assert main._start_rollout_loop(first) is True
+            # Registered before the task has had a chance to run at all.
+            assert ctx.rollout_loops["rollout-abc"] is first
+            assert first.id in ctx.active
+
+            second = _make_run()
+            assert main._start_rollout_loop(second) is False
+            assert ctx.rollout_loops["rollout-abc"] is first
+            assert second.id not in ctx.active
+
+            never_finish.set()
+            await asyncio.gather(*ctx.active.values())
+
+    async def test_sweep_does_not_start_a_second_loop_a_dispatch_started_meanwhile(
+        self,
+    ) -> None:
+        from agent_gtd_dispatch import main
+
+        never_finish = asyncio.Event()
+
+        async def _fake_worker(run, *, attribution=None):
+            await never_finish.wait()
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_rollout_loop_worker", _fake_worker),
+        ):
+            dispatched = _make_run()
+
+            async def _insert_run(run):
+                # A MANAGE /dispatch lands while the sweep awaits insert_run.
+                assert main._start_rollout_loop(dispatched) is True
+
+            ctx.db.insert_run = AsyncMock(side_effect=_insert_run)
+            ctx.gtd.list_running_rollouts = AsyncMock(
+                return_value=[{"id": "rollout-abc", "project_name": "p"}]
+            )
+            await main._readopt_running_rollouts()
+            # Let the scheduled cancel write run (asyncio.sleep is mocked here).
+            await asyncio.gather(*list(main._background_tasks))
+
+            assert ctx.rollout_loops["rollout-abc"] is dispatched
+            assert list(ctx.active) == [dispatched.id]
+            swept = ctx.db.insert_run.call_args.args[0]
+            cancel = [
+                c for c in ctx.db.update_run.call_args_list if c.args[0] == swept.id
+            ]
+            assert cancel
+            assert cancel[-1].kwargs["status"] == RunStatus.cancelled
+            assert "already driven" in cancel[-1].kwargs["error"]
+
+            never_finish.set()
+            await asyncio.gather(*ctx.active.values())
+
+    async def test_queued_refusal_cancels_the_local_row(self) -> None:
+        from agent_gtd_dispatch import main
+        from agent_gtd_dispatch.engines import get_engine
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_pending_queue", []) as queue,
+        ):
+            ctx.rollout_loops["rollout-abc"] = _make_run()
+            queued = _make_run()
+            queue.append(
+                main._PendingDispatch(
+                    run=queued,
+                    engine=get_engine("claude-code"),
+                    max_turns=10,
+                    timeout_seconds=60,
+                    attribution=None,
+                )
+            )
+            main._try_start_pending()
+            await asyncio.gather(*list(main._background_tasks))
+
+            assert queue == []
+            assert queued.id not in ctx.active
+            ctx.db.update_run.assert_awaited_once()
+            assert ctx.db.update_run.call_args.args[0] == queued.id
+            assert ctx.db.update_run.call_args.kwargs["status"] == RunStatus.cancelled
+
+    async def test_halted_loop_deregisters_before_its_bookkeeping_awaits(
+        self,
+    ) -> None:
+        from agent_gtd_dispatch import main
+
+        real_worker = main._rollout_loop_worker
+        seen: dict[str, object] = {}
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(
+                main, "_rollout_wave_tick", AsyncMock(return_value=main._TICK_HALTED)
+            ),
+            patch.object(main, "_publish_rollout_phase", AsyncMock()),
+        ):
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"id": "rollout-abc", "project_id": "proj"}
+            )
+            ctx.gtd.get_project = AsyncMock(return_value={"name": "p"})
+            fresh = _make_run()
+
+            async def _update_run(run_id, **kwargs):
+                if kwargs.get("status") == RunStatus.failed:
+                    # The terminal bookkeeping write: the halted loop must no
+                    # longer hold the rollout, so a relaunch is accepted.
+                    seen["live"] = main._live_rollout_driver("rollout-abc")
+                    with patch.object(main, "_rollout_loop_worker", AsyncMock()):
+                        seen["started"] = main._start_rollout_loop(fresh)
+
+            ctx.db.update_run = AsyncMock(side_effect=_update_run)
+            halted = _make_run()
+            ctx.rollout_loops["rollout-abc"] = halted
+            await real_worker(halted)
+
+            assert seen == {"live": None, "started": True}
+            # The halted loop's finally must not evict the fresh loop.
+            assert ctx.rollout_loops["rollout-abc"] is fresh
+            await asyncio.gather(*[t for t in ctx.active.values() if t])

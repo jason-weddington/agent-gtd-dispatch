@@ -526,6 +526,29 @@ resident manager agent, so there is nothing to relaunch:
 - **The reviewer is bounded** by `REVIEW_TIMEOUT_SECONDS` (45 min).
 - **A restart is covered by the re-adoption sweep** (`_readopt_running_rollouts`), which runs
   once at startup and resumes ONLY rollouts this host holds a local MANAGE run row for.
+- **A lead's resume relaunches the loop.** When a loop reads a halted rollout it exits. After
+  the lead resolves the halt, `resume_rollout` (board side) puts the rollout back to running
+  and dispatches a new MANAGE run pinned to the rollout's OWNING host (the host that last
+  drove it). Keeping every loop for a rollout on one host is what makes the per-host guard
+  below sufficient: re-adoption only ever happens where the local MANAGE rows are.
+
+### One loop per rollout (per host)
+
+Two loops on one rollout halted it falsely (rollout fe1e828d), so a host refuses a second:
+
+- **Single choke point.** `_start_rollout_loop(run)` is the only place a loop is
+  registered. With no await between check and registration it refuses (returns `False`,
+  creates no task) when `run.rollout_id` is already in `_rollout_loops`; otherwise it sets
+  the map entry BEFORE `asyncio.create_task`. `/dispatch`, `_try_start_pending` and
+  `_readopt_running_rollouts` all go through it; a refused local row is marked `cancelled`.
+- **409 on `/dispatch`.** A MANAGE dispatch for a rollout with a live loop or a queued
+  MANAGE entry returns HTTP 409 naming the rollout and the live run id, before
+  `db.insert_run`. The board maps that 409 to a `cancelled` run; the live loop keeps driving.
+- **Synchronous deregistration.** When `_drive_rollout` decides to exit (`_TICK_DONE` /
+  `_TICK_HALTED`) it pops its own `_rollout_loops` entry at that decision point, before any
+  further await, so a relaunch arriving while the old loop is still doing bookkeeping
+  starts a fresh loop instead of being refused. The worker's `finally` pops only an entry
+  that still maps to its own run.
 
 The resident-manager keep-alive machinery (exit-path relaunch ladder `_maybe_relaunch_manage`,
 shared `_do_manage_recovery`, the staleness watchdog, its in-memory tallies and the

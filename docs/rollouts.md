@@ -769,7 +769,8 @@ watchdog, the in-memory free-relaunch tallies, the `MAX_MANAGE_RETRIES` cap, the
 `## Recovery Context` prompt block and the GTD-side
 `POST /api/rollouts/{id}/relaunch-manage` route were all removed in item
 7baf77d0. The `autonomous_rollouts.manage_retry_count` column and the
-`manage_relaunched` event kind remain for historical rows; nothing writes them.
+`manage_relaunched` event kind remain; the column is historical, and the event
+kind is now written by a lead's resume (below).
 
 What replaces them:
 
@@ -783,6 +784,21 @@ What replaces them:
   scanned every running rollout fleet-wide; on rollout fe1e828d it started a
   second loop on a host that had never owned the rollout, and the two loops
   landed the same item.
+- **A lead's resume relaunches the loop.** A loop that reads `halted` exits.
+  `resume_rollout` (MCP tool / `agent-gtd resume-rollout` / `POST
+  /api/rollouts/{id}/resume`) puts the rollout back to `running` and creates a
+  new MANAGE run pinned to the rollout's owning host (its pinned host, else the
+  host of its latest MANAGE run), emitting `manage_relaunched`. On a `running`
+  rollout it only relaunches a missing loop (one that crashed). Pinning keeps
+  every loop for a rollout on one host, so re-adoption after a restart cannot
+  put a second loop elsewhere.
+- **One loop per rollout per host.** `_start_rollout_loop` is the single,
+  await-free choke point that registers a loop in `_rollout_loops` (before the
+  task is created) and refuses a duplicate. `POST /dispatch` returns 409 for a
+  MANAGE dispatch whose rollout already has a live loop or a queued MANAGE
+  entry; the board records that run as `cancelled` and the live loop keeps
+  driving. A loop deregisters synchronously when it decides to exit, so a
+  relaunch that arrives just after it read `halted` starts a fresh loop.
 - **Never background a wait.** The loop awaits each poll interval and each
   reviewer in its own task; every agent prompt carries the shared
   turn-discipline block.
@@ -929,5 +945,6 @@ the lead's job in the interactive session.
 | `complete_item_in_rollout` HTTP call | `src/agent_gtd_dispatch/gtd_client.py::complete_in_rollout` |
 | `halt_rollout` HTTP call | `src/agent_gtd_dispatch/gtd_client.py::halt_rollout` |
 | Re-adoption sweep (restart resume) | `src/agent_gtd_dispatch/main.py::_readopt_running_rollouts` |
+| One-loop-per-rollout choke point | `src/agent_gtd_dispatch/main.py::_start_rollout_loop` |
 | Wire-contract models | `packages/protocol/src/agent_gtd_dispatch_protocol/models.py` |
 | Branch-name helper | `packages/protocol/src/agent_gtd_dispatch_protocol/branches.py::make_branch_name` |

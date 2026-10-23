@@ -1938,3 +1938,120 @@ class TestReviewModeIsNotExternallyDispatchable:
         )
         assert resp.status_code == 400
         assert "not externally dispatchable" in resp.json()["detail"]
+
+
+class TestOneLoopPerRollout:
+    """A host refuses a second MANAGE loop for a rollout it already drives."""
+
+    @staticmethod
+    def _mock_upstream(mock_client) -> None:
+        mock_client.get_rollout = AsyncMock(
+            return_value={"id": "wr-dup", "project_id": "proj1", "status": "running"}
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "WaveProject",
+                "git_origin": "git@git.example.com:repos/wave-project",
+            }
+        )
+
+    @patch("agent_gtd_dispatch.main._start_rollout_loop")
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_live_loop_yields_409_and_starts_nothing(
+        self, mock_client, mock_dispatch, mock_loop, client, auth_headers, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch.models import Run
+
+        self._mock_upstream(mock_client)
+        live = Run(project_name="WaveProject", mode="manage", rollout_id="wr-dup")
+        monkeypatch.setattr(main, "_rollout_loops", {"wr-dup": live})
+
+        resp = client.post(
+            "/dispatch",
+            json={"rollout_id": "wr-dup", "mode": "manage", "max_turns": 50},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 409
+        assert "wr-dup" in resp.json()["detail"]
+        assert live.id in resp.json()["detail"]
+        mock_loop.assert_not_called()
+
+    @patch("agent_gtd_dispatch.main._start_rollout_loop")
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_queued_manage_entry_yields_409(
+        self, mock_client, mock_dispatch, mock_loop, client, auth_headers, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch.engines import get_engine
+        from agent_gtd_dispatch.models import Run
+
+        self._mock_upstream(mock_client)
+        queued = Run(project_name="WaveProject", mode="manage", rollout_id="wr-dup")
+        queue = [
+            main._PendingDispatch(
+                run=queued,
+                engine=get_engine("claude-code"),
+                max_turns=50,
+                timeout_seconds=60,
+                attribution=None,
+            )
+        ]
+        monkeypatch.setattr(main, "_pending_queue", queue)
+
+        resp = client.post(
+            "/dispatch",
+            json={"rollout_id": "wr-dup", "mode": "manage", "max_turns": 50},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 409
+        assert queued.id in resp.json()["detail"]
+        assert len(queue) == 1
+        mock_loop.assert_not_called()
+
+    @patch("agent_gtd_dispatch.main._start_rollout_loop", return_value=False)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_choke_point_refusal_cancels_the_row_and_yields_409(
+        self, mock_client, mock_dispatch, mock_loop, client, auth_headers
+    ) -> None:
+        self._mock_upstream(mock_client)
+
+        resp = client.post(
+            "/dispatch",
+            json={"rollout_id": "wr-dup", "mode": "manage", "max_turns": 50},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 409
+        refused = mock_loop.call_args.args[0]
+        row = client.get(f"/runs/{refused.id}", headers=auth_headers).json()
+        assert row["status"] == "cancelled"
+        assert "already driven" in row["error"]
+
+    @patch("agent_gtd_dispatch.main._start_rollout_loop", return_value=True)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_fresh_loop_starts_after_a_halted_loop_deregistered(
+        self, mock_client, mock_dispatch, mock_loop, client, auth_headers, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch.models import Run
+
+        self._mock_upstream(mock_client)
+        old = Run(project_name="WaveProject", mode="manage", rollout_id="wr-dup")
+        loops = {"wr-dup": old}
+        monkeypatch.setattr(main, "_rollout_loops", loops)
+        # The halted loop deregisters at its exit decision (see _drive_rollout).
+        main._deregister_rollout_loop(old)
+
+        resp = client.post(
+            "/dispatch",
+            json={"rollout_id": "wr-dup", "mode": "manage", "max_turns": 50},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 200
+        mock_loop.assert_called_once()

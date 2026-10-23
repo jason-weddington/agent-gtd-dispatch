@@ -150,13 +150,21 @@ _pending_queue: list[_PendingDispatch] = []
 _retention_task: asyncio.Task[None] | None = None  # handle for clean shutdown
 
 # rollout_id -> the MANAGE Run whose worker-driven wave loop is live on THIS
-# host.  Ownership only: it stops the startup re-adoption sweep (which runs as
-# a background task, so a dispatch can start a loop before the sweep reaches
-# that rollout) from starting a second loop for a rollout already driven here.
-# It is NOT relaunch bookkeeping — the resident-manager keep-alive machinery
+# host.  Ownership only: it is the one-loop-per-rollout guard.  Every loop is
+# registered here by `_start_rollout_loop` (the single, await-free choke
+# point) BEFORE its task is created, so neither the startup re-adoption sweep
+# (a background task) nor a second MANAGE `/dispatch` (a lead's resume can
+# relaunch a loop) can start a second loop for a rollout already driven here.
+# A loop deregisters synchronously the moment it decides to exit (see
+# `_drive_rollout`), so a relaunch arriving after that is not refused by a
+# loop that is already leaving.  It is NOT relaunch bookkeeping — the resident-manager keep-alive machinery
 # that used to share this map (relaunch ladder, staleness watchdog, free-
 # relaunch tallies, retry caps) was retired once the worker owned the loop.
 _rollout_loops: dict[str, Run] = {}
+
+# Strong references to fire-and-forget bookkeeping tasks (e.g. cancelling a
+# refused loop row from a synchronous caller) so they are not GC'd mid-flight.
+_background_tasks: set[asyncio.Task[None]] = set()
 
 
 def _publish_run_event(run_id: str, status: str, completed_at: str | None) -> None:
@@ -361,7 +369,8 @@ def _try_start_pending() -> None:
     while _pending_queue and len(_active_processes) < config.MAX_CONCURRENT_RUNS:
         pending = _pending_queue.pop(0)
         if pending.run.mode == DispatchMode.MANAGE and pending.run.rollout_id:
-            _start_rollout_loop(pending.run, attribution=pending.attribution)
+            if not _start_rollout_loop(pending.run, attribution=pending.attribution):
+                _cancel_refused_loop_run(pending.run)
             continue
         task = asyncio.create_task(
             _dispatch_worker(
@@ -4212,6 +4221,12 @@ async def _drive_rollout(
                 ),
             )
             if directive in (_TICK_DONE, _TICK_HALTED):
+                # Deregister NOW, synchronously, before any further await
+                # (workspace cleanup, the worker's db.update_run): a lead's
+                # resume that relaunches the loop after this tick read
+                # 'halted' must start a fresh loop, not be refused by this
+                # one, which is already leaving.
+                _deregister_rollout_loop(run)
                 return directive
             if directive == _TICK_WAIT:
                 await asyncio.sleep(config.ROLLOUT_LOOP_POLL_SECONDS)
@@ -4242,10 +4257,9 @@ async def _rollout_loop_worker(run: Run, *, attribution: str | None = None) -> N
     """
     assert run.rollout_id is not None  # noqa: S101
     started = datetime.now(UTC).isoformat()
-    await db.update_run(run.id, status=RunStatus.running, started_at=started)
-    _publish_run_event(run.id, "running", None)
-    _rollout_loops[run.rollout_id] = run
     try:
+        await db.update_run(run.id, status=RunStatus.running, started_at=started)
+        _publish_run_event(run.id, "running", None)
         directive = await _drive_rollout(run, attribution=attribution)
         finished = datetime.now(UTC).isoformat()
         status = RunStatus.succeeded if directive == _TICK_DONE else RunStatus.failed
@@ -4277,16 +4291,94 @@ async def _rollout_loop_worker(run: Run, *, attribution: str | None = None) -> N
         _active_processes.pop(run.id, None)
         _try_start_pending()
         _run_event_queues.pop(run.id, None)
-        _rollout_loops.pop(run.rollout_id, None)
+        _deregister_rollout_loop(run)
         logger.info(
             "rollout-loop: exit rollout_id=%s run_id=%s", run.rollout_id, run.id
         )
 
 
-def _start_rollout_loop(run: Run, *, attribution: str | None = None) -> None:
-    """Create and register the background task that drives one rollout."""
+def _deregister_rollout_loop(run: Run) -> None:
+    """Drop ``run``'s rollout from ``_rollout_loops`` if it still maps to ``run``.
+
+    Only the owning run may remove the entry: once a loop has deregistered
+    itself at its exit decision, a relaunched loop may already hold the slot.
+    """
+    if run.rollout_id and _rollout_loops.get(run.rollout_id) is run:
+        del _rollout_loops[run.rollout_id]
+
+
+def _live_rollout_driver(rollout_id: str) -> str | None:
+    """Return the id of the MANAGE run already driving ``rollout_id`` here, if any.
+
+    Covers both a live loop (``_rollout_loops``) and a MANAGE dispatch still
+    waiting for a slot in ``_pending_queue``.
+    """
+    live = _rollout_loops.get(rollout_id)
+    if live is not None:
+        return live.id
+    for pending in _pending_queue:
+        if (
+            pending.run.mode == DispatchMode.MANAGE
+            and pending.run.rollout_id == rollout_id
+        ):
+            return pending.run.id
+    return None
+
+
+def _start_rollout_loop(run: Run, *, attribution: str | None = None) -> bool:
+    """Register and start the background task that drives one rollout.
+
+    THE single choke point for the one-loop-per-rollout guard: every caller
+    (``/dispatch``, ``_try_start_pending``, ``_readopt_running_rollouts``)
+    goes through here.  There is no await between the check and the
+    registration, so two callers in the same event loop cannot both pass.
+    The map entry is set BEFORE the task is created.  Returns False (and
+    starts nothing) when the rollout already has a live loop on this host.
+    """
+    assert run.rollout_id is not None  # noqa: S101 — MANAGE runs carry one
+    live = _rollout_loops.get(run.rollout_id)
+    if live is not None and live is not run:
+        logger.warning(
+            "rollout-loop: refusing second loop for rollout_id=%s run_id=%s"
+            " — already driven by run_id=%s",
+            run.rollout_id,
+            run.id,
+            live.id,
+        )
+        return False
+    _rollout_loops[run.rollout_id] = run
     task = asyncio.create_task(_rollout_loop_worker(run, attribution=attribution))
     _active_processes[run.id] = task
+    return True
+
+
+def _cancel_refused_loop_run(run: Run) -> None:
+    """Mark a local MANAGE row ``cancelled`` after the choke point refused it.
+
+    Synchronous callers (``_try_start_pending``) cannot await, so the DB write
+    is scheduled as a task.
+    """
+    live = _rollout_loops.get(run.rollout_id or "")
+    error = (
+        f"rollout {run.rollout_id} is already driven by live loop run "
+        f"{live.id if live else '?'} on this host"
+    )
+    _run_event_queues.pop(run.id, None)
+
+    async def _write() -> None:
+        try:
+            await db.update_run(
+                run.id,
+                status=RunStatus.cancelled,
+                completed_at=datetime.now(UTC).isoformat(),
+                error=error,
+            )
+        except Exception:
+            logger.exception("rollout-loop: failed to cancel refused run %s", run.id)
+
+    task = asyncio.create_task(_write())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 async def _readopt_running_rollouts() -> None:
@@ -4371,7 +4463,10 @@ async def _readopt_running_rollouts() -> None:
             rollout_id,
             run.id,
         )
-        _start_rollout_loop(run)
+        # A /dispatch may have started a loop for this rollout while the sweep
+        # was awaiting insert_run; the choke point refuses the duplicate.
+        if not _start_rollout_loop(run):
+            _cancel_refused_loop_run(run)
 
 
 async def _dispatch_worker(
@@ -5996,6 +6091,21 @@ async def dispatch_item(
     else:
         timeout_seconds = config.timeout_seconds_for_mode(body.mode)
 
+    # One loop per rollout per host: refuse a MANAGE dispatch for a rollout
+    # this host is already driving (live loop or queued entry).  Checked
+    # before db.insert_run so a refusal leaves no row; the choke point
+    # (_start_rollout_loop) covers the insert_run await gap.
+    if body.mode == DispatchMode.MANAGE and body.rollout_id:
+        _driver = _live_rollout_driver(body.rollout_id)
+        if _driver is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"rollout {body.rollout_id} is already driven by live loop "
+                    f"run {_driver} on this host"
+                ),
+            )
+
     run = Run(
         item_id=item_id_for_run,
         project_name=project["name"],
@@ -6053,7 +6163,20 @@ async def dispatch_item(
         # WORKER drives the wave loop and launches a short-lived reviewer per
         # completed build.  Nothing relaunches a manager any more — the loop
         # owns liveness and the re-adoption sweep resumes it after a restart.
-        _start_rollout_loop(run, attribution=body.attribution)
+        if not _start_rollout_loop(run, attribution=body.attribution):
+            _run_event_queues.pop(run.id, None)
+            _live = _rollout_loops.get(run.rollout_id)
+            _msg = (
+                f"rollout {run.rollout_id} is already driven by live loop run "
+                f"{_live.id if _live else '?'} on this host"
+            )
+            await db.update_run(
+                run.id,
+                status=RunStatus.cancelled,
+                completed_at=datetime.now(UTC).isoformat(),
+                error=_msg,
+            )
+            raise HTTPException(status_code=409, detail=_msg)
     else:
         task = asyncio.create_task(
             _dispatch_worker(
