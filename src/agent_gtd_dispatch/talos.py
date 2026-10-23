@@ -553,6 +553,17 @@ def parse_disposition_summary(disposition: dict[str, Any]) -> str:
     return f"Unknown disposition: {disposition!r}"
 
 
+# Disposition mode talos emits when its wall-clock/iteration budget runs out
+# (``MaxIterations`` collapses to this too). Defined once; compared against the
+# parsed RunSummary ``Failed.mode``, never inferred from elapsed time or text.
+BUDGET_EXHAUSTED_MODE = "BudgetExhausted"
+
+BUDGET_EXHAUSTED_GUIDANCE = (
+    "ran out of its budget while making progress — the work so far is sound; "
+    "raise the budget and resume/re-dispatch (do not distrust the output)"
+)
+
+
 def failure_mode_guidance(mode: str) -> str:
     """Map a talos FailureMode string to an actionable caller hint.
 
@@ -561,17 +572,21 @@ def failure_mode_guidance(mode: str) -> str:
     ``crates/harness/src/run_record.rs`` FailureMode doc-comments and
     ``crates/harness/src/engine.rs::into_disposition``:
 
+    - BUDGET WIND-DOWN: ``BudgetExhausted`` (also what a ``MaxIterations``
+      LoopOutcome collapses to) → progress was being made; raise the budget
+      and resume. NOT a stall.
     - RE-DECOMPOSE (the item was too big to hold, not too hard):
-      ``StoppedWithoutFinish`` and ``BudgetExhausted`` (the latter is also
-      what a ``MaxIterations`` LoopOutcome collapses to) → caller should
-      re-decompose into smaller single-subsystem items.
+      ``StoppedWithoutFinish`` → caller should re-decompose into smaller
+      single-subsystem items.
     - RE-DISPATCH (the spec looks sound; re-run or fix the environment):
       ``Loop``, ``FinishDiscipline``, ``TransientInfra``, and
       ``PersistentToolError``.
     - any unrecognized mode → a defensible fallback that echoes the mode and
       asks the caller to inspect the run record.
     """
-    if mode in ("StoppedWithoutFinish", "BudgetExhausted"):
+    if mode == BUDGET_EXHAUSTED_MODE:
+        return BUDGET_EXHAUSTED_GUIDANCE
+    if mode == "StoppedWithoutFinish":
         return (
             "stalled / no convergence — consider re-decomposing into smaller "
             "single-subsystem items"
@@ -631,7 +646,13 @@ def build_comment_body(
                     and isinstance(disposition.get("Failed"), dict)
                     and isinstance(disposition["Failed"].get("mode"), str)
                 ):
-                    parts.append(failure_mode_guidance(disposition["Failed"]["mode"]))
+                    fmode = disposition["Failed"]["mode"]
+                    parts.append(failure_mode_guidance(fmode))
+                    if fmode == BUDGET_EXHAUSTED_MODE:
+                        facts = [f"iterations={iterations}"]
+                        if branch_name:
+                            facts.append(f"branch=`{branch_name}`")
+                        parts.append("Recovery facts: " + ", ".join(facts))
     elif stderr_line and status == RunStatus.failed:
         # Engine-broke pre-run infra error: quote the stderr line the operator
         # needs. map_talos_result already embedded it in the header for exit 1;
@@ -641,6 +662,8 @@ def build_comment_body(
 
 
 __all__ = [
+    "BUDGET_EXHAUSTED_GUIDANCE",
+    "BUDGET_EXHAUSTED_MODE",
     "build_comment_body",
     "build_talos_argv",
     "failure_mode_guidance",

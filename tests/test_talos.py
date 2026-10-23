@@ -1078,10 +1078,22 @@ class TestFailureModeGuidance:
     def test_redecompose_bucket_modes(self) -> None:
         from agent_gtd_dispatch.talos import failure_mode_guidance
 
-        for mode in ("StoppedWithoutFinish", "BudgetExhausted"):
-            out = failure_mode_guidance(mode)
-            assert "stalled / no convergence" in out, mode
-            assert "re-decomposing" in out, mode
+        out = failure_mode_guidance("StoppedWithoutFinish")
+        assert "stalled / no convergence" in out
+        assert "re-decomposing" in out
+
+    def test_budget_exhausted_is_not_a_stall(self) -> None:
+        from agent_gtd_dispatch.talos import (
+            BUDGET_EXHAUSTED_MODE,
+            failure_mode_guidance,
+        )
+
+        out = failure_mode_guidance(BUDGET_EXHAUSTED_MODE)
+        assert "stalled / no convergence" not in out
+        assert "re-decomposing" not in out
+        assert "budget" in out
+        assert "sound" in out
+        assert "resume" in out
 
     def test_redispatch_bucket_modes(self) -> None:
         from agent_gtd_dispatch.talos import failure_mode_guidance
@@ -2808,6 +2820,69 @@ class TestBuildCommentBody:
         assert "re-dispatch" not in body
         assert "stalled / no convergence" not in body
         assert "unrecognized failure mode" not in body
+
+
+_BUDGET_EXHAUSTED_SUMMARY = json.dumps(
+    {
+        "outcome": "Finished",
+        "iterations": 42,
+        "disposition": {
+            "Failed": {"mode": "BudgetExhausted", "summary": "out of time"}
+        },
+    }
+)
+
+
+class TestBudgetExhaustedSurface:
+    def test_comment_body_has_guidance_and_recovery_facts(self) -> None:
+        from agent_gtd_dispatch.talos import build_comment_body
+
+        body = build_comment_body(20, _BUDGET_EXHAUSTED_SUMMARY, "", "feat/x")
+        assert "Failed (BudgetExhausted):" in body
+        assert "raise the budget" in body
+        assert "iterations=42" in body
+        assert "`feat/x`" in body
+        assert "stalled / no convergence" not in body
+
+    async def test_run_error_carries_budget_guidance(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        run, engine, item, project = _make_talos_run()
+        update_run_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", AsyncMock())
+        monkeypatch.setattr(gtd_client, "set_item_status", AsyncMock())
+
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (_BUDGET_EXHAUSTED_SUMMARY.encode(), b"")
+        mock_proc.returncode = 20
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", MagicMock()),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+        failed = [
+            c
+            for c in update_run_mock.await_args_list
+            if c.kwargs.get("status") == RunStatus.failed
+        ]
+        assert failed
+        error = failed[-1].kwargs["error"]
+        assert "raise the budget" in error
+        assert "stalled / no convergence" not in error
 
 
 class TestGitFailureErrorKeepsHead:
