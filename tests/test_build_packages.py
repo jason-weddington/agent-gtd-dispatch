@@ -19,6 +19,7 @@ DEPLOY_SCRIPT = REPO_ROOT / "deploy.sh"
 REQUIRED_APT = {
     "cmake",
     "libasound2-dev",
+    "libclang-dev",
     "pkg-config",
     "libwebkit2gtk-4.1-dev",
     "libgtk-3-dev",
