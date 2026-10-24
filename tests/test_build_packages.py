@@ -41,7 +41,7 @@ def _source(expr: str) -> list[str]:
 
 def test_apt_list_covers_native_and_tauri_builds() -> None:
     pkgs = _source('"${DEV_TOOLCHAIN_APT_PKGS[@]}"')
-    assert REQUIRED_APT <= set(pkgs)
+    assert set(pkgs) >= REQUIRED_APT
     assert len(pkgs) == len(set(pkgs))
 
 
