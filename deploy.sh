@@ -118,6 +118,22 @@ if sudo test -f /home/${SERVICE_USER}/.env; then if ! sudo bash "${_stage}/kb-mc
 # templates/personal-kb-hook-settings.py alongside the refresh scripts above and
 # is removed together with the rest of _stage after the wiring step.
 
+# Refuse stray user-level steering BEFORE installing anything: headless runs load
+# ~/.claude/CLAUDE.md and ~/.claude/rules/*.md even with --system-prompt, so a
+# copied-in personal CLAUDE.md silently changes every run on this host. Dispatch
+# steering lives in the dispatch prompt. ~/.claude/settings.json (the KB hooks) is
+# legitimate and is deliberately not checked.
+_stray=""
+for _f in /home/${AGENT_USER}/.claude/CLAUDE.md /home/${AGENT_USER}/.claude/CLAUDE.local.md; do
+    if sudo test -e "\$_f"; then _stray="\${_stray} \$_f"; fi
+done
+if sudo test -d /home/${AGENT_USER}/.claude/rules && [ -n "\$(sudo ls -A /home/${AGENT_USER}/.claude/rules 2>/dev/null)" ]; then _stray="\${_stray} /home/${AGENT_USER}/.claude/rules/"; fi
+if [ -n "\$_stray" ]; then
+    rm -rf "${_stage}"
+    echo "[ERR]  stray user-level steering for ${AGENT_USER} on ${host}:\$_stray — dispatched runs would load it; remove it (dispatch steering lives in the dispatch prompt)" >&2
+    exit 1
+fi
+
 # Install/refresh the wheel from the private index.
 # -H sets HOME=/home/${SERVICE_USER} so uv installs the tool under the service
 # user's ~/.local (not root's HOME); without it the entry point lands in the

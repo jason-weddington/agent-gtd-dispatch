@@ -5105,6 +5105,7 @@ async def _dispatch_worker(
             workspace_repo_dirs=workspace_repo_dirs,
             workspace=workspace,
             merge_notes=merge_notes,
+            engine_name=engine_used.name,
         )
 
         item_title = item.get("title", f"rollout:{run.rollout_id}")

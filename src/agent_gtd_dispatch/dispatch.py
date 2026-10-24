@@ -25,7 +25,13 @@ from agent_gtd_dispatch_protocol.branches import make_branch_name
 from agent_gtd_dispatch_protocol.models import BuildEngine, DispatchMode
 
 from . import config, gtd_client
-from .engines import COMMON_ENV_KEYS, FORBIDDEN_ENV_KEYS, Engine, build_env
+from .engines import (
+    COMMON_ENV_KEYS,
+    FORBIDDEN_ENV_KEYS,
+    Engine,
+    build_env,
+    is_talos_engine,
+)
 from .models import PushStatus, RepoPushStatus
 
 logger = logging.getLogger(__name__)
@@ -1656,6 +1662,7 @@ def build_system_prompt(
     workspace_repo_dirs: list[str] | None = None,
     workspace: Path | None = None,
     merge_notes: list[dict[str, Any]] | None = None,
+    engine_name: str | None = None,
 ) -> str:
     """Build the headless agent system prompt.
 
@@ -1671,6 +1678,7 @@ def build_system_prompt(
             attachments=attachments,
             run_id=run_id,
             workspace_repo_dirs=workspace_repo_dirs,
+            engine_name=engine_name,
         )
     if mode == DispatchMode.REVIEW:
         # REVIEW prompts need the review envelope (branch, diff target, gate
@@ -1686,6 +1694,7 @@ def build_system_prompt(
             max_turns,
             workspace_repo_dirs=workspace_repo_dirs,
             merge_notes=merge_notes,
+            engine_name=engine_name,
         )
     return _build_build_prompt(
         item,
@@ -1696,6 +1705,7 @@ def build_system_prompt(
         attachments=attachments,
         run_id=run_id,
         workspace_repo_dirs=workspace_repo_dirs,
+        engine_name=engine_name,
     )
 
 
@@ -1731,6 +1741,7 @@ def _build_plan_prompt(
     attachments: list[dict[str, Any]] | None = None,
     run_id: str = "",
     workspace_repo_dirs: list[str] | None = None,
+    engine_name: str | None = None,
 ) -> str:
     """System prompt for plan mode — groom a task, don't build it."""
     item_id = item["id"]
@@ -1781,6 +1792,8 @@ def _build_plan_prompt(
         prompt += (
             "\n" + _build_workspace_layout_section_plan(workspace_repo_dirs) + "\n"
         )
+
+    prompt += "\n" + _standard_headless_rules(engine_name) + "\n"
 
     prompt += textwrap.dedent(
         f"""\
@@ -2098,6 +2111,44 @@ A change someone using the project could notice is `feat` or `fix`, never
     return _indent_prompt_block(body)
 
 
+STANDARD_RULES_HEADING: str = "## Standard rules for headless runs"
+
+
+def _standard_headless_rules(engine_name: str | None = None) -> str:
+    """The always-true rules for every headless run, rendered into every mode's prompt.
+
+    One section, one wording. The copy is engine-agnostic on purpose: it says "the agent", "the worker" and "the configured engine" and never names a product. The single engine-conditional bullet (a talos-family agent must not commit, because the worker owns the commit) renders only when ``engine_name`` is a talos-family engine.
+    """
+    lines = [
+        STANDARD_RULES_HEADING,
+        "",
+        "- Never end your turn while anything you started is still running: the "
+        "run ends with your turn, and a backgrounded command dies with it.",
+        "- You cannot read service credentials. Never claim an acceptance "
+        "criterion that needs a credentialed check is met; say plainly that it "
+        "needs the lead.",
+        "- You cannot install software or system packages, and must not design a "
+        "fix that installs anything at run time; host tooling is provisioned by "
+        "the host setup. If a tool is missing, say so in your final report.",
+        "- What decides the run's outcome is the commits on the remote branch, "
+        "the gate result and the worker's result record; nothing you say about "
+        "your own work changes it.",
+        "- Never push to or commit on the default branch, except through a merge "
+        "procedure this prompt explicitly gives you.",
+    ]
+    if engine_name and is_talos_engine(engine_name):
+        lines.append(
+            "- Never run `git commit`: the worker owns the commit for this "
+            "configured engine and makes it from your working tree."
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _standard_rules_block(engine_name: str | None = None) -> str:
+    """:func:`_standard_headless_rules` re-indented for the manage/review templates."""
+    return _indent_prompt_block(_standard_headless_rules(engine_name))
+
+
 _TURN_DISCIPLINE_BODY: str = """\
 ## Turn Discipline — Never End Your Turn With Something Still Running
 
@@ -2182,6 +2233,7 @@ def _build_manage_workspace_main_prompt(
     max_turns: int,
     workspace_repo_dirs: list[str],
     merge_notes: list[dict[str, Any]] | None = None,
+    engine_name: str | None = None,
 ) -> str:
     """Workspace-variant manage prompt: per-repo review, merge, push, cleanup."""
     project_name = project["name"]
@@ -2211,6 +2263,7 @@ def _build_manage_workspace_main_prompt(
 
     step3 = _manage_wait_step(rollout_id, gate_exception)
     turn_discipline = _turn_discipline_block()
+    standard_rules = _standard_rules_block(engine_name)
     merge_bar = _manage_merge_bar_block(_gate, "3", workspace=True)
     recent_notes = _manage_recent_merge_notes_block(merge_notes)
     merge_note_step = _manage_merge_note_block()
@@ -2244,6 +2297,8 @@ def _build_manage_workspace_main_prompt(
         Do NOT add comments to the launch item_id.
         Do NOT mark it complete.
         Do NOT treat it as a gate.
+
+        {standard_rules}
 
         {turn_discipline}
 
@@ -2679,6 +2734,7 @@ def _build_manage_prompt(
     max_turns: int,
     workspace_repo_dirs: list[str] | None = None,
     merge_notes: list[dict[str, Any]] | None = None,
+    engine_name: str | None = None,
 ) -> str:
     """System prompt for manage mode — run the rollout-manager executor loop.
 
@@ -2692,7 +2748,12 @@ def _build_manage_prompt(
 
     if workspace_repo_dirs:
         return _build_manage_workspace_main_prompt(
-            rollout_id, project, max_turns, workspace_repo_dirs, merge_notes
+            rollout_id,
+            project,
+            max_turns,
+            workspace_repo_dirs,
+            merge_notes,
+            engine_name=engine_name,
         )
 
     _gate = (project.get("gate_command") or "").strip()
@@ -2715,6 +2776,7 @@ def _build_manage_prompt(
 
     step3 = _manage_wait_step(rollout_id, gate_exception)
     turn_discipline = _turn_discipline_block()
+    standard_rules = _standard_rules_block(engine_name)
     merge_bar = _manage_merge_bar_block(_gate, "2", workspace=False)
     recent_notes = _manage_recent_merge_notes_block(merge_notes)
     merge_note_step = _manage_merge_note_block()
@@ -2747,6 +2809,8 @@ def _build_manage_prompt(
         Do NOT add comments to the launch item_id.
         Do NOT mark it complete.
         Do NOT treat it as a gate.
+
+        {standard_rules}
 
         {turn_discipline}
 
@@ -4121,6 +4185,7 @@ def build_review_prompt(
     redispatches_used: int = 0,
     redispatch_cap: int = 1,
     gate_failure_output: str | None = None,
+    engine_name: str | None = None,
 ) -> str:
     """System prompt for REVIEW mode — review ONE build, then approve or refuse.
 
@@ -4223,6 +4288,7 @@ record `none` for it and continue — do NOT halt for that alone."""
         )
     merge_note_rules = _manage_merge_note_block()
     turn_discipline = _turn_discipline_block()
+    standard_rules = _standard_rules_block(engine_name)
 
     redispatch_line = (
         f"This item has already been re-dispatched {redispatches_used} time(s); "
@@ -4461,6 +4527,8 @@ uncertain; `merge` frequently is."""
           `# type: ignore`, or bypass hooks with `--no-verify`.
         - Never force-push, and never push at all.
 
+        {standard_rules}
+
         {turn_discipline}
 
         ## Completion Artifact — this is how you return your verdict
@@ -4543,6 +4611,7 @@ def _build_build_prompt(
     attachments: list[dict[str, Any]] | None = None,
     run_id: str = "",
     workspace_repo_dirs: list[str] | None = None,
+    engine_name: str | None = None,
 ) -> str:
     """System prompt for build mode — implement and push a branch.
 
@@ -4552,6 +4621,7 @@ def _build_build_prompt(
     """
     item_id = item["id"]
     turn_discipline = _turn_discipline_block()
+    standard_rules = _standard_rules_block(engine_name)
 
     files_section = _build_supporting_files_section(attachments, run_id)
 
@@ -4593,12 +4663,14 @@ def _build_build_prompt(
     prompt += textwrap.dedent(
         f"""\
 
+        {standard_rules}
+
         {turn_discipline}
 
         ## Rules
 
         1. **Fetch the item first.** Call `get_item` with item_id="{item_id}" as your first action.
-        2. **Branch.** You are already on branch `{branch_name}`. Stay on it. Never commit to main.
+        2. **Branch.** You are already on branch `{branch_name}`. Stay on it.
         3. **Test.** Run the project's test suite before committing. Fix failures.
         4. **Commit.** Use conventional commit messages. Small, focused commits.
            **Commit as you go** — do not leave finished work uncommitted while you
@@ -4647,7 +4719,7 @@ def _build_build_prompt(
         ## Important
 
         - You have max {max_turns} turns. Budget them wisely.
-        - Never force-push, never push to main, never delete branches you didn't create.
+        - Never force-push, never delete branches you didn't create.
         - Never modify CI/CD configs, deployment scripts, or secrets.
         - Focus only on this task. Don't fix unrelated issues you notice.
     """

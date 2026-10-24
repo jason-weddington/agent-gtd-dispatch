@@ -461,6 +461,26 @@ else
     _create_user "$AGENT_USER"   "$AGENT_HOME"   "Dispatch agent subprocess user"
 fi
 
+# Guard: no stray user-level steering in the agent home. Headless runs load
+# ~/.claude/CLAUDE.md and ~/.claude/rules/*.md even when --system-prompt is passed,
+# so a copied-in personal CLAUDE.md silently changes every run on this host.
+# ~/.claude/settings.json (the KB hooks) is legitimate and is not checked.
+_stray=""
+for _f in "${AGENT_HOME}/.claude/CLAUDE.md" "${AGENT_HOME}/.claude/CLAUDE.local.md"; do
+    [[ -e "$_f" ]] && _stray="${_stray} ${_f}"
+done
+if [[ -d "${AGENT_HOME}/.claude/rules" ]] && [[ -n "$(ls -A "${AGENT_HOME}/.claude/rules" 2>/dev/null)" ]]; then
+    _stray="${_stray} ${AGENT_HOME}/.claude/rules/"
+fi
+if [[ -n "$_stray" ]]; then
+    _stray_msg="stray user-level steering for ${AGENT_USER} on $(hostname):${_stray} — dispatched runs would load it; remove it (dispatch steering lives in the dispatch prompt)"
+    if $DRY_RUN; then
+        would "refuse: ${_stray_msg}"
+    else
+        die "$_stray_msg"
+    fi
+fi
+
 # Guard: neither user may be in the sudo group
 for u in "$AGENT_USER" "$SERVICE_USER"; do
     if id -u "$u" &>/dev/null && groups "$u" 2>/dev/null | grep -q sudo; then
