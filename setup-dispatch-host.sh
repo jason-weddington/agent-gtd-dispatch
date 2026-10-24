@@ -1880,7 +1880,7 @@ fi
 # future repo needs is a one-line change there — never edit the loop below.
 # ===========================================================================
 echo ""
-echo "--- Step 4.9: Dev toolchain (Rust tools + gitleaks, agent user) ---"
+echo "--- Step 4.9: Dev toolchain (system build packages, Rust tools + gitleaks, agent user) ---"
 
 TOOLCHAIN_CONF="${TMPL_DIR}/dev-toolchain.sh"
 if [[ ! -f "$TOOLCHAIN_CONF" ]]; then
@@ -1888,6 +1888,42 @@ if [[ ! -f "$TOOLCHAIN_CONF" ]]; then
 fi
 # shellcheck source=templates/dev-toolchain.sh
 source "$TOOLCHAIN_CONF"
+
+# Sub-action 0: system build packages (apt) and global npm tools, from the data file.
+# Every host builds every dispatched project, so these are not optional per host.
+_apt_missing=()
+for _pkg in "${DEV_TOOLCHAIN_APT_PKGS[@]}"; do
+    dpkg-query -W -f='${Status}' "$_pkg" 2>/dev/null | grep -q "install ok installed" \
+        || _apt_missing+=("$_pkg")
+done
+if [[ ${#_apt_missing[@]} -eq 0 ]]; then
+    skip "System build packages already installed (${#DEV_TOOLCHAIN_APT_PKGS[@]}) — already configured"
+elif ! command -v apt-get &>/dev/null; then
+    warn "apt-get not found — install these build packages by hand: ${_apt_missing[*]}"
+elif $DRY_RUN; then
+    would "apt-get install -y ${_apt_missing[*]}"
+else
+    { DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+        && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${_apt_missing[@]}"; } \
+        || die "apt-get install failed for: ${_apt_missing[*]}"
+    info "Installed system build packages: ${_apt_missing[*]}"
+fi
+for _npm_entry in "${DEV_TOOLCHAIN_NPM_GLOBAL_PKGS[@]}"; do
+    _npm_pkg="${_npm_entry%%|*}"
+    _npm_bin="${_npm_entry#*|}"
+    if runuser -l "$AGENT_USER" -c "command -v '${_npm_bin}'" >/dev/null 2>&1; then
+        skip "${_npm_bin} already on ${AGENT_USER}'s PATH — already configured"
+    elif ! command -v npm &>/dev/null; then
+        warn "npm not found — cannot install ${_npm_pkg}; install Node.js first"
+    elif $DRY_RUN; then
+        would "npm install -g ${_npm_pkg}"
+    else
+        npm install -g "$_npm_pkg" >/dev/null || die "npm install -g ${_npm_pkg} failed"
+        runuser -l "$AGENT_USER" -c "command -v '${_npm_bin}'" >/dev/null 2>&1 \
+            || die "npm install -g ${_npm_pkg} ran but '${_npm_bin}' is not on ${AGENT_USER}'s PATH"
+        info "Installed ${_npm_pkg} globally"
+    fi
+done
 
 # Sub-action A: rustup + cargo-binstall (shared helpers; no-ops when 4.5b ran them)
 ensure_rustup

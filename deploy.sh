@@ -64,6 +64,11 @@ if [ -f "${TOOLCHAIN_CONF}" ]; then
     for _e in "${GITLEAKS_ARCH_MAP[@]}"; do
         GITLEAKS_ARCH_MAP_LIST="${GITLEAKS_ARCH_MAP_LIST}'${_e}' "
     done
+    APT_PKG_LIST="${DEV_TOOLCHAIN_APT_PKGS[*]}"
+    NPM_GLOBAL_LIST=""
+    for _e in "${DEV_TOOLCHAIN_NPM_GLOBAL_PKGS[@]}"; do
+        NPM_GLOBAL_LIST="${NPM_GLOBAL_LIST}'${_e}' "
+    done
     # Substitute {version} locally; {arch} is resolved on each host from `uname -m`.
     GITLEAKS_URL_VERSIONED="${GITLEAKS_URL_TEMPLATE//\{version\}/${GITLEAKS_VERSION}}"
     # Playwright pins, same single-quoted-entry interpolation pattern as above.
@@ -74,6 +79,8 @@ if [ -f "${TOOLCHAIN_CONF}" ]; then
 else
     echo "[WARN] ${TOOLCHAIN_CONF} not found — dev toolchain refresh will be skipped on every host" >&2
     DEV_TOOLCHAIN_PKG_LIST=""
+    APT_PKG_LIST=""
+    NPM_GLOBAL_LIST=""
     GITLEAKS_ARCH_MAP_LIST=""
     GITLEAKS_URL_VERSIONED=""
     GITLEAKS_VERSION=""
@@ -164,6 +171,35 @@ if LH_VER=\$(sudo -u ${AGENT_USER} -H /home/${AGENT_USER}/.local/bin/lefthook ve
 else
     echo "[WARN] lefthook not runnable for ${AGENT_USER} — lefthook repos cannot activate hooks on this host" >&2
 fi
+
+# System build packages and global npm tools (setup-dispatch-host.sh Step 4.9,
+# sub-action 0), from templates/dev-toolchain.sh. Only missing packages are installed,
+# so a fully provisioned host runs no apt-get. Non-fatal.
+_apt_missing=""
+for _pkg in ${APT_PKG_LIST}; do
+    dpkg-query -W -f='\${Status}' "\$_pkg" 2>/dev/null | grep -q "install ok installed" || _apt_missing="\${_apt_missing} \$_pkg"
+done
+if [ -z "\$_apt_missing" ]; then
+    echo "[OK]   system build packages present"
+elif ! command -v apt-get >/dev/null 2>&1; then
+    echo "[WARN] apt-get not found — missing build packages:\$_apt_missing" >&2
+elif sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 \
+    && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \$_apt_missing >/dev/null 2>&1; then
+    echo "[OK]   installed system build packages:\$_apt_missing"
+else
+    echo "[WARN] apt-get install failed for:\$_apt_missing" >&2
+fi
+for _entry in ${NPM_GLOBAL_LIST}; do
+    _npkg="\${_entry%%|*}"
+    _nbin="\${_entry#*|}"
+    if sudo -u ${AGENT_USER} -H bash -lc "command -v \$_nbin" >/dev/null 2>&1; then
+        echo "[OK]   \$_nbin present for ${AGENT_USER}"
+    elif command -v npm >/dev/null 2>&1 && sudo npm install -g "\$_npkg" >/dev/null 2>&1; then
+        echo "[OK]   installed \$_npkg globally"
+    else
+        echo "[WARN] could not install \$_npkg globally (npm missing or install failed)" >&2
+    fi
+done
 
 # Refresh the agent user's dev toolchain (setup-dispatch-host.sh Step 4.9): the
 # Rust tools and gitleaks that dispatched repos' hooks and gate commands call.

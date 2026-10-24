@@ -42,6 +42,36 @@
 # one for the host triple and falls back to `cargo install` (source build) otherwise,
 # so every entry works on both x86_64 and aarch64 (a Pi 5 host is aarch64).
 
+# ---------------------------------------------------------------------------
+# FORMAT — DEV_TOOLCHAIN_APT_PKGS / DEV_TOOLCHAIN_NPM_GLOBAL_PKGS
+# ---------------------------------------------------------------------------
+# WHY: every dispatch host must be able to build every dispatched project, and the
+# agent user cannot install system packages. So the system build dependencies any
+# dispatched repo needs are installed on every host, never pinned to the one host
+# that happened to have them:
+#   * cmake, libasound2-dev — native Rust crates that build C/C++ code (whisper-rs-sys
+#     builds whisper.cpp with cmake) or link ALSA (cpal).
+#   * the Tauri 2 Linux stack (webkit2gtk-4.1, gtk3, libsoup3, javascriptcoregtk-4.1,
+#     ayatana-appindicator, rsvg, xdo) — desktop apps built with Tauri.
+#
+# DEV_TOOLCHAIN_APT_PKGS: Debian/Ubuntu package names. setup-dispatch-host.sh and
+#   deploy.sh install whichever are missing (dpkg-query check first, so a host that
+#   has them all runs no apt-get at all). Hosts without apt-get are skipped with a
+#   warning.
+# DEV_TOOLCHAIN_NPM_GLOBAL_PKGS: "<npm package>|<binary>", installed system-wide with
+#   `npm install -g` when <binary> is not on the agent user's PATH.
+#
+# To ADD a package: append ONE entry. Re-run setup-dispatch-host.sh (or ./deploy.sh).
+DEV_TOOLCHAIN_APT_PKGS=(
+  build-essential pkg-config cmake libssl-dev   # native builds (cc crate, cmake crate, openssl-sys)
+  libasound2-dev                                # ALSA headers (cpal)
+  libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev  # Tauri 2
+  libayatana-appindicator3-dev librsvg2-dev libxdo-dev file                        # Tauri 2
+)
+DEV_TOOLCHAIN_NPM_GLOBAL_PKGS=(
+  "pnpm|pnpm"   # JS package manager used by Tauri app frontends
+)
+
 DEV_TOOLCHAIN_CARGO_PKGS=(
   "cargo-nextest|cargo-nextest"   # test runner (harness-design lefthook + gate)
   "cargo-llvm-cov|cargo-llvm-cov" # coverage
