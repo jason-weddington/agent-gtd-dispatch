@@ -2,6 +2,20 @@
 
 <!-- version list -->
 
+## v2.13.0 (2026-10-24)
+
+### Features
+
+- **2e745843**: Dispatched agents: one shared block of standard headless rules in every dispatch
+  prompt, and deploy refuses a host carrying stray user-level steering files
+  ([`82cfb11`](https://github.com/repos/agent-gtd-dispatch/commit/82cfb1186a29133e4ed202717a71a3ade4352b37))
+
+### Testing
+
+- Satisfy ruff SIM300 in the build-packages test
+  ([`163eb17`](https://github.com/repos/agent-gtd-dispatch/commit/163eb173da313b9528e3f93437c749358ffcaab5))
+
+
 ## v2.12.1 (2026-10-24)
 
 ### Bug Fixes
