@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v2.11.1 (2026-10-23)
+
+### Bug Fixes
+
+- **32e20e22**: Rollout loops park in place while their host drains: stop starting new work at a
+  tick boundary, drop out of active_runs, resume when the host returns
+  ([`11f8b80`](https://github.com/repos/agent-gtd-dispatch/commit/11f8b809bca183cee4a7920a72e74890400d936c))
+
+- **ccf3cf46**: Plan runs: the prompt always sets build_engine explicitly, and a plan run that
+  writes no acceptance criteria does not report success
+  ([`96e5ed0`](https://github.com/repos/agent-gtd-dispatch/commit/96e5ed044a44283af4336486253ebb41772341d2))
+
+
 ## v2.11.0 (2026-10-23)
 
 ### Bug Fixes
