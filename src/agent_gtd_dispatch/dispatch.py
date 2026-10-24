@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
 from agent_gtd_dispatch_protocol.branches import make_branch_name
-from agent_gtd_dispatch_protocol.models import DispatchMode
+from agent_gtd_dispatch_protocol.models import BuildEngine, DispatchMode
 
 from . import config, gtd_client
 from .engines import COMMON_ENV_KEYS, FORBIDDEN_ENV_KEYS, Engine, build_env
@@ -1699,6 +1699,31 @@ def build_system_prompt(
     )
 
 
+ENGINE_RUBRIC_DESCRIPTIONS: dict[str, str] = {
+    "claude-code": "cloud Opus, expensive, slower, most capable reasoning (the default engine)",
+    "claude-code-sonnet": "cloud Sonnet, medium cost, fast, strong reasoning for well-scoped work",
+    "claude-code-haiku": "cloud Haiku, very cheap, fast, weaker reasoning",
+    "claude-code-ollama": "Claude Code on a local Ollama model, free, weak; not routed by the rubric",
+    "claude-code-glm": "Claude Code on a GLM model, cheap, moderate reasoning",
+    "kiro": "Kiro CLI engine, alternative agent harness",
+    "talos-haiku": "talos harness with Haiku, very cheap, mechanical work",
+    "talos-sonnet": "talos harness with Sonnet, medium cost, well-scoped work",
+    "talos-opus": "talos harness with Opus, expensive, most capable",
+    "talos-qwen": "talos harness with Qwen, cheap, moderate reasoning",
+    "talos-glm": "talos harness with GLM, cheap, moderate reasoning",
+    "talos-glm-flash": "talos harness with GLM Flash, cheapest, mechanical work",
+}
+
+
+def _render_engine_rubric_list() -> str:
+    """Bullet list of every BuildEngine member, in the plan prompt's 8-space indent."""
+    return "\n".join(
+        f"        - **`{m.value}`** — "
+        f"{ENGINE_RUBRIC_DESCRIPTIONS.get(m.value, 'no description')}"
+        for m in BuildEngine
+    )
+
+
 def _build_plan_prompt(
     item: dict[str, Any],
     project: dict[str, Any],
@@ -1720,6 +1745,17 @@ def _build_plan_prompt(
     )
 
     files_section = _build_supporting_files_section(attachments, run_id)
+    current_engine = item.get("build_engine")
+    if current_engine:
+        current_engine_line = (
+            f'This item already has `build_engine="{current_engine}"`. Keep it '
+            "(pass the same value) unless the rubric clearly says otherwise."
+        )
+    else:
+        current_engine_line = (
+            "The item has no build_engine yet; choose one per the rubric."
+        )
+    engine_list = _render_engine_rubric_list()
 
     prompt = textwrap.dedent(
         f"""\
@@ -1793,12 +1829,12 @@ def _build_plan_prompt(
         4. **Define scope boundaries.** Explicitly state what NOT to touch (use `scope_out`).
         5. **Add verification steps.** How to test the changes (commands, expected output).
         6. **Select build engine.** Evaluate this task against the Engine-Selection Rubric below.
-           - Route to one of the three engines per the rubric criteria.
-           - Call `update_item(build_engine="<engine-name>")` if routing to anything other than the
-             default (e.g. `build_engine="claude-code-haiku"` or `"claude-code-sonnet"`).
-           - Leave `build_engine` unset (don't call update_item for it) to route to `claude-code`
-             (default Opus).
-           - When uncertain, route UP (toward Opus), not down.
+           - ALWAYS call `update_item` with `build_engine` set to exactly one engine name
+             from the rubric, e.g. `update_item(build_engine="<engine-name>")`.
+           - Never write the `build_engine` key without a value, and never omit it to mean
+             "default". Every plan run names an engine explicitly.
+           - {current_engine_line}
+           - When uncertain, route UP (toward the most capable engine), not down.
         7. **Ask questions if unclear.** If the intent is ambiguous, post a comment asking
            for clarification and stop. Do NOT guess.
 
@@ -1812,14 +1848,15 @@ def _build_plan_prompt(
           structured fields only** — prose Markdown in `description` is ignored by the validator.
         - Use `add_comment` with item_id="{item_id}" for questions or notes.
         - When grooming is complete, set item status to `ready` using `update_item`.
+        - If an `update_item` call fails, retry with fewer fields per call (for example
+          `acceptance_criteria` alone, then the other fields one call each) rather than
+          resending the same payload. Write `acceptance_criteria` first.
 
         ## Engine-Selection Rubric
 
-        Three engines are available for build-mode dispatches:
+        These engines are available for build-mode dispatches:
 
-        - **`claude-code-haiku`** — cloud Haiku 4.5, very cheap, fast, weak-ish reasoning
-        - **`claude-code-sonnet`** — cloud Sonnet 4.6, medium cost, fast, strong reasoning for well-scoped work
-        - **`claude-code` (default Opus)** — cloud Opus, expensive, slower, most capable reasoning
+{engine_list}
 
         ### Route to `claude-code-haiku` when ALL of these hold
 
@@ -1837,7 +1874,7 @@ def _build_plan_prompt(
         - No novel design decisions, no debugging, no cross-cutting judgment
         - "Well-scoped non-trivial" sweet spot — the plan agent did the thinking, builder needs strong execution
 
-        ### Route to `claude-code` (default Opus) when ANY of these hold
+        ### Route to `claude-code` when ANY of these hold
 
         1. Multi-file orchestration with coordinating intent across modules
         2. Novel design decisions ("decide whether…", "design a way to…")
@@ -1851,7 +1888,7 @@ def _build_plan_prompt(
 
         ### Default policy
 
-        When uncertain, route UP (toward Opus), not down. The cost of a failed cheap-engine attempt (re-dispatch + lead intervention) outweighs the savings.
+        When uncertain, route UP (toward the most capable engine), not down. The cost of a failed cheap-engine attempt (re-dispatch + lead intervention) outweighs the savings.
 
         ## Reporting
 

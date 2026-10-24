@@ -773,10 +773,41 @@ class TestBuildPlanPrompt:
         assert "Route to `claude-code-sonnet` when" in self._prompt()
 
     def test_includes_rubric_anthropic_criteria(self) -> None:
-        assert (
-            "Route to `claude-code` (default Opus) when ANY of these hold"
-            in self._prompt()
+        assert "Route to `claude-code` when ANY of these hold" in self._prompt()
+
+    def test_always_sets_build_engine_explicitly(self) -> None:
+        prompt = self._prompt()
+        assert "ALWAYS call `update_item` with `build_engine`" in prompt
+        assert "Never write the `build_engine` key without a value" in prompt
+        assert "Leave `build_engine` unset" not in prompt
+        assert "three engines" not in prompt.lower()
+        assert "default Opus" not in prompt
+
+    def test_existing_build_engine_is_kept(self) -> None:
+        item = {**self._item, "build_engine": "claude-code-sonnet"}
+        prompt = build_system_prompt(
+            item, self._project, branch_name=None, max_turns=30, mode="plan"
         )
+        assert 'already has `build_engine="claude-code-sonnet"`' in prompt
+
+    def test_rubric_lists_every_build_engine(self) -> None:
+        from agent_gtd_dispatch_protocol.models import BuildEngine
+
+        prompt = self._prompt()
+        for m in BuildEngine:
+            assert f"**`{m.value}`**" in prompt
+
+    def test_rubric_descriptions_match_enum(self) -> None:
+        from agent_gtd_dispatch_protocol.models import BuildEngine
+
+        from agent_gtd_dispatch.dispatch import ENGINE_RUBRIC_DESCRIPTIONS
+
+        assert set(ENGINE_RUBRIC_DESCRIPTIONS) == {m.value for m in BuildEngine}
+
+    def test_retry_with_fewer_fields_rule(self) -> None:
+        prompt = self._prompt()
+        assert "retry with fewer fields per call" in prompt
+        assert "rather than" in prompt
 
     def test_includes_engine_selection_step(self) -> None:
         prompt = self._prompt()
