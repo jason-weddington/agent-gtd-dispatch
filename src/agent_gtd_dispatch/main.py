@@ -1764,6 +1764,36 @@ _TICK_CONTINUE = "continue"  # state changed — re-read immediately
 _TICK_WAIT = "wait"  # builds in flight — sleep, then re-read
 _TICK_DONE = "done"  # graph_complete, or the rollout left `running`
 _TICK_HALTED = "halted"  # the loop halted the rollout (or it was halted)
+_TICK_PARKED = "parked"  # the loop's host is draining — sleep, then re-read
+
+# Run ids of rollout loops currently SLEEPING after a parked tick.  Membership
+# means exactly that: a loop is discarded at the top of every iteration, before
+# its tick runs, and added only right before the sleep that follows a parked
+# tick.  So any tick that reviews, lands or dispatches runs while the loop
+# counts as active.  Parked loops stay in ``_active_processes`` (the host's own
+# admission still counts them); only the reported ``active_runs`` leaves them
+# out so a draining host can read idle.
+_parked_rollout_loops: set[str] = set()
+
+# Substring both the board's pinned-host refusal and HostDrainingError carry
+# for a single drained host.  "All dispatch hosts are draining" does not match.
+_HOST_DRAINING_MARKER = "' is draining: "
+
+
+def _counted_active_runs() -> int:
+    """Active runs as reported on /health and /info: parked rollout loops excluded."""
+    return len(_active_processes) - len(
+        _parked_rollout_loops & _active_processes.keys()
+    )
+
+
+def _parked_step(drain: str) -> str:
+    """The manager step published while a rollout loop is parked."""
+    return (
+        f"Parked: this dispatch host is draining ({drain}); "
+        "the rollout resumes when the host returns to rotation"
+    )
+
 
 # The worker's land step (see `_land_reviewed_merge`).
 # Total `git push` REJECTIONS tolerated per land before it halts; on a
@@ -1898,7 +1928,9 @@ async def _publish_rollout_phase(
     is the agent actually in that phase), ``merging`` (now published by the
     worker's land step — :func:`_land_reviewed_merge` — which owns the fetch,
     rebase, gate and push, and republishes it as a heartbeat while it waits on
-    locks or a gate), ``reconciling_ac`` (the reviewer's), and ``halted``.
+    locks or a gate), ``reconciling_ac`` (the reviewer's), ``parked``
+    (published by the loop on every tick while its host drains), and
+    ``halted``.
     """
     try:
         await gtd_client.update_rollout_state(
@@ -3869,6 +3901,78 @@ async def _ride_out_board_outage[T](
         return result
 
 
+async def _park_or_halt_on_dispatch_refusal(
+    rollout_id: str,
+    item_id: str,
+    exc: BaseException,
+    *,
+    halt_reason: str,
+    token: str | None,
+    attribution: str | None,
+) -> str:
+    """Decide whether a NON-transient dispatch refusal parks the loop or halts.
+
+    Re-reads the rollout: a drain on the loop's host parks (the refusal was the
+    drain racing this tick), otherwise the rollout halts with ``halt_reason``.
+    A transient error on the re-read re-raises so ``_ride_out_board_outage``
+    re-runs the tick; that is safe because a refused dispatch did not move the
+    item out of ``next_ready``.
+    """
+    status_code = _http_status(exc)
+    try:
+        reread = await gtd_client.get_rollout(rollout_id, token=token)
+    except Exception as reread_exc:
+        if _is_transient_board_error(reread_exc):
+            raise
+        logger.info(
+            "rollout-loop: dispatch-failure-drain-check rollout_id=%s item_id=%s "
+            "status_code=%s outcome=%s drain_reason=%r",
+            rollout_id,
+            item_id,
+            status_code,
+            "halt_reread_failed",
+            None,
+        )
+        return await _halt_rollout_from_loop(
+            rollout_id,
+            halt_reason + f" (drain re-check failed: {type(reread_exc).__name__})",
+            item_id=item_id,
+            token=token,
+            attribution=attribution,
+        )
+    drain = str(reread.get("loop_host_drain_reason") or "").strip()
+    if drain:
+        logger.info(
+            "rollout-loop: dispatch-failure-drain-check rollout_id=%s item_id=%s "
+            "status_code=%s outcome=%s drain_reason=%r",
+            rollout_id,
+            item_id,
+            status_code,
+            "parked",
+            drain,
+        )
+        await _publish_rollout_phase(
+            rollout_id, "parked", step=_parked_step(drain), token=token
+        )
+        return _TICK_PARKED
+    logger.info(
+        "rollout-loop: dispatch-failure-drain-check rollout_id=%s item_id=%s "
+        "status_code=%s outcome=%s drain_reason=%r",
+        rollout_id,
+        item_id,
+        status_code,
+        "halt_no_drain",
+        None,
+    )
+    return await _halt_rollout_from_loop(
+        rollout_id,
+        halt_reason,
+        item_id=item_id,
+        token=token,
+        attribution=attribution,
+    )
+
+
 async def _rollout_wave_tick(
     rollout_id: str,
     *,
@@ -3879,8 +3983,16 @@ async def _rollout_wave_tick(
     token: str | None,
     attribution: str | None,
     loop_run_id: str,
+    was_parked: bool = False,
 ) -> str:
     """One pass of the wave loop. Returns a ``_TICK_*`` directive.
+
+    Drain parking.  When the board reports the loop's host draining
+    (``loop_host_drain_reason`` on ``get_rollout``), the tick stops starting
+    new work at the tick top, after the unrecorded-merge retry and before any
+    review or dispatch, and returns ``_TICK_PARKED``.  Drain is checked only
+    there, so a tick that has started a review always runs it, the land and the
+    verdict to completion.  ``was_parked`` only quiets the park-enter log.
 
     Order is load-bearing: completed builds are reviewed BEFORE newly-ready
     items are dispatched, so a dependent item is never dispatched against a
@@ -3978,10 +4090,74 @@ async def _rollout_wave_tick(
         if directive is not None:
             return directive
 
+    drain = str(rollout.get("loop_host_drain_reason") or "").strip()
+    if drain:
+        if pending:
+            await _publish_rollout_phase(
+                rollout_id,
+                "polling",
+                step=(
+                    "Recording merged item(s) on the board before parking: "
+                    f"{', '.join(pending)}"
+                ),
+                token=token,
+            )
+            return _TICK_WAIT
+        await _publish_rollout_phase(
+            rollout_id, "parked", step=_parked_step(drain), token=token
+        )
+        if not was_parked:
+            logger.info(
+                "rollout-loop: park-enter rollout_id=%s run_id=%s reason=%r",
+                rollout_id,
+                loop_run_id,
+                drain,
+            )
+        else:
+            logger.debug(
+                "rollout-loop: park-still rollout_id=%s run_id=%s reason=%r",
+                rollout_id,
+                loop_run_id,
+                drain,
+            )
+        return _TICK_PARKED
+
     reviewable = [i for i in completed if i not in pending]
 
     if reviewable:
         item_id = reviewable[0]
+        # A child build the board failed because its pinned host was draining
+        # never ran: re-dispatch it (the host is back, or this tick would have
+        # parked above) instead of sending it to the reviewer.
+        latest_run = await _latest_run_for_item(item_id, rollout_id, token=token)
+        if str(latest_run.get("status") or "") == "failed" and (
+            _HOST_DRAINING_MARKER in str(latest_run.get("error_msg") or "")
+        ):
+            try:
+                await gtd_client.reset_rollout_item(rollout_id, item_id, token=token)
+                await gtd_client.dispatch_item(
+                    item_id, rollout_id=rollout_id, token=token
+                )
+            except Exception as exc:
+                if _is_transient_board_error(exc):
+                    raise
+                return await _park_or_halt_on_dispatch_refusal(
+                    rollout_id,
+                    item_id,
+                    exc,
+                    halt_reason=(
+                        f"re-dispatch of item {item_id} after a drain refusal "
+                        f"failed: {type(exc).__name__}: {exc}"
+                    ),
+                    token=token,
+                    attribution=attribution,
+                )
+            logger.info(
+                "rollout-loop: redispatch-after-drain-refusal rollout_id=%s item_id=%s",
+                rollout_id,
+                item_id,
+            )
+            return _TICK_CONTINUE
         if workspace_ref[0] is None:
             await _publish_rollout_phase(
                 rollout_id,
@@ -4098,10 +4274,14 @@ async def _rollout_wave_tick(
                 # board's wave linkage is guarded by `AND status = 'ready'`).
                 if _is_transient_board_error(exc):
                     raise
-                return await _halt_rollout_from_loop(
+                return await _park_or_halt_on_dispatch_refusal(
                     rollout_id,
-                    f"dispatch of item {item_id} failed: {type(exc).__name__}: {exc}",
-                    item_id=item_id,
+                    item_id,
+                    exc,
+                    halt_reason=(
+                        f"dispatch of item {item_id} failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
                     token=token,
                     attribution=attribution,
                 )
@@ -4201,15 +4381,23 @@ async def _drive_rollout(
     workspace_ref: list[dispatch.RolloutWorkspace | None] = [None]
     dispatch_attempts: dict[str, int] = {}
     directive = _TICK_CONTINUE
+    parked_since: float | None = None
+    parked_ticks = 0
+    last_park_warn_at: float | None = None
     try:
         while True:
+            # Every tick runs while the loop counts as active: membership in
+            # the parked set means "sleeping after a parked tick", nothing else.
+            _parked_rollout_loops.discard(run.id)
+            was_parked = parked_since is not None
             # A transient board error re-runs the whole tick from the top.
             # That is safe because every side effect in the tick is either
             # re-derived from the board on the next read or is followed only by
             # board calls that never raise (see _rollout_wave_tick).
             directive = await _ride_out_board_outage(
                 outage,
-                lambda: _rollout_wave_tick(
+                functools.partial(
+                    _rollout_wave_tick,
                     rollout_id,
                     project=project,
                     workspace_ref=workspace_ref,
@@ -4218,8 +4406,41 @@ async def _drive_rollout(
                     token=token,
                     attribution=attribution,
                     loop_run_id=run.id,
+                    was_parked=was_parked,
                 ),
             )
+            if directive == _TICK_PARKED:
+                now = _monotonic()
+                if parked_since is None:
+                    parked_since = now
+                    last_park_warn_at = now
+                parked_ticks += 1
+                assert last_park_warn_at is not None  # noqa: S101
+                if now - last_park_warn_at >= config.ROLLOUT_PARK_WARN_SECONDS:
+                    logger.warning(
+                        "rollout-loop: park-long rollout_id=%s run_id=%s "
+                        "parked_seconds=%d",
+                        rollout_id,
+                        run.id,
+                        int(now - parked_since),
+                    )
+                    last_park_warn_at = now
+                _parked_rollout_loops.add(run.id)
+                await asyncio.sleep(config.ROLLOUT_LOOP_POLL_SECONDS)
+                continue
+            if parked_since is not None:
+                logger.info(
+                    "rollout-loop: park-exit rollout_id=%s run_id=%s "
+                    "parked_seconds=%d parked_ticks=%d next_directive=%s",
+                    rollout_id,
+                    run.id,
+                    int(_monotonic() - parked_since),
+                    parked_ticks,
+                    directive,
+                )
+                parked_since = None
+                parked_ticks = 0
+                last_park_warn_at = None
             if directive in (_TICK_DONE, _TICK_HALTED):
                 # Deregister NOW, synchronously, before any further await
                 # (workspace cleanup, the worker's db.update_run): a lead's
@@ -4231,6 +4452,15 @@ async def _drive_rollout(
             if directive == _TICK_WAIT:
                 await asyncio.sleep(config.ROLLOUT_LOOP_POLL_SECONDS)
     finally:
+        _parked_rollout_loops.discard(run.id)
+        if parked_since is not None:
+            logger.info(
+                "rollout-loop: park-abandoned rollout_id=%s run_id=%s "
+                "parked_seconds=%d",
+                rollout_id,
+                run.id,
+                int(_monotonic() - parked_since),
+            )
         _rollout_redispatches.pop(rollout_id, None)
         _rollout_unrecorded_merges.pop(rollout_id, None)
         ws = workspace_ref[0]
@@ -4288,6 +4518,7 @@ async def _rollout_loop_worker(run: Run, *, attribution: str | None = None) -> N
         )
         _publish_run_event(run.id, "failed", failed)
     finally:
+        _parked_rollout_loops.discard(run.id)
         _active_processes.pop(run.id, None)
         _try_start_pending()
         _run_event_queues.pop(run.id, None)
@@ -5758,8 +5989,8 @@ async def _dispatch_worker(
 
 @app.get("/health")
 async def health() -> dict[str, object]:
-    """Return service health and active run count."""
-    active = len(_active_processes)
+    """Return service health and active run count (parked rollout loops excluded)."""
+    active = _counted_active_runs()
     return {"status": "ok", "active_runs": active}
 
 
@@ -5770,15 +6001,18 @@ async def info() -> InfoResponse:
     The capacity fields (max_concurrent_runs, active_runs) and capability lists
     (engines, agents) let a multi-host router on the caller side filter and
     rank dispatch targets without a separate round trip to /agents.
+    ``active_runs`` leaves out rollout loops parked behind a host drain; they
+    are reported in ``parked_rollout_loops``.
     """
     agent_dicts = await run_list_agents_script()
     return InfoResponse(
         engine=ENGINE_NAME,
         version=SERVICE_VERSION,
         max_concurrent_runs=config.MAX_CONCURRENT_RUNS,
-        active_runs=len(_active_processes),
+        active_runs=_counted_active_runs(),
         engines=get_available_engine_names(),
         agents=[a["name"] for a in agent_dicts],
+        parked_rollout_loops=len(_parked_rollout_loops & _active_processes.keys()),
     )
 
 

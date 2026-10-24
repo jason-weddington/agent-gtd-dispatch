@@ -51,6 +51,36 @@ class TestHealth:
         assert resp.json()["status"] == "ok"
 
 
+class TestParkedRolloutLoopsExcludedFromActiveRuns:
+    def test_info_and_health_exclude_parked_loops(self, client, monkeypatch) -> None:
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "agent_gtd_dispatch.main._active_processes",
+            {"build-1": MagicMock(), "loop-1": MagicMock()},
+        )
+        monkeypatch.setattr("agent_gtd_dispatch.main._parked_rollout_loops", {"loop-1"})
+
+        info = client.get("/info").json()
+        assert info["active_runs"] == 1
+        assert info["parked_rollout_loops"] == 1
+        assert client.get("/health").json()["active_runs"] == 1
+
+    def test_parked_id_without_live_task_is_not_counted(
+        self, client, monkeypatch
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "agent_gtd_dispatch.main._active_processes", {"build-1": MagicMock()}
+        )
+        monkeypatch.setattr("agent_gtd_dispatch.main._parked_rollout_loops", {"gone"})
+
+        info = client.get("/info").json()
+        assert info["active_runs"] == 1
+        assert info["parked_rollout_loops"] == 0
+
+
 class TestAuth:
     def test_no_auth(self, client):
         resp = client.post("/dispatch", json={"item_id": "abc"})

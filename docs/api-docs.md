@@ -19,7 +19,7 @@ Invalid or missing credentials return **401 Unauthorized**.
 
 **Auth**: None required.
 
-Returns the service health status and the count of currently active (running) dispatches.
+Returns the service health status and the count of currently active (running) dispatches. `active_runs` excludes rollout loops parked behind a host drain, so a draining host reads 0 once its loops park and its other runs finish.
 
 **Response 200:**
 ```json
@@ -47,7 +47,8 @@ separate round-trip to `/agents`.
   "max_concurrent_runs": 32,
   "active_runs": 3,
   "engines": ["claude-code", "claude-code-sonnet", "claude-code-haiku"],
-  "agents": ["claude-lead-abc", "claude-build-def"]
+  "agents": ["claude-lead-abc", "claude-build-def"],
+  "parked_rollout_loops": 1
 }
 ```
 
@@ -56,9 +57,10 @@ separate round-trip to `/agents`.
 | `engine` | `str` | Default engine name for this host |
 | `version` | `str` | Service version (from `agent_discovery.SERVICE_VERSION`) |
 | `max_concurrent_runs` | `int` | Configured concurrency limit |
-| `active_runs` | `int` | Currently running (not queued) dispatches |
+| `active_runs` | `int` | Currently running (not queued) dispatches, excluding rollout loops parked behind a host drain |
 | `engines` | `list[str]` | Engine names with credentials present in the environment |
 | `agents` | `list[str]` | Agent names from `list_agents.sh` |
+| `parked_rollout_loops` | `int` | Rollout loops parked behind a host drain. They still hold a slot on the host, so routers compute free slots as `max_concurrent_runs - active_runs - parked_rollout_loops` |
 
 ---
 

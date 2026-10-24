@@ -131,6 +131,10 @@ LAND_GIT_TIMEOUT_SECONDS: int = 120
 # notification to wait on.
 ROLLOUT_LOOP_POLL_SECONDS: int = 30
 
+# Seconds a rollout loop may stay parked behind a host drain before it logs a
+# ``park-long`` WARNING; repeated every further interval while still parked.
+ROLLOUT_PARK_WARN_SECONDS: int = 3600
+
 # Wall-clock seconds the wave loop rides out a TRANSIENT board outage (a
 # transport error, or a 502/503/504) before giving up.  Measured from the first
 # error of the current consecutive streak; a clean tick resets it.  Past the
@@ -260,7 +264,7 @@ def load() -> None:
     global AGENT_SUBPROCESS_USER
     global REVIEWER_ENGINE, REVIEW_MAX_TURNS, REVIEW_TIMEOUT_SECONDS
     global LAND_GATE_TIMEOUT_SECONDS, LAND_GIT_TIMEOUT_SECONDS
-    global ROLLOUT_LOOP_POLL_SECONDS, MAX_ITEM_REDISPATCHES
+    global ROLLOUT_LOOP_POLL_SECONDS, ROLLOUT_PARK_WARN_SECONDS, MAX_ITEM_REDISPATCHES
     global ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS
     global EVIDENCE_ROOT, EVIDENCE_RETENTION_DAYS, WORKSPACE_RETENTION_HOURS
     global RETENTION_INTERVAL_SECONDS
@@ -360,6 +364,9 @@ def load() -> None:
     )
     ROLLOUT_LOOP_POLL_SECONDS = int(
         os.environ.get("DISPATCH_ROLLOUT_LOOP_POLL_SECONDS", "30")
+    )
+    ROLLOUT_PARK_WARN_SECONDS = int(
+        os.environ.get("DISPATCH_ROLLOUT_PARK_WARN_SECONDS", "3600")
     )
     ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS = int(
         os.environ.get("DISPATCH_ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS", "3600")

@@ -171,7 +171,10 @@ async def get_rollout_merge_notes(
 async def get_rollout(rollout_id: str, *, token: str | None = None) -> dict[str, Any]:
     """GET /api/rollouts/{rollout_id}.
 
-    Returns the rollout dict, including status and inFlightBuildRuns.
+    Returns the rollout dict, including status and inFlightBuildRuns, plus
+    ``loop_host_url`` (the rollout loop's owning host, or None) and
+    ``loop_host_drain_reason`` (that host's drain reason, or None when it is
+    not draining; the key is absent on an older board).
     """
     result: dict[str, Any] = await _request(
         "GET", f"/rollouts/{rollout_id}", token=token

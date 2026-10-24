@@ -26,6 +26,12 @@ class InfoResponse(BaseModel):
 
     Consumed by multi-host routers on the agent_gtd side to filter
     dispatch targets by available engines/agents and pick by capacity.
+
+    ``active_runs`` excludes rollout loops parked behind a host drain, so a
+    drained host reads idle once its loops park; those loops are reported in
+    ``parked_rollout_loops``.  A parked loop still holds its slot on the host,
+    so routers add ``parked_rollout_loops`` back to compute slot occupancy
+    (``max_concurrent_runs - active_runs - parked_rollout_loops`` free).
     """
 
     engine: str
@@ -34,6 +40,7 @@ class InfoResponse(BaseModel):
     active_runs: int
     engines: list[str]
     agents: list[str]
+    parked_rollout_loops: int = 0
 
 
 class PushStatus(StrEnum):

@@ -82,6 +82,7 @@ class TestInfoEndpoint:
             "active_runs",
             "engines",
             "agents",
+            "parked_rollout_loops",
         }
 
     def test_capacity_fields(self, client) -> None:

@@ -72,6 +72,7 @@ def _loop_patch_stack():
         patch("agent_gtd_dispatch.main._rollout_loops", {}) as rollout_loops,
         patch("agent_gtd_dispatch.main._rollout_redispatches", {}) as redispatches,
         patch("agent_gtd_dispatch.main._rollout_unrecorded_merges", {}) as unrecorded,
+        patch("agent_gtd_dispatch.main._parked_rollout_loops", set()) as parked,
     ):
         mock_gtd.update_rollout_state = AsyncMock()
         mock_gtd.post_comment = AsyncMock()
@@ -95,6 +96,7 @@ def _loop_patch_stack():
             rollout_loops=rollout_loops,
             redispatches=redispatches,
             unrecorded=unrecorded,
+            parked=parked,
         )
 
 
@@ -3085,3 +3087,546 @@ class TestOneLoopPerRolloutGuard:
             # The halted loop's finally must not evict the fresh loop.
             assert ctx.rollout_loops["rollout-abc"] is fresh
             await asyncio.gather(*[t for t in ctx.active.values() if t])
+
+
+# ---------------------------------------------------------------------------
+# Drain parking: a rollout loop parks in place while its host drains
+# ---------------------------------------------------------------------------
+
+_DRAIN_409_DETAIL = (
+    "Dispatch host 'h1' is draining: rolling deploy. "
+    "Dispatch refused; retry when the host returns to rotation."
+)
+
+
+def _drain_409() -> httpx.HTTPStatusError:
+    req = httpx.Request("POST", "http://gtd.test/dispatch")
+    return httpx.HTTPStatusError(
+        _DRAIN_409_DETAIL,
+        request=req,
+        response=httpx.Response(409, request=req, json={"detail": _DRAIN_409_DETAIL}),
+    )
+
+
+def _rollout_row(drain: str | None = None, **extra) -> dict:
+    row = {
+        "status": "running",
+        "inFlightBuildRuns": [],
+        "loop_host_url": "http://h1:8100",
+        "loop_host_drain_reason": drain,
+    }
+    row.update(extra)
+    return row
+
+
+def _parked_publishes(ctx) -> list:
+    return [
+        c for c in ctx.gtd.update_rollout_state.await_args_list if c.args[1] == "parked"
+    ]
+
+
+def _loop_run() -> Run:
+    return Run(
+        project_name="p",
+        mode="manage",
+        rollout_id="rollout-abc",
+        engine="claude-code",
+    )
+
+
+class TestTickParksOnDrain:
+    async def test_drain_parks_without_review_or_dispatch(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_PARKED
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._launch_reviewer", new=AsyncMock()) as rev,
+            patch(
+                "agent_gtd_dispatch.main._land_reviewed_merge", new=AsyncMock()
+            ) as land,
+        ):
+            ctx.gtd.advance_rollout = _advance(["item-a"], next_ready=["item-b"])
+            ctx.gtd.get_rollout = AsyncMock(return_value=_rollout_row("rolling deploy"))
+            assert await _tick(ctx) == _TICK_PARKED
+
+        rev.assert_not_awaited()
+        land.assert_not_awaited()
+        ctx.gtd.dispatch_item.assert_not_awaited()
+        ctx.gtd.reset_rollout_item.assert_not_awaited()
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        (call,) = _parked_publishes(ctx)
+        assert call.kwargs["current_step"] == (
+            "Parked: this dispatch host is draining (rolling deploy); "
+            "the rollout resumes when the host returns to rotation"
+        )
+
+    async def test_missing_drain_key_never_parks(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.advance_rollout = _advance([], next_ready=["item-b"])
+            ctx.gtd.get_rollout = AsyncMock(
+                return_value={"status": "running", "inFlightBuildRuns": []}
+            )
+            assert await _tick(ctx) == _TICK_CONTINUE
+
+        ctx.gtd.dispatch_item.assert_awaited_once()
+        assert _parked_publishes(ctx) == []
+
+    async def test_recorded_pending_merge_then_drain_parks(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_PARKED, _UnrecordedMerge
+
+        async def _record(rollout_id, pending, **kw):
+            pending.clear()
+            return None
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._retry_unrecorded_merges",
+                new=AsyncMock(side_effect=_record),
+            ),
+        ):
+            ctx.unrecorded["rollout-abc"] = {"item-a": _UnrecordedMerge(1, "n", 0.0)}
+            ctx.gtd.advance_rollout = _advance(["item-a"])
+            ctx.gtd.get_rollout = AsyncMock(return_value=_rollout_row("rolling deploy"))
+            assert await _tick(ctx) == _TICK_PARKED
+
+    async def test_still_pending_merge_plus_drain_waits(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_WAIT, _UnrecordedMerge
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._retry_unrecorded_merges",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            ctx.unrecorded["rollout-abc"] = {"item-a": _UnrecordedMerge(1, "n", 0.0)}
+            ctx.gtd.advance_rollout = _advance(["item-a"])
+            ctx.gtd.get_rollout = AsyncMock(return_value=_rollout_row("rolling deploy"))
+            assert await _tick(ctx) == _TICK_WAIT
+
+        assert _parked_publishes(ctx) == []
+        steps = [
+            c.kwargs["current_step"]
+            for c in ctx.gtd.update_rollout_state.await_args_list
+        ]
+        assert "Recording merged item(s) on the board before parking: item-a" in steps
+
+
+class TestSynchronousDrainRefusal:
+    @staticmethod
+    def _board(ctx, reread) -> None:
+        ctx.gtd.advance_rollout = _advance([], next_ready=["item-x"])
+        ctx.gtd.dispatch_item = AsyncMock(side_effect=_drain_409())
+        ctx.gtd.get_rollout = AsyncMock(side_effect=[_rollout_row(None), reread])
+
+    async def test_reread_shows_drain_parks(self, caplog) -> None:
+        from agent_gtd_dispatch.main import _TICK_PARKED
+
+        attempts: dict[str, int] = {}
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            self._board(ctx, _rollout_row("rolling deploy"))
+            assert await _tick(ctx, dispatch_attempts=attempts) == _TICK_PARKED
+
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        assert attempts == {}
+        assert len(_parked_publishes(ctx)) == 1
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "dispatch-failure-drain-check" in r.getMessage()
+        ]
+        assert len(lines) == 1
+        assert "status_code=409" in lines[0]
+        assert "outcome=parked" in lines[0]
+
+    async def test_reread_without_drain_halts(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with _loop_patch_stack() as ctx:
+            self._board(ctx, _rollout_row(None))
+            assert await _tick(ctx) == _TICK_HALTED
+
+        reason = ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+        assert reason.startswith("dispatch of item item-x failed: HTTPStatusError")
+
+    async def test_transient_reread_propagates(self) -> None:
+        with _loop_patch_stack() as ctx:
+            self._board(ctx, None)
+            ctx.gtd.get_rollout = AsyncMock(
+                side_effect=[_rollout_row(None), httpx.ConnectError("down")]
+            )
+            with pytest.raises(httpx.ConnectError):
+                await _tick(ctx)
+
+        ctx.gtd.halt_rollout.assert_not_awaited()
+
+    async def test_non_transient_reread_failure_halts(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with _loop_patch_stack() as ctx:
+            self._board(ctx, None)
+            ctx.gtd.get_rollout = AsyncMock(
+                side_effect=[_rollout_row(None), _http_error(404)]
+            )
+            assert await _tick(ctx) == _TICK_HALTED
+
+        reason = ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+        assert reason.endswith("(drain re-check failed: HTTPStatusError)")
+
+    async def test_at_capacity_refusal_without_drain_halts(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        with _loop_patch_stack() as ctx:
+            self._board(ctx, _rollout_row(None))
+            ctx.gtd.dispatch_item = AsyncMock(side_effect=_http_error(409))
+            assert await _tick(ctx) == _TICK_HALTED
+
+        assert (
+            "dispatch of item item-x failed"
+            in (ctx.gtd.halt_rollout.await_args.kwargs["reason"])
+        )
+
+
+class TestAsynchronousDrainRefusal:
+    @staticmethod
+    def _board(ctx, error_msg: str) -> None:
+        ctx.gtd.advance_rollout = _advance(["item-a"])
+        ctx.gtd.get_rollout = AsyncMock(return_value=_rollout_row(None))
+        ctx.gtd.list_runs_for_item = AsyncMock(
+            return_value=[
+                {
+                    "id": "child-1",
+                    "rollout_id": "rollout-abc",
+                    "status": "failed",
+                    "error_msg": error_msg,
+                    "created_at": "2026-10-23T00:00:00",
+                }
+            ]
+        )
+
+    async def test_drain_refused_child_is_redispatched_not_reviewed(
+        self, caplog
+    ) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        attempts: dict[str, int] = {}
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._launch_reviewer", new=AsyncMock()) as rev,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            self._board(ctx, _DRAIN_409_DETAIL)
+            assert await _tick(ctx, dispatch_attempts=attempts) == _TICK_CONTINUE
+
+        rev.assert_not_awaited()
+        ctx.gtd.reset_rollout_item.assert_awaited_once()
+        ctx.gtd.dispatch_item.assert_awaited_once()
+        assert attempts == {}
+        assert ctx.redispatches == {}
+        assert any(
+            "redispatch-after-drain-refusal" in r.getMessage() for r in caplog.records
+        )
+
+    async def test_other_failure_still_goes_to_the_reviewer(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE, ReviewVerdict
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._launch_reviewer",
+                new=AsyncMock(return_value=ReviewVerdict("skip", "r", "", "")),
+            ) as rev,
+            patch(
+                "agent_gtd_dispatch.main._act_on_verdict",
+                new=AsyncMock(return_value=_TICK_CONTINUE),
+            ),
+        ):
+            self._board(ctx, "All dispatch hosts are draining: rolling deploy")
+            assert await _tick(ctx) == _TICK_CONTINUE
+
+        rev.assert_awaited_once()
+        ctx.gtd.reset_rollout_item.assert_not_awaited()
+
+
+class TestNeverParkMidLand:
+    async def test_drain_arriving_mid_review_finishes_the_land(self) -> None:
+        from agent_gtd_dispatch import main
+        from agent_gtd_dispatch.main import _TICK_PARKED, ReviewVerdict
+
+        run = _loop_run()
+        board = {"drain": None}
+        verdict = ReviewVerdict("merge", "r", "note", "")
+
+        async def _get_rollout(*a, **kw):
+            return _rollout_row(board["drain"])
+
+        async def _reviewer(*a, **kw):
+            board["drain"] = "rolling deploy"
+            assert run.id not in main._parked_rollout_loops
+            assert main._counted_active_runs() == 1
+            return verdict
+
+        async def _land(*a, **kw):
+            assert run.id not in main._parked_rollout_loops
+            assert main._counted_active_runs() == 1
+            return verdict
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._launch_reviewer",
+                new=AsyncMock(side_effect=_reviewer),
+            ) as rev,
+            patch(
+                "agent_gtd_dispatch.main._land_reviewed_merge",
+                new=AsyncMock(side_effect=_land),
+            ) as land,
+        ):
+            ctx.active[run.id] = MagicMock()
+            ctx.dispatch.find_landed_commit_subjects = MagicMock(return_value=({}, []))
+            ctx.gtd.advance_rollout = _advance(["item-a"])
+            ctx.gtd.get_rollout = AsyncMock(side_effect=_get_rollout)
+            first = await _tick(ctx, loop_run_id=run.id)
+            assert first != _TICK_PARKED
+            land.assert_awaited_once()
+            ctx.gtd.complete_in_rollout.assert_awaited_once()
+
+            ctx.gtd.dispatch_item.reset_mock()
+            second = await _tick(ctx, loop_run_id=run.id)
+
+        assert second == _TICK_PARKED
+        assert rev.await_count == 1
+        ctx.gtd.dispatch_item.assert_not_awaited()
+
+
+class TestDriveRolloutParking:
+    @staticmethod
+    def _board(ctx, ticks: list[tuple[dict, dict]]) -> None:
+        ctx.gtd.get_project = AsyncMock(
+            return_value={"name": "P", "workspace_repos": []}
+        )
+        ctx.gtd.get_rollout = AsyncMock(
+            side_effect=[{"project_id": "proj-1"}] + [r for _, r in ticks]
+        )
+        ctx.gtd.advance_rollout = AsyncMock(side_effect=[a for a, _ in ticks])
+
+    @staticmethod
+    def _adv(*, completed=(), next_ready=(), done=False) -> dict:
+        return {
+            "next_ready": list(next_ready),
+            "in_progress": list(completed),
+            "blocked": [],
+            "graph_complete": done,
+        }
+
+    async def _resume(self, caplog, tick2: dict) -> SimpleNamespace:
+        from agent_gtd_dispatch import main
+        from agent_gtd_dispatch.main import _TICK_CONTINUE, _TICK_DONE, ReviewVerdict
+
+        run = _loop_run()
+        sleeps_parked: list[bool] = []
+        reviewer_checks: list[tuple[bool, int]] = []
+
+        async def _sleep(_secs):
+            sleeps_parked.append(run.id in main._parked_rollout_loops)
+
+        async def _reviewer(*a, **kw):
+            reviewer_checks.append(
+                (run.id in main._parked_rollout_loops, main._counted_active_runs())
+            )
+            return ReviewVerdict("skip", "r", "", "")
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._launch_reviewer",
+                new=AsyncMock(side_effect=_reviewer),
+            ),
+            patch(
+                "agent_gtd_dispatch.main._act_on_verdict",
+                new=AsyncMock(return_value=_TICK_CONTINUE),
+            ),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            ctx.sleep.side_effect = _sleep
+            ctx.active[run.id] = MagicMock()
+            self._board(
+                ctx,
+                [
+                    (self._adv(completed=["item-a"]), _rollout_row("rolling deploy")),
+                    (tick2, _rollout_row(None)),
+                    (self._adv(done=True), _rollout_row(None)),
+                ],
+            )
+            result = await main._drive_rollout(run)
+            parked_after = run.id in main._parked_rollout_loops
+
+        assert result == _TICK_DONE
+        assert not parked_after
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        messages = [r.getMessage() for r in caplog.records]
+        assert sum("park-enter" in m for m in messages) == 1
+        assert sum("park-exit" in m for m in messages) == 1
+        return SimpleNamespace(
+            ctx=ctx,
+            sleeps_parked=sleeps_parked,
+            reviewer_checks=reviewer_checks,
+        )
+
+    async def test_resume_tick_reviews_while_counted_active(self, caplog) -> None:
+        out = await self._resume(caplog, self._adv(completed=["item-a"]))
+        assert out.sleeps_parked == [True]
+        assert out.reviewer_checks == [(False, 1)]
+
+    async def test_resume_tick_dispatches(self, caplog) -> None:
+        out = await self._resume(caplog, self._adv(next_ready=["item-x"]))
+        assert out.sleeps_parked == [True]
+        out.ctx.gtd.dispatch_item.assert_awaited_once()
+        assert out.ctx.gtd.dispatch_item.await_args.args[0] == "item-x"
+
+    async def test_two_parked_ticks_log_enter_once_and_publish_twice(
+        self, caplog
+    ) -> None:
+        from agent_gtd_dispatch import main
+        from agent_gtd_dispatch.main import _TICK_DONE
+
+        run = _loop_run()
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            ctx.active[run.id] = MagicMock()
+            self._board(
+                ctx,
+                [
+                    (self._adv(completed=["item-a"]), _rollout_row("rolling deploy")),
+                    (self._adv(completed=["item-a"]), _rollout_row("rolling deploy")),
+                    (self._adv(done=True), _rollout_row(None)),
+                ],
+            )
+            assert await main._drive_rollout(run) == _TICK_DONE
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert sum("park-enter" in m for m in messages) == 1
+        assert len(_parked_publishes(ctx)) == 2
+        exit_line = next(m for m in messages if "park-exit" in m)
+        assert "parked_ticks=2" in exit_line
+
+    async def test_park_long_warns_each_interval(self, caplog) -> None:
+        from agent_gtd_dispatch import main
+        from agent_gtd_dispatch.main import _TICK_DONE
+
+        run = _loop_run()
+        clock = iter([0.0, 1800.0, 3600.0, 5400.0, 7200.0, 7300.0, 7300.0])
+        parked = (self._adv(completed=["item-a"]), _rollout_row("rolling deploy"))
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._monotonic", side_effect=lambda: next(clock)
+            ),
+            caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.main"),
+        ):
+            self._board(ctx, [parked] * 5 + [(self._adv(done=True), _rollout_row())])
+            assert await main._drive_rollout(run) == _TICK_DONE
+
+        warns = [
+            r.getMessage() for r in caplog.records if "park-long" in r.getMessage()
+        ]
+        assert len(warns) == 2
+        assert "parked_seconds=3600" in warns[0]
+        assert "parked_seconds=7200" in warns[1]
+
+    async def test_operator_halt_while_parked_exits(self) -> None:
+        from agent_gtd_dispatch import main
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        run = _loop_run()
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._launch_reviewer", new=AsyncMock()) as rev,
+        ):
+            ctx.rollout_loops["rollout-abc"] = run
+            self._board(
+                ctx,
+                [
+                    (self._adv(completed=["item-a"]), _rollout_row("rolling deploy")),
+                    (
+                        self._adv(completed=["item-a"]),
+                        _rollout_row("rolling deploy", status="halted"),
+                    ),
+                ],
+            )
+            assert await main._drive_rollout(run) == _TICK_HALTED
+            assert "rollout-abc" not in ctx.rollout_loops
+            assert run.id not in ctx.parked
+
+        rev.assert_not_awaited()
+        ctx.gtd.dispatch_item.assert_not_awaited()
+        ctx.gtd.reset_rollout_item.assert_not_awaited()
+
+    async def test_park_abandoned_logged_when_cancelled_while_parked(
+        self, caplog
+    ) -> None:
+        from agent_gtd_dispatch import main
+
+        run = _loop_run()
+
+        async def _sleep(_secs):
+            raise asyncio.CancelledError
+
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            ctx.sleep.side_effect = _sleep
+            self._board(
+                ctx,
+                [(self._adv(completed=["item-a"]), _rollout_row("rolling deploy"))],
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await main._drive_rollout(run)
+            assert run.id not in ctx.parked
+
+        assert any("park-abandoned" in r.getMessage() for r in caplog.records)
+
+
+class TestParkedLoopGuards:
+    async def test_single_loop_guard_holds_while_parked(self) -> None:
+        from agent_gtd_dispatch import main
+
+        with _loop_patch_stack() as ctx:
+            first = _make_run()
+            ctx.rollout_loops["rollout-abc"] = first
+            ctx.active[first.id] = MagicMock()
+            ctx.parked.add(first.id)
+
+            second = _make_run()
+            assert main._start_rollout_loop(second) is False
+            assert second.id not in ctx.active
+            assert ctx.rollout_loops["rollout-abc"] is first
+
+    async def test_readopts_rollout_whose_local_manage_row_was_cancelled(
+        self,
+    ) -> None:
+        from agent_gtd_dispatch.main import _readopt_running_rollouts
+
+        cancelled = _make_run()
+        cancelled.status = RunStatus.cancelled
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._start_rollout_loop") as mock_loop,
+        ):
+            ctx.db.list_runs_by_rollout = AsyncMock(return_value=[cancelled])
+            ctx.gtd.list_running_rollouts = AsyncMock(
+                return_value=[{"id": "rollout-abc", "project_name": "p"}]
+            )
+            await _readopt_running_rollouts()
+
+        mock_loop.assert_called_once()
+        assert mock_loop.call_args.args[0].rollout_id == "rollout-abc"
