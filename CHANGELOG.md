@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.12.0 (2026-10-24)
+
+### Features
+
+- **setup**: Every dispatch host provisions system build packages: cmake, ALSA headers, the Tauri 2
+  Linux stack and pnpm
+  ([`2fa6d14`](https://github.com/repos/agent-gtd-dispatch/commit/2fa6d142bdf6c556534f148651a9c1b2da83d545))
+
+
 ## v2.11.1 (2026-10-23)
 
 ### Bug Fixes
