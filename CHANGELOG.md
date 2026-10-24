@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.12.1 (2026-10-24)
+
+### Bug Fixes
+
+- **setup**: Every dispatch host provisions libclang-dev, so crates that run bindgen at build time
+  (whisper-rs-sys) build anywhere
+  ([`a46b6aa`](https://github.com/repos/agent-gtd-dispatch/commit/a46b6aa968c63333c15a607b3751e25797751567))
+
+
 ## v2.12.0 (2026-10-24)
 
 ### Features
