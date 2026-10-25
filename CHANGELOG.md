@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v2.14.1 (2026-10-25)
+
+### Bug Fixes
+
+- **8efac29a**: Rollout reviewer skips the merge bar when the post-run gate passed, and never
+  re-runs long verification
+  ([`d8978cf`](https://github.com/repos/agent-gtd-dispatch/commit/d8978cfe6798123422197ea877b0244a03a1af0c))
+
+### Testing
+
+- **f2f86ded**: Isolate test git subprocesses from inherited GIT_* env so a hook-run suite cannot
+  write to the outer repo
+  ([`06005ae`](https://github.com/repos/agent-gtd-dispatch/commit/06005aecda15d1fdaa57e6674c83ff35354dc692))
+
+
 ## v2.14.0 (2026-10-25)
 
 ### Features
