@@ -37,6 +37,10 @@ from .models import PushStatus, RepoPushStatus
 logger = logging.getLogger(__name__)
 
 _executor: concurrent.futures.ThreadPoolExecutor | None = None
+# Dedicated pool for rollout-loop reviewer runs, sized to
+# config.ROLLOUT_MAX_CONCURRENT_REVIEWS, so concurrent reviewers never starve
+# builds, land gates or reaping on ``_executor`` (and vice versa).
+_review_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
 _DEFAULT_BRANCH_CANDIDATES: tuple[str, ...] = ("main", "master")
 
@@ -242,13 +246,20 @@ def init_executor() -> None:
     """Create (or recreate) the module-level ThreadPoolExecutor.
 
     Must be called after config.load() so that config.MAX_CONCURRENT_RUNS is set.
+    Also (re)creates ``_review_executor``, sized to
+    ``config.ROLLOUT_MAX_CONCURRENT_REVIEWS``.
     Shuts down the previous executor without waiting for running tasks to finish.
     """
-    global _executor
+    global _executor, _review_executor
     if _executor is not None:
         _executor.shutdown(wait=False)
     _executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=config.MAX_CONCURRENT_RUNS
+    )
+    if _review_executor is not None:
+        _review_executor.shutdown(wait=False)
+    _review_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=config.ROLLOUT_MAX_CONCURRENT_REVIEWS
     )
 
 
@@ -3226,13 +3237,16 @@ class RolloutWorkspace:
     workspace_mode: bool = False
 
 
-def rollout_workspace_path(rollout_id: str) -> Path:
-    """Return the stable workspace path for *rollout_id*.
+def rollout_workspace_path(rollout_id: str, slot: int = 0) -> Path:
+    """Return the stable workspace path for *rollout_id*'s review *slot*.
 
     Named ``rollout-<id>`` rather than ``repos-<run_id>`` precisely because it
-    is NOT per-run: it outlives every reviewer that uses it.
+    is NOT per-run: it outlives every reviewer that uses it.  Slot 0 keeps the
+    historical ``rollout-<id>`` name; slot ``k >= 1`` is ``rollout-<id>-s<k>``.
     """
-    return config.WORKSPACE_ROOT / f"rollout-{rollout_id}"
+    if slot == 0:
+        return config.WORKSPACE_ROOT / f"rollout-{rollout_id}"
+    return config.WORKSPACE_ROOT / f"rollout-{rollout_id}-s{slot}"
 
 
 def _read_default_branches(root: Path) -> dict[str, str]:
@@ -3272,8 +3286,9 @@ def prepare_rollout_workspace(
     *,
     git_origin: str = "",
     repo_urls: list[str] | None = None,
+    slot: int = 0,
 ) -> RolloutWorkspace:
-    """Prepare (or REUSE) the persistent workspace shared by a rollout's reviewers.
+    """Prepare (or REUSE) one persistent review-slot workspace of a rollout.
 
     Why reuse rather than clone per item: ``prepare_manage_workspace`` does a
     ``--depth=50`` clone per manage run, and the workspace variant clones every
@@ -3283,10 +3298,12 @@ def prepare_rollout_workspace(
     free — the reviewer never has to re-derive a repo's base branch, which is
     the input to the commit-count guard and to the merge itself.
 
-    Reuse is safe because the workspace is single-writer by construction: the
-    wave loop runs at most one reviewer per rollout at a time, and each reviewer
-    is handed a workspace that has just been HARD RESET to origin's default
-    branch in every repo (see :func:`refresh_rollout_workspace`).  Nothing from
+    Reuse is safe because each SLOT is single-writer by construction: the
+    wave loop assigns a slot to at most one item at a time (its review, then
+    its land), and calls :func:`refresh_rollout_workspace` before every
+    reviewer launch, so each reviewer is handed a slot that has just been HARD
+    RESET to origin's default branch in every repo.  Concurrent reviews of one
+    rollout run in different slots and never share a tree.  Nothing from
     a previous reviewer's tree survives that reset, so a reviewer cannot inherit
     a half-applied inline fix from the item before it.
 
@@ -3298,6 +3315,7 @@ def prepare_rollout_workspace(
         rollout_id: The rollout this workspace belongs to.
         git_origin: Monorepo clone URL. Used when *repo_urls* is empty.
         repo_urls: Workspace-project clone URLs, in project order.
+        slot: The review slot (see :func:`rollout_workspace_path`).
 
     Returns:
         A :class:`RolloutWorkspace`.
@@ -3311,7 +3329,7 @@ def prepare_rollout_workspace(
     if not urls and not git_origin:
         raise ValueError("prepare_rollout_workspace needs git_origin or repo_urls")
 
-    root = rollout_workspace_path(rollout_id)
+    root = rollout_workspace_path(rollout_id, slot)
 
     if urls:
         dir_names = [repo_dir_from_url(u) for u in urls]
@@ -3475,9 +3493,12 @@ def compose_squash_subject(item: dict[str, Any]) -> str | None:
 
 
 def find_landed_commit_subjects(
-    workspace: RolloutWorkspace, item_id: str
+    workspace: RolloutWorkspace, item_id: str, *, rollout_id: str | None = None
 ) -> tuple[dict[str, str], list[str]]:
     """Find each repo's landed squash commit for ``item_id`` by its trailer.
+
+    With *rollout_id* set, the commit must ALSO carry ``Rollout: <rollout_id>``
+    (``--all-match``): squash commits carry both trailers.
 
     Returns ``(subjects_by_repo, failed_repos)``. A repo whose default branch
     has no commit carrying ``Item: <item_id>`` is simply absent from the
@@ -3525,6 +3546,11 @@ def find_landed_commit_subjects(
                         "-1",
                         "--format=%s",
                         f"--grep=^Item: {item_id}$",
+                        *(
+                            [f"--grep=^Rollout: {rollout_id}$", "--all-match"]
+                            if rollout_id
+                            else []
+                        ),
                     ]
                 ),
                 cwd=repo_path,
@@ -4761,8 +4787,13 @@ async def run_agent(
     callback_token: str | None = None,
     run_id: str = "",
     disallowed_tools: list[str] | None = None,
+    executor: concurrent.futures.ThreadPoolExecutor | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a headless agent CLI as a subprocess.
+
+    ``executor`` picks the thread pool the blocking subprocess wait runs on;
+    None means the shared ``_executor``.  Rollout-loop reviewers pass
+    ``_review_executor``.
 
     ``disallowed_tools`` (claude-code engines only) is passed as
     ``--disallowedTools``. It is a deny-list because REVIEW runs use
@@ -4838,4 +4869,4 @@ async def run_agent(
         return subprocess.CompletedProcess(cmd, proc.returncode, stdout="", stderr="")
 
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_executor, _stream)
+    return await loop.run_in_executor(executor or _executor, _stream)

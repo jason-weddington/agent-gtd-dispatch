@@ -982,6 +982,31 @@ class TestRunAgent:
             await run_agent(CLAUDE, tmp_path, "sys", "T", 20)
         assert "attachments" not in exclude.read_text()
 
+    async def test_executor_kwarg_picks_the_thread_pool(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import concurrent.futures
+        import threading
+
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        seen: list[str] = []
+        mock_proc = _make_mock_proc(0)
+        mock_proc.wait.side_effect = lambda **_kw: seen.append(
+            threading.current_thread().name
+        )
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="review-pool"
+        )
+        try:
+            with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+                mock_popen.return_value = mock_proc
+                await run_agent(CLAUDE, tmp_path, "sys", "T", 20, executor=pool)
+                await run_agent(CLAUDE, tmp_path, "sys", "T", 20)
+        finally:
+            pool.shutdown(wait=True)
+        assert seen[0].startswith("review-pool")
+        assert not seen[1].startswith("review-pool")
+
     async def test_passes_workspace_as_cwd(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
         mock_proc = _make_mock_proc(0)
@@ -5818,6 +5843,62 @@ class TestReadReviewVerdict:
         assert dispatch.read_review_verdict(tmp_path) == (None, "absent")
 
 
+class TestRolloutWorkspaceSlots:
+    """Concurrent reviews: one isolated checkout per review slot."""
+
+    @pytest.fixture(autouse=True)
+    def _no_sudo(self, monkeypatch):
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+
+    def test_slot_zero_keeps_the_historical_name(self, tmp_path: Path) -> None:
+        with patch.object(config, "WORKSPACE_ROOT", tmp_path):
+            assert dispatch.rollout_workspace_path("roll-1", 0) == (
+                tmp_path / "rollout-roll-1"
+            )
+            assert dispatch.rollout_workspace_path("roll-1", 1) == (
+                tmp_path / "rollout-roll-1-s1"
+            )
+            assert dispatch.rollout_workspace_path("roll-1", 2) == (
+                tmp_path / "rollout-roll-1-s2"
+            )
+
+    def test_two_slots_are_two_clones_with_their_own_branch_record(
+        self, tmp_path: Path
+    ) -> None:
+        origin = tmp_path / "origins" / "repo-a.git"
+        origin.parent.mkdir()
+        subprocess.run(
+            ["git", "init", "--bare", "-b", "trunk", str(origin)],
+            check=True,
+            capture_output=True,
+        )
+        seed = tmp_path / "seed"
+        seed.mkdir()
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+        for args in (
+            ["init", "-b", "trunk"],
+            ["commit", "--allow-empty", "-m", "base"],
+            ["push", str(origin), "trunk"],
+        ):
+            subprocess.run([*git, *args], cwd=seed, check=True, capture_output=True)
+        root = tmp_path / "ws"
+        with patch.object(config, "WORKSPACE_ROOT", root):
+            ws0 = dispatch.prepare_rollout_workspace(
+                "roll-1", repo_urls=[str(origin)], slot=0
+            )
+            ws1 = dispatch.prepare_rollout_workspace(
+                "roll-1", repo_urls=[str(origin)], slot=1
+            )
+        assert ws0.root != ws1.root
+        assert ws0.root == root / "rollout-roll-1"
+        assert ws1.root == root / "rollout-roll-1-s1"
+        for ws in (ws0, ws1):
+            record = ws.root / dispatch.DEFAULT_BRANCHES_RELPATH
+            assert json.loads(record.read_text()) == {"repo-a": "trunk"}
+            assert ws.created is True
+            assert (next(iter(ws.repo_paths.values())) / ".git").is_dir()
+
+
 class TestRolloutWorkspaceReuse:
     """One clone per ROLLOUT, not one per item."""
 
@@ -6530,6 +6611,35 @@ class TestFindLandedCommitSubjects:
             assert c.kwargs["timeout"] == 60
             assert c.kwargs["check"] is False
             assert c.kwargs["text"] is True
+
+    def test_rollout_id_adds_the_rollout_trailer_grep(self, tmp_path: Path) -> None:
+        ws = self._ws(tmp_path, {"repo-a": tmp_path})
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                [], 0, stdout="fix(x): y\n", stderr=""
+            )
+            dispatch.find_landed_commit_subjects(
+                ws, _GROOMED_ID, rollout_id="rollout-abc"
+            )
+        log_argv = mock_run.call_args_list[1].args[0]
+        assert log_argv[-3:] == [
+            f"--grep=^Item: {_GROOMED_ID}$",
+            "--grep=^Rollout: rollout-abc$",
+            "--all-match",
+        ]
+
+    def test_rollout_scoped_lookup_ignores_another_rollouts_commit(
+        self, tmp_path: Path
+    ) -> None:
+        seed, clone = self._repo(tmp_path, "repo-a")
+        self._land(seed, "fix(996b308e): Add X", _GROOMED_ID)  # rollout-abc
+        ws = self._ws(tmp_path, {"repo-a": clone})
+        assert dispatch.find_landed_commit_subjects(
+            ws, _GROOMED_ID, rollout_id="rollout-abc"
+        ) == ({"repo-a": "fix(996b308e): Add X"}, [])
+        assert dispatch.find_landed_commit_subjects(
+            ws, _GROOMED_ID, rollout_id="rollout-other"
+        ) == ({}, [])
 
     def test_timeout_and_oserror_never_raise(self, tmp_path: Path) -> None:
         ws = self._ws(tmp_path, {"repo-a": tmp_path, "repo-b": tmp_path})

@@ -110,6 +110,8 @@ def _http_error(code):
 def _fake_workspace():
     from pathlib import Path
 
+    # The root must exist: the tick re-prepares a slot whose root was pruned.
+    Path("/tmp/rollout-ws").mkdir(exist_ok=True)  # noqa: S108
     return SimpleNamespace(
         root=Path("/tmp/rollout-ws"),  # noqa: S108 — never touched, dispatch is mocked
         repo_paths={"repo-a": Path("/tmp/rollout-ws/repo-a")},  # noqa: S108
@@ -121,11 +123,11 @@ def _fake_workspace():
 
 async def _tick(ctx, **overrides):
     """Run one wave-loop tick with sensible defaults."""
-    from agent_gtd_dispatch.main import _rollout_wave_tick
+    from agent_gtd_dispatch.main import _rollout_wave_tick, _RolloutLoopState
 
     kwargs = {
         "project": {"name": "p", "workspace_repos": ["git@h:o/repo-a"]},
-        "workspace_ref": [_fake_workspace()],
+        "loop_state": _RolloutLoopState(slots={0: _fake_workspace()}),
         "reviewer_engine": MagicMock(name="claude-code-sonnet"),
         "dispatch_attempts": {},
         "token": None,
@@ -134,6 +136,41 @@ async def _tick(ctx, **overrides):
     }
     kwargs.update(overrides)
     return await _rollout_wave_tick("rollout-abc", **kwargs)
+
+
+async def _settle_children(loop_state) -> bool:
+    """Await every review and land task the loop holds. True if any existed."""
+    tasks = [e.task for e in loop_state.reviews.values()]
+    if loop_state.active_land is not None:
+        tasks.append(loop_state.active_land.task)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return bool(tasks)
+
+
+async def _tick_until_settled(ctx, loop_state=None, *, max_ticks=10, **overrides):
+    """Run ticks, awaiting child review/land tasks between them, until settled.
+
+    Settled: a terminal directive, or a tick after which no child task is held.
+    Returns the last tick's directive.
+    """
+    from agent_gtd_dispatch.main import (
+        _TICK_DONE,
+        _TICK_HALTED,
+        _TICK_PARKED,
+        _RolloutLoopState,
+    )
+
+    if loop_state is None:
+        loop_state = _RolloutLoopState(slots={0: _fake_workspace()})
+    directive = None
+    for _ in range(max_ticks):
+        directive = await _tick(ctx, loop_state=loop_state, **overrides)
+        if directive in (_TICK_DONE, _TICK_HALTED, _TICK_PARKED):
+            return directive
+        if not await _settle_children(loop_state):
+            return directive
+    return directive
 
 
 class TestAdvanceInFlightCombination:
@@ -182,7 +219,7 @@ class TestAdvanceInFlightCombination:
             ctx.gtd.get_rollout = AsyncMock(
                 return_value={"status": "running", "inFlightBuildRuns": []}
             )
-            directive = await _tick(ctx)
+            directive = await _tick_until_settled(ctx)
 
         assert directive == _TICK_CONTINUE
         mock_reviewer.assert_awaited_once()
@@ -1324,31 +1361,41 @@ class TestRolloutLoopWorker:
             ctx.gtd.get_project = AsyncMock(
                 return_value={"name": "p", "workspace_repos": ["git@h:o/repo-a"]}
             )
-            ctx.gtd.get_rollout = AsyncMock(
-                return_value={
-                    "project_id": "proj-1",
-                    "status": "running",
-                    "inFlightBuildRuns": [],
-                }
-            )
-            ctx.gtd.advance_rollout = AsyncMock(
-                side_effect=[
-                    {
-                        "next_ready": [],
-                        "in_progress": ["item-a"],
-                        "blocked": [],
-                        "graph_complete": False,
-                    },
-                    _http_error(422),
-                    _http_error(422),
-                ]
-            )
             ctx.gtd.complete_in_rollout = AsyncMock(
                 return_value={"newly_ready": [], "graph_complete": True}
             )
+            after_completion: list[str] = []
+
+            def _completed() -> bool:
+                return ctx.gtd.complete_in_rollout.await_count > 0
+
+            async def _get_rollout(*_a, **_kw):
+                return {
+                    "project_id": "proj-1",
+                    "status": "completed" if _completed() else "running",
+                    "inFlightBuildRuns": [],
+                }
+
+            async def _advance(*_a, **_kw):
+                # The board answers 422 once the rollout has completed.
+                if _completed():
+                    after_completion.append("advance")
+                    raise _http_error(422)
+                return {
+                    "next_ready": [],
+                    "in_progress": ["item-a"],
+                    "blocked": [],
+                    "graph_complete": False,
+                }
+
+            ctx.gtd.get_rollout = AsyncMock(side_effect=_get_rollout)
+            ctx.gtd.advance_rollout = AsyncMock(side_effect=_advance)
             await _rollout_loop_worker(self._run())
 
-        assert ctx.gtd.advance_rollout.await_count == 1
+        # Concurrent reviews: the land runs in its own task, so the tick that
+        # harvests it reads the board once more; nothing advances after that.
+        assert len(after_completion) <= 1
+        ctx.gtd.complete_in_rollout.assert_awaited_once()
         kw = ctx.db.update_run.await_args.kwargs
         assert kw["status"] == RunStatus.succeeded
         assert kw["error"] == ""
@@ -1750,7 +1797,7 @@ class TestCommitTypeVerification:
         assert "reviewer_agrees=False" in lines[0].getMessage()
 
     async def test_wave_tick_passes_the_workspace(self) -> None:
-        from agent_gtd_dispatch.main import ReviewVerdict
+        from agent_gtd_dispatch.main import ReviewVerdict, _RolloutLoopState
 
         ws = _fake_workspace()
         with (
@@ -1772,7 +1819,7 @@ class TestCommitTypeVerification:
             ctx.gtd.get_rollout = AsyncMock(
                 return_value={"status": "running", "inFlightBuildRuns": []}
             )
-            await _tick(ctx, workspace_ref=[ws])
+            await _tick_until_settled(ctx, _RolloutLoopState(slots={0: ws}))
         assert act.await_args.kwargs["workspace"] is ws
 
 
@@ -1815,7 +1862,7 @@ class TestWaveTickLandStep:
         ):
             ctx.dispatch.land_origin_shas = MagicMock(return_value={"repo-a": "abc"})
             self._reviewable(ctx)
-            assert await _tick(ctx) == _TICK_CONTINUE
+            assert await _tick_until_settled(ctx) == _TICK_CONTINUE
         kwargs = land.await_args.kwargs
         assert kwargs["pre_review_origin"] == {"repo-a": "abc"}
         assert kwargs["loop_run_id"] == "loop-run-1"
@@ -1838,7 +1885,7 @@ class TestWaveTickLandStep:
             patch("agent_gtd_dispatch.main._act_on_verdict", new=AsyncMock()) as act,
         ):
             self._reviewable(ctx)
-            assert await _tick(ctx) == _TICK_HALTED
+            assert await _tick_until_settled(ctx) == _TICK_HALTED
         act.assert_not_awaited()
         ctx.gtd.complete_in_rollout.assert_not_awaited()
 
@@ -1859,7 +1906,7 @@ class TestWaveTickLandStep:
             ),
         ):
             self._reviewable(ctx)
-            await _tick(ctx)
+            await _tick_until_settled(ctx)
         land.assert_not_called()
 
     async def test_drive_rollout_passes_its_run_id(self) -> None:
@@ -2162,7 +2209,7 @@ class TestUnrecordedMergeRetryPass:
                 return_value={"status": "running", "inFlightBuildRuns": []}
             )
             ctx.gtd.complete_in_rollout = AsyncMock(side_effect=_http_error(503))
-            await _tick(ctx)
+            await _tick_until_settled(ctx)
 
         reviewer.assert_awaited_once()
         assert reviewer.await_args.args[1] == "item-b"
@@ -2590,7 +2637,7 @@ class TestTickIsSafeToReRunAfterATimeout:
             ctx.gtd.get_rollout = AsyncMock(
                 return_value={"status": "running", "inFlightBuildRuns": []}
             )
-            await _tick(ctx)
+            await _tick_until_settled(ctx)
 
         assert order == ["get_item", "reviewer"]
         assert reviewer.await_args.kwargs["item"] is item
@@ -3348,7 +3395,7 @@ class TestAsynchronousDrainRefusal:
             ),
         ):
             self._board(ctx, "All dispatch hosts are draining: rolling deploy")
-            assert await _tick(ctx) == _TICK_CONTINUE
+            assert await _tick_until_settled(ctx) == _TICK_CONTINUE
 
         rev.assert_awaited_once()
         ctx.gtd.reset_rollout_item.assert_not_awaited()
@@ -3357,7 +3404,12 @@ class TestAsynchronousDrainRefusal:
 class TestNeverParkMidLand:
     async def test_drain_arriving_mid_review_finishes_the_land(self) -> None:
         from agent_gtd_dispatch import main
-        from agent_gtd_dispatch.main import _TICK_PARKED, ReviewVerdict
+        from agent_gtd_dispatch.main import (
+            _TICK_PARKED,
+            _TICK_WAIT,
+            ReviewVerdict,
+            _RolloutLoopState,
+        )
 
         run = _loop_run()
         board = {"drain": None}
@@ -3392,13 +3444,18 @@ class TestNeverParkMidLand:
             ctx.dispatch.find_landed_commit_subjects = MagicMock(return_value=({}, []))
             ctx.gtd.advance_rollout = _advance(["item-a"])
             ctx.gtd.get_rollout = AsyncMock(side_effect=_get_rollout)
-            first = await _tick(ctx, loop_run_id=run.id)
+            ls = _RolloutLoopState(slots={0: _fake_workspace()})
+            first = await _tick(ctx, loop_state=ls, loop_run_id=run.id)
             assert first != _TICK_PARKED
+            await _settle_children(ls)
+            # The drain arrived mid-review: the merge still lands before parking.
+            assert await _tick(ctx, loop_state=ls, loop_run_id=run.id) == _TICK_WAIT
+            await _settle_children(ls)
             land.assert_awaited_once()
             ctx.gtd.complete_in_rollout.assert_awaited_once()
 
             ctx.gtd.dispatch_item.reset_mock()
-            second = await _tick(ctx, loop_run_id=run.id)
+            second = await _tick(ctx, loop_state=ls, loop_run_id=run.id)
 
         assert second == _TICK_PARKED
         assert rev.await_count == 1
@@ -3451,7 +3508,7 @@ class TestDriveRolloutParking:
             patch(
                 "agent_gtd_dispatch.main._act_on_verdict",
                 new=AsyncMock(return_value=_TICK_CONTINUE),
-            ),
+            ) as act,
             caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
         ):
             ctx.sleep.side_effect = _sleep
@@ -3461,9 +3518,24 @@ class TestDriveRolloutParking:
                 [
                     (self._adv(completed=["item-a"]), _rollout_row("rolling deploy")),
                     (tick2, _rollout_row(None)),
-                    (self._adv(done=True), _rollout_row(None)),
                 ],
             )
+            # Reviews run as tasks: the resume tick's board state holds until
+            # its review was acted on (or its dispatch made), then completes.
+            first_two = list(ctx.gtd.advance_rollout.side_effect)
+            rows = list(ctx.gtd.get_rollout.side_effect)
+
+            async def _advance(*_a, **_kw):
+                if first_two:
+                    return first_two.pop(0)
+                settled = act.await_count or ctx.gtd.dispatch_item.await_count
+                return self._adv(done=True) if settled else tick2
+
+            async def _get_rollout(*_a, **_kw):
+                return rows.pop(0) if rows else _rollout_row(None)
+
+            ctx.gtd.advance_rollout = AsyncMock(side_effect=_advance)
+            ctx.gtd.get_rollout = AsyncMock(side_effect=_get_rollout)
             result = await main._drive_rollout(run)
             parked_after = run.id in main._parked_rollout_loops
 

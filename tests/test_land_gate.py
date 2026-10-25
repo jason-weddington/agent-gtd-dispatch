@@ -1348,6 +1348,22 @@ class TestWorkspaceProjects:
 # ---------------------------------------------------------------------------
 
 
+async def _tick_until_settled(loop_state, *, max_ticks=10, **kwargs):
+    """Run wave ticks, awaiting child review/land tasks between them."""
+    directive = None
+    for _ in range(max_ticks):
+        directive = await main._rollout_wave_tick(
+            ROLLOUT, loop_state=loop_state, **kwargs
+        )
+        tasks = [e.task for e in loop_state.reviews.values()]
+        if loop_state.active_land is not None:
+            tasks.append(loop_state.active_land.task)
+        if not tasks:
+            return directive
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return directive
+
+
 class TestThroughTheWaveTick:
     async def test_fix_relaunch_keeps_the_original_merge_note(self, mono, gtd) -> None:
         verdicts = []
@@ -1378,10 +1394,9 @@ class TestThroughTheWaveTick:
             patch.object(main, "_launch_reviewer", side_effect=reviewer),
             patch.object(main, "_rollout_unrecorded_merges", {}),
         ):
-            directive = await main._rollout_wave_tick(
-                ROLLOUT,
+            directive = await _tick_until_settled(
+                main._RolloutLoopState(slots={0: mono.ws}),
                 project={"name": "P", "gate_command": "test -f fixed.txt"},
-                workspace_ref=[mono.ws],
                 reviewer_engine=get_engine("claude-code-sonnet"),
                 dispatch_attempts={},
                 token=None,
@@ -1435,10 +1450,9 @@ class TestFixRelaunchAfterABoardTimeout:
             patch.object(main, "_launch_reviewer", side_effect=reviewer),
             patch.object(main, "_rollout_unrecorded_merges", {}),
         ):
-            directive = await main._rollout_wave_tick(
-                ROLLOUT,
+            directive = await _tick_until_settled(
+                main._RolloutLoopState(slots={0: mono.ws}),
                 project={"name": "P", "gate_command": "test -f fixed.txt"},
-                workspace_ref=[mono.ws],
                 reviewer_engine=get_engine("claude-code-sonnet"),
                 dispatch_attempts={},
                 token=None,

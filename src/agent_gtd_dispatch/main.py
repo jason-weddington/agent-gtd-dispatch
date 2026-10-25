@@ -12,9 +12,10 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -25,8 +26,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 if TYPE_CHECKING:
+    import concurrent.futures
     from collections.abc import AsyncGenerator, Awaitable, Callable
-
 from agent_gtd_dispatch_protocol.branches import make_branch_name
 
 from . import (
@@ -165,6 +166,26 @@ _rollout_loops: dict[str, Run] = {}
 # Strong references to fire-and-forget bookkeeping tasks (e.g. cancelling a
 # refused loop row from a synchronous caller) so they are not GC'd mid-flight.
 _background_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _terminate_run_session(proc: subprocess.Popen[bytes]) -> bool:
+    """SIGTERM a run's whole session, wait the grace period, SIGKILL if needed.
+
+    Signals the whole SESSION, not just the sudo wrapper's pid — sudo cannot
+    relay signals to the agent user's child, so terminate/kill on proc alone
+    would orphan the agent and every command it spawned (kb-03965).  The
+    wrapper was launched with ``start_new_session=True``, so ``proc.pid`` is
+    the session id.
+
+    Returns:
+        True when the SIGKILL escalation was needed.
+    """
+    kill_run_session(proc, signal.SIGTERM)
+    await asyncio.sleep(config.CANCEL_GRACE_SECONDS)
+    if proc.poll() is None or run_session_has_members(proc):
+        kill_run_session(proc, signal.SIGKILL)
+        return True
+    return False
 
 
 def _publish_run_event(run_id: str, status: str, completed_at: str | None) -> None:
@@ -2023,8 +2044,20 @@ async def _launch_reviewer(
     attribution: str | None,
     gate_failure_output: str | None = None,
     item: dict[str, Any] | None = None,
+    executor: concurrent.futures.ThreadPoolExecutor | None = None,
+    slot: int = 0,
 ) -> ReviewVerdict:
     """Run ONE short-lived reviewer for ONE completed build and read its verdict.
+
+    *executor* is the thread pool the reviewer subprocess wait runs on (None:
+    the shared pool).  Loop-started reviews pass ``dispatch._review_executor``;
+    the land step's FIX MODE relaunch passes nothing.  *slot* is the review
+    slot whose workspace this is, for the logs only.
+
+    The reviewer's process is registered in ``_active_subprocesses`` under its
+    run id, so the cancel endpoint can stop it.  Cancelling the awaiting task
+    (the rollout loop's review teardown) terminates the reviewer's session and
+    records the run ``cancelled`` before re-raising.
 
     With *gate_failure_output* set, the reviewer is relaunched in FIX MODE by
     the land step: the worker's land gate failed on the rebased squash commit,
@@ -2119,13 +2152,14 @@ async def _launch_reviewer(
     await db.insert_run(reviewer_run)
     logger.info(
         "rollout-loop: reviewer spawn rollout_id=%s item_id=%s run_id=%s engine=%s "
-        "branch=%s max_turns=%d",
+        "branch=%s max_turns=%d slot=%d",
         rollout_id,
         item_id,
         reviewer_run.id,
         reviewer_engine.name,
         branch_name,
         config.REVIEW_MAX_TURNS,
+        slot,
     )
 
     # Clear any prior verdict so a reviewer that dies before writing one can
@@ -2134,6 +2168,27 @@ async def _launch_reviewer(
 
     exit_code: int | None = None
     failure: str = ""
+    # Set when this review is cancelled.  run_agent's Popen happens on an
+    # executor thread, so a cancel can land after the thread picked up the
+    # job but before it registered the process: the cancel handler then finds
+    # nothing to stop.  The callback registers first and checks the flag
+    # second, the handler sets the flag first and looks second, so one of
+    # them always sees the process.
+    cancel_requested = threading.Event()
+
+    def _on_popen(proc: subprocess.Popen[bytes]) -> None:
+        _active_subprocesses[reviewer_run.id] = proc
+        if cancel_requested.is_set():
+            _active_subprocesses.pop(reviewer_run.id, None)
+            logger.info(
+                "rollout-loop: review-cancel-late-popen rollout_id=%s item_id=%s "
+                "run_id=%s action=sigkill",
+                rollout_id,
+                item_id,
+                reviewer_run.id,
+            )
+            kill_run_session(proc, signal.SIGKILL)
+
     try:
         result = await dispatch.run_agent(
             reviewer_engine,
@@ -2147,8 +2202,33 @@ async def _launch_reviewer(
             callback_token=token,
             run_id=reviewer_run.id,
             disallowed_tools=list(dispatch.REVIEWER_DISALLOWED_TOOLS),
+            popen_callback=_on_popen,
+            executor=executor,
         )
         exit_code = result.returncode
+    except asyncio.CancelledError:
+        # Not caught by `except Exception`: the rollout loop tore this review
+        # down (a halt, or the loop exiting).  Stop the agent, record the run.
+        cancel_requested.set()
+        proc = _active_subprocesses.get(reviewer_run.id)
+        escalated = False
+        if proc is not None:
+            escalated = await _terminate_run_session(proc)
+        await db.update_run(
+            reviewer_run.id,
+            status=RunStatus.cancelled,
+            completed_at=datetime.now(UTC).isoformat(),
+            error="reviewer cancelled by rollout loop",
+        )
+        logger.info(
+            "rollout-loop: review-cancel rollout_id=%s item_id=%s run_id=%s "
+            "escalated_sigkill=%d",
+            rollout_id,
+            item_id,
+            reviewer_run.id,
+            1 if escalated else 0,
+        )
+        raise
     except Exception as exc:
         failure = f"reviewer subprocess failed: {type(exc).__name__}: {exc}"
         logger.exception(
@@ -2156,6 +2236,8 @@ async def _launch_reviewer(
             reviewer_run.id,
             item_id,
         )
+    finally:
+        _active_subprocesses.pop(reviewer_run.id, None)
 
     verdict_blob, reason = dispatch.read_review_verdict(workspace.root)
 
@@ -2478,12 +2560,15 @@ async def _confirm_merge_landed(
     item_id: str,
     *,
     errors: list[Exception] | None = None,
+    rollout_id: str | None = None,
 ) -> tuple[str, dict[str, str], list[str]]:
     """Check whether the item's squash commit landed on origin's default branch.
 
     Args:
-        workspace: The shared rollout workspace, or None if never prepared.
+        workspace: A rollout slot workspace, or None if never prepared.
         item_id: The item whose ``Item: <id>`` trailer is looked up.
+        rollout_id: When set, the commit must also carry the
+            ``Rollout: <id>`` trailer (the pre-review already-landed check).
         errors: Optional out-list; on ``lookup-raised`` the exception is
             appended so the caller can name it in its log line.
 
@@ -2497,7 +2582,12 @@ async def _confirm_merge_landed(
     try:
         subjects, failed = await asyncio.get_running_loop().run_in_executor(
             None,
-            functools.partial(dispatch.find_landed_commit_subjects, workspace, item_id),
+            functools.partial(
+                dispatch.find_landed_commit_subjects,
+                workspace,
+                item_id,
+                **({"rollout_id": rollout_id} if rollout_id else {}),
+            ),
         )
     except Exception as exc:
         if errors is not None:
@@ -2703,6 +2793,14 @@ async def _retry_unrecorded_merges(
     return None
 
 
+def _with_suffix(reason: str, suffix: str) -> str:
+    """*reason* plus *suffix*, clipped to the error budget keeping the suffix."""
+    if not suffix:
+        return reason[:ERROR_TEXT_MAX_CHARS]
+    head = reason[: max(0, ERROR_TEXT_MAX_CHARS - len(suffix))]
+    return (head + suffix)[:ERROR_TEXT_MAX_CHARS]
+
+
 async def _act_on_verdict(
     rollout_id: str,
     item_id: str,
@@ -2711,6 +2809,7 @@ async def _act_on_verdict(
     token: str | None,
     attribution: str | None,
     workspace: dispatch.RolloutWorkspace | None = None,
+    halt_suffix: str = "",
 ) -> str:
     """Apply a reviewer's verdict. The WORKER acts; the reviewer only decided.
 
@@ -2736,6 +2835,9 @@ async def _act_on_verdict(
     - For a ``merge``, the push has ALREADY happened by the time this runs:
       :func:`_land_reviewed_merge` fetched, rebased, gated and pushed the
       reviewer's local squash commit (and deleted the feature branch) first.
+
+    *halt_suffix* is appended to the reason of any halt issued here (the
+    rollout loop names the queued merge verdicts the halt discards).
     """
     if outcome.verdict == "halt":
         reason = f"reviewer halted item {item_id}: {outcome.rationale}"
@@ -2743,7 +2845,7 @@ async def _act_on_verdict(
             reason = f"{reason} ({outcome.detail})"
         return await _halt_rollout_from_loop(
             rollout_id,
-            reason[:ERROR_TEXT_MAX_CHARS],
+            _with_suffix(reason, halt_suffix),
             item_id=item_id,
             token=token,
             attribution=attribution,
@@ -2762,8 +2864,11 @@ async def _act_on_verdict(
             if outcome.verdict == "skip":
                 return await _halt_rollout_from_loop(
                     rollout_id,
-                    f"failed to record item {item_id} as {recorded}: "
-                    f"{type(exc).__name__}: {exc}",
+                    _with_suffix(
+                        f"failed to record item {item_id} as {recorded}: "
+                        f"{type(exc).__name__}: {exc}",
+                        halt_suffix,
+                    ),
                     item_id=item_id,
                     token=token,
                     attribution=attribution,
@@ -2817,8 +2922,11 @@ async def _act_on_verdict(
     if used >= MAX_ITEM_REDISPATCHES:
         return await _halt_rollout_from_loop(
             rollout_id,
-            f"re-dispatch cap reached for item {item_id} "
-            f"({used}/{MAX_ITEM_REDISPATCHES}): {outcome.rationale}",
+            _with_suffix(
+                f"re-dispatch cap reached for item {item_id} "
+                f"({used}/{MAX_ITEM_REDISPATCHES}): {outcome.rationale}",
+                halt_suffix,
+            ),
             item_id=item_id,
             token=token,
             attribution=attribution,
@@ -2830,7 +2938,10 @@ async def _act_on_verdict(
     except Exception as exc:
         return await _halt_rollout_from_loop(
             rollout_id,
-            f"re-dispatch of item {item_id} failed: {type(exc).__name__}: {exc}",
+            _with_suffix(
+                f"re-dispatch of item {item_id} failed: {type(exc).__name__}: {exc}",
+                halt_suffix,
+            ),
             item_id=item_id,
             token=token,
             attribution=attribution,
@@ -3973,11 +4084,423 @@ async def _park_or_halt_on_dispatch_refusal(
     )
 
 
+# Loop-started reviewer tasks in flight across EVERY rollout loop in this
+# process, capped by config.ROLLOUT_MAX_CONCURRENT_REVIEWS.  Incremented right
+# after a review task's create_task and decremented when that task finishes;
+# no lock is needed because the event loop is single-threaded.  Never exceeds
+# the size of dispatch._review_executor, so a loop-started reviewer never
+# queues inside that pool.
+_host_reviews_in_flight: int = 0
+
+
+@dataclass
+class _ReviewEntry:
+    """One reviewer task in flight for one completed build."""
+
+    item_id: str
+    slot: int
+    task: asyncio.Task[ReviewVerdict]
+    item: dict[str, Any]
+    pre_review_origin: dict[str, str]
+    started_at: float
+
+
+@dataclass
+class _QueuedLand:
+    """A ``merge`` verdict waiting for this rollout's single land step."""
+
+    item_id: str
+    slot: int
+    verdict: ReviewVerdict
+    item: dict[str, Any]
+    pre_review_origin: dict[str, str]
+    queued_at: float
+
+
+@dataclass
+class _ActiveLand:
+    """The one land task (land, then act on the verdict) running for a rollout."""
+
+    item_id: str
+    slot: int
+    task: asyncio.Task[ReviewVerdict | str]
+    started_at: float
+
+
+@dataclass
+class _RolloutLoopState:
+    """In-memory state one rollout loop carries across ticks. Never persisted.
+
+    A restart starts a fresh, empty state: every item whose review or land was
+    in flight is still ``dispatched`` with a terminal build, so it is simply
+    re-reviewed (after the rollout-scoped already-landed precheck).
+    """
+
+    slots: dict[int, dispatch.RolloutWorkspace] = field(default_factory=dict)
+    reviews: dict[str, _ReviewEntry] = field(default_factory=dict)
+    land_queue: list[_QueuedLand] = field(default_factory=list)
+    active_land: _ActiveLand | None = None
+    pending_directive: str | None = None
+    # Observability counters (logged as `concurrency-summary` at loop exit).
+    reviews_started: int = 0
+    peak_reviews_in_flight: int = 0
+    dispatches_while_reviewing: int = 0
+    lands: int = 0
+    peak_land_queue: int = 0
+    max_land_queued_secs: float = 0.0
+    halt_cancelled_reviews: int = 0
+    # Quiets the drain-finishing INFO line after the first tick that logs it.
+    drain_finishing_logged: bool = False
+
+
+def _held_slots(loop_state: _RolloutLoopState) -> list[int]:
+    """Every slot index held by a review, a queued land or the active land."""
+    held = [e.slot for e in loop_state.reviews.values()]
+    held += [q.slot for q in loop_state.land_queue]
+    if loop_state.active_land is not None:
+        held.append(loop_state.active_land.slot)
+    return held
+
+
+def _free_slot(loop_state: _RolloutLoopState) -> int | None:
+    """The lowest slot index no review or land holds, else None."""
+    held = set(_held_slots(loop_state))
+    for slot in range(config.ROLLOUT_MAX_CONCURRENT_REVIEWS):
+        if slot not in held:
+            return slot
+    return None
+
+
+def _tracked_item_ids(rollout_id: str, loop_state: _RolloutLoopState) -> list[str]:
+    """Item ids the loop is tracking, with duplicates kept (for the audit).
+
+    The active land's own item is not counted again when it is also an
+    unrecorded merge: the land task registers that entry from inside
+    ``_handle_unrecorded_merge`` and keeps running (comment, phase, commit-type
+    check), so for that window both legitimately name the same item.
+    """
+    ids = list(loop_state.reviews)
+    ids += [q.item_id for q in loop_state.land_queue]
+    active_item: str | None = None
+    if loop_state.active_land is not None:
+        active_item = loop_state.active_land.item_id
+        ids.append(active_item)
+    ids += [
+        i for i in _rollout_unrecorded_merges.get(rollout_id, {}) if i != active_item
+    ]
+    return ids
+
+
+def _busy(loop_state: _RolloutLoopState) -> bool:
+    """Whether any review, queued land or active land exists."""
+    return bool(
+        loop_state.reviews
+        or loop_state.land_queue
+        or loop_state.active_land is not None
+    )
+
+
+def _audit_loop_state(
+    rollout_id: str,
+    loop_state: _RolloutLoopState,
+    *,
+    dispatching: str | None = None,
+    land_start: bool = False,
+) -> str | None:
+    """Check the loop's concurrency invariants. Returns the violation kind or None.
+
+    Called at review start, at land start (``land_start=True``), before each
+    ``next_ready`` dispatch (``dispatching=<item id>``) and at the end of each
+    tick.  A breach is logged at ERROR; the caller halts the rollout with
+    ``bad_local_state: <kind>`` instead of proceeding.
+    """
+    kind: str | None = None
+    item_id = dispatching or "-"
+    detail: Any = None
+    tracked = _tracked_item_ids(rollout_id, loop_state)
+    held = _held_slots(loop_state)
+    if len(loop_state.reviews) > config.ROLLOUT_MAX_CONCURRENT_REVIEWS:
+        kind = "reviews-over-limit"
+        detail = sorted(loop_state.reviews)
+    elif len(held) != len(set(held)):
+        kind = "slot-shared"
+        detail = held
+    elif len(tracked) != len(set(tracked)):
+        kind = "item-double-tracked"
+        dupes = sorted({i for i in tracked if tracked.count(i) > 1})
+        item_id = ",".join(dupes)
+        detail = tracked
+    elif land_start and loop_state.active_land is not None:
+        kind = "second-land"
+        item_id = loop_state.active_land.item_id
+        detail = [q.item_id for q in loop_state.land_queue]
+    elif dispatching is not None and dispatching in tracked:
+        kind = "dispatch-while-tracked"
+        detail = tracked
+    if kind is not None:
+        logger.error(
+            "rollout-loop: concurrency-invariant-violation rollout_id=%s kind=%s "
+            "item_id=%s detail=%r",
+            rollout_id,
+            kind,
+            item_id,
+            detail,
+        )
+    return kind
+
+
+async def _teardown_reviews(
+    loop_state: _RolloutLoopState, *, rollout_id: str = ""
+) -> list[str]:
+    """Cancel and await every review task, clear ``reviews`` (freeing slots).
+
+    Cancelling a task stops its reviewer: ``_launch_reviewer`` terminates the
+    reviewer's session and records the run ``cancelled``.  Returns the ids of
+    the reviews that were still running when torn down.
+    """
+    entries = list(loop_state.reviews.values())
+    loop_state.reviews.clear()
+    if not entries:
+        return []
+    running = [e.item_id for e in entries if not e.task.done()]
+    for entry in entries:
+        entry.task.cancel()
+    await asyncio.gather(*(e.task for e in entries), return_exceptions=True)
+    loop_state.halt_cancelled_reviews += len(running)
+    if running:
+        logger.info(
+            "rollout-loop: reviews-torn-down rollout_id=%s item_ids=%s",
+            rollout_id,
+            ",".join(running),
+        )
+    return running
+
+
+def _queued_land_suffix(loop_state: _RolloutLoopState) -> str:
+    """The halt-reason suffix naming queued merge verdicts a halt discards."""
+    if not loop_state.land_queue:
+        return ""
+    ids = ", ".join(q.item_id for q in loop_state.land_queue)
+    return (
+        f"; discarded queued merge verdict(s) for {ids}: "
+        "they will be re-reviewed on resume"
+    )
+
+
+async def _halt_teardown(
+    rollout_id: str,
+    loop_state: _RolloutLoopState,
+    *,
+    cause: str,
+    cause_item: str | None,
+    directive: str = _TICK_HALTED,
+) -> str:
+    """The halt path: no further reviews, lands or dispatches.
+
+    Tears down every review, drops the land queue WITHOUT landing, and never
+    cancels the active land: while one runs, *directive* is parked in
+    ``pending_directive`` and the tick waits for that land to finish.
+    """
+    cancelled = await _teardown_reviews(loop_state, rollout_id=rollout_id)
+    dropped = [q.item_id for q in loop_state.land_queue]
+    loop_state.land_queue.clear()
+    active = loop_state.active_land
+    logger.info(
+        "rollout-loop: halt-teardown rollout_id=%s cause=%s cause_item=%s "
+        "reviews_cancelled=%s land_queue_dropped=%s active_land=%s",
+        rollout_id,
+        cause,
+        cause_item or "-",
+        ",".join(cancelled) or "-",
+        ",".join(dropped) or "-",
+        active.item_id if active is not None else "-",
+    )
+    if active is not None and not active.task.done():
+        loop_state.pending_directive = directive
+        return _TICK_WAIT
+    return directive
+
+
+async def _loop_halt(
+    rollout_id: str,
+    loop_state: _RolloutLoopState,
+    reason: str,
+    *,
+    item_id: str | None,
+    cause: str,
+    token: str | None,
+    attribution: str | None,
+) -> str:
+    """Halt the rollout from the loop (naming discarded merges), then tear down."""
+    await _halt_rollout_from_loop(
+        rollout_id,
+        _with_suffix(reason, _queued_land_suffix(loop_state)),
+        item_id=item_id,
+        token=token,
+        attribution=attribution,
+    )
+    return await _halt_teardown(rollout_id, loop_state, cause=cause, cause_item=item_id)
+
+
+async def _exit_tick(
+    rollout_id: str, loop_state: _RolloutLoopState, directive: str
+) -> str:
+    """An early DONE/HALTED exit at the tick top, deferred behind an active land."""
+    land = loop_state.active_land
+    if (
+        loop_state.reviews
+        or loop_state.land_queue
+        or (land is not None and not land.task.done())
+    ):
+        return await _halt_teardown(
+            rollout_id,
+            loop_state,
+            cause="board-status",
+            cause_item=None,
+            directive=directive,
+        )
+    return directive
+
+
+async def _slot_workspace(
+    rollout_id: str,
+    loop_state: _RolloutLoopState,
+    slot: int,
+    *,
+    project: dict[str, Any],
+    item_id: str,
+    token: str | None,
+) -> dispatch.RolloutWorkspace:
+    """Return *slot*'s workspace, preparing it the first time it is needed.
+
+    A cached slot whose root has vanished (pruned by retention) is dropped and
+    prepared again rather than crashed on.
+    """
+    workspace = loop_state.slots.get(slot)
+    if workspace is not None and not workspace.root.is_dir():
+        logger.warning(
+            "rollout-loop: slot-workspace-missing rollout_id=%s slot=%d root=%s "
+            "action=re-prepare",
+            rollout_id,
+            slot,
+            workspace.root,
+        )
+        del loop_state.slots[slot]
+        workspace = None
+    if workspace is None:
+        await _publish_rollout_phase(
+            rollout_id,
+            "warm_up",
+            item_id=item_id,
+            step=f"Preparing rollout review workspace slot {slot}",
+            token=token,
+        )
+        workspace = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                dispatch.prepare_rollout_workspace,
+                rollout_id,
+                git_origin=str(project.get("git_origin") or ""),
+                repo_urls=list(project.get("workspace_repos") or []),
+                slot=slot,
+            ),
+        )
+        loop_state.slots[slot] = workspace
+    return workspace
+
+
+def _release_host_review(_task: asyncio.Task[Any]) -> None:
+    """Done callback of a loop-started review task: free its host-wide slot.
+
+    A done callback rather than a ``finally`` in the coroutine, because a task
+    cancelled before its first step never enters its coroutine body.
+    """
+    global _host_reviews_in_flight
+    _host_reviews_in_flight = max(0, _host_reviews_in_flight - 1)
+
+
+async def _run_land_task(
+    rollout_id: str,
+    queued: _QueuedLand,
+    *,
+    project: dict[str, Any],
+    workspace: dispatch.RolloutWorkspace,
+    reviewer_engine: Engine,
+    loop_run_id: str,
+    token: str | None,
+    attribution: str | None,
+) -> ReviewVerdict | str:
+    """Land one queued merge in its slot, then act on the returned verdict."""
+    landed = await _land_reviewed_merge(
+        rollout_id,
+        queued.item_id,
+        queued.verdict,
+        project=project,
+        workspace=workspace,
+        pre_review_origin=queued.pre_review_origin,
+        reviewer_engine=reviewer_engine,
+        loop_run_id=loop_run_id,
+        token=token,
+        attribution=attribution,
+        item=queued.item,
+    )
+    if isinstance(landed, str):
+        return landed
+    return await _act_on_verdict(
+        rollout_id,
+        queued.item_id,
+        landed,
+        token=token,
+        attribution=attribution,
+        workspace=workspace,
+    )
+
+
+def _start_land(
+    rollout_id: str,
+    loop_state: _RolloutLoopState,
+    *,
+    project: dict[str, Any],
+    reviewer_engine: Engine,
+    loop_run_id: str,
+    token: str | None,
+    attribution: str | None,
+) -> None:
+    """Pop the head of the land queue and start its (single) land task."""
+    queued = loop_state.land_queue.pop(0)
+    workspace = loop_state.slots[queued.slot]
+    task: asyncio.Task[ReviewVerdict | str] = asyncio.create_task(
+        _run_land_task(
+            rollout_id,
+            queued,
+            project=project,
+            workspace=workspace,
+            reviewer_engine=reviewer_engine,
+            loop_run_id=loop_run_id,
+            token=token,
+            attribution=attribution,
+        )
+    )
+    now = _monotonic()
+    loop_state.active_land = _ActiveLand(queued.item_id, queued.slot, task, now)
+    queued_secs = now - queued.queued_at
+    loop_state.max_land_queued_secs = max(loop_state.max_land_queued_secs, queued_secs)
+    logger.info(
+        "rollout-loop: land-start rollout_id=%s item_id=%s slot=%d "
+        "queued_secs=%.1f land_queue_remaining=%d",
+        rollout_id,
+        queued.item_id,
+        queued.slot,
+        queued_secs,
+        len(loop_state.land_queue),
+    )
+
+
 async def _rollout_wave_tick(
     rollout_id: str,
     *,
     project: dict[str, Any],
-    workspace_ref: list[dispatch.RolloutWorkspace | None],
+    loop_state: _RolloutLoopState,
     reviewer_engine: Engine,
     dispatch_attempts: dict[str, int],
     token: str | None,
@@ -3987,16 +4510,37 @@ async def _rollout_wave_tick(
 ) -> str:
     """One pass of the wave loop. Returns a ``_TICK_*`` directive.
 
-    Drain parking.  When the board reports the loop's host draining
-    (``loop_host_drain_reason`` on ``get_rollout``), the tick stops starting
-    new work at the tick top, after the unrecorded-merge retry and before any
-    review or dispatch, and returns ``_TICK_PARKED``.  Drain is checked only
-    there, so a tick that has started a review always runs it, the land and the
-    verdict to completion.  ``was_parked`` only quiets the park-enter log.
+    Reviews run as background tasks, several at once (capped per rollout by
+    the slot count and host-wide by ``_host_reviews_in_flight``), each in its
+    own slot workspace.  A tick never waits on a reviewer; it HARVESTS the
+    finished ones.  After the board reads at the top, in this order:
 
-    Order is load-bearing: completed builds are reviewed BEFORE newly-ready
-    items are dispatched, so a dependent item is never dispatched against a
-    base its predecessor has not yet been merged into.
+    (a) harvest finished reviews: a ``merge`` verdict joins ``land_queue``;
+        every other verdict is acted on at once; (b) harvest the finished
+        land; (c) the drain check; (d) start ONE land if none is active;
+        (e) start reviews into free slots; (f) dispatch ``next_ready``;
+        (g) publish the phase and return.
+
+    Land is strictly serialized per rollout: at most one land task exists
+    (``active_land``), lands start in harvest order, and ``_Lander`` rebases
+    each onto the LIVE origin tip and gates that exact tree — so a review done
+    against an older base is still gated on the post-merge tip.  No halt ever
+    cancels a land: the DONE/HALTED exits wait for it (``pending_directive``).
+
+    Drain parking.  When the board reports the loop's host draining
+    (``loop_host_drain_reason`` on ``get_rollout``), the tick starts no new
+    review and dispatches nothing; in-flight reviews and queued lands finish
+    first (``_TICK_WAIT``), and only then does it return ``_TICK_PARKED``.
+    ``was_parked`` only quiets the park-enter log.
+
+    Dependent ordering (why dispatching on every tick is safe).
+    ``advance_rollout`` lists an item in ``next_ready`` only when every
+    predecessor's rollout item is terminal (completed, halted or skipped).  The
+    worker records ``completed`` for a merge only inside ``_act_on_verdict``,
+    AFTER ``_land_reviewed_merge`` has pushed and audited the gated sha.  So a
+    dependent is dispatched only once every predecessor is terminal, and for a
+    merged predecessor that means its gated sha is on origin's tip — no matter
+    how many unrelated reviews are in flight.
 
     Re-run safety.  ``_drive_rollout`` re-runs a tick FROM THE TOP when a
     transient board error escapes it, so every side effect taken before a
@@ -4004,14 +4548,16 @@ async def _rollout_wave_tick(
 
     - Phase publishes, item comments, ``halt_rollout``, merge-note and run-list
       reads: best effort, they swallow every error and never raise.
-    - Preparing the shared workspace: held in ``workspace_ref``, which outlives
-      the tick, so a re-run reuses it instead of preparing another.
-    - Launching the reviewer: the only board calls that can raise on the
-      review path (``get_item``, and ``advance_rollout``/``get_rollout`` above)
-      happen BEFORE it.  The item is fetched once here and handed to the land
-      step's fix relaunch, so nothing after the first reviewer can raise a
-      board error out of the tick.
-    - The land (push): followed only by best-effort board calls.
+    - Slot workspaces, review tasks, the land queue and the active land live in
+      ``loop_state``, which outlives the tick, so a re-run reuses them.
+    - Starting a review: every board call that can raise (``get_item``, and
+      ``advance_rollout``/``get_rollout`` above) happens BEFORE that item's
+      ``create_task``, and an item already in ``reviews`` is never started
+      again.
+    - Harvesting: each finished review is popped from ``reviews`` BEFORE it is
+      acted on, so a re-run never acts on the same verdict twice.
+    - The land (push): runs in its own task, followed only by best-effort
+      board calls.
     - Recording an outcome: ``_complete_in_rollout_with_retry`` returns its
       error instead of raising, and ``complete_in_rollout`` is idempotent by
       item id; a merge whose record still fails is tracked in
@@ -4019,9 +4565,9 @@ async def _rollout_wave_tick(
     - Re-dispatch (reset + dispatch): any error halts, so it never escapes.
     - Dispatching a ready item: a transient error escapes and the tick is
       re-run.  A dispatch that landed moved the item out of ``next_ready``, so
-      it is not dispatched again; items dispatched earlier in the same tick
-      are likewise reported ``in_progress``.
+      it is not dispatched again.
     """
+    global _host_reviews_in_flight
     try:
         advance = await gtd_client.advance_rollout(rollout_id, token=token)
     except httpx.HTTPStatusError as exc:
@@ -4045,7 +4591,11 @@ async def _rollout_wave_tick(
             reread_status,
             action,
         )
-        return _TICK_HALTED if reread_status == "halted" else _TICK_DONE
+        return await _exit_tick(
+            rollout_id,
+            loop_state,
+            _TICK_HALTED if reread_status == "halted" else _TICK_DONE,
+        )
     rollout = await gtd_client.get_rollout(rollout_id, token=token)
 
     status = str(rollout.get("status") or "")
@@ -4055,7 +4605,9 @@ async def _rollout_wave_tick(
             rollout_id,
             status,
         )
-        return _TICK_HALTED if status == "halted" else _TICK_DONE
+        return await _exit_tick(
+            rollout_id, loop_state, _TICK_HALTED if status == "halted" else _TICK_DONE
+        )
 
     # Wave completion is READ, not computed. `complete_item_in_rollout` already
     # closes the rollout and signals `graph_complete`, and `advance_rollout`
@@ -4065,7 +4617,7 @@ async def _rollout_wave_tick(
         logger.info(
             "rollout-loop: rollout_id=%s graph_complete — loop exits", rollout_id
         )
-        return _TICK_DONE
+        return await _exit_tick(rollout_id, loop_state, _TICK_DONE)
 
     in_flight = _in_flight_build_runs(rollout)
     completed = _completed_build_item_ids(advance, in_flight)
@@ -4087,11 +4639,181 @@ async def _rollout_wave_tick(
         directive = await _retry_unrecorded_merges(
             rollout_id, pending, token=token, attribution=attribution
         )
+        if directive == _TICK_HALTED:
+            return await _halt_teardown(
+                rollout_id, loop_state, cause="verdict", cause_item=None
+            )
         if directive is not None:
             return directive
 
+    acted_this_tick: set[str] = set()
+    harvested = False
+    started = False
+    dispatched = False
+    done_seen = False
+
+    # (a) HARVEST finished reviews.
+    for item_id, entry in list(loop_state.reviews.items()):
+        if not entry.task.done():
+            continue
+        loop_state.reviews.pop(item_id)
+        dispatch_attempts.pop(item_id, None)
+        acted_this_tick.add(item_id)
+        harvested = True
+        if entry.task.cancelled():
+            continue
+        task_exc = entry.task.exception()
+        if task_exc is not None:
+            logger.exception(
+                "rollout-loop: review-task-raised rollout_id=%s item_id=%s slot=%d",
+                rollout_id,
+                item_id,
+                entry.slot,
+                exc_info=task_exc,
+            )
+            outcome = ReviewVerdict(
+                "halt",
+                "review task raised",
+                "",
+                f"{type(task_exc).__name__}: {task_exc}",
+            )
+        else:
+            outcome = entry.task.result()
+        review_secs = _monotonic() - entry.started_at
+        if outcome.verdict == "merge":
+            loop_state.land_queue.append(
+                _QueuedLand(
+                    item_id,
+                    entry.slot,
+                    outcome,
+                    entry.item,
+                    entry.pre_review_origin,
+                    _monotonic(),
+                )
+            )
+            loop_state.peak_land_queue = max(
+                loop_state.peak_land_queue, len(loop_state.land_queue)
+            )
+            logger.info(
+                "rollout-loop: review-harvest rollout_id=%s item_id=%s slot=%d "
+                "verdict=%s review_secs=%.1f action=land-queued",
+                rollout_id,
+                item_id,
+                entry.slot,
+                outcome.verdict,
+                review_secs,
+            )
+            logger.info(
+                "rollout-loop: land-enqueue rollout_id=%s item_id=%s slot=%d "
+                "queue_pos=%d",
+                rollout_id,
+                item_id,
+                entry.slot,
+                len(loop_state.land_queue),
+            )
+            continue
+        logger.info(
+            "rollout-loop: review-harvest rollout_id=%s item_id=%s slot=%d "
+            "verdict=%s review_secs=%.1f action=%s",
+            rollout_id,
+            item_id,
+            entry.slot,
+            outcome.verdict,
+            review_secs,
+            "halt-raised" if outcome.verdict == "halt" else "acted",
+        )
+        # The entry is already popped, so its slot is free whatever happens
+        # here; a transient error re-raises and the tick is re-run.
+        directive = await _act_on_verdict(
+            rollout_id,
+            item_id,
+            outcome,
+            token=token,
+            attribution=attribution,
+            workspace=loop_state.slots.get(entry.slot),
+            halt_suffix=_queued_land_suffix(loop_state),
+        )
+        if directive == _TICK_HALTED:
+            return await _halt_teardown(
+                rollout_id, loop_state, cause="verdict", cause_item=item_id
+            )
+        if directive == _TICK_DONE:
+            done_seen = True
+
+    # (b) HARVEST the land.
+    land = loop_state.active_land
+    if land is not None and land.task.done():
+        loop_state.active_land = None
+        acted_this_tick.add(land.item_id)
+        harvested = True
+        land_secs = _monotonic() - land.started_at
+        land_exc: BaseException | None = (
+            asyncio.CancelledError("land task cancelled")
+            if land.task.cancelled()
+            else land.task.exception()
+        )
+        if land_exc is None:
+            result = land.task.result()
+            loop_state.lands += 1
+            label = result if isinstance(result, str) else result.verdict
+            logger.info(
+                "rollout-loop: land-done rollout_id=%s item_id=%s slot=%d "
+                "directive=%s land_secs=%.1f",
+                rollout_id,
+                land.item_id,
+                land.slot,
+                label,
+                land_secs,
+            )
+            if result == _TICK_HALTED:
+                return await _halt_teardown(
+                    rollout_id, loop_state, cause="land", cause_item=land.item_id
+                )
+            if result == _TICK_DONE:
+                done_seen = True
+        elif _is_transient_board_error(land_exc):
+            # The item stays dispatched with a terminal build; the pre-review
+            # already-landed check records it if the push reached origin.
+            logger.warning(
+                "rollout-loop: land-task-transient rollout_id=%s item_id=%s",
+                rollout_id,
+                land.item_id,
+            )
+        else:
+            # The slot's tree stays on disk as evidence; the item is never
+            # re-queued.
+            return await _loop_halt(
+                rollout_id,
+                loop_state,
+                f"land task for item {land.item_id} raised: "
+                f"{type(land_exc).__name__}: {land_exc}",
+                item_id=land.item_id,
+                cause="land",
+                token=token,
+                attribution=attribution,
+            )
+    if loop_state.pending_directive is not None:
+        if loop_state.active_land is not None:
+            return _TICK_WAIT
+        directive = loop_state.pending_directive
+        loop_state.pending_directive = None
+        return directive
+
+    # (c) DRAIN check.
     drain = str(rollout.get("loop_host_drain_reason") or "").strip()
-    if drain:
+    if not drain:
+        loop_state.drain_finishing_logged = False
+    else:
+        if loop_state.active_land is None and loop_state.land_queue:
+            _start_land(
+                rollout_id,
+                loop_state,
+                project=project,
+                reviewer_engine=reviewer_engine,
+                loop_run_id=loop_run_id,
+                token=token,
+                attribution=attribution,
+            )
         if pending:
             await _publish_rollout_phase(
                 rollout_id,
@@ -4102,6 +4824,32 @@ async def _rollout_wave_tick(
                 ),
                 token=token,
             )
+            return _TICK_WAIT
+        if _busy(loop_state):
+            n_reviews = len(loop_state.reviews)
+            n_lands = len(loop_state.land_queue) + (
+                1 if loop_state.active_land is not None else 0
+            )
+            if loop_state.active_land is None:
+                await _publish_rollout_phase(
+                    rollout_id,
+                    "polling",
+                    step=(
+                        f"Host draining: finishing {n_reviews} review(s) and "
+                        f"{n_lands} land(s) before parking"
+                    ),
+                    token=token,
+                )
+            log = logger.debug if loop_state.drain_finishing_logged else logger.info
+            log(
+                "rollout-loop: drain-finishing rollout_id=%s run_id=%s reviews=%d "
+                "lands=%d",
+                rollout_id,
+                loop_run_id,
+                n_reviews,
+                n_lands,
+            )
+            loop_state.drain_finishing_logged = True
             return _TICK_WAIT
         await _publish_rollout_phase(
             rollout_id, "parked", step=_parked_step(drain), token=token
@@ -4122,13 +4870,49 @@ async def _rollout_wave_tick(
             )
         return _TICK_PARKED
 
-    reviewable = [i for i in completed if i not in pending]
+    # (d) Start ONE land.
+    if loop_state.active_land is None and loop_state.land_queue:
+        kind = _audit_loop_state(rollout_id, loop_state, land_start=True)
+        if kind is not None:
+            return await _loop_halt(
+                rollout_id,
+                loop_state,
+                f"bad_local_state: {kind}",
+                item_id=loop_state.land_queue[0].item_id,
+                cause="verdict",
+                token=token,
+                attribution=attribution,
+            )
+        _start_land(
+            rollout_id,
+            loop_state,
+            project=project,
+            reviewer_engine=reviewer_engine,
+            loop_run_id=loop_run_id,
+            token=token,
+            attribution=attribution,
+        )
+        started = True
 
-    if reviewable:
-        item_id = reviewable[0]
+    # (e) START reviews.
+    active_item = (
+        loop_state.active_land.item_id if loop_state.active_land is not None else None
+    )
+    queued_ids = {q.item_id for q in loop_state.land_queue}
+    reviewable = [
+        i
+        for i in completed
+        if i not in loop_state.reviews
+        and i != active_item
+        and i not in queued_ids
+        and i not in pending
+        and i not in acted_this_tick
+    ]
+    parked = False
+    for item_id in reviewable:
         # A child build the board failed because its pinned host was draining
         # never ran: re-dispatch it (the host is back, or this tick would have
-        # parked above) instead of sending it to the reviewer.
+        # stopped at the drain check) instead of sending it to the reviewer.
         latest_run = await _latest_run_for_item(item_id, rollout_id, token=token)
         if str(latest_run.get("status") or "") == "failed" and (
             _HOST_DRAINING_MARKER in str(latest_run.get("error_msg") or "")
@@ -4141,45 +4925,49 @@ async def _rollout_wave_tick(
             except Exception as exc:
                 if _is_transient_board_error(exc):
                     raise
-                return await _park_or_halt_on_dispatch_refusal(
+                refusal = await _park_or_halt_on_dispatch_refusal(
                     rollout_id,
                     item_id,
                     exc,
-                    halt_reason=(
+                    halt_reason=_with_suffix(
                         f"re-dispatch of item {item_id} after a drain refusal "
-                        f"failed: {type(exc).__name__}: {exc}"
+                        f"failed: {type(exc).__name__}: {exc}",
+                        _queued_land_suffix(loop_state),
                     ),
                     token=token,
                     attribution=attribution,
                 )
+                if refusal == _TICK_HALTED:
+                    return await _halt_teardown(
+                        rollout_id, loop_state, cause="verdict", cause_item=item_id
+                    )
+                parked = True
+                break
             logger.info(
                 "rollout-loop: redispatch-after-drain-refusal rollout_id=%s item_id=%s",
                 rollout_id,
                 item_id,
             )
-            return _TICK_CONTINUE
-        if workspace_ref[0] is None:
-            await _publish_rollout_phase(
-                rollout_id,
-                "warm_up",
-                item_id=item_id,
-                step="Preparing the shared rollout workspace",
-                token=token,
-            )
-            workspace_ref[0] = await asyncio.get_running_loop().run_in_executor(
-                None,
-                functools.partial(
-                    dispatch.prepare_rollout_workspace,
-                    rollout_id,
-                    git_origin=str(project.get("git_origin") or ""),
-                    repo_urls=list(project.get("workspace_repos") or []),
-                ),
-            )
-        workspace = workspace_ref[0]
-        assert workspace is not None  # noqa: S101 — just assigned above
-        # Fetched here, before any reviewer runs, and threaded through to the
-        # land step's fix relaunch: after the first reviewer has run, no board
-        # call may raise out of this tick (see _drive_rollout's outage retry).
+            acted_this_tick.add(item_id)
+            dispatched = True
+            continue
+        slot = _free_slot(loop_state)
+        if (
+            slot is None
+            or _host_reviews_in_flight >= config.ROLLOUT_MAX_CONCURRENT_REVIEWS
+        ):
+            continue
+        workspace = await _slot_workspace(
+            rollout_id,
+            loop_state,
+            slot,
+            project=project,
+            item_id=item_id,
+            token=token,
+        )
+        # Fetched here, before the reviewer starts, and threaded through to the
+        # land step's fix relaunch: nothing after create_task may raise a board
+        # error out of this tick for this item.
         review_item = await gtd_client.get_item(item_id, token=token)
         await asyncio.get_running_loop().run_in_executor(
             None, dispatch.refresh_rollout_workspace, workspace
@@ -4197,64 +4985,109 @@ async def _rollout_wave_tick(
                 config.LAND_GIT_TIMEOUT_SECONDS,
             ),
         )
-        await _publish_rollout_phase(
-            rollout_id,
-            "reviewing",
-            item_id=item_id,
-            step=f"Reviewing the completed build for {item_id}",
-            token=token,
-        )
-        outcome = await _launch_reviewer(
+        precheck = await _pre_review_landed_check(
             rollout_id,
             item_id,
-            project=project,
-            workspace=workspace,
-            reviewer_engine=reviewer_engine,
+            slot,
+            workspace,
+            loop_state,
             token=token,
             attribution=attribution,
-            item=review_item,
         )
-        dispatch_attempts.pop(item_id, None)
-        if outcome.verdict == "merge":
-            landed = await _land_reviewed_merge(
+        if precheck is not None:
+            acted_this_tick.add(item_id)
+            harvested = True
+            # Any halt path has already torn down; a halt behind an active
+            # land comes back as WAIT with HALTED parked in pending_directive.
+            # Either way nothing more may start or dispatch this tick.
+            if precheck not in (_TICK_CONTINUE, _TICK_DONE):
+                return precheck
+            if precheck == _TICK_DONE:
+                done_seen = True
+            continue
+        kind = _audit_loop_state(rollout_id, loop_state)
+        if kind is not None:
+            return await _loop_halt(
+                rollout_id,
+                loop_state,
+                f"bad_local_state: {kind}",
+                item_id=item_id,
+                cause="verdict",
+                token=token,
+                attribution=attribution,
+            )
+        task: asyncio.Task[ReviewVerdict] = asyncio.create_task(
+            _launch_reviewer(
                 rollout_id,
                 item_id,
-                outcome,
                 project=project,
                 workspace=workspace,
-                pre_review_origin=pre_review_origin,
                 reviewer_engine=reviewer_engine,
-                loop_run_id=loop_run_id,
                 token=token,
                 attribution=attribution,
                 item=review_item,
+                executor=dispatch._review_executor,
+                slot=slot,
             )
-            if isinstance(landed, str):
-                return landed
-            outcome = landed
-        return await _act_on_verdict(
+        )
+        _host_reviews_in_flight += 1
+        task.add_done_callback(_release_host_review)
+        loop_state.reviews[item_id] = _ReviewEntry(
+            item_id, slot, task, review_item, pre_review_origin, _monotonic()
+        )
+        loop_state.reviews_started += 1
+        loop_state.peak_reviews_in_flight = max(
+            loop_state.peak_reviews_in_flight, len(loop_state.reviews)
+        )
+        started = True
+        logger.info(
+            "rollout-loop: review-start rollout_id=%s item_id=%s slot=%d "
+            "workspace=%s reviews_in_flight=%d host_reviews_in_flight=%d/%d "
+            "land_queue=%d active_land=%s",
             rollout_id,
             item_id,
-            outcome,
-            token=token,
-            attribution=attribution,
-            workspace=workspace,
+            slot,
+            workspace.root,
+            len(loop_state.reviews),
+            _host_reviews_in_flight,
+            config.ROLLOUT_MAX_CONCURRENT_REVIEWS,
+            len(loop_state.land_queue),
+            loop_state.active_land.item_id
+            if loop_state.active_land is not None
+            else "-",
         )
 
+    # (f) DISPATCH next_ready, on every tick regardless of reviews or lands.
     next_ready = [str(i) for i in (advance.get("next_ready") or [])]
-    if next_ready:
-        for item_id in next_ready:
-            attempts = dispatch_attempts.get(item_id, 0)
-            if attempts >= _MAX_DISPATCH_ATTEMPTS_PER_ITEM:
-                return await _halt_rollout_from_loop(
-                    rollout_id,
-                    f"item {item_id} is still reported ready after {attempts} "
-                    "successful dispatch calls — the rollout item never "
-                    "transitioned to 'dispatched'",
-                    item_id=item_id,
-                    token=token,
-                    attribution=attribution,
-                )
+    tracked = set(_tracked_item_ids(rollout_id, loop_state))
+    for item_id in [] if parked else next_ready:
+        if item_id in tracked or item_id in acted_this_tick:
+            continue
+        attempts = dispatch_attempts.get(item_id, 0)
+        if attempts >= _MAX_DISPATCH_ATTEMPTS_PER_ITEM:
+            return await _loop_halt(
+                rollout_id,
+                loop_state,
+                f"item {item_id} is still reported ready after {attempts} "
+                "successful dispatch calls — the rollout item never "
+                "transitioned to 'dispatched'",
+                item_id=item_id,
+                cause="verdict",
+                token=token,
+                attribution=attribution,
+            )
+        kind = _audit_loop_state(rollout_id, loop_state, dispatching=item_id)
+        if kind is not None:
+            return await _loop_halt(
+                rollout_id,
+                loop_state,
+                f"bad_local_state: {kind}",
+                item_id=item_id,
+                cause="verdict",
+                token=token,
+                attribution=attribution,
+            )
+        if loop_state.active_land is None:
             await _publish_rollout_phase(
                 rollout_id,
                 "dispatching",
@@ -4262,54 +5095,102 @@ async def _rollout_wave_tick(
                 step=f"Dispatching {item_id}",
                 token=token,
             )
-            try:
-                child = await gtd_client.dispatch_item(
-                    item_id, rollout_id=rollout_id, token=token
-                )
-            except Exception as exc:
-                # A transient board error is ridden out by _drive_rollout, not
-                # turned into a halt.  Re-running the tick cannot double-dispatch:
-                # a dispatch that DID land moved the item to `dispatched`, so
-                # advance_rollout no longer reports it in next_ready (and the
-                # board's wave linkage is guarded by `AND status = 'ready'`).
-                if _is_transient_board_error(exc):
-                    raise
-                return await _park_or_halt_on_dispatch_refusal(
-                    rollout_id,
-                    item_id,
-                    exc,
-                    halt_reason=(
-                        f"dispatch of item {item_id} failed: "
-                        f"{type(exc).__name__}: {exc}"
-                    ),
-                    token=token,
-                    attribution=attribution,
-                )
-            dispatch_attempts[item_id] = attempts + 1
-            logger.info(
-                "rollout-loop: dispatched rollout_id=%s item_id=%s run_id=%s",
+        try:
+            child = await gtd_client.dispatch_item(
+                item_id, rollout_id=rollout_id, token=token
+            )
+        except Exception as exc:
+            # A transient board error is ridden out by _drive_rollout, not
+            # turned into a halt.  Re-running the tick cannot double-dispatch:
+            # a dispatch that DID land moved the item to `dispatched`, so
+            # advance_rollout no longer reports it in next_ready (and the
+            # board's wave linkage is guarded by `AND status = 'ready'`).
+            if _is_transient_board_error(exc):
+                raise
+            refusal = await _park_or_halt_on_dispatch_refusal(
                 rollout_id,
                 item_id,
-                (child or {}).get("id"),
+                exc,
+                halt_reason=_with_suffix(
+                    f"dispatch of item {item_id} failed: {type(exc).__name__}: {exc}",
+                    _queued_land_suffix(loop_state),
+                ),
+                token=token,
+                attribution=attribution,
             )
+            if refusal == _TICK_HALTED:
+                return await _halt_teardown(
+                    rollout_id, loop_state, cause="verdict", cause_item=item_id
+                )
+            parked = True
+            break
+        dispatch_attempts[item_id] = attempts + 1
+        dispatched = True
+        if loop_state.reviews:
+            loop_state.dispatches_while_reviewing += 1
+        logger.info(
+            "rollout-loop: dispatched rollout_id=%s item_id=%s run_id=%s "
+            "reviews_in_flight=%d lands_in_flight=%d",
+            rollout_id,
+            item_id,
+            (child or {}).get("id"),
+            len(loop_state.reviews),
+            1 if loop_state.active_land is not None else 0,
+        )
+
+    # (g) PUBLISH and return.
+    kind = _audit_loop_state(rollout_id, loop_state)
+    if kind is not None:
+        return await _loop_halt(
+            rollout_id,
+            loop_state,
+            f"bad_local_state: {kind}",
+            item_id=None,
+            cause="verdict",
+            token=token,
+            attribution=attribution,
+        )
+    if parked:
+        return _TICK_WAIT if _busy(loop_state) else _TICK_PARKED
+    if loop_state.active_land is None:
+        if loop_state.reviews:
+            newest = max(loop_state.reviews.values(), key=lambda e: e.started_at)
+            ids = ", ".join(loop_state.reviews)
+            await _publish_rollout_phase(
+                rollout_id,
+                "reviewing",
+                item_id=newest.item_id,
+                step=(
+                    f"Reviewing {len(loop_state.reviews)} completed build(s): "
+                    f"{ids}; {len(loop_state.land_queue)} queued to land"
+                )[:200],
+                token=token,
+            )
+        elif not (harvested or started or dispatched):
+            if in_flight:
+                await _publish_rollout_phase(
+                    rollout_id,
+                    "polling",
+                    step=f"Waiting on {len(in_flight)} in-flight build run(s)",
+                    token=token,
+                )
+            elif pending:
+                await _publish_rollout_phase(
+                    rollout_id,
+                    "polling",
+                    step=(
+                        "Waiting to record merged item(s) on the board: "
+                        f"{', '.join(pending)}"
+                    ),
+                    token=token,
+                )
+    if done_seen and not _busy(loop_state):
+        return _TICK_DONE
+    if harvested or started or dispatched:
         return _TICK_CONTINUE
-
-    if in_flight:
-        await _publish_rollout_phase(
-            rollout_id,
-            "polling",
-            step=f"Waiting on {len(in_flight)} in-flight build run(s)",
-            token=token,
-        )
+    if _busy(loop_state) or in_flight:
         return _TICK_WAIT
-
     if pending:
-        await _publish_rollout_phase(
-            rollout_id,
-            "polling",
-            step=f"Waiting to record merged item(s) on the board: {', '.join(pending)}",
-            token=token,
-        )
         logger.warning(
             "rollout-loop: waiting-on-unrecorded-merges rollout_id=%s pending=%s",
             rollout_id,
@@ -4326,6 +5207,101 @@ async def _rollout_wave_tick(
     )
 
 
+async def _pre_review_landed_check(
+    rollout_id: str,
+    item_id: str,
+    slot: int,
+    workspace: dispatch.RolloutWorkspace,
+    loop_state: _RolloutLoopState,
+    *,
+    token: str | None,
+    attribution: str | None,
+) -> str | None:
+    """Record, instead of re-reviewing, an item whose squash already landed.
+
+    After a restart (or a land task that died on a board blip after its push),
+    an item can still be ``dispatched`` with its squash commit already on
+    origin.  The lookup is scoped to THIS rollout (``Rollout:`` trailer).
+
+    A hit in some repos and none in the others counts as landed (a workspace
+    item lands only in the repos it touched); a repo whose lookup failed halts.
+
+    Returns None to proceed to review, else the directive of what was done
+    (recorded, routed to the unrecorded-merge path, or halted).  Every halt
+    path has already run the halt teardown, so a halt behind an active land
+    comes back as ``_TICK_WAIT`` with ``pending_directive`` set.
+    """
+    confirmation, subjects, failed_repos = await _confirm_merge_landed(
+        workspace, item_id, rollout_id=rollout_id
+    )
+    action = "review"
+    directive: str | None = None
+    if confirmation == "confirmed":
+        # A workspace item lands only in the repos it touched, and the lookup
+        # omits repos with no matching commit, so a repo with no hit is not
+        # evidence of a partial land.  Only a lookup that FAILED leaves the
+        # answer unknown, and that halts.
+        if failed_repos:
+            action = "halted"
+            directive = await _loop_halt(
+                rollout_id,
+                loop_state,
+                f"item {item_id}'s squash commit is on origin in "
+                f"{', '.join(sorted(subjects))}, but the landed-commit lookup "
+                f"failed in {', '.join(sorted(failed_repos))}",
+                item_id=item_id,
+                cause="verdict",
+                token=token,
+                attribution=attribution,
+            )
+        else:
+            action = "recorded"
+            merge_note = (
+                f"Recorded after restart: the squash commit for {item_id} was "
+                "already on origin ("
+                + "; ".join(
+                    f"{repo}: {subj}" for repo, subj in sorted(subjects.items())
+                )
+                + ")."
+            )
+            result, exc = await _complete_in_rollout_with_retry(
+                rollout_id,
+                item_id,
+                outcome="completed",
+                merge_note=merge_note,
+                token=token,
+            )
+            if exc is not None:
+                directive = await _handle_unrecorded_merge(
+                    rollout_id,
+                    item_id,
+                    ReviewVerdict("merge", "already landed on origin", merge_note, ""),
+                    exc,
+                    token=token,
+                    attribution=attribution,
+                    workspace=workspace,
+                )
+                if directive == _TICK_HALTED:
+                    directive = await _halt_teardown(
+                        rollout_id, loop_state, cause="verdict", cause_item=item_id
+                    )
+            elif isinstance(result, dict) and result.get("graph_complete") is True:
+                directive = _TICK_DONE
+            else:
+                directive = _TICK_CONTINUE
+    log = logger.warning if confirmation == "confirmed" else logger.debug
+    log(
+        "rollout-loop: pre-review-landed-check rollout_id=%s item_id=%s slot=%d "
+        "result=%s action=%s",
+        rollout_id,
+        item_id,
+        slot,
+        confirmation,
+        action,
+    )
+    return directive
+
+
 async def _drive_rollout(
     run: Run,
     *,
@@ -4333,9 +5309,9 @@ async def _drive_rollout(
 ) -> str:
     """Drive one rollout's wave loop to completion. Returns the final directive.
 
-    This is the whole of AC1: determine what is ready, dispatch it, wait for
-    completion, review each completed build, act on the verdict, advance,
-    repeat until the rollout is complete or halted.
+    Determine what is ready, dispatch it, wait for completion, review each
+    completed build (several at once), land merges one at a time, act on the
+    verdicts, advance, repeat until the rollout is complete or halted.
     """
     rollout_id = run.rollout_id
     assert rollout_id is not None  # noqa: S101 — caller guarantees this
@@ -4378,12 +5354,13 @@ async def _drive_rollout(
         rollout_id, "warm_up", step="Wave loop adopted the rollout", token=token
     )
 
-    workspace_ref: list[dispatch.RolloutWorkspace | None] = [None]
+    loop_state = _RolloutLoopState()
     dispatch_attempts: dict[str, int] = {}
     directive = _TICK_CONTINUE
     parked_since: float | None = None
     parked_ticks = 0
     last_park_warn_at: float | None = None
+    shutdown = False
     try:
         while True:
             # Every tick runs while the loop counts as active: membership in
@@ -4392,15 +5369,16 @@ async def _drive_rollout(
             was_parked = parked_since is not None
             # A transient board error re-runs the whole tick from the top.
             # That is safe because every side effect in the tick is either
-            # re-derived from the board on the next read or is followed only by
-            # board calls that never raise (see _rollout_wave_tick).
+            # re-derived from the board on the next read, held in loop_state,
+            # or followed only by board calls that never raise (see
+            # _rollout_wave_tick).
             directive = await _ride_out_board_outage(
                 outage,
                 functools.partial(
                     _rollout_wave_tick,
                     rollout_id,
                     project=project,
-                    workspace_ref=workspace_ref,
+                    loop_state=loop_state,
                     reviewer_engine=reviewer_engine,
                     dispatch_attempts=dispatch_attempts,
                     token=token,
@@ -4450,7 +5428,24 @@ async def _drive_rollout(
                 _deregister_rollout_loop(run)
                 return directive
             if directive == _TICK_WAIT:
-                await asyncio.sleep(config.ROLLOUT_LOOP_POLL_SECONDS)
+                # Wake as soon as a review or the land finishes, or after the
+                # poll interval (builds run elsewhere and push nothing).
+                tasks: set[asyncio.Task[Any]] = {
+                    e.task for e in loop_state.reviews.values()
+                }
+                if loop_state.active_land is not None:
+                    tasks.add(loop_state.active_land.task)
+                if tasks:
+                    await asyncio.wait(
+                        tasks,
+                        timeout=config.ROLLOUT_LOOP_POLL_SECONDS,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                else:
+                    await asyncio.sleep(config.ROLLOUT_LOOP_POLL_SECONDS)
+    except asyncio.CancelledError:
+        shutdown = True
+        raise
     finally:
         _parked_rollout_loops.discard(run.id)
         if parked_since is not None:
@@ -4461,22 +5456,49 @@ async def _drive_rollout(
                 run.id,
                 int(_monotonic() - parked_since),
             )
+        await _teardown_reviews(loop_state, rollout_id=rollout_id)
+        land = loop_state.active_land
+        if land is not None:
+            # A land is never abandoned mid-push: it is awaited.  Only service
+            # shutdown cancels it; the pre-review already-landed check then
+            # recovers a push that had already reached origin.
+            if shutdown:
+                land.task.cancel()
+            await asyncio.gather(land.task, return_exceptions=True)
         _rollout_redispatches.pop(rollout_id, None)
         _rollout_unrecorded_merges.pop(rollout_id, None)
-        ws = workspace_ref[0]
-        # The shared workspace is torn down only when the loop itself ends. A
-        # halted rollout keeps it: the tree is the evidence a human needs.
-        if ws is not None and directive == _TICK_DONE:
-            with contextlib.suppress(Exception):
-                for _rp in dispatch.reap_workspace_processes(ws.root):
-                    logger.warning(
-                        "reaped leaked process from rollout workspace: pid=%s %s (%s)",
-                        _rp.pid,
-                        _rp.cmdline,
-                        _rp.killed_with,
-                    )
-            with contextlib.suppress(Exception):
-                dispatch.cleanup_workspace(ws.root)
+        logger.info(
+            "rollout-loop: concurrency-summary rollout_id=%s run_id=%s limit=%d "
+            "reviews_started=%d peak_reviews_in_flight=%d "
+            "dispatches_while_reviewing=%d lands=%d peak_land_queue=%d "
+            "max_land_queued_secs=%.1f halt_cancelled_reviews=%d",
+            rollout_id,
+            run.id,
+            config.ROLLOUT_MAX_CONCURRENT_REVIEWS,
+            loop_state.reviews_started,
+            loop_state.peak_reviews_in_flight,
+            loop_state.dispatches_while_reviewing,
+            loop_state.lands,
+            loop_state.peak_land_queue,
+            loop_state.max_land_queued_secs,
+            loop_state.halt_cancelled_reviews,
+        )
+        # Slot workspaces are torn down only when the rollout completed. A
+        # halted rollout keeps every slot: the trees are the evidence a human
+        # needs.
+        if directive == _TICK_DONE:
+            for ws in loop_state.slots.values():
+                with contextlib.suppress(Exception):
+                    for _rp in dispatch.reap_workspace_processes(ws.root):
+                        logger.warning(
+                            "reaped leaked process from rollout workspace: "
+                            "pid=%s %s (%s)",
+                            _rp.pid,
+                            _rp.cmdline,
+                            _rp.killed_with,
+                        )
+                with contextlib.suppress(Exception):
+                    dispatch.cleanup_workspace(ws.root)
 
 
 async def _rollout_loop_worker(run: Run, *, attribution: str | None = None) -> None:
@@ -6517,18 +7539,11 @@ async def cancel_run(
     if task is not None:
         task.cancel()
 
-    # Terminate the subprocess: SIGTERM, grace period, then SIGKILL.
-    # Signal the whole SESSION, not just the sudo wrapper's pid — sudo cannot
-    # relay signals to the agent user's child, so terminate/kill on proc alone
-    # would orphan the agent and every command it spawned inside a clone that
-    # is about to be deleted (kb-03965).  The wrapper was launched with
-    # start_new_session=True, so proc.pid is the session id.
+    # Terminate the subprocess: SIGTERM, grace period, then SIGKILL, on the
+    # whole session (see _terminate_run_session).
     proc = _active_subprocesses.get(run_id)
     if proc is not None:
-        kill_run_session(proc, signal.SIGTERM)
-        await asyncio.sleep(config.CANCEL_GRACE_SECONDS)
-        if proc.poll() is None or run_session_has_members(proc):
-            kill_run_session(proc, signal.SIGKILL)
+        await _terminate_run_session(proc)
 
     # Update DB to cancelled
     completed = datetime.now(UTC).isoformat()
