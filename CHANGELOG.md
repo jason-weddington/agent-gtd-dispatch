@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.14.0 (2026-10-25)
+
+### Features
+
+- **95c346c4**: Rollouts review completed builds concurrently and keep dispatching ready items; land
+  stays serialized
+  ([`d72fff7`](https://github.com/repos/agent-gtd-dispatch/commit/d72fff74b7d5d418a272759b5de1acf423bff326))
+
+
 ## v2.13.0 (2026-10-24)
 
 ### Features
