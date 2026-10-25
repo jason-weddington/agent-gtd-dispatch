@@ -1985,7 +1985,9 @@ async def _latest_run_for_item(
     return max(matching, key=lambda r: str(r.get("created_at") or ""))
 
 
-def _gate_result_summary(run_row: dict[str, Any]) -> str:
+def _gate_result_summary(
+    run_row: dict[str, Any], *, gate_command: str = "", build_engine: str = ""
+) -> str:
     """Render the post-run gate outcome for the reviewer's envelope.
 
     The GTD-side run row has no gate column; the gate's verdict reaches it as
@@ -1994,6 +1996,21 @@ def _gate_result_summary(run_row: dict[str, Any]) -> str:
     reviewer a bare string.
     """
     error_msg = str(run_row.get("error_msg") or "").strip()
+    if (
+        not error_msg
+        and gate_command.strip()
+        # The board's run status for a finished build is "success"
+        # (agent_gtd RunStatus.SUCCESS), not the dispatch-side "succeeded".
+        and str(run_row.get("status") or "") == "success"
+        and not is_talos_engine(build_engine)
+    ):
+        # A succeeded non-talos build of a project with a gate_command only
+        # reaches ``succeeded`` after the worker's post-run gate exited 0
+        # (a failing or timed-out gate fails the run with a ``post-run gate``
+        # error_msg), so silence here is a pass, not a skip.
+        return dispatch.GATE_PASSED_WORDING + (
+            f" (the worker ran `{gate_command.strip()}` and it exited 0)."
+        )
     if not error_msg:
         return (
             "no failure recorded on the run — the post-run gate did not fail "
@@ -2120,7 +2137,16 @@ async def _launch_reviewer(
         default_branches=workspace.default_branches,
         workspace_mode=workspace.workspace_mode,
         run_status=str(run_row.get("status") or "unknown"),
-        gate_result=_gate_result_summary(run_row),
+        gate_result=_gate_result_summary(
+            run_row,
+            gate_command=str(project.get("gate_command") or ""),
+            build_engine=str(
+                run_row.get("engine_actual")
+                or run_row.get("engine")
+                or item.get("build_engine")
+                or ""
+            ),
+        ),
         merge_notes=merge_notes,
         redispatches_used=used,
         redispatch_cap=MAX_ITEM_REDISPATCHES,

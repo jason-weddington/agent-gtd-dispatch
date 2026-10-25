@@ -4077,6 +4077,11 @@ remain in a resolved file.
     return _indent_prompt_block(body)
 
 
+# The exact phrase ``main._gate_result_summary`` renders when the build's
+# post-run gate passed.  The reviewer prompt's Step 4 keys off it verbatim.
+GATE_PASSED_WORDING = "the post-run gate PASSED"
+
+
 def _review_envelope_block(
     item: dict[str, Any],
     branch_name: str,
@@ -4403,7 +4408,29 @@ record `none` for it and continue — do NOT halt for that alone."""
 
                 ## Step 4 — Run the merge bar in every repo that received the branch
 
+                **Skip the merge bar when the post-run gate already passed.** If the
+                `Post-run gate result` line above says "{GATE_PASSED_WORDING}",
+                do NOT run the merge bar yourself unless you make an inline change.
+                The worker's land step re-runs the project gate on the rebased
+                post-merge tip before anything is pushed, so a reviewer gate run
+                on the same tip is duplication. If that line reports a failure,
+                says the gate may have been skipped, is absent or is unclear, or
+                if you apply ANY inline fix, run the merge bar exactly as
+                described below.
+
                 {{gate_block}}
+
+                **No long-running verification.** Do not run long-running
+                verification to check an acceptance criterion: no mutation testing
+                (e.g. `cargo mutants`, `mutmut`, `stryker`), no benchmarks, no
+                soak or load runs, and no single command you expect to take more
+                than 5 minutes. Judge such criteria from the diff, the tests the
+                build added, the build agent's reported evidence in its final
+                comment, and the post-run gate. If a criterion can only be
+                confirmed by such a run and the build reported no evidence for
+                it, return `halt` naming that criterion instead of running it.
+                Short targeted checks (a single test file or module) remain
+                allowed.
 
                 **Inline-fix phase boundary.** A SMALL gate failure may be fixed inline
                 before you create the squash commit; after the squash commit exists, any
