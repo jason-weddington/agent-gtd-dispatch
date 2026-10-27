@@ -2,6 +2,20 @@
 
 <!-- version list -->
 
+## v2.14.2 (2026-10-27)
+
+### Bug Fixes
+
+- **fdfa8658**: Dispatch runs get a private TMPDIR that is removed at teardown, so build and gate
+  output stops filling the host's /tmp
+  ([`b1415ad`](https://github.com/repos/agent-gtd-dispatch/commit/b1415adf5438e9c1345395fd5d202ae6dd68ed44))
+
+### Chores
+
+- **host-setup**: Provision shellcheck and python3 on every dispatch host
+  ([`9f516b5`](https://github.com/repos/agent-gtd-dispatch/commit/9f516b5b894bc19659258f6aecd60d095d7352bb))
+
+
 ## v2.14.1 (2026-10-25)
 
 ### Bug Fixes
