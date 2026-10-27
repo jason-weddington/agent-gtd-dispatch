@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 from . import config
 from .dispatch import _sudo_wrap
 from .models import RunStatus
+from .run_tmp import with_tmp_env
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -262,8 +263,13 @@ def build_talos_argv(
     task_id: str,
     attempt: int,
     timeout_seconds: int | None = None,
+    *,
+    tmp_dir: Path | None = None,
 ) -> list[str]:
     """Return the sudo-wrapped ``talos run …`` argv for the subprocess launch.
+
+    ``tmp_dir`` is the run's private TMPDIR, prefixed via ``with_tmp_env``
+    inside the sudo wrap; None leaves the argv unchanged.
 
     - Uses ``config.TALOS_BIN`` (default ``'talos'``, PATH-resolved).
     - Passes ``--workspace``, ``--task-id``, ``--attempt``. The TaskSpec JSON is
@@ -315,7 +321,7 @@ def build_talos_argv(
     if config.TALOS_MEMORY != "off":
         argv += ["--memory", config.TALOS_MEMORY]
     argv.append("--transcript")
-    return _sudo_wrap(argv)
+    return _sudo_wrap(with_tmp_env(argv, tmp_dir))
 
 
 # ---------------------------------------------------------------------------

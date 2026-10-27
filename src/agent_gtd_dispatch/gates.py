@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING
 
 from .dispatch import _sudo_wrap
 from .engines import prepend_agent_bin_dirs
+from .run_tmp import with_tmp_env
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -207,7 +208,11 @@ def agent_shell_env() -> dict[str, str]:
 
 
 def run_as_agent(
-    argv: list[str], cwd: Path, timeout_seconds: int
+    argv: list[str],
+    cwd: Path,
+    timeout_seconds: int,
+    *,
+    tmp_dir: Path | None = None,
 ) -> AgentCommandResult:
     """Run *argv* as the agent subprocess user, sudo-wrapped, with a minimal env.
 
@@ -215,11 +220,14 @@ def run_as_agent(
     mapped to an AgentCommandResult with `error` set. Reusable by the post-run
     gate (sibling 850c058b), which runs the project `gate_command` after a
     successful agent exit under the same sudo/env constraints.
+
+    ``tmp_dir`` (the run's private TMPDIR) is prefixed via ``with_tmp_env``
+    inside the sudo wrap; None leaves the argv unchanged.
     """
     start = time.monotonic()
     try:
         result = subprocess.run(
-            _sudo_wrap(argv),
+            _sudo_wrap(with_tmp_env(argv, tmp_dir)),
             cwd=cwd,
             env=agent_shell_env(),
             stdout=subprocess.PIPE,
@@ -455,7 +463,11 @@ def _verify_manager(step: GateStep, hooks_dir: Path) -> tuple[list[str], str | N
 
 
 def run_gate_steps(
-    steps: list[GateStep], timeout_seconds: int, *, run_id: str
+    steps: list[GateStep],
+    timeout_seconds: int,
+    *,
+    run_id: str,
+    tmp_dir: Path | None = None,
 ) -> GateFailure | None:
     """Run each step in order, stopping at the first failure.
 
@@ -468,7 +480,9 @@ def run_gate_steps(
     """
     for step in steps:
         step_start = time.monotonic()
-        result = run_as_agent(step.argv, step.repo_path, timeout_seconds)
+        result = run_as_agent(
+            step.argv, step.repo_path, timeout_seconds, tmp_dir=tmp_dir
+        )
 
         if result.error is not None or result.returncode != 0:
             reason = (

@@ -39,3 +39,33 @@ def _isolate_git_env() -> Iterator[None]:
     removed = strip_git_env()
     yield
     os.environ.update(removed)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_run_tmp_root(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    # A run-tmp root OUTSIDE each test's tmp_path, so tests that set
+    # DISPATCH_WORKSPACE_ROOT=tmp_path never trip config's overlap guard, and
+    # no test touches ~/run-tmp or tmp_path.parent/run-tmp.
+    #
+    # Restored by hand rather than through `monkeypatch`, for the same reason
+    # as _isolate_git_env: an autouse fixture requesting `monkeypatch` sets it
+    # up before every other fixture, so its undo would run AFTER theirs (e.g.
+    # test_api's `client` would shut the app down while a test's patched
+    # `_active_processes` was still in place).
+    from agent_gtd_dispatch import config, run_tmp
+
+    root = tmp_path_factory.mktemp("run-tmp")
+    saved_env = os.environ.get("DISPATCH_RUN_TMP_ROOT")
+    saved_root = config.RUN_TMP_ROOT
+    os.environ["DISPATCH_RUN_TMP_ROOT"] = str(root)
+    config.RUN_TMP_ROOT = root
+    with run_tmp._LOCK:
+        run_tmp._LIVE.clear()
+    yield
+    with run_tmp._LOCK:
+        run_tmp._LIVE.clear()
+    config.RUN_TMP_ROOT = saved_root
+    if saved_env is None:
+        os.environ.pop("DISPATCH_RUN_TMP_ROOT", None)
+    else:
+        os.environ["DISPATCH_RUN_TMP_ROOT"] = saved_env

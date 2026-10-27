@@ -38,6 +38,7 @@ from . import (
     gates,
     gtd_client,
     retention,
+    run_tmp,
     talos,
 )
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
@@ -66,6 +67,7 @@ from .models import (
     RunResponse,
     RunStatus,
 )
+from .run_tmp import with_tmp_env
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +248,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             logger.warning("Reconciled orphaned run: %s", run_id)
     else:
         logger.info("No orphaned runs found on startup")
+    # Nothing is in flight yet, so every rt- dir under RUN_TMP_ROOT is an
+    # orphan of a previous process (crash, SIGKILL past the stop timeout).
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(run_tmp.sweep_orphans, frozenset(), 0, context="startup"),
+        )
+    except Exception:
+        logger.exception("run-tmp startup sweep failed — continuing")
     _retention_task = asyncio.create_task(_retention_loop())
     # Re-adoption sweep: the wave loop lives inside THIS service, so a routine
     # deploy restart would otherwise silently stop every running rollout from
@@ -376,6 +387,18 @@ async def _retention_loop() -> None:
             await asyncio.get_event_loop().run_in_executor(
                 None, retention.prune, frozenset(_active_processes)
             )
+            # Snapshot on the event loop; any rt- dir not owned by an
+            # in-flight run and older than the min age is a missed teardown.
+            live = run_tmp.live_paths()
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                functools.partial(
+                    run_tmp.sweep_orphans,
+                    live,
+                    config.RUN_TMP_ORPHAN_MIN_AGE_SECONDS,
+                    context="periodic",
+                ),
+            )
         except Exception:
             logger.exception("Retention sweep failed — continuing")
 
@@ -450,8 +473,15 @@ def _commit_with_retry(
     repo_dir: str,
     git_ident_flags: list[str],
     commit_msg: str,
+    *,
+    tmp_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run ``git commit`` with bounded re-stage retries.
+
+    ``tmp_dir`` is the run's private TMPDIR: the hooked ``git commit`` runs
+    the repo's pre-commit hooks, which may write temp files, so both commit
+    invocations carry it via ``with_tmp_env``.  ``git status``/``git add``
+    stay unwrapped.
 
     A fixer-style pre-commit hook (end-of-file-fixer, trailing-whitespace,
     ruff --fix, black, prettier, …) may modify the staged files and exit
@@ -472,7 +502,9 @@ def _commit_with_retry(
     """
     max_retries = 2
     result = subprocess.run(
-        dispatch._sudo_wrap(["git", *git_ident_flags, "commit", "-m", commit_msg]),
+        dispatch._sudo_wrap(
+            with_tmp_env(["git", *git_ident_flags, "commit", "-m", commit_msg], tmp_dir)
+        ),
         cwd=repo_dir,
         check=False,
         capture_output=True,
@@ -498,7 +530,11 @@ def _commit_with_retry(
             capture_output=True,
         )
         result = subprocess.run(
-            dispatch._sudo_wrap(["git", *git_ident_flags, "commit", "-m", commit_msg]),
+            dispatch._sudo_wrap(
+                with_tmp_env(
+                    ["git", *git_ident_flags, "commit", "-m", commit_msg], tmp_dir
+                )
+            ),
             cwd=repo_dir,
             check=False,
             capture_output=True,
@@ -517,8 +553,12 @@ async def _run_talos(
     attribution: str | None,
     register_cb: Callable[[subprocess.Popen[bytes]], None],
     workspace_repo_dirs: list[str] | None = None,
+    tmp_dir: Path | None = None,
 ) -> None:
     """Talos execution branch: subprocess launch, commit/push, comment-back, status set.
+
+    ``tmp_dir`` is the run's private TMPDIR, forwarded to the talos argv and
+    to the hooked commits in :func:`_commit_with_retry`.
 
     Entered from :func:`_dispatch_worker` when the resolved engine is in
     :data:`engines.TALOS_ENGINES`. Owns the full lifecycle:
@@ -571,7 +611,11 @@ async def _run_talos(
     env["HEADLESS_BUILD_ENGINE"] = engine.name
 
     argv = talos.build_talos_argv(
-        workspace, item_id, attempt=1, timeout_seconds=timeout_seconds
+        workspace,
+        item_id,
+        attempt=1,
+        timeout_seconds=timeout_seconds,
+        tmp_dir=tmp_dir,
     )
 
     stdout_text = ""
@@ -782,7 +826,7 @@ async def _run_talos(
 
                 # (c) Staged changes present — commit + push this repo.
                 commit_rc = _commit_with_retry(
-                    str(repo_path), git_ident_flags, commit_msg
+                    str(repo_path), git_ident_flags, commit_msg, tmp_dir=tmp_dir
                 )
                 if commit_rc.returncode != 0:
                     # A non-zero commit is not, on its own, a failed run.
@@ -965,7 +1009,9 @@ async def _run_talos(
                 logger.warning("Failed to post git-add failure comment for %s", run.id)
             return
 
-        commit_rc = _commit_with_retry(str(workspace), git_ident_flags, commit_msg)
+        commit_rc = _commit_with_retry(
+            str(workspace), git_ident_flags, commit_msg, tmp_dir=tmp_dir
+        )
         if commit_rc.returncode != 0:
             # A non-zero commit is not, on its own, a failed run: the agent may
             # have committed everything and then attempted a redundant final
@@ -2215,7 +2261,11 @@ async def _launch_reviewer(
             )
             kill_run_session(proc, signal.SIGKILL)
 
+    reviewer_tmp: Path | None = None
     try:
+        # First: a create failure lands in `except Exception` below and takes
+        # the existing no-verdict path.
+        reviewer_tmp = run_tmp.create_run_tmp(reviewer_run.id)
         result = await dispatch.run_agent(
             reviewer_engine,
             workspace.root,
@@ -2230,6 +2280,7 @@ async def _launch_reviewer(
             disallowed_tools=list(dispatch.REVIEWER_DISALLOWED_TOOLS),
             popen_callback=_on_popen,
             executor=executor,
+            tmp_dir=reviewer_tmp,
         )
         exit_code = result.returncode
     except asyncio.CancelledError:
@@ -2264,6 +2315,13 @@ async def _launch_reviewer(
         )
     finally:
         _active_subprocesses.pop(reviewer_run.id, None)
+        if reviewer_tmp is not None:
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                functools.partial(
+                    run_tmp.remove_run_tmp, reviewer_tmp, kind="reviewer"
+                ),
+            )
 
     verdict_blob, reason = dispatch.read_review_verdict(workspace.root)
 
@@ -3068,6 +3126,9 @@ class _Lander:
         self.conflict_found: dict[str, list[str]] = {}
         self.conflict_reported: dict[str, list[str]] = {}
         self.conflict_unreported: dict[str, list[str]] = {}
+        # Private TMPDIR for the land's gate install and gate run; created in
+        # run() and removed in its outer finally.
+        self.tmp_dir: Path | None = None
 
     # -- plumbing ---------------------------------------------------------
 
@@ -3434,6 +3495,7 @@ class _Lander:
                 steps,
                 config.GATE_INSTALL_TIMEOUT_SECONDS,
                 run_id=self.loop_run_id,
+                tmp_dir=self.tmp_dir,
             ),
         )
         if failure is not None:
@@ -3480,6 +3542,7 @@ class _Lander:
                         config.LAND_GATE_TIMEOUT_SECONDS,
                         self.reviewer_engine,
                         _land_popen_cb,
+                        tmp_dir=self.tmp_dir,
                     ),
                 )
             )
@@ -3846,6 +3909,16 @@ class _Lander:
         acquired_at = 0.0
         try:
             try:
+                try:
+                    self.tmp_dir = run_tmp.create_run_tmp(
+                        f"land-{self.loop_run_id}-{self.item_id}"
+                    )
+                except Exception as exc:
+                    raise _LandHalt(
+                        "run_tmp_failed",
+                        "land could not create private TMPDIR for item "
+                        f"{self.item_id}: {exc}",
+                    ) from exc
                 keys = await self._lock_keys()
                 wait_start = time.monotonic()
                 for key in keys:
@@ -3877,6 +3950,19 @@ class _Lander:
                     keys,
                     time.monotonic() - acquired_at,
                 )
+            # A cancelled land may leave its gate running on an executor
+            # thread; stop it before its TMPDIR is removed under it.
+            leftover = _active_subprocesses.get(self.loop_run_id)
+            if leftover is not None:
+                await _terminate_run_session(leftover)
+            if self.tmp_dir is not None:
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    functools.partial(
+                        run_tmp.remove_run_tmp, self.tmp_dir, kind="land"
+                    ),
+                )
+                self.tmp_dir = None
             stop.set()
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -5824,8 +5910,15 @@ async def _dispatch_worker(
     should_cleanup = True
     _human_cancelled = False
     _exit_code: int | None = None
+    # The run's private TMPDIR (TMPDIR/TMP/TEMP for every process it
+    # launches).  Removed in the teardown `finally` on every path, regardless
+    # of workspace retention.
+    run_tmp_dir: Path | None = None
 
     try:
+        # First, before anything that launches a process.  A create failure
+        # fails the run through the generic handler — never fall back to /tmp.
+        run_tmp_dir = run_tmp.create_run_tmp(run.id)
         # Fetch item and project.
         # manage-mode runs have item_id=None — derive project from the rollout instead.
         item: dict[str, Any] = {}
@@ -6058,6 +6151,7 @@ async def _dispatch_worker(
                         gate_steps,
                         config.GATE_INSTALL_TIMEOUT_SECONDS,
                         run_id=run.id,
+                        tmp_dir=run_tmp_dir,
                     ),
                 )
                 if gate_failure is not None:
@@ -6238,6 +6332,7 @@ async def _dispatch_worker(
                 attribution=attribution,
                 register_cb=_register_subprocess,
                 workspace_repo_dirs=workspace_repo_dirs,
+                tmp_dir=run_tmp_dir,
             )
             return
 
@@ -6254,6 +6349,7 @@ async def _dispatch_worker(
             popen_callback=_register_subprocess,
             callback_token=run.callback_token,
             run_id=run.id,
+            tmp_dir=run_tmp_dir,
         )
         _exit_code = result.returncode
 
@@ -6606,12 +6702,15 @@ async def _dispatch_worker(
                     )
                     _gate_result = await asyncio.get_event_loop().run_in_executor(
                         dispatch._executor,
-                        dispatch.run_gate_command,
-                        workspace,
-                        _gate_cmd,
-                        _gate_timeout,
-                        engine_used,
-                        _register_subprocess,
+                        functools.partial(
+                            dispatch.run_gate_command,
+                            workspace,
+                            _gate_cmd,
+                            _gate_timeout,
+                            engine_used,
+                            _register_subprocess,
+                            tmp_dir=run_tmp_dir,
+                        ),
                     )
                     assert _gate_result is not None  # noqa: S101
                     completed = datetime.now(UTC).isoformat()
@@ -7028,6 +7127,14 @@ async def _dispatch_worker(
         # before deletion, and even when the workspace is kept.
         if workspace is not None:
             await _reap_leaked_processes(run, workspace)
+
+        # Independent of should_cleanup: a retained workspace keeps the work,
+        # never the run's temp files.
+        if run_tmp_dir is not None:
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                functools.partial(run_tmp.remove_run_tmp, run_tmp_dir, kind="build"),
+            )
 
         if workspace is not None and should_cleanup:
             dispatch.cleanup_workspace(workspace)

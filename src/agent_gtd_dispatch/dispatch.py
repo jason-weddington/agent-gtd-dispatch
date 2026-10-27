@@ -33,6 +33,7 @@ from .engines import (
     is_talos_engine,
 )
 from .models import PushStatus, RepoPushStatus
+from .run_tmp import with_tmp_env
 
 logger = logging.getLogger(__name__)
 
@@ -789,6 +790,8 @@ def run_gate_command(
     timeout_seconds: int,
     engine: Engine,
     popen_callback: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    *,
+    tmp_dir: Path | None = None,
 ) -> GateResult:
     """Run the project's post-run quality gate and capture its outcome.
 
@@ -804,16 +807,21 @@ def run_gate_command(
 
     The gate runs against the working tree EXACTLY as the agent left it. This function used to ``git stash push`` any uncommitted changes first, on the theory that a gate should only judge committed work. That theory destroyed four runs' worth of real work in one night: agents that had implemented an item but not yet committed it had their entire tree stashed away, at which point the gate passed trivially against the pristine base commit and the worker concluded the work was already done. Stashing is a MUTATION performed on evidence during the act of judging it, and there is no version of that which is safe. A dirty tree is now handled where it belongs — by the rescue path at teardown, which commits and pushes it to the run's own branch rather than hiding it.
     """
+    # ``tmp_dir`` (the run's private TMPDIR) rides in the argv via
+    # /usr/bin/env, inside the sudo wrap: sudo strips TMPDIR from the env.
     argv = _sudo_wrap(
-        [
-            "/bin/bash",
-            "-c",
-            _GATE_SHIM,
-            "agent-gtd-gate",
-            f"{config.CANCEL_GRACE_SECONDS}s",
-            f"{timeout_seconds}s",
-            gate_command,
-        ]
+        with_tmp_env(
+            [
+                "/bin/bash",
+                "-c",
+                _GATE_SHIM,
+                "agent-gtd-gate",
+                f"{config.CANCEL_GRACE_SECONDS}s",
+                f"{timeout_seconds}s",
+                gate_command,
+            ],
+            tmp_dir,
+        )
     )
     env = {
         k: v
@@ -4815,8 +4823,13 @@ async def run_agent(
     run_id: str = "",
     disallowed_tools: list[str] | None = None,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
+    tmp_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a headless agent CLI as a subprocess.
+
+    ``tmp_dir`` is the run's private TMPDIR (see ``run_tmp``); it is passed
+    as ``/usr/bin/env TMPDIR=.. TMP=.. TEMP=..`` in the argv, inside the sudo
+    wrap.  None leaves the argv exactly as before.
 
     ``executor`` picks the thread pool the blocking subprocess wait runs on;
     None means the shared ``_executor``.  Rollout-loop reviewers pass
@@ -4862,7 +4875,7 @@ async def run_agent(
     # per-subprocess env dict — it is never written to os.environ.
     env["HEADLESS_BUILD_ENGINE"] = engine.name
 
-    cmd = _sudo_wrap(cmd)
+    cmd = _sudo_wrap(with_tmp_env(cmd, tmp_dir))
     transcript_path = workspace / "transcript.txt"
     # Exclude transcript.txt, .dispatch/ and this run's staged attachments
     # BEFORE the subprocess starts — the agent is never asked not to commit

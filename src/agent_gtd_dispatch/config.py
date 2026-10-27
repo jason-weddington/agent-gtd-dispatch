@@ -38,6 +38,13 @@ EVIDENCE_RETENTION_DAYS: int = 30
 WORKSPACE_RETENTION_HOURS: int = 48
 RETENTION_INTERVAL_SECONDS: int = 3600
 
+# Private per-run TMPDIR root (see run_tmp.py).  Every build/plan run, reviewer
+# and land gets TMPDIR/TMP/TEMP at <RUN_TMP_ROOT>/rt-<key>, removed at teardown;
+# leftovers older than RUN_TMP_ORPHAN_MIN_AGE_SECONDS are swept at startup and
+# every RETENTION_INTERVAL_SECONDS.
+RUN_TMP_ROOT: Path = Path.home() / "run-tmp"
+RUN_TMP_ORPHAN_MIN_AGE_SECONDS: int = 600
+
 # Agent limits
 MAX_TURNS: int = 100
 TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
@@ -256,6 +263,34 @@ def timeout_seconds_for_mode(mode: str) -> int:
     return TIMEOUT_SECONDS
 
 
+def _validate_run_tmp_root(root: Path, min_age_seconds: int) -> None:
+    """Refuse a RUN_TMP_ROOT whose orphan sweep could touch anything else.
+
+    Raises:
+        ValueError: the root is a shared temp dir, overlaps the workspace or
+            evidence roots, is the service home or one of its ancestors, or
+            the orphan min age is negative.
+    """
+    problem = ""
+    home = Path.home()
+    if root in (Path("/"), Path("/tmp"), Path("/var/tmp")):  # noqa: S108
+        problem = "is a shared system temp directory"
+    for name, other in (("workspace", WORKSPACE_ROOT), ("evidence", EVIDENCE_ROOT)):
+        if root == other or other in root.parents or root in other.parents:
+            problem = f"overlaps the {name} root {other}"
+    if root == home or root in home.parents:
+        problem = f"is the service home {home} or one of its ancestors"
+    if problem:
+        msg = f"Invalid DISPATCH_RUN_TMP_ROOT={str(root)!r}: {problem}"
+        raise ValueError(msg)
+    if min_age_seconds < 0:
+        msg = (
+            "Invalid DISPATCH_RUN_TMP_ORPHAN_MIN_AGE_SECONDS="
+            f"{min_age_seconds}: must be >= 0"
+        )
+        raise ValueError(msg)
+
+
 def load() -> None:
     """Load configuration from environment. Call once at startup."""
     global DISPATCH_API_KEY, AGENT_GTD_URL, AGENT_GTD_API_KEY
@@ -274,6 +309,7 @@ def load() -> None:
     global ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS, ROLLOUT_MAX_CONCURRENT_REVIEWS
     global EVIDENCE_ROOT, EVIDENCE_RETENTION_DAYS, WORKSPACE_RETENTION_HOURS
     global RETENTION_INTERVAL_SECONDS
+    global RUN_TMP_ROOT, RUN_TMP_ORPHAN_MIN_AGE_SECONDS
     global LOG_LEVEL
 
     LOG_LEVEL = os.environ.get("DISPATCH_LOG_LEVEL", "INFO").strip().upper() or "INFO"
@@ -301,6 +337,15 @@ def load() -> None:
         EVIDENCE_ROOT = Path(_evidence_env)
     else:
         EVIDENCE_ROOT = WORKSPACE_ROOT.parent / "run-evidence"
+    _run_tmp_env = os.environ.get("DISPATCH_RUN_TMP_ROOT", "")
+    if _run_tmp_env:
+        RUN_TMP_ROOT = Path(_run_tmp_env)
+    else:
+        RUN_TMP_ROOT = WORKSPACE_ROOT.parent / "run-tmp"
+    RUN_TMP_ORPHAN_MIN_AGE_SECONDS = int(
+        os.environ.get("DISPATCH_RUN_TMP_ORPHAN_MIN_AGE_SECONDS", "600")
+    )
+    _validate_run_tmp_root(RUN_TMP_ROOT, RUN_TMP_ORPHAN_MIN_AGE_SECONDS)
     EVIDENCE_RETENTION_DAYS = int(
         os.environ.get("DISPATCH_EVIDENCE_RETENTION_DAYS", "30")
     )

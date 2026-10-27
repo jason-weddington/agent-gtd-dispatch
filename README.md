@@ -33,6 +33,8 @@ Retention is configured separately, and splits by decay rate — evidence is sma
 
 ```bash
 export DISPATCH_EVIDENCE_ROOT="/path/to/run-evidence"   # default: <workspace root>/../run-evidence
+export DISPATCH_RUN_TMP_ROOT="/path/to/run-tmp"         # default: <workspace root>/../run-tmp
+export DISPATCH_RUN_TMP_ORPHAN_MIN_AGE_SECONDS=600      # default: 600
 export DISPATCH_EVIDENCE_RETENTION_DAYS=30              # default: 30
 export DISPATCH_WORKSPACE_RETENTION_HOURS=48            # default: 48
 export DISPATCH_RETENTION_INTERVAL_SECONDS=3600         # default: 3600
@@ -289,6 +291,8 @@ Every build terminal writes a JSON blob into the runs table's nullable `completi
 Every terminal run's evidence is captured into `<DISPATCH_EVIDENCE_ROOT>/<run_id>/` BEFORE the workspace is torn down: `transcript.txt` and `patch.diff` (a per-repo `git diff <base>..HEAD`). Capture is verdict-free and best-effort — it never raises into a teardown path.
 
 Pruning is age-based only, never free-space-based and never outcome-based. Workspace trees older than `DISPATCH_WORKSPACE_RETENTION_HOURS` and evidence directories older than `DISPATCH_EVIDENCE_RETENTION_DAYS` are deleted, except those belonging to a live run.
+
+Every build/plan run, rollout reviewer and land gets a private `TMPDIR`/`TMP`/`TEMP` at `<DISPATCH_RUN_TMP_ROOT>/rt-<key>`, so build and gate output no longer accumulates in the host's `/tmp`. The directory is removed at teardown on every path, regardless of whether the workspace is retained. Leftovers (a crash, a SIGKILL past the stop timeout) are swept at startup and every `DISPATCH_RETENTION_INTERVAL_SECONDS` (default 3600) for directories older than `DISPATCH_RUN_TMP_ORPHAN_MIN_AGE_SECONDS`, and only `rt-` names are ever swept. The values are passed via `/usr/bin/env` in the argv, inside the sudo wrap, because sudo strips `TMPDIR` (`env_keep` does not work for it). The root must not be, contain or sit inside the workspace or evidence roots or the service home; startup refuses such a configuration.
 
 To retrieve a transcript after teardown, `show_run_transcript` falls back from the live workspace glob to the retained evidence copy, and exits 1 only when both lookups miss. Its output is now a stream that ENDS in a single JSON object (the result envelope) — pipe it through `jq` to read it:
 

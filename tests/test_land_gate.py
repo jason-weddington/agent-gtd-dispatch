@@ -223,7 +223,7 @@ async def _land(
     gate: str | None = "true",
     outcome: ReviewVerdict | None = None,
     item_id: str = ITEM,
-    loop_run_id: str = "loop-1",
+    loop_run_id: str = "100000000001",
 ):
     project = {"name": "P", "git_origin": "git@h:o/repo.git"}
     if gate is not None:
@@ -1115,14 +1115,14 @@ class TestConcurrentLands:
         gate = f'sleep 1; echo "$(pwd) $(git rev-parse HEAD~1)" >> {record}'
         with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
             res_a, res_b = await asyncio.gather(
-                _land(ws_a, pre_a, gate=gate, item_id=ITEM, loop_run_id="la"),
+                _land(ws_a, pre_a, gate=gate, item_id=ITEM, loop_run_id="a00000000001"),
                 _land(
                     ws_b,
                     pre_b,
                     gate=gate,
                     item_id=ITEM_B,
                     outcome=_verdict(branch_name="feat/b"),
-                    loop_run_id="lb",
+                    loop_run_id="b00000000001",
                 ),
             )
         assert isinstance(res_a, ReviewVerdict)
@@ -1401,7 +1401,7 @@ class TestThroughTheWaveTick:
                 dispatch_attempts={},
                 token=None,
                 attribution=None,
-                loop_run_id="loop-1",
+                loop_run_id="100000000001",
             )
         assert directive == main._TICK_CONTINUE
         assert len(verdicts) == 2
@@ -1457,7 +1457,7 @@ class TestFixRelaunchAfterABoardTimeout:
                 dispatch_attempts={},
                 token=None,
                 attribution=None,
-                loop_run_id="loop-1",
+                loop_run_id="100000000001",
             )
         assert directive == main._TICK_CONTINUE
         assert len(calls) == 2
