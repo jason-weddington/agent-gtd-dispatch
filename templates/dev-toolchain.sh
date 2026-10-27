@@ -68,6 +68,7 @@ DEV_TOOLCHAIN_APT_PKGS=(
   libclang-dev                                  # libclang for bindgen (whisper-rs-sys)
   libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev  # Tauri 2
   libayatana-appindicator3-dev librsvg2-dev libxdo-dev file                        # Tauri 2
+  shellcheck python3                             # shell linting + scripts in project gates (poolhouse vm-harness-selftest)
 )
 DEV_TOOLCHAIN_NPM_GLOBAL_PKGS=(
   "pnpm|pnpm"   # JS package manager used by Tauri app frontends
