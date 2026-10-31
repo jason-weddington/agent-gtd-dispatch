@@ -87,8 +87,10 @@ class TestStageAttachments:
 
         attach_dir = workspace / "run-abc-attachments"
         assert attach_dir.exists()
-        # Mode should be 0700
-        mode = stat.S_IMODE(attach_dir.stat().st_mode)
+        # Permission bits should be 0700. Mask with 0o777: on a dispatch host the
+        # workspace sits under a setgid directory, so the new dir inherits S_ISGID
+        # (S_IMODE reads 0o2700), which grants no access.
+        mode = stat.S_IMODE(attach_dir.stat().st_mode) & 0o777
         assert mode == 0o700
         # Both files present with correct content
         assert (attach_dir / "spec.md").read_bytes() == b"markdown content"
