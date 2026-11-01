@@ -48,7 +48,9 @@ separate round-trip to `/agents`.
   "active_runs": 3,
   "engines": ["claude-code", "claude-code-sonnet", "claude-code-haiku"],
   "agents": ["claude-lead-abc", "claude-build-def"],
-  "parked_rollout_loops": 1
+  "parked_rollout_loops": 1,
+  "load_avg_1m": 0.42,
+  "cpu_count": 32
 }
 ```
 
@@ -60,6 +62,8 @@ separate round-trip to `/agents`.
 | `active_runs` | `int` | Currently running (not queued) dispatches, excluding rollout loops parked behind a host drain |
 | `engines` | `list[str]` | Engine names with credentials present in the environment |
 | `agents` | `list[str]` | Agent names from `list_agents.sh` |
+| `load_avg_1m` | `float \| null` | 1-minute load average from `os.getloadavg`; null when unavailable. Routers treat a host as overloaded above 1.5 x `cpu_count` |
+| `cpu_count` | `int \| null` | Logical CPU count from `os.cpu_count`; null when unknown |
 | `parked_rollout_loops` | `int` | Rollout loops parked behind a host drain. They still hold a slot on the host, so routers compute free slots as `max_concurrent_runs - active_runs - parked_rollout_loops` |
 
 ---

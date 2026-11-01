@@ -32,6 +32,10 @@ class InfoResponse(BaseModel):
     ``parked_rollout_loops``.  A parked loop still holds its slot on the host,
     so routers add ``parked_rollout_loops`` back to compute slot occupancy
     (``max_concurrent_runs - active_runs - parked_rollout_loops`` free).
+
+    ``load_avg_1m`` and ``cpu_count`` report host health.  Routers treat a
+    host as overloaded when ``load_avg_1m > 1.5 x cpu_count``; a missing or
+    null field means 'unknown, treat as healthy'.
     """
 
     engine: str
@@ -41,6 +45,8 @@ class InfoResponse(BaseModel):
     engines: list[str]
     agents: list[str]
     parked_rollout_loops: int = 0
+    load_avg_1m: float | None = None
+    cpu_count: int | None = None
 
 
 class PushStatus(StrEnum):

@@ -83,7 +83,22 @@ class TestInfoEndpoint:
             "engines",
             "agents",
             "parked_rollout_loops",
+            "load_avg_1m",
+            "cpu_count",
         }
+
+    def test_load_wiring(self, client) -> None:
+        with patch("agent_gtd_dispatch.main._host_load", return_value=(551.0, 32)):
+            data = client.get("/info").json()
+        assert data["load_avg_1m"] == 551.0
+        assert data["cpu_count"] == 32
+
+    def test_load_unknown(self, client) -> None:
+        with patch("agent_gtd_dispatch.main._host_load", return_value=(None, None)):
+            resp = client.get("/info")
+        assert resp.status_code == 200
+        assert resp.json()["load_avg_1m"] is None
+        assert resp.json()["cpu_count"] is None
 
     def test_capacity_fields(self, client) -> None:
         resp = client.get("/info")
@@ -744,3 +759,31 @@ class TestOllamaCloudEngineGating:
             if r.levelno == logging.WARNING and "agent_gtd_dispatch.engines" in r.name
         ]
         assert len(warnings) == 1, "WARNING must be logged exactly once"
+
+
+class TestHostLoad:
+    def test_populated(self, monkeypatch) -> None:
+        from agent_gtd_dispatch.main import _host_load
+
+        monkeypatch.setattr(os, "getloadavg", lambda: (551.0, 400.0, 300.0))
+        monkeypatch.setattr(os, "cpu_count", lambda: 32)
+        assert _host_load() == (551.0, 32)
+
+    def test_oserror(self, monkeypatch, caplog) -> None:
+        from agent_gtd_dispatch.main import _host_load
+
+        def boom():
+            raise OSError("nope")
+
+        monkeypatch.setattr(os, "getloadavg", boom)
+        monkeypatch.setattr(os, "cpu_count", lambda: 4)
+        with caplog.at_level("WARNING"):
+            assert _host_load() == (None, 4)
+        assert "host load unavailable" in caplog.text
+
+    def test_cpu_count_none(self, monkeypatch) -> None:
+        from agent_gtd_dispatch.main import _host_load
+
+        monkeypatch.setattr(os, "getloadavg", lambda: (1.0, 1.0, 1.0))
+        monkeypatch.setattr(os, "cpu_count", lambda: None)
+        assert _host_load() == (1.0, None)

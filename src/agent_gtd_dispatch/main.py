@@ -7228,6 +7228,17 @@ async def health() -> dict[str, object]:
     return {"status": "ok", "active_runs": active}
 
 
+def _host_load() -> tuple[float | None, int | None]:
+    """Return the host's (1-minute load average, logical CPU count)."""
+    load: float | None
+    try:
+        load = os.getloadavg()[0]
+    except OSError as exc:
+        logger.warning("host load unavailable: %s", exc)
+        load = None
+    return load, os.cpu_count()
+
+
 @app.get("/info", response_model=InfoResponse)
 async def info() -> InfoResponse:
     """Return engine identity, version, capacity, and capabilities. No auth required.
@@ -7239,6 +7250,7 @@ async def info() -> InfoResponse:
     are reported in ``parked_rollout_loops``.
     """
     agent_dicts = await run_list_agents_script()
+    load_avg_1m, cpu_count = _host_load()
     return InfoResponse(
         engine=ENGINE_NAME,
         version=SERVICE_VERSION,
@@ -7247,6 +7259,8 @@ async def info() -> InfoResponse:
         engines=get_available_engine_names(),
         agents=[a["name"] for a in agent_dicts],
         parked_rollout_loops=len(_parked_rollout_loops & _active_processes.keys()),
+        load_avg_1m=load_avg_1m,
+        cpu_count=cpu_count,
     )
 
 
