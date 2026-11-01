@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v2.16.0 (2026-11-01)
+
+### Bug Fixes
+
+- **4ff7a815**: Rollouts: resuming a halted, unpinned rollout relaunches its loop on a healthy host
+  when its previous loop host is drained, unregistered or unreachable, instead of refusing
+  ([`57fce2b`](https://github.com/repos/agent-gtd-dispatch/commit/57fce2b1c38d27143c8e86361697249662822b78))
+
+### Features
+
+- **21106de8**: Rollout land step: a rebase conflict at land time (origin advanced between review
+  and land) gets the same keep-both resolution plus gate rerun as a reviewer squash conflict
+  ([`b57b57c`](https://github.com/repos/agent-gtd-dispatch/commit/b57b57cef384e349bd71ef42cb736893ceb6036d))
+
+
 ## v2.15.0 (2026-11-01)
 
 ### Bug Fixes
