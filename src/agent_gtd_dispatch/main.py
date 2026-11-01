@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import httpx
 import uvicorn
@@ -1884,6 +1884,10 @@ def _parked_step(drain: str) -> str:
 MAX_LAND_PUSH_ATTEMPTS: int = 3
 # Reviewer FIX MODE relaunches allowed per land after a red land gate.
 MAX_LAND_FIX_RELAUNCHES: int = 1
+# Reviewer LAND CONFLICT MODE relaunches allowed per land, after the land's
+# rebase onto an origin that advanced during review conflicts.  Independent of
+# MAX_LAND_FIX_RELAUNCHES and MAX_LAND_PUSH_ATTEMPTS.
+MAX_LAND_CONFLICT_RELAUNCHES: int = 1
 # Heartbeat cadence (``manager_state_updated_at``) while a land waits on
 # locks or a gate.  Nothing in the service reads the heartbeat for liveness
 # any more; it keeps the rollout monitor's "last update" honest.
@@ -2162,6 +2166,7 @@ async def _launch_reviewer(
     token: str | None,
     attribution: str | None,
     gate_failure_output: str | None = None,
+    land_conflict: dict[str, list[str]] | None = None,
     item: dict[str, Any] | None = None,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
     slot: int = 0,
@@ -2182,6 +2187,16 @@ async def _launch_reviewer(
     the land step: the worker's land gate failed on the rebased squash commit,
     and the reviewer may amend that commit (see ``dispatch.build_review_prompt``).
 
+    With *land_conflict* set, the reviewer is relaunched in LAND CONFLICT MODE
+    by the land step: origin advanced after the reviewer approved, and the
+    land's rebase of the squash commit onto it conflicted.  The mapping is
+    repo (a ``workspace.repo_paths`` key) -> the conflicting repo-relative
+    paths.  The reviewer re-runs the rebase without fetching, resolves
+    keep-both conflicts and continues it, or aborts and halts; the land step
+    then re-verifies the result and gates the exact tree it pushes.
+    *land_conflict* and *gate_failure_output* are mutually exclusive: passing
+    both raises :class:`ValueError`.
+
     The reviewer run carries ``mode=DispatchMode.REVIEW``.  A distinct mode
     buys the env withholding (``_MANAGE_EXECUTOR_ENV_KEYS`` is granted only for
     MANAGE) and the reviewer's own turn budget.  (It was originally chosen to
@@ -2200,6 +2215,8 @@ async def _launch_reviewer(
     run would make the loop re-run the tick from the top and launch a second
     reviewer for the same build.
     """
+    if land_conflict is not None and gate_failure_output is not None:
+        raise ValueError("land_conflict and gate_failure_output are mutually exclusive")
     if item is None:
         item = await gtd_client.get_item(item_id, token=token)
     raw_item_type = item.get("commit_type")
@@ -2253,6 +2270,7 @@ async def _launch_reviewer(
         redispatches_used=used,
         redispatch_cap=MAX_ITEM_REDISPATCHES,
         gate_failure_output=gate_failure_output,
+        land_conflict=land_conflict,
     )
     pinned_subject = dispatch.compose_squash_subject(item)
     logger.info(
@@ -3165,6 +3183,16 @@ class _LandHalt(Exception):  # noqa: N818 — a control-flow signal, not an erro
         self.tail = tail
 
 
+class _ConflictCheck(NamedTuple):
+    """One repo's conflict-guard result (see ``_Lander._check_repo_conflicts``)."""
+
+    found: list[str]
+    reported: list[str]
+    unreported: list[str]
+    overreported: list[str]
+    keepboth_dropped: list[tuple[str, int, int]]
+
+
 class _Lander:
     """State for ONE worker-owned land of a reviewer-approved squash commit.
 
@@ -3227,6 +3255,21 @@ class _Lander:
         self.conflict_overreported: dict[str, list[str]] = {}
         # Keep-both audit drops per repo: (path, main_dropped, branch_dropped).
         self.keepboth_dropped: dict[str, list[tuple[str, int, int]]] = {}
+        # LAND CONFLICT MODE: the land's own rebase conflicted because origin
+        # advanced during review.  Relaunch budget, the relaunch's rationale,
+        # and the land-rebase phase's conflict guard results per repo.
+        self.conflict_relaunches: int = 0
+        self.conflict_rationale: str = ""
+        self.rebase_conflict_found: dict[str, list[str]] = {}
+        self.rebase_conflict_reported: dict[str, list[str]] = {}
+        self.rebase_conflict_unreported: dict[str, list[str]] = {}
+        self.rebase_conflict_overreported: dict[str, list[str]] = {}
+        self.rebase_keepboth_dropped: dict[str, list[tuple[str, int, int]]] = {}
+        # Per conflicted repo: the origin sha the failed rebase targeted, the
+        # squash commit it was replaying, and how far origin had advanced.
+        self.rebase_onto: dict[str, str] = {}
+        self.rebase_old_squash: dict[str, str] = {}
+        self.rebase_conflict_origin_advanced: dict[str, int] = {}
         # Private TMPDIR for the land's gate install and gate run; created in
         # run() and removed in its outer finally.
         self.tmp_dir: Path | None = None
@@ -3287,12 +3330,16 @@ class _Lander:
         found = self.conflict_found.get(repo) or []
         code = [p for p in found if not dispatch.is_documentation_path(p)]
         conflict = "code" if code else ("doc" if found else "none")
+        rfound = self.rebase_conflict_found.get(repo) or []
+        rcode = [p for p in rfound if not dispatch.is_documentation_path(p)]
+        rconflict = "code" if rcode else ("doc" if rfound else "none")
         logger.log(
             logging.INFO if outcome == "pushed" else logging.WARNING,
             "rollout-loop: land rollout_id=%s item_id=%s push_attempt=%d/%d "
             "fix_relaunches=%d repo=%s base_before=%s base_after=%s "
             "origin_advanced=%d gated_sha=%s pushed_sha=%s gate=%s gate_rc=%s "
-            "gate_secs=%.1f outcome=%s conflict=%s conflict_code_paths=%s",
+            "gate_secs=%.1f outcome=%s conflict=%s conflict_code_paths=%s "
+            "conflict_relaunches=%d rebase_conflict=%s rebase_conflict_code_paths=%s",
             self.rollout_id,
             self.item_id,
             self.push_round,
@@ -3310,6 +3357,9 @@ class _Lander:
             outcome,
             conflict,
             ",".join(code) or "-",
+            self.conflict_relaunches,
+            rconflict,
+            ",".join(rcode) or "-",
         )
 
     # -- the steps --------------------------------------------------------
@@ -3413,14 +3463,16 @@ class _Lander:
         paths: list[str],
         reported: list[str],
         decision: str,
+        phase: str = "squash",
     ) -> None:
         logger.info(
             "rollout-loop: land-conflict-check rollout_id=%s item_id=%s repo=%s "
-            "base=%s base_sha=%s tip_ref=%s tip_sha=%s conflict_paths=%s "
+            "phase=%s base=%s base_sha=%s tip_ref=%s tip_sha=%s conflict_paths=%s "
             "reported_resolved=%s decision=%s",
             self.rollout_id,
             self.item_id,
             repo,
+            phase,
             base,
             base_sha or "-",
             tip_ref,
@@ -3445,7 +3497,8 @@ class _Lander:
         conflict otherwise lands only through the land gate on the exact
         pushed tree.  A keep-both audit warns (never halts) when a side's
         added lines are missing from the resolution.  Runs before anything is
-        pushed.
+        pushed.  The per-repo checks live in :meth:`_check_repo_conflicts`,
+        shared with the land-rebase phase.
         """
         timeout = config.LAND_GIT_TIMEOUT_SECONDS
         resolved = list(self.outcome.resolved_conflict_paths)
@@ -3481,136 +3534,191 @@ class _Lander:
             base_sha = await self._git(
                 repo, dispatch.land_resolve_ref, path, base, timeout
             )
-            # (1) The conflicts, the reviewer's claim, and the code subset.
-            paths = await self._git(
-                repo, dispatch.land_conflict_paths, path, base, tip, timeout
-            )
-            if self.workspace.workspace_mode:
-                reported = [
-                    p.removeprefix(f"{repo}/")
-                    for p in resolved
-                    if p.startswith(f"{repo}/")
-                ]
-            else:
-                reported = list(resolved)
-            non_doc = [p for p in paths if not dispatch.is_documentation_path(p)]
-
-            log = functools.partial(
-                self._log_conflict_check,
+            check = await self._check_repo_conflicts(
                 repo,
                 base=base,
                 base_sha=base_sha,
                 tip_ref=tip_ref,
-                tip_sha=tip,
-                paths=paths,
-                reported=reported,
+                tip=tip,
+                reported=self._reported_for(repo, resolved),
+                phase="squash",
             )
-            head = f"land refused for item {self.item_id}: repo {repo}"
-            # (2) Lockfiles are never keep-both.
-            kind = [
-                p for p in paths if PurePosixPath(p).name in dispatch.LOCKFILE_BASENAMES
+            self.conflict_found[repo] = check.found
+            self.conflict_reported[repo] = check.reported
+            self.conflict_unreported[repo] = check.unreported
+            self.conflict_overreported[repo] = check.overreported
+            self.keepboth_dropped[repo] = check.keepboth_dropped
+
+    def _reported_for(self, repo: str, resolved: list[str]) -> list[str]:
+        """The verdict's resolved paths that belong to *repo*, repo prefix removed."""
+        if self.workspace.workspace_mode:
+            return [
+                p.removeprefix(f"{repo}/") for p in resolved if p.startswith(f"{repo}/")
             ]
-            if kind:
-                log(decision="kind_halt")
-                raise _LandHalt(
-                    "unresolvable_conflict_kind",
-                    f"{head}: conflicts on lockfiles cannot be resolved by keeping "
-                    f"both sides: {', '.join(kind)}",
+        return list(resolved)
+
+    async def _check_repo_conflicts(
+        self,
+        repo: str,
+        *,
+        base: str,
+        base_sha: str,
+        tip_ref: str,
+        tip: str,
+        reported: list[str],
+        phase: Literal["squash", "land_rebase"],
+    ) -> _ConflictCheck:
+        """One repo's conflict checks, for either conflict phase.
+
+        Recomputes the conflicting paths of merging *tip* into *base* and halts
+        on a lockfile, a path missing from the resolved commit, a leftover
+        marker, an unreported code path, or a code path with no gate to verify
+        it.  Writes no conflict state: the caller stores the returned
+        :class:`_ConflictCheck`.  In the ``land_rebase`` phase the recomputed
+        set is compared with the paths the failed land rebase reported, and a
+        mismatch is logged and resolved by checking the union (fail closed).
+        """
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        path = self._path(repo)
+        # (1) The conflicts, the reviewer's claim, and the code subset.
+        paths: list[str] = await self._git(
+            repo, dispatch.land_conflict_paths, path, base, tip, timeout
+        )
+        if phase == "land_rebase":
+            rebase_paths = list(self.rebase_conflict_found.get(repo) or [])
+            if set(paths) != set(rebase_paths):
+                logger.warning(
+                    "rollout-loop: land-conflict-recompute-mismatch rollout_id=%s "
+                    "item_id=%s repo=%s rebase_paths=%s recomputed=%s",
+                    self.rollout_id,
+                    self.item_id,
+                    repo,
+                    ",".join(rebase_paths) or "-",
+                    ",".join(paths) or "-",
                 )
-            # (3) A conflicting path absent from the squash commit was deleted
-            # or renamed by one side: a judgment shape.
-            missing = await self._git(
+                paths = sorted(set(paths) | set(rebase_paths))
+        non_doc = [p for p in paths if not dispatch.is_documentation_path(p)]
+
+        log = functools.partial(
+            self._log_conflict_check,
+            repo,
+            base=base,
+            base_sha=base_sha,
+            tip_ref=tip_ref,
+            tip_sha=tip,
+            paths=paths,
+            reported=reported,
+            phase=phase,
+        )
+        head = f"land refused for item {self.item_id}: repo {repo}"
+        # (2) Lockfiles are never keep-both.
+        kind = [
+            p for p in paths if PurePosixPath(p).name in dispatch.LOCKFILE_BASENAMES
+        ]
+        if kind:
+            log(decision="kind_halt")
+            raise _LandHalt(
+                "unresolvable_conflict_kind",
+                f"{head}: conflicts on lockfiles cannot be resolved by keeping "
+                f"both sides: {', '.join(kind)}",
+            )
+        # (3) A conflicting path absent from the resolved commit was deleted
+        # or renamed by one side: a judgment shape.
+        missing = await self._git(
+            repo,
+            dispatch.land_paths_missing,
+            path,
+            self.branches[repo],
+            paths,
+            timeout,
+        )
+        if missing:
+            log(decision="missing_halt")
+            raise _LandHalt(
+                "conflict_path_missing",
+                f"{head}: conflicting paths are absent from the squash commit "
+                "(a delete or rename conflict needs judgment): "
+                f"{', '.join(missing)}",
+            )
+        # (4) No conflict marker lands.
+        if paths:
+            markers = await self._git(
                 repo,
-                dispatch.land_paths_missing,
+                dispatch.land_conflict_markers,
                 path,
                 self.branches[repo],
                 paths,
                 timeout,
             )
-            if missing:
-                log(decision="missing_halt")
+            if markers:
+                log(decision="markers_halt")
                 raise _LandHalt(
-                    "conflict_path_missing",
-                    f"{head}: conflicting paths are absent from the squash commit "
-                    "(a delete or rename conflict needs judgment): "
-                    f"{', '.join(missing)}",
+                    "conflict_markers",
+                    f"{head}: conflict markers remain in: {', '.join(markers)}",
                 )
-            # (4) No conflict marker lands.
-            if paths:
-                markers = await self._git(
-                    repo,
-                    dispatch.land_conflict_markers,
-                    path,
-                    self.branches[repo],
-                    paths,
-                    timeout,
-                )
-                if markers:
-                    log(decision="markers_halt")
-                    raise _LandHalt(
-                        "conflict_markers",
-                        f"{head}: conflict markers remain in: {', '.join(markers)}",
-                    )
-            # (5) A code conflict the reviewer did not report is not landed.
-            unreported_code = sorted(set(non_doc) - set(reported))
-            if unreported_code:
-                log(decision="unreported_halt")
-                raise _LandHalt(
-                    "unreported_conflict",
-                    f"{head}: the squash merge conflicts on paths the reviewer did "
-                    f"not report resolving: {', '.join(unreported_code)}",
-                )
-            # (6) A resolved code conflict needs a gate to verify the tree.
-            if non_doc and not self.gate_command:
-                log(decision="no_gate_halt")
-                shown = [
-                    f"{repo}/{p}" if self.workspace.workspace_mode else p
-                    for p in non_doc
-                ]
-                raise _LandHalt(
-                    "conflict_needs_gate",
-                    f"land refused for item {self.item_id}: code conflicts were "
-                    f"resolved in {', '.join(shown)} but the project has no "
-                    "gate_command to verify the merged tree",
-                )
-            # (7) Mismatches that do not block the land.
-            unreported = sorted(set(paths) - set(reported))
-            if unreported:
-                logger.warning(
-                    "rollout-loop: land-conflict-unreported rollout_id=%s "
-                    "item_id=%s repo=%s unreported=%s",
-                    self.rollout_id,
-                    self.item_id,
-                    repo,
-                    ",".join(unreported),
-                )
-            overreported = sorted(set(reported) - set(paths))
-            if overreported:
-                logger.warning(
-                    "rollout-loop: land-conflict-overreported rollout_id=%s "
-                    "item_id=%s repo=%s overreported=%s",
-                    self.rollout_id,
-                    self.item_id,
-                    repo,
-                    ",".join(overreported),
-                )
-            self.conflict_overreported[repo] = overreported
-            # (8) Keep-both audit: warn when a side's added lines are gone.
-            self.keepboth_dropped[repo] = await self._keepboth_audit(
-                repo,
-                base=base,
-                base_sha=base_sha,
-                tip=tip,
-                audited=sorted(set(non_doc) & set(reported)),
+        # (5) A code conflict the reviewer did not report is not landed.
+        unreported_code = sorted(set(non_doc) - set(reported))
+        if unreported_code:
+            log(decision="unreported_halt")
+            what = (
+                "the land rebase conflicts"
+                if phase == "land_rebase"
+                else "the squash merge conflicts"
             )
-            # (9) Record the outcome.
-            if non_doc:
-                log(decision="resolved")
-            else:
-                log(decision="doc_only" if paths else "clean")
-            self.conflict_found[repo] = list(paths)
-            self.conflict_reported[repo] = reported
-            self.conflict_unreported[repo] = unreported
+            raise _LandHalt(
+                "unreported_conflict",
+                f"{head}: {what} on paths the reviewer did "
+                f"not report resolving: {', '.join(unreported_code)}",
+            )
+        # (6) A resolved code conflict needs a gate to verify the tree.
+        if non_doc and not self.gate_command:
+            log(decision="no_gate_halt")
+            shown = [
+                f"{repo}/{p}" if self.workspace.workspace_mode else p for p in non_doc
+            ]
+            raise _LandHalt(
+                "conflict_needs_gate",
+                f"land refused for item {self.item_id}: code conflicts were "
+                f"resolved in {', '.join(shown)} but the project has no "
+                "gate_command to verify the merged tree",
+            )
+        # (7) Mismatches that do not block the land.
+        unreported = sorted(set(paths) - set(reported))
+        if unreported:
+            logger.warning(
+                "rollout-loop: land-conflict-unreported rollout_id=%s "
+                "item_id=%s repo=%s unreported=%s",
+                self.rollout_id,
+                self.item_id,
+                repo,
+                ",".join(unreported),
+            )
+        overreported = sorted(set(reported) - set(paths))
+        if overreported:
+            logger.warning(
+                "rollout-loop: land-conflict-overreported rollout_id=%s "
+                "item_id=%s repo=%s overreported=%s",
+                self.rollout_id,
+                self.item_id,
+                repo,
+                ",".join(overreported),
+            )
+        # (8) Keep-both audit: warn when a side's added lines are gone.
+        dropped = await self._keepboth_audit(
+            repo,
+            base=base,
+            base_sha=base_sha,
+            tip=tip,
+            audited=sorted(set(non_doc) & set(reported)),
+        )
+        # (9) Report the outcome.
+        if non_doc:
+            log(decision="resolved")
+        else:
+            log(decision="doc_only" if paths else "clean")
+        return _ConflictCheck(
+            list(paths), list(reported), unreported, overreported, dropped
+        )
 
     async def _keepboth_audit(
         self, repo: str, *, base: str, base_sha: str, tip: str, audited: list[str]
@@ -3660,12 +3768,20 @@ class _Lander:
         return dropped
 
     def _code_conflict_paths(self) -> list[str]:
-        """Non-documentation conflict paths over the landing repos, in order."""
+        """Non-documentation conflict paths over the landing repos, in order.
+
+        The de-duplicated union of both conflict phases: the reviewer's squash
+        merge and the land's own rebase.
+        """
         out: list[str] = []
         for repo in self.landing:
-            for p in self.conflict_found.get(repo) or []:
-                if not dispatch.is_documentation_path(p):
-                    out.append(f"{repo}/{p}" if self.workspace.workspace_mode else p)
+            for found in (self.conflict_found, self.rebase_conflict_found):
+                for p in found.get(repo) or []:
+                    if dispatch.is_documentation_path(p):
+                        continue
+                    shown = f"{repo}/{p}" if self.workspace.workspace_mode else p
+                    if shown not in out:
+                        out.append(shown)
         return out
 
     async def _landing_set(self, *, report_disagreement: bool) -> list[str]:
@@ -3948,6 +4064,259 @@ class _Lander:
             self._log_land(repo, "pushed", pushed_sha=self.gated[repo])
         return False
 
+    def _shown(self, repo: str, path: str) -> str:
+        return f"{repo}/{path}" if self.workspace.workspace_mode else path
+
+    def _rebase_conflict_decision(
+        self, failures: list[tuple[str, list[str], str]]
+    ) -> tuple[str, str, str]:
+        """``(decision, repo, suffix)`` for a set of land-rebase failures.
+
+        Evaluated in a pinned order; the first match halts.  ``relaunch`` when
+        nothing matches (then *repo* and *suffix* are unused).
+        """
+        first_repo = failures[0][0]
+        if self.pushed:
+            return "halt_already_pushed", first_repo, ""
+        if self.conflict_relaunches >= MAX_LAND_CONFLICT_RELAUNCHES:
+            return (
+                "halt_budget",
+                first_repo,
+                "; land conflict relaunch budget exhausted "
+                f"({self.conflict_relaunches}/{MAX_LAND_CONFLICT_RELAUNCHES})",
+            )
+        for repo, paths, _excerpt in failures:
+            if not paths:
+                return "halt_no_paths", repo, ""
+        lock_repo = ""
+        lock_paths: list[str] = []
+        for repo, paths, _excerpt in failures:
+            hits = [
+                p for p in paths if PurePosixPath(p).name in dispatch.LOCKFILE_BASENAMES
+            ]
+            if hits and not lock_repo:
+                lock_repo = repo
+            lock_paths += [self._shown(repo, p) for p in hits]
+        if lock_repo:
+            return (
+                "halt_lockfile",
+                lock_repo,
+                "; lockfiles cannot be resolved by keeping both sides: "
+                + ", ".join(lock_paths),
+            )
+        if not self.gate_command:
+            code_repo = ""
+            code_paths: list[str] = []
+            for repo, paths, _excerpt in failures:
+                hits = [p for p in paths if not dispatch.is_documentation_path(p)]
+                if hits and not code_repo:
+                    code_repo = repo
+                code_paths += [self._shown(repo, p) for p in hits]
+            if code_repo:
+                return (
+                    "halt_needs_gate",
+                    code_repo,
+                    "; code conflicts need a gate_command to verify the merged "
+                    "tree: " + ", ".join(code_paths),
+                )
+        return "relaunch", first_repo, ""
+
+    async def _land_rebase_conflict(
+        self, failures: list[tuple[str, list[str], str]]
+    ) -> None:
+        """Handle the land rebase's conflicts: halt, or relaunch and verify.
+
+        Origin advanced between review and land, and the land's rebase of the
+        squash commit onto it conflicted.  Either halts ``rebase_conflict``
+        (already pushed, budget spent, no paths, a lockfile, a code conflict
+        with no gate) or relaunches the reviewer ONCE in LAND CONFLICT MODE,
+        still holding the land locks, and then verifies its resolution with the
+        same conflict guard the squash phase uses.  Returns only when the
+        resolution passed every check; the caller's next pass gates and pushes.
+        """
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        order = {r: i for i, r in enumerate(self.landing)}
+        failures = sorted(failures, key=lambda f: order.get(f[0], len(order)))
+        decision, halt_repo, suffix = self._rebase_conflict_decision(failures)
+        conflicted = [repo for repo, _p, _e in failures]
+        logger.warning(
+            "rollout-loop: land-rebase-conflict rollout_id=%s item_id=%s repos=%s "
+            "paths=%s origin_advanced=%s pushed=%s conflict_relaunches=%d/%d "
+            "gate=%s decision=%s",
+            self.rollout_id,
+            self.item_id,
+            ",".join(conflicted),
+            ",".join(self._shown(r, p) for r, paths, _e in failures for p in paths)
+            or "-",
+            ",".join(
+                f"{r}:{self.rebase_conflict_origin_advanced.get(r, 0)}"
+                for r in conflicted
+            ),
+            ",".join(self.pushed) or "-",
+            self.conflict_relaunches,
+            MAX_LAND_CONFLICT_RELAUNCHES,
+            "on" if self.gate_command else "off",
+            decision,
+        )
+        if decision != "relaunch":
+            _r, paths, excerpt = next(f for f in failures if f[0] == halt_repo)
+            detail = (
+                f"conflicting paths: {', '.join(paths)}"
+                if paths
+                else f"no conflicting paths reported; git: {excerpt[:500]}"
+            )
+            raise _LandHalt(
+                "rebase_conflict",
+                f"land rebase conflict for item {self.item_id} in repo "
+                f"{halt_repo}: {detail}{suffix}",
+            )
+
+        self.conflict_relaunches += 1
+        await self.publish(
+            f"Land: origin advanced during review for {self.item_id} — "
+            "relaunching the reviewer to resolve the rebase conflict"
+        )
+        started = time.monotonic()
+        verdict = await _launch_reviewer(
+            self.rollout_id,
+            self.item_id,
+            project=self.project,
+            workspace=self.workspace,
+            reviewer_engine=self.reviewer_engine,
+            token=self.token,
+            attribution=self.attribution,
+            land_conflict={repo: list(paths) for repo, paths, _e in failures},
+            item=self.item,
+        )
+        logger.log(
+            logging.INFO if verdict.verdict == "merge" else logging.WARNING,
+            "rollout-loop: land-conflict-relaunch-verdict rollout_id=%s item_id=%s "
+            "verdict=%s resolved=%s judgment=%s secs=%.1f",
+            self.rollout_id,
+            self.item_id,
+            verdict.verdict,
+            ",".join(verdict.resolved_conflict_paths) or "-",
+            ",".join(verdict.judgment_conflict_paths) or "-",
+            time.monotonic() - started,
+        )
+        if verdict.verdict != "merge":
+            for repo in conflicted:
+                await self._abort_leftover_rebase(repo)
+            judgment = (
+                f" [conflicts needing judgment: "
+                f"{', '.join(verdict.judgment_conflict_paths)}]"
+                if verdict.judgment_conflict_paths
+                else ""
+            )
+            raise _LandHalt(
+                "land_conflict_not_resolved",
+                f"land rebase conflict for item {self.item_id} in repo(s) "
+                f"{', '.join(conflicted)}: the reviewer did not resolve it "
+                f"({verdict.verdict}): {verdict.rationale}{judgment}",
+            )
+        self.conflict_rationale = verdict.rationale
+
+        # (1) The rebase completed onto exactly the sha it was given.  Checked
+        # BEFORE fetching: a newer origin is not the reviewer's doing.
+        for repo in conflicted:
+            path = self._path(repo)
+            branch = self.branches[repo]
+            expected = self.rebase_onto[repo]
+            in_progress = await self._git(
+                repo, dispatch.land_rebase_in_progress, path, timeout
+            )
+            actual = ""
+            check = ""
+            if in_progress:
+                check = "rebase_in_progress"
+            else:
+                actual = await self._git(
+                    repo, dispatch.land_resolve_ref, path, f"{branch}~1", timeout
+                )
+                if actual != expected:
+                    check = "parent_not_target"
+            if check:
+                logger.warning(
+                    "rollout-loop: land-conflict-postcheck rollout_id=%s item_id=%s "
+                    "repo=%s check=%s expected=%s actual=%s",
+                    self.rollout_id,
+                    self.item_id,
+                    repo,
+                    check,
+                    expected,
+                    actual or "-",
+                )
+                raise _LandHalt(
+                    "bad_local_state",
+                    f"land bad local state for item {self.item_id}: repo {repo}: "
+                    f"rebase not completed onto origin/{branch} ({branch}~1 is "
+                    f"{actual or '(none)'}, expected {expected})",
+                )
+        # (2)-(3) Re-fetch; a push of this item during the relaunch halts.
+        for repo in self.repos:
+            await self._fetch(repo)
+        await self._reviewer_pushed_guard()
+        # (4) The relaunch must not change which repos land.
+        landing = await self._landing_set(report_disagreement=False)
+        if landing != self.landing:
+            logger.warning(
+                "rollout-loop: land-conflict-postcheck rollout_id=%s item_id=%s "
+                "repo=%s check=landing_set expected=%s actual=%s",
+                self.rollout_id,
+                self.item_id,
+                "-",
+                ",".join(self.landing),
+                ",".join(landing) or "-",
+            )
+            raise _LandHalt(
+                "bad_local_state",
+                f"land bad local state for item {self.item_id}: the land conflict "
+                f"relaunch changed the landing set from {self.landing} to {landing}",
+            )
+        # (5) The same guard as the squash phase, against the rebased commit.
+        resolved = list(verdict.resolved_conflict_paths)
+        for repo in conflicted:
+            check_result = await self._check_repo_conflicts(
+                repo,
+                base=f"{self.branches[repo]}~1",
+                base_sha=self.rebase_onto[repo],
+                tip_ref="old-squash",
+                tip=self.rebase_old_squash[repo],
+                reported=self._reported_for(repo, resolved),
+                phase="land_rebase",
+            )
+            self.rebase_conflict_found[repo] = check_result.found
+            self.rebase_conflict_reported[repo] = check_result.reported
+            self.rebase_conflict_unreported[repo] = check_result.unreported
+            self.rebase_conflict_overreported[repo] = check_result.overreported
+            self.rebase_keepboth_dropped[repo] = check_result.keepboth_dropped
+
+    async def _abort_leftover_rebase(self, repo: str) -> None:
+        """Best effort: abort a rebase the reviewer left in progress in *repo*."""
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        path = self._path(repo)
+        try:
+            if not await asyncio.get_running_loop().run_in_executor(
+                dispatch._executor,
+                functools.partial(dispatch.land_rebase_in_progress, path, timeout),
+            ):
+                return
+            err = await asyncio.get_running_loop().run_in_executor(
+                dispatch._executor,
+                functools.partial(dispatch.land_rebase_abort, path, timeout),
+            )
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+        if err:
+            logger.warning(
+                "rollout-loop: land-conflict-abort-failed rollout_id=%s item_id=%s "
+                "repo=%s detail=%s",
+                self.rollout_id,
+                self.item_id,
+                repo,
+                err[:300],
+            )
+
     async def _land(self) -> ReviewVerdict:
         timeout = config.LAND_GIT_TIMEOUT_SECONDS
         await self.publish(f"Land: fetching origin for {self.item_id}")
@@ -3973,31 +4342,58 @@ class _Lander:
         while True:
             remaining = [r for r in self.landing if r not in self.pushed]
             await self.publish(f"Land: rebasing {', '.join(remaining)} onto origin")
-            # Rebase EVERY remaining repo before anything is pushed, so a
-            # conflict halts with nothing (more) pushed.
+            # Rebase EVERY remaining repo before anything is pushed, collecting
+            # every conflict, so a conflict is handled with nothing (more)
+            # pushed.
+            failures: list[tuple[str, list[str], str]] = []
             for repo in remaining:
                 if not first:
                     await self._fetch(repo)
+                path = self._path(repo)
+                pre = await self._git(
+                    repo, dispatch.land_rev_parse, path, "HEAD", timeout
+                )
                 ok, paths, excerpt = await self._git(
-                    repo,
-                    dispatch.land_rebase,
-                    self._path(repo),
-                    self.branches[repo],
-                    timeout,
+                    repo, dispatch.land_rebase, path, self.branches[repo], timeout
                 )
                 if not ok:
-                    detail = (
-                        f"conflicting paths: {', '.join(paths)}"
-                        if paths
-                        else f"no conflicting paths reported; git: {excerpt[:500]}"
+                    # land_rebase has already run `git rebase --abort`.
+                    post = await self._git(
+                        repo, dispatch.land_rev_parse, path, "HEAD", timeout
                     )
-                    raise _LandHalt(
-                        "rebase_conflict",
-                        f"land rebase conflict for item {self.item_id} in repo "
-                        f"{repo}: {detail}",
+                    self.rebase_onto[repo] = self.base_after[repo]
+                    self.rebase_old_squash[repo] = post
+                    self.rebase_conflict_origin_advanced[repo] = (
+                        self.origin_advanced.get(repo, 0)
                     )
+                    if post != pre:
+                        logger.error(
+                            "rollout-loop: land-invariant-violation rollout_id=%s "
+                            "item_id=%s repo=%s kind=rebase_abort_moved_head "
+                            "pre=%s post=%s",
+                            self.rollout_id,
+                            self.item_id,
+                            repo,
+                            pre,
+                            post,
+                        )
+                        raise _LandHalt(
+                            "bad_local_state",
+                            f"land bad local state for item {self.item_id}: repo "
+                            f"{repo}: HEAD moved across an aborted rebase "
+                            f"({pre} -> {post})",
+                        )
+                    self.rebase_conflict_found[repo] = list(paths)
+                    failures.append((repo, list(paths), excerpt))
+                    continue
                 await self._check_landing_repo(repo)
             first = False
+            if failures:
+                # Resolved: the next pass re-fetches, re-rebases (a no-op when
+                # origin has not moved), re-checks, gates and pushes the exact
+                # gated tree.
+                await self._land_rebase_conflict(failures)
+                continue
             if self.workspace.workspace_mode:
                 await self._reset_non_landing()
             for repo in remaining:
@@ -4111,6 +4507,32 @@ class _Lander:
                     f"{branch_dropped} branch added lines)"
                 )
             lines.append(line)
+        for repo in self.landing:
+            found = self.rebase_conflict_found.get(repo) or []
+            if not found:
+                continue
+            reported = self.rebase_conflict_reported.get(repo) or []
+            line = (
+                f"Land rebase conflict ({repo}): origin advanced by "
+                f"{self.rebase_conflict_origin_advanced.get(repo, 0)} commit(s) "
+                f"during review; worker found conflicts in {', '.join(found)}; "
+                "reviewer resolved keep-both: "
+                f"{', '.join(reported) if reported else 'none'}"
+            )
+            unreported = self.rebase_conflict_unreported.get(repo) or []
+            if unreported:
+                line += f" (mismatch: unreported {', '.join(unreported)})"
+            overreported = self.rebase_conflict_overreported.get(repo) or []
+            if overreported:
+                line += f" (mismatch: over-reported {', '.join(overreported)})"
+            for p, main_dropped, branch_dropped in (
+                self.rebase_keepboth_dropped.get(repo) or []
+            ):
+                line += (
+                    f" (keep-both audit: {p} dropped {main_dropped} main / "
+                    f"{branch_dropped} branch added lines)"
+                )
+            lines.append(line)
         if self.outcome.resolved_conflict_paths:
             lines.append(
                 "Reviewer resolved merge conflicts by keeping both sides in: "
@@ -4127,10 +4549,13 @@ class _Lander:
             logger.warning(
                 "rollout-loop: failed to post land comment on item %s", self.item_id
             )
+        rationale = self.outcome.rationale
         if self.fix_relaunches:
-            return self.outcome._replace(
-                rationale=f"{self.outcome.rationale} (land fix: {self.fix_rationale})"
-            )
+            rationale = f"{rationale} (land fix: {self.fix_rationale})"
+        if self.conflict_relaunches:
+            rationale = f"{rationale} (land conflict: {self.conflict_rationale})"
+        if rationale != self.outcome.rationale:
+            return self.outcome._replace(rationale=rationale)
         return self.outcome
 
     async def _halt(self, halt: _LandHalt) -> str:
@@ -4280,6 +4705,19 @@ async def _land_reviewed_merge(
       origin (workspace mode), gate once from the workspace root, push in repo
       order with ``--no-verify`` (the land gate just judged that exact sha; a
       project with no ``gate_command`` pushes WITH hooks instead).
+    - A land rebase that conflicts because origin advanced during review
+      (``land rebase conflict for item <item_id>``) collects every repo's
+      failure first, then halts ``rebase_conflict`` when a repo was already
+      pushed, the ``MAX_LAND_CONFLICT_RELAUNCHES`` budget is spent (suffix
+      ``; land conflict relaunch budget exhausted (1/1)``), a repo reported no
+      paths, a path is a lockfile (suffix ``; lockfiles cannot be resolved by
+      keeping both sides: ...``) or a code path has no gate (suffix ``; code
+      conflicts need a gate_command to verify the merged tree: ...``).
+      Otherwise the reviewer is relaunched ONCE in LAND CONFLICT MODE, holding
+      the land locks; a non-merge answer halts ``land_conflict_not_resolved``.
+      A merge is checked (rebase completed onto the sha it was given, the
+      reviewer-pushed guard, the landing set), re-guarded with phase
+      ``land_rebase``, and the next pass gates and pushes the exact tree.
     - A red gate before any push gets ONE reviewer FIX MODE relaunch; a
       non-fast-forward push re-fetches, re-rebases and re-gates, bounded by
       ``MAX_LAND_PUSH_ATTEMPTS``; every other failure halts.

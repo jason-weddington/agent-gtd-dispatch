@@ -54,6 +54,7 @@ from agent_gtd_dispatch.models import (
     RepoPushStatus,
     Run,
 )
+from tests import review_prompt_golden_inputs as golden_inputs
 from tests.completion_fixtures import (
     MAX_TURNS_ENVELOPE,
     seed_build_evidence,
@@ -6789,3 +6790,107 @@ class TestSudoWrapUmask:
             preexec_fn=lambda: os.umask(0o022),
         )
         assert target.stat().st_mode & 0o020
+
+
+class TestLandConflictModePrompt:
+    def _prompt(self, **kw) -> str:
+        return dispatch.build_review_prompt(
+            {"id": "item-1", "title": "T"},
+            {"name": "P", "gate_command": "make check"},
+            "rollout-1",
+            "feat/item-1",
+            30,
+            Path("/ws"),
+            repo_dirs=["repo"],
+            default_branches={"repo": "main"},
+            **kw,
+        )
+
+    def test_land_conflict_mode_sections(self) -> None:
+        prompt = self._prompt(land_conflict={"repo": ["a.py"]})
+        assert "## LAND CONFLICT MODE — origin advanced after you approved" in prompt
+        assert "a.py" in prompt
+        assert "git rebase --continue" in prompt
+        assert "git rebase --abort" in prompt
+        for name in dispatch.LOCKFILE_BASENAMES:
+            assert name in prompt
+        assert "FORBIDDEN in this mode" in prompt
+        assert (
+            "FORBIDDEN in this mode: `git fetch`, `git push`, `git reset`, "
+            "`git checkout`, `git merge`, `git commit --amend`."
+        ) in prompt
+        assert 'phase="merging"' in prompt
+        assert 'current_step="Land: resolving rebase conflict"' in prompt
+        assert "GIT_EDITOR=true git rebase --continue" in prompt
+        assert "git diff --name-only --diff-filter=U" in prompt
+        assert "## Merge Conflict — the contract" not in prompt
+        assert "hard-reset to origin" not in prompt
+        assert 'phase="reviewing"' not in prompt
+        assert "## Step 2" not in prompt
+        assert "re-dispatch` or `skip`" in prompt
+
+    def test_land_conflict_mode_is_engine_agnostic(self) -> None:
+        block = dispatch._review_land_conflict_mode_block(
+            {"repo": ["a.py"]},
+            workspace_mode=True,
+            has_gate=True,
+            default_branches={"repo": "main"},
+        )
+        for engine in ("claude", "kiro", "talos", "codex"):
+            assert engine not in block.lower()
+
+    def test_land_conflict_workspace_prefix_and_no_gate_rule(self) -> None:
+        block = dispatch._review_land_conflict_mode_block(
+            {"repo-b": ["src/r.py"]},
+            workspace_mode=True,
+            has_gate=False,
+            default_branches={"repo-b": "trunk"},
+        )
+        assert "`repo-b/` (default branch `trunk`)" in block
+        assert "`src/r.py`" in block
+        assert "prefixed `<repo_dir>/`" in block
+        assert "This project has no gate_command" in block
+
+    def test_land_conflict_and_fix_mode_are_exclusive(self) -> None:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            self._prompt(land_conflict={"repo": ["a.py"]}, gate_failure_output="x")
+
+
+class TestReviewPromptGoldens:
+    """AC-12: the shared classification helper changes no rendered byte."""
+
+    @pytest.mark.parametrize("workspace_mode", [False, True])
+    @pytest.mark.parametrize("has_gate", [False, True])
+    def test_conflict_contract_block(
+        self, workspace_mode: bool, has_gate: bool
+    ) -> None:
+        golden = (
+            golden_inputs.GOLDEN_DIR
+            / golden_inputs.contract_name(workspace_mode, has_gate)
+        ).read_text()
+        rendered = golden_inputs.render_contract(workspace_mode, has_gate)
+        assert golden_inputs.golden_text(rendered) == golden
+
+    @pytest.mark.parametrize("fix_mode", [False, True])
+    def test_review_prompt(self, fix_mode: bool) -> None:
+        golden = (
+            golden_inputs.GOLDEN_DIR / golden_inputs.prompt_name(fix_mode=fix_mode)
+        ).read_text()
+        rendered = golden_inputs.render_prompt(fix_mode=fix_mode)
+        assert golden_inputs.golden_text(rendered) == golden
+
+    def test_classification_text_is_in_both_blocks(self) -> None:
+        for has_gate in (False, True):
+            text = dispatch._conflict_classification_text(has_gate=has_gate)
+            contract = dispatch._review_conflict_contract_block(
+                workspace_mode=False, has_gate=has_gate
+            )
+            land = dispatch._review_land_conflict_mode_block(
+                {"r": ["a.py"]},
+                workspace_mode=False,
+                has_gate=has_gate,
+                default_branches={},
+            )
+            first = text.splitlines()[0]
+            assert first in contract
+            assert first in land

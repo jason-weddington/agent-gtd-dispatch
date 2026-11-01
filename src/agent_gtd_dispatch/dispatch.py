@@ -3949,6 +3949,28 @@ def land_rebase(repo: Path, branch: str, timeout: int) -> tuple[bool, list[str],
     return False, paths, excerpt
 
 
+def land_rebase_in_progress(repo: Path, timeout: int) -> list[str]:
+    """The rebase state dirs (``rebase-merge``, ``rebase-apply``) present in *repo*.
+
+    Resolved with ``git rev-parse --git-path`` so a linked worktree or a
+    relocated git dir is checked where git itself keeps the state.
+    """
+    present: list[str] = []
+    for name in ("rebase-merge", "rebase-apply"):
+        rel = _land_git_ok(repo, ["rev-parse", "--git-path", name], timeout)
+        if rel and (repo / rel).exists():
+            present.append(name)
+    return present
+
+
+def land_rebase_abort(repo: Path, timeout: int) -> str:
+    """Best-effort ``git rebase --abort``; returns "" on success, else the excerpt."""
+    proc = _land_git(repo, ["rebase", "--abort"], timeout)
+    if proc.returncode == 0:
+        return ""
+    return git_output_excerpt(proc) or f"exit {proc.returncode}"
+
+
 def land_reset_to_origin(repo: Path, branch: str, timeout: int) -> None:
     """Put a NON-landing repo on ``origin/<branch>`` (checkout, then hard reset)."""
     _land_git_ok(repo, ["checkout", "-f", branch], timeout)
@@ -4237,70 +4259,24 @@ def read_review_verdict(workspace_root: Path) -> tuple[dict[str, Any] | None, st
     return data, "ok"
 
 
-def _review_conflict_contract_block(*, workspace_mode: bool, has_gate: bool) -> str:
-    """The merge-conflict contract. Verbatim in the prompt.
+def _conflict_classification_text(*, has_gate: bool) -> str:
+    """The keep_both / judgment classification, shared by both conflict blocks.
 
-    The reviewer no longer pushes, so the non-fast-forward rejection it used to
-    handle is gone from this block: the worker's land step owns the push and
-    retries a rejection itself (fetch, rebase, re-gate).  What remains is the
-    local ``git merge --squash`` conflict.  The reviewer classifies every
-    conflicting path as ``keep_both`` (both sides added disjoint content, such
-    as appends to the same registry) or ``judgment`` (the sides disagree about
-    the same lines, or the conflict shape is one that keeping both sides cannot
-    express: delete/rename, binary, mode, submodule, or a lockfile in
-    :data:`LOCKFILE_BASENAMES`).  It resolves the conflict, code or
-    documentation, only when every path is ``keep_both``; any ``judgment`` path
-    aborts the whole merge and is reported in ``judgment_conflict_paths``.  A
-    project without a ``gate_command`` makes every non-documentation path
-    ``judgment``, because nothing could verify the merged tree.  The worker's
-    land step re-checks the result independently and reruns the project gate
-    on the exact tree it pushes.
+    The ONE copy of the definitions, the always-judgment list (lockfiles from
+    :data:`LOCKFILE_BASENAMES`), the documentation rule (extensions from
+    :data:`DOCUMENTATION_EXTENSIONS`) and the no-gate rule.  Rendered by the
+    squash-merge contract (:func:`_review_conflict_contract_block`) and by
+    LAND CONFLICT MODE (:func:`_review_land_conflict_mode_block`).
     """
     extensions = ", ".join(f"`{e}`" for e in DOCUMENTATION_EXTENSIONS)
     lockfiles = ", ".join(f"`{n}`" for n in LOCKFILE_BASENAMES)
-    if workspace_mode:
-        partial = """\
-
-**Workspace mode.** In the abort case (d), or on any other failure, reset every repo's local default branch to
-`origin/<default_branch>` and return `halt`; no repo has been pushed, so there
-is no split state. Name every repo in `repo_states` with exactly one of
-`committed`, `failed` or `untouched`, plus `failure.kind` and
-`failure.detail`. A repo whose keep_both conflicts were resolved and committed under (c) reports `repo_states[<repo>] = "committed"`, and its paths go in `resolved_conflict_paths` prefixed `<repo_dir>/`.
-If any repo has a judgment path, no repo is resolved: every repo is reset as above and resolved_conflict_paths is [].
-The `<repo_dir>/` prefix applies to both `resolved_conflict_paths` and
-`judgment_conflict_paths`."""
-    else:
-        partial = """\
-
-**Single repo.** There is no partial state to describe: either the one squash
-commit exists locally or nothing does."""
-
     if has_gate:
         gate_rule = ""
     else:
         gate_rule = """
 This project has no gate_command, so every non-documentation conflicting path is judgment: abort and halt.
 """
-
-    body = f"""\
-## Merge Conflict — the contract
-
-A merge conflict that needs judgment is handled one way:
-**attempt, detect, abort cleanly, report.** A conflict where both sides only
-added disjoint content (keep_both) is resolved by keeping both sides, as
-described in (c); the worker then reruns the project gate on the merged tree
-before anything lands.
-
-**(a) List the conflicting paths.** When `git merge --squash <branch>` exits
-non-zero, list every conflicting path before doing anything else:
-
-```bash
-git diff --name-only --diff-filter=U
-```
-
-**(b) Classify every path: keep_both or judgment.** Look at each conflicting
-path's hunks and both sides' changes since the merge base, then classify it:
-
+    return f"""\
 - `keep_both`: a text conflict where both sides added or changed disjoint
   content in the same region, such as both appending entries to a list,
   registry, enum, settings struct, fixture map or allow-list. The resolution
@@ -4323,7 +4299,66 @@ These are ALWAYS `judgment`, whatever the hunks look like:
 Documentation paths (extensions {extensions}, case-insensitive, at any depth)
 that are resolved by integrating both sides' text are `keep_both`.
 {gate_rule}
-**(c) Every path is keep_both: resolve it.** If EVERY listed path is
+"""
+
+
+def _review_conflict_contract_block(*, workspace_mode: bool, has_gate: bool) -> str:
+    """The merge-conflict contract. Verbatim in the prompt.
+
+    The reviewer no longer pushes, so the non-fast-forward rejection it used to
+    handle is gone from this block: the worker's land step owns the push and
+    retries a rejection itself (fetch, rebase, re-gate).  What remains is the
+    local ``git merge --squash`` conflict.  The reviewer classifies every
+    conflicting path as ``keep_both`` (both sides added disjoint content, such
+    as appends to the same registry) or ``judgment`` (the sides disagree about
+    the same lines, or the conflict shape is one that keeping both sides cannot
+    express: delete/rename, binary, mode, submodule, or a lockfile in
+    :data:`LOCKFILE_BASENAMES`).  It resolves the conflict, code or
+    documentation, only when every path is ``keep_both``; any ``judgment`` path
+    aborts the whole merge and is reported in ``judgment_conflict_paths``.  A
+    project without a ``gate_command`` makes every non-documentation path
+    ``judgment``, because nothing could verify the merged tree.  The worker's
+    land step re-checks the result independently and reruns the project gate
+    on the exact tree it pushes.
+    """
+    classification = _conflict_classification_text(has_gate=has_gate)
+    if workspace_mode:
+        partial = """\
+
+**Workspace mode.** In the abort case (d), or on any other failure, reset every repo's local default branch to
+`origin/<default_branch>` and return `halt`; no repo has been pushed, so there
+is no split state. Name every repo in `repo_states` with exactly one of
+`committed`, `failed` or `untouched`, plus `failure.kind` and
+`failure.detail`. A repo whose keep_both conflicts were resolved and committed under (c) reports `repo_states[<repo>] = "committed"`, and its paths go in `resolved_conflict_paths` prefixed `<repo_dir>/`.
+If any repo has a judgment path, no repo is resolved: every repo is reset as above and resolved_conflict_paths is [].
+The `<repo_dir>/` prefix applies to both `resolved_conflict_paths` and
+`judgment_conflict_paths`."""
+    else:
+        partial = """\
+
+**Single repo.** There is no partial state to describe: either the one squash
+commit exists locally or nothing does."""
+
+    body = f"""\
+## Merge Conflict — the contract
+
+A merge conflict that needs judgment is handled one way:
+**attempt, detect, abort cleanly, report.** A conflict where both sides only
+added disjoint content (keep_both) is resolved by keeping both sides, as
+described in (c); the worker then reruns the project gate on the merged tree
+before anything lands.
+
+**(a) List the conflicting paths.** When `git merge --squash <branch>` exits
+non-zero, list every conflicting path before doing anything else:
+
+```bash
+git diff --name-only --diff-filter=U
+```
+
+**(b) Classify every path: keep_both or judgment.** Look at each conflicting
+path's hunks and both sides' changes since the merge base, then classify it:
+
+{classification}**(c) Every path is keep_both: resolve it.** If EVERY listed path is
 `keep_both`, resolve them:
 
 1. Edit each conflicting file so it keeps BOTH sides: every line the branch
@@ -4499,6 +4534,93 @@ Your verdict in this mode is restricted to `merge` (fixed and amended) or
     return _indent_prompt_block(body)
 
 
+def _review_land_conflict_mode_block(
+    land_conflict: dict[str, list[str]],
+    *,
+    workspace_mode: bool,
+    has_gate: bool,
+    default_branches: dict[str, str],
+) -> str:
+    """The LAND CONFLICT MODE section that replaces Steps 2-5 on a relaunch.
+
+    Origin advanced after the reviewer approved, and the worker's land rebase
+    of the squash commit onto it conflicted.  The reviewer re-runs that rebase
+    WITHOUT fetching (so it targets exactly the origin sha the worker
+    recorded), resolves keep-both conflicts using the same classification as
+    the squash-merge contract, and continues the rebase; any judgment path or
+    failed continue aborts every rebase and halts.
+    """
+    rows: list[str] = []
+    for repo, paths in land_conflict.items():
+        branch = default_branches.get(repo) or "main"
+        where = f"`{repo}/`" if workspace_mode else f"`{repo}`"
+        shown = ", ".join(f"`{p}`" for p in paths) or "(none reported)"
+        rows.append(
+            f"- {where} (default branch `{branch}`): rebase onto "
+            f"`origin/{branch}` conflicted on {shown}"
+        )
+    repo_rows = "\n".join(rows)
+    classification = _conflict_classification_text(has_gate=has_gate)
+    prefix_rule = (
+        "prefixed `<repo_dir>/` (for example `repo-b/src/registry.py`)"
+        if workspace_mode
+        else "as repo-relative paths"
+    )
+    body = f"""\
+## LAND CONFLICT MODE — origin advanced after you approved
+
+You already approved this build and created its squash commit. While you were
+reviewing, another change landed on origin. The dispatch worker fetched
+`origin/<default_branch>` and tried to rebase your squash commit onto it, and
+that rebase CONFLICTED. The worker aborted it, so the repos below are back on
+their default branch with your squash commit on top of the pre-advance origin.
+
+The conflicted repos and the paths the worker saw conflict:
+
+{repo_rows}
+
+During a rebase the sides are swapped compared with a merge: `--ours` (stage 2)
+is `origin/<default_branch>`, the commit being rebased onto, and `--theirs`
+(stage 3) is your squash commit being replayed.
+
+### Classify every conflicting path: keep_both or judgment
+
+{classification}### What to do, in each conflicted repo
+
+1. Run `git rebase origin/<default_branch>` WITHOUT fetching first. The worker
+   already fetched; the rebase must target exactly that origin commit.
+2. List the conflicting paths: `git diff --name-only --diff-filter=U`
+3. Classify each path `keep_both` or `judgment` as above.
+4. If EVERY path (in every conflicted repo) is `keep_both`:
+   - edit each file to keep BOTH sides: every line origin added and every line
+     your squash commit added;
+   - confirm no conflict markers remain; this MUST print nothing:
+     `git grep -nE '^(<<<<<<<|>>>>>>>|\\|\\|\\|\\|\\|\\|\\|)( |$)' -- <paths>`
+   - `git add` exactly those paths, and nothing else;
+   - `GIT_EDITOR=true git rebase --continue`
+   - confirm HEAD is exactly ONE commit ahead of `origin/<default_branch>`
+     (`git rev-list --count origin/<default_branch>..HEAD` prints `1`) and
+     that commit still carries its `Rollout:` and `Item:` trailers.
+   Report every resolved path in `resolved_conflict_paths`, {prefix_rule}.
+   If the rebase completes without any conflict, return `merge` with an empty
+   `resolved_conflict_paths`.
+5. If ANY path in ANY repo is `judgment`, OR `git rebase --continue` fails for
+   any reason (a commit hook included): run `git rebase --abort` in EVERY
+   conflicted repo, confirm `git status --porcelain` is empty, and return
+   `halt` with `failure.kind` set to `merge_conflict`, every judgment path in
+   `judgment_conflict_paths`, and the git output tail in `failure.detail` when
+   a command failed. Never pass `--no-verify`.
+
+FORBIDDEN in this mode: `git fetch`, `git push`, `git reset`, `git checkout`, `git merge`, `git commit --amend`.
+
+The worker checks your work before anything lands: the rebase must have
+completed onto exactly the origin commit it fetched, the conflicts are
+recomputed and re-checked (lockfiles, missing paths, leftover markers,
+unreported code paths), and a resolved code conflict lands only if the project
+gate passes on the exact tree that is pushed."""
+    return _indent_prompt_block(body)
+
+
 def build_review_prompt(
     item: dict[str, Any],
     project: dict[str, Any],
@@ -4517,6 +4639,7 @@ def build_review_prompt(
     redispatch_cap: int = 1,
     gate_failure_output: str | None = None,
     engine_name: str | None = None,
+    land_conflict: dict[str, list[str]] | None = None,
 ) -> str:
     """System prompt for REVIEW mode — review ONE build, then approve or refuse.
 
@@ -4533,8 +4656,19 @@ def build_review_prompt(
     When *gate_failure_output* is not None the prompt is in FIX MODE: Steps 2-5
     and the conflict contract are replaced by a section asking for a minimal
     amend of the existing squash commit after the land gate failed.
+
+    When *land_conflict* is not None (repo -> conflicting paths) the prompt is
+    in LAND CONFLICT MODE: origin advanced after the reviewer approved, the
+    worker's land rebase conflicted, and the reviewer re-runs that rebase and
+    resolves keep-both conflicts or aborts.  Steps 2-5 and the conflict
+    contract are replaced by :func:`_review_land_conflict_mode_block`, and only
+    ``merge`` or ``halt`` may be returned.  It cannot be combined with
+    *gate_failure_output* (:class:`ValueError`).
     """
+    if land_conflict is not None and gate_failure_output is not None:
+        raise ValueError("land_conflict and gate_failure_output are mutually exclusive")
     fix_mode = gate_failure_output is not None
+    conflict_mode = land_conflict is not None
     project_name = project.get("name", "")
     dirs = list(repo_dirs or [])
     branches = dict(default_branches or {})
@@ -4560,6 +4694,19 @@ Squash-commit order is that list order, repos that received the branch only."""
             f"`{branches.get(only, 'main')}` and hard-reset to origin."
         )
         where = "the repo root"
+    if conflict_mode:
+        listed = list(land_conflict or {})
+        conflict_bullets = "\n".join(
+            f"- `{d}` (default branch `{branches.get(d, 'main')}`)" for d in listed
+        )
+        layout = f"""\
+Your workspace is {"a **workspace root** containing one git clone per repo" if workspace_mode else "a single git clone"}.
+Each repo listed below is checked out on its default branch, with your
+approved squash commit exactly one commit ahead of the pre-advance origin. The
+worker has already fetched `origin/<default_branch>` in each, so do not fetch
+again:
+
+{conflict_bullets}"""
 
     if gate_command:
         gate_block = f"""\
@@ -4636,7 +4783,14 @@ record `none` for it and continue — do NOT halt for that alone."""
     )
 
     layout = _indent_prompt_block(layout)
-    if fix_mode:
+    if conflict_mode:
+        steps = _review_land_conflict_mode_block(
+            dict(land_conflict or {}),
+            workspace_mode=workspace_mode,
+            has_gate=bool(gate_command),
+            default_branches=branches,
+        )
+    elif fix_mode:
         steps = _review_fix_mode_block(
             str(gate_failure_output), workspace_mode=workspace_mode, where=where
         )
@@ -4790,7 +4944,16 @@ record `none` for it and continue — do NOT halt for that alone."""
             .replace("{conflict_contract}", conflict_contract)
         )
 
-    if fix_mode:
+    if conflict_mode:
+        decide = """\
+## What You Decide In LAND CONFLICT MODE
+
+You return `merge` once every conflicted repo's rebase has completed with its
+keep-both resolution, or `halt` for anything else (a judgment path, a failed
+`git rebase --continue`, anything you are unsure of). The worker re-checks the
+resolution, re-rebases onto any newer origin, gates the exact tree and pushes
+it on `merge`; it halts the rollout on `halt`. Never `re-dispatch` or `skip`."""
+    elif fix_mode:
         decide = """\
 ## What You Decide In FIX MODE
 
@@ -4835,6 +4998,12 @@ an outcome yourself makes the worker's own record collide with it.
 regression does not. `halt` is never the wrong answer when you are
 uncertain; `merge` frequently is."""
     decide = _indent_prompt_block(decide)
+    if conflict_mode:
+        step1_phase = "merging"
+        step1_step = "Land: resolving rebase conflict"
+    else:
+        step1_phase = "reviewing"
+        step1_step = f"Reviewing {branch_name}"
 
     return textwrap.dedent(
         f"""\
@@ -4861,9 +5030,9 @@ uncertain; `merge` frequently is."""
         ```
         mcp__agent-gtd__update_rollout_state(
             rollout_id="{rollout_id}",
-            phase="reviewing",
+            phase="{step1_phase}",
             current_item_id="{item_id}",
-            current_step="Reviewing {branch_name}",
+            current_step="{step1_step}",
         )
         ```
         The call REPLACES all four state fields — pass `current_item_id`.

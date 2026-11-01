@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import subprocess
 from datetime import UTC, datetime
@@ -286,6 +287,7 @@ class TestConstants:
     def test_values(self) -> None:
         assert main.MAX_LAND_PUSH_ATTEMPTS == 3
         assert main.MAX_LAND_FIX_RELAUNCHES == 1
+        assert main.MAX_LAND_CONFLICT_RELAUNCHES == 1
         assert main.LAND_HEARTBEAT_SECONDS == 300
 
     def test_config_defaults_and_env(self, monkeypatch) -> None:
@@ -783,22 +785,46 @@ class TestFixRelaunch:
 
 
 class TestRebaseAndPushFailures:
-    async def test_rebase_conflict_names_paths(self, mono, gtd) -> None:
+    async def test_rebase_conflict_names_paths(self, mono, gtd, caplog) -> None:
         _git(mono.seed, "pull", "-q", "origin", "main")
         (mono.seed / "f.txt").write_text("origin-version\n")
         _git(mono.seed, "commit", "-qam", "origin edits f")
         _git(mono.seed, "push", "-q", "origin", "main")
         before = _tip(mono.origin)
         _squash(mono.clone, filename="f.txt", content="squash-version\n")
-        result = await _land(mono.ws, mono.pre)
+        refuse = AsyncMock(
+            return_value=ReviewVerdict(
+                "halt",
+                "the sides disagree",
+                "",
+                "",
+                judgment_conflict_paths=("f.txt",),
+            )
+        )
+        with (
+            patch.object(main, "_launch_reviewer", refuse),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, mono.pre)
         assert result == main._TICK_HALTED
         reason = _halt_reason(gtd)
         assert reason.startswith(f"land rebase conflict for item {ITEM}")
         assert "f.txt" in reason
         assert "repo" in reason
+        assert "[conflicts needing judgment: f.txt]" in reason
         assert _tip(mono.origin) == before
         assert not (mono.clone / ".git" / "rebase-merge").exists()
         assert not (mono.clone / ".git" / "rebase-apply").exists()
+        assert "outcome=land_conflict_not_resolved" in caplog.text
+        assert "decision=relaunch" in caplog.text
+        verdicts = [
+            r.getMessage()
+            for r in caplog.records
+            if "land-conflict-relaunch-verdict" in r.getMessage()
+        ]
+        assert len(verdicts) == 1
+        assert "verdict=halt" in verdicts[0]
+        refuse.assert_awaited_once()
 
     async def test_non_fast_forward_race_regates_and_lands(
         self, mono, tmp_path: Path, caplog
@@ -1677,20 +1703,45 @@ class TestWorkspaceProjects:
         assert _tip(two_repo.origin_b) != tip_b
 
     async def test_rebase_conflict_in_second_repo_pushes_nothing(
-        self, two_repo, gtd
+        self, two_repo, gtd, caplog
     ) -> None:
         tip_a = _tip(two_repo.origin_a)
         _git(two_repo.seed_b, "pull", "-q", "origin", "main")
         (two_repo.seed_b / "f.txt").write_text("origin-version\n")
         _git(two_repo.seed_b, "commit", "-qam", "origin edits f")
         _git(two_repo.seed_b, "push", "-q", "origin", "main")
+        tip_b = _tip(two_repo.origin_b)
         _squash(two_repo.clone_a)
         _squash(two_repo.clone_b, filename="f.txt", content="mine\n")
-        assert await _land(two_repo.ws, two_repo.pre) == main._TICK_HALTED
+        refuse = AsyncMock(
+            return_value=ReviewVerdict(
+                "halt",
+                "the sides disagree",
+                "",
+                "",
+                judgment_conflict_paths=("repo-b/f.txt",),
+            )
+        )
+        with (
+            patch.object(main, "_launch_reviewer", refuse),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(two_repo.ws, two_repo.pre)
+        assert result == main._TICK_HALTED
         reason = _halt_reason(gtd)
+        assert reason.startswith(f"land rebase conflict for item {ITEM}")
         assert "repo-b" in reason
         assert "f.txt" in reason
+        assert "[conflicts needing judgment: repo-b/f.txt]" in reason
         assert _tip(two_repo.origin_a) == tip_a
+        assert _tip(two_repo.origin_b) == tip_b
+        for clone in (two_repo.clone_a, two_repo.clone_b):
+            assert not (clone / ".git" / "rebase-merge").exists()
+            assert not (clone / ".git" / "rebase-apply").exists()
+        assert "outcome=land_conflict_not_resolved" in caplog.text
+        assert "decision=relaunch" in caplog.text
+        assert "verdict=halt" in caplog.text
+        assert refuse.await_args.kwargs["land_conflict"] == {"repo-b": ["f.txt"]}
 
     async def test_non_landing_repo_ahead_after_fix_halts(self, two_repo, gtd) -> None:
         _squash(two_repo.clone_a)
@@ -1826,3 +1877,539 @@ class TestFixRelaunchAfterABoardTimeout:
         assert calls[1] is not None  # the second launch was the fix relaunch
         gtd.get_item.assert_awaited_once()
         gtd.complete_in_rollout.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Land rebase conflict: origin advanced between review and land
+# ---------------------------------------------------------------------------
+
+_BASE = "BASE = 0\n"
+_LINE_A = "LINE_A = 1\n"  # origin's append, landed during review
+_LINE_B = "LINE_B = 2\n"  # the squash commit's append
+_BOTH = _BASE + _LINE_A + _LINE_B
+_BOTH_GATE = "grep -q LINE_A registry.py && grep -q LINE_B registry.py"
+
+
+def _git_continue(repo: Path, *args: str, check: bool = True):
+    return subprocess.run(
+        ["git", *_GIT_ID, *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=check,
+        env={**os.environ, "GIT_EDITOR": "true"},
+    )
+
+
+def _advance_during_review(
+    seed: Path,
+    clone: Path,
+    ws: dispatch.RolloutWorkspace,
+    *,
+    name: str = "registry.py",
+    base: str = _BASE,
+    ours: str = _LINE_B,
+    theirs: str = _LINE_A,
+) -> tuple[dict[str, str], str]:
+    """Seed *name*, approve a squash appending *ours*, then land *theirs*.
+
+    Returns ``(pre_review_origin, origin tip after the advance)``.  Both sides
+    append at the end of the same file, so the land's rebase conflicts.
+    """
+    _git(seed, "pull", "-q", "origin", "main")
+    _write_or_delete(seed, name, base)
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-qm", f"seed {name}")
+    _git(seed, "push", "-q", "origin", "main")
+    _git(clone, "pull", "-q", "origin", "main")
+    pre = _pre(ws)
+    _squash(clone, filename=name, content=base + ours)
+    _write_or_delete(seed, name, base + theirs)
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-qm", f"origin appends to {name}")
+    _git(seed, "push", "-q", "origin", "main")
+    return pre, _git(seed, "rev-parse", "HEAD")
+
+
+def _resolver(
+    clone: Path,
+    *,
+    name: str = "registry.py",
+    content: str | None = _BOTH,
+    report: tuple[str, ...] = ("registry.py",),
+    rebase: bool = True,
+    verdict: str = "merge",
+    after=None,
+):
+    """A fake LAND CONFLICT MODE reviewer working in *clone*.
+
+    Re-runs the rebase without fetching; on a merge verdict writes *content*
+    (None keeps git's conflicted file, markers and all), stages it and
+    continues.  *after* runs last (pushes from elsewhere, and so on).
+    """
+
+    async def fake(*_a, **_kw):
+        if rebase:
+            _git_continue(clone, "rebase", "origin/main", check=False)
+            if verdict == "merge":
+                if content is not None:
+                    (clone / name).write_text(content)
+                _git(clone, "add", name)
+                _git_continue(clone, "rebase", "--continue")
+        if after is not None:
+            after()
+        return ReviewVerdict(
+            verdict,
+            "kept both appends",
+            "",
+            "",
+            resolved_conflict_paths=report if verdict == "merge" else (),
+        )
+
+    return fake
+
+
+def _no_rebase_dirs(clone: Path) -> bool:
+    return (
+        not (clone / ".git" / "rebase-merge").exists()
+        and not (clone / ".git" / "rebase-apply").exists()
+    )
+
+
+class TestLandRebaseConflict:
+    async def test_keep_both_resolution_lands(self, mono, gtd, caplog) -> None:
+        pre, advanced = _advance_during_review(mono.seed, mono.clone, mono.ws)
+        with (
+            patch.object(
+                main, "_launch_reviewer", side_effect=_resolver(mono.clone)
+            ) as reviewer,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre, gate=_BOTH_GATE)
+        assert isinstance(result, ReviewVerdict)
+        gtd.halt_rollout.assert_not_awaited()
+        assert "(land conflict: kept both appends)" in result.rationale
+        assert f"Item: {ITEM}" in _git(mono.origin, "log", "-1", "--format=%B", "main")
+        assert _git(mono.origin, "rev-parse", "main~1") == advanced
+        assert _git(mono.origin, "show", "main:registry.py") == _BOTH.strip()
+        reviewer.assert_awaited_once()
+        assert reviewer.await_args.kwargs["land_conflict"] == {
+            mono.clone.name: ["registry.py"]
+        }
+        assert reviewer.await_args.kwargs.get("gate_failure_output") is None
+        comment = gtd.post_comment.await_args.args[1]
+        assert (
+            f"Land rebase conflict ({mono.clone.name}): origin advanced by 1 "
+            "commit(s) during review; worker found conflicts in registry.py; "
+            "reviewer resolved keep-both: registry.py"
+        ) in comment
+        pushed = [line for line in _land_lines(caplog) if "outcome=pushed" in line]
+        assert len(pushed) == 1
+        assert (
+            "conflict_relaunches=1 rebase_conflict=code "
+            "rebase_conflict_code_paths=registry.py"
+        ) in pushed[0]
+        assert "decision=relaunch" in caplog.text
+        assert "phase=land_rebase" in caplog.text
+        assert "tip_ref=old-squash" in caplog.text
+        verdicts = [
+            r for r in caplog.records if "land-conflict-relaunch-verdict" in r.msg
+        ]
+        assert len(verdicts) == 1
+        assert verdicts[0].levelno == logging.INFO
+        assert "verdict=merge resolved=registry.py" in verdicts[0].getMessage()
+        assert _no_rebase_dirs(mono.clone)
+
+    async def test_lockfile_conflict_halts_without_relaunch(
+        self, mono, gtd, caplog
+    ) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws, name="uv.lock")
+        before = _tip(mono.origin)
+        reviewer = AsyncMock()
+        with (
+            patch.object(main, "_launch_reviewer", reviewer),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre)
+        assert result == main._TICK_HALTED
+        reviewer.assert_not_awaited()
+        assert _halt_reason(gtd) == (
+            f"land rebase conflict for item {ITEM} in repo {mono.clone.name}: "
+            "conflicting paths: uv.lock; lockfiles cannot be resolved by keeping "
+            "both sides: uv.lock"
+        )
+        assert "decision=halt_lockfile" in caplog.text
+        assert "outcome=rebase_conflict" in caplog.text
+        assert _tip(mono.origin) == before
+
+    async def test_code_conflict_without_gate_halts_without_relaunch(
+        self, mono, gtd, caplog
+    ) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws)
+        reviewer = AsyncMock()
+        with (
+            patch.object(main, "_launch_reviewer", reviewer),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre, gate=None)
+        assert result == main._TICK_HALTED
+        reviewer.assert_not_awaited()
+        assert _halt_reason(gtd) == (
+            f"land rebase conflict for item {ITEM} in repo {mono.clone.name}: "
+            "conflicting paths: registry.py; code conflicts need a gate_command "
+            "to verify the merged tree: registry.py"
+        )
+        assert "decision=halt_needs_gate" in caplog.text
+        assert "gate=off" in caplog.text
+
+    async def test_doc_conflict_without_gate_relaunches_and_lands(
+        self, mono, gtd, caplog
+    ) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws, name="notes.md")
+        fake = _resolver(mono.clone, name="notes.md", report=("notes.md",))
+        with (
+            patch.object(main, "_launch_reviewer", side_effect=fake) as reviewer,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre, gate=None)
+        assert isinstance(result, ReviewVerdict)
+        reviewer.assert_awaited_once()
+        assert "decision=relaunch" in caplog.text
+        assert _git(mono.origin, "show", "main:notes.md") == _BOTH.strip()
+        pushed = [line for line in _land_lines(caplog) if "outcome=pushed" in line]
+        assert "rebase_conflict=doc rebase_conflict_code_paths=-" in pushed[0]
+
+    async def test_markers_left_in_the_resolution_halt(self, mono, gtd, caplog) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws)
+        before = _tip(mono.origin)
+        fake = _resolver(mono.clone, content=None)
+        with (
+            patch.object(main, "_launch_reviewer", side_effect=fake),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre, gate=_BOTH_GATE)
+        assert result == main._TICK_HALTED
+        reason = _halt_reason(gtd)
+        assert reason.startswith(f"land refused for item {ITEM}")
+        assert "conflict markers remain in: registry.py" in reason
+        assert "outcome=conflict_markers" in caplog.text
+        assert _tip(mono.origin) == before
+
+    async def test_unreported_resolution_halts(self, mono, gtd, caplog) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws)
+        fake = _resolver(mono.clone, report=())
+        with (
+            patch.object(main, "_launch_reviewer", side_effect=fake),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre, gate=_BOTH_GATE)
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd) == (
+            f"land refused for item {ITEM}: repo {mono.clone.name}: the land "
+            "rebase conflicts on paths the reviewer did not report resolving: "
+            "registry.py"
+        )
+        assert "outcome=unreported_conflict" in caplog.text
+
+    async def test_red_gate_after_resolution_halts_without_fix_mode(
+        self, mono, gtd, caplog
+    ) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws)
+        before = _tip(mono.origin)
+        with (
+            patch.object(
+                main, "_launch_reviewer", side_effect=_resolver(mono.clone)
+            ) as reviewer,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre, gate="false")
+        assert result == main._TICK_HALTED
+        reviewer.assert_awaited_once()
+        assert "gate_failure_output" not in reviewer.await_args.kwargs
+        reason = _halt_reason(gtd)
+        assert reason.startswith(
+            f"land gate failed for item {ITEM} after keep-both conflict "
+            "resolution in registry.py:"
+        )
+        assert "land-fix-relaunch-skipped" in caplog.text
+        assert _tip(mono.origin) == before
+
+    async def test_second_conflict_exhausts_the_budget(
+        self, mono, gtd, caplog, tmp_path: Path
+    ) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws)
+        other = _clone(mono.origin, tmp_path / "other")
+        marker = tmp_path / "raced"
+        gate = (
+            f"if [ ! -f {marker} ]; then touch {marker}; cd {other} && "
+            "git pull -q origin main && echo 'LINE_C = 3' >> registry.py && "
+            "git commit -qam race && git push -q origin main; fi; true"
+        )
+        with (
+            patch.object(
+                main, "_launch_reviewer", side_effect=_resolver(mono.clone)
+            ) as reviewer,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre, gate=gate)
+        assert result == main._TICK_HALTED
+        reviewer.assert_awaited_once()
+        reason = _halt_reason(gtd)
+        assert reason.startswith(f"land rebase conflict for item {ITEM}")
+        assert reason.endswith("; land conflict relaunch budget exhausted (1/1)")
+        assert "decision=halt_budget" in caplog.text
+        assert "outcome=non_fast_forward" in caplog.text
+        assert f"Item: {ITEM}" not in _git(mono.origin, "log", "--format=%B", "main")
+
+    async def test_origin_advancing_again_during_the_relaunch_lands(
+        self, mono, gtd, caplog, tmp_path: Path
+    ) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws)
+        other = _clone(mono.origin, tmp_path / "other")
+        raced: list[str] = []
+
+        def push_unrelated() -> None:
+            raced.append(_commit_unrelated(other, "unrelated.txt"))
+
+        fake = _resolver(mono.clone, after=push_unrelated)
+        with (
+            patch.object(main, "_launch_reviewer", side_effect=fake) as reviewer,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre, gate=_BOTH_GATE)
+        assert isinstance(result, ReviewVerdict)
+        reviewer.assert_awaited_once()
+        gtd.halt_rollout.assert_not_awaited()
+        assert "bad_local_state" not in caplog.text
+        assert _git(mono.origin, "rev-parse", "main~1") == raced[0]
+        assert f"Item: {ITEM}" in _git(mono.origin, "log", "-1", "--format=%B", "main")
+        assert _git(mono.origin, "show", "main:registry.py") == _BOTH.strip()
+
+    async def test_reviewer_pushing_the_resolution_halts(
+        self, mono, gtd, caplog
+    ) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws)
+
+        def push_it() -> None:
+            _git(mono.clone, "push", "-q", "origin", "HEAD:main")
+
+        fake = _resolver(mono.clone, after=push_it)
+        with patch.object(main, "_launch_reviewer", side_effect=fake):
+            result = await _land(mono.ws, pre, gate=_BOTH_GATE)
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd).startswith(
+            f"commit for item {ITEM} appeared on origin during review"
+        )
+
+    async def test_merge_without_rebasing_halts(self, mono, gtd, caplog) -> None:
+        pre, advanced = _advance_during_review(mono.seed, mono.clone, mono.ws)
+        fake = _resolver(mono.clone, rebase=False)
+        with (
+            patch.object(main, "_launch_reviewer", side_effect=fake),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre, gate=_BOTH_GATE)
+        assert result == main._TICK_HALTED
+        reason = _halt_reason(gtd)
+        assert reason.startswith(f"land bad local state for item {ITEM}")
+        assert "rebase not completed onto origin/main" in reason
+        assert f"expected {advanced}" in reason
+        assert "check=parent_not_target" in caplog.text
+
+    async def test_rebase_left_in_progress_on_merge_halts(
+        self, mono, gtd, caplog
+    ) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws)
+
+        async def leave_it(*_a, **_kw):
+            _git_continue(mono.clone, "rebase", "origin/main", check=False)
+            return ReviewVerdict(
+                "merge", "done", "", "", resolved_conflict_paths=("registry.py",)
+            )
+
+        with (
+            patch.object(main, "_launch_reviewer", side_effect=leave_it),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre, gate=_BOTH_GATE)
+        assert result == main._TICK_HALTED
+        assert "rebase not completed onto origin/main" in _halt_reason(gtd)
+        assert "check=rebase_in_progress" in caplog.text
+
+    async def test_halt_leaving_a_rebase_aborts_it(self, mono, gtd, caplog) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws)
+        squash = _git(mono.clone, "rev-parse", "HEAD")
+        fake = _resolver(mono.clone, verdict="halt")
+        with (
+            patch.object(main, "_launch_reviewer", side_effect=fake),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre, gate=_BOTH_GATE)
+        assert result == main._TICK_HALTED
+        assert "outcome=land_conflict_not_resolved" in caplog.text
+        assert _halt_reason(gtd).startswith(
+            f"land rebase conflict for item {ITEM} in repo(s) {mono.clone.name}: "
+            "the reviewer did not resolve it (halt): kept both appends"
+        )
+        assert _no_rebase_dirs(mono.clone)
+        assert _git(mono.clone, "rev-parse", "HEAD") == squash
+
+    async def test_two_repo_conflict_in_one_repo_lands(
+        self, two_repo, gtd, caplog
+    ) -> None:
+        _git(two_repo.seed_b, "pull", "-q", "origin", "main")
+        (two_repo.seed_b / "registry.py").write_text(_BASE)
+        _git(two_repo.seed_b, "add", "-A")
+        _git(two_repo.seed_b, "commit", "-qm", "seed registry")
+        _git(two_repo.seed_b, "push", "-q", "origin", "main")
+        _git(two_repo.clone_b, "pull", "-q", "origin", "main")
+        pre = _pre(two_repo.ws)
+        _squash(two_repo.clone_a)
+        _squash(two_repo.clone_b, filename="registry.py", content=_BASE + _LINE_B)
+        (two_repo.seed_b / "registry.py").write_text(_BASE + _LINE_A)
+        _git(two_repo.seed_b, "commit", "-qam", "origin appends")
+        _git(two_repo.seed_b, "push", "-q", "origin", "main")
+        fake = _resolver(two_repo.clone_b, report=("repo-b/registry.py",))
+        with (
+            patch.object(main, "_launch_reviewer", side_effect=fake) as reviewer,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(two_repo.ws, pre, gate=f"cd repo-b && {_BOTH_GATE}")
+        assert isinstance(result, ReviewVerdict)
+        gtd.halt_rollout.assert_not_awaited()
+        reviewer.assert_awaited_once()
+        assert reviewer.await_args.kwargs["land_conflict"] == {
+            "repo-b": ["registry.py"]
+        }
+        for origin in (two_repo.origin_a, two_repo.origin_b):
+            assert f"Item: {ITEM}" in _git(origin, "log", "-1", "--format=%B", "main")
+        assert "repos=repo-b paths=repo-b/registry.py" in caplog.text
+        comment = gtd.post_comment.await_args.args[1]
+        assert (
+            "Land rebase conflict (repo-b): origin advanced by 1 commit(s) during "
+            "review; worker found conflicts in registry.py; reviewer resolved "
+            "keep-both: registry.py"
+        ) in comment
+
+    async def test_recompute_mismatch_uses_the_union(self, mono, gtd, caplog) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws)
+        real = dispatch.land_conflict_paths
+        calls: list[int] = []
+
+        def extra(repo, base, tip, timeout):
+            calls.append(1)
+            paths = real(repo, base, tip, timeout)
+            # The squash-phase guard runs first; only the land_rebase phase
+            # recompute is skewed.
+            return [*paths, "base.txt"] if len(calls) > 1 else paths
+
+        with (
+            patch.object(main, "_launch_reviewer", side_effect=_resolver(mono.clone)),
+            patch.object(dispatch, "land_conflict_paths", side_effect=extra),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre, gate=_BOTH_GATE)
+        assert isinstance(result, ReviewVerdict)
+        mismatch = [
+            r for r in caplog.records if "land-conflict-recompute-mismatch" in r.msg
+        ]
+        assert len(mismatch) == 1
+        assert mismatch[0].levelno == logging.WARNING
+        assert (
+            "rebase_paths=registry.py recomputed=registry.py,base.txt"
+            in mismatch[0].getMessage()
+        )
+        comment = gtd.post_comment.await_args.args[1]
+        assert "worker found conflicts in base.txt, registry.py;" in comment
+        assert "(mismatch: unreported base.txt)" in comment
+
+
+class TestLandRebaseConflictUnits:
+    def _lander(self, mono, *, gate: str = "true") -> main._Lander:
+        lander = main._Lander(
+            ROLLOUT,
+            ITEM,
+            _verdict(),
+            project={"name": "P", "gate_command": gate},
+            workspace=mono.ws,
+            pre_review_origin=mono.pre,
+            reviewer_engine=get_engine("claude-code-sonnet"),
+            loop_run_id="1",
+            token=None,
+            attribution=None,
+        )
+        lander.landing = [mono.clone.name]
+        return lander
+
+    def test_decision_order(self, mono) -> None:
+        repo = mono.clone.name
+        lander = self._lander(mono)
+        fails = [(repo, ["uv.lock", "a.py"], "")]
+        assert lander._rebase_conflict_decision(fails)[0] == "halt_lockfile"
+        assert lander._rebase_conflict_decision([(repo, [], "x")])[0] == (
+            "halt_no_paths"
+        )
+        lander.conflict_relaunches = 1
+        assert lander._rebase_conflict_decision(fails)[0] == "halt_budget"
+        lander.pushed = {repo: "abc"}
+        assert lander._rebase_conflict_decision(fails) == (
+            "halt_already_pushed",
+            repo,
+            "",
+        )
+        nogate = self._lander(mono, gate="")
+        assert nogate._rebase_conflict_decision([(repo, ["a.py"], "")])[0] == (
+            "halt_needs_gate"
+        )
+        assert nogate._rebase_conflict_decision([(repo, ["a.md"], "")])[0] == (
+            "relaunch"
+        )
+
+    async def test_launch_reviewer_rejects_both_modes(self, mono) -> None:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            await main._launch_reviewer(
+                ROLLOUT,
+                ITEM,
+                project={},
+                workspace=mono.ws,
+                reviewer_engine=get_engine("claude-code-sonnet"),
+                token=None,
+                attribution=None,
+                gate_failure_output="boom",
+                land_conflict={"r": ["a.py"]},
+            )
+
+    async def test_abort_failure_only_warns(self, mono, caplog) -> None:
+        lander = self._lander(mono)
+        with (
+            patch.object(
+                dispatch, "land_rebase_in_progress", side_effect=OSError("nope")
+            ),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            await lander._abort_leftover_rebase(mono.clone.name)
+        assert "land-conflict-abort-failed" in caplog.text
+
+    def test_rebase_helpers(self, mono) -> None:
+        assert dispatch.land_rebase_in_progress(mono.clone, 30) == []
+        assert dispatch.land_rebase_abort(mono.clone, 30) != ""
+
+    async def test_abort_moving_head_is_an_invariant_violation(
+        self, mono, gtd, caplog
+    ) -> None:
+        pre, _ = _advance_during_review(mono.seed, mono.clone, mono.ws)
+        real = dispatch.land_rebase
+
+        def moving(repo, branch, timeout):
+            result = real(repo, branch, timeout)
+            _git(repo, "commit", "--allow-empty", "-qm", "sneaky")
+            return result
+
+        with (
+            patch.object(dispatch, "land_rebase", side_effect=moving),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, pre)
+        assert result == main._TICK_HALTED
+        assert "HEAD moved across an aborted rebase" in _halt_reason(gtd)
+        assert "kind=rebase_abort_moved_head" in caplog.text
