@@ -1762,18 +1762,24 @@ class TestWorkspaceProjects:
 
 
 async def _tick_until_settled(loop_state, *, max_ticks=10, **kwargs):
-    """Run wave ticks, awaiting child review/land tasks between them."""
+    """Run wave ticks, awaiting child review/land tasks between them.
+
+    The tick's loop-fencing check reads this host's runs for the rollout from
+    the local SQLite db. Stub it to "no runs" so the test never depends on
+    config.WORKSPACE_ROOT existing (it does on a dispatch host, not elsewhere).
+    """
     directive = None
-    for _ in range(max_ticks):
-        directive = await main._rollout_wave_tick(
-            ROLLOUT, loop_state=loop_state, **kwargs
-        )
-        tasks = [e.task for e in loop_state.reviews.values()]
-        if loop_state.active_land is not None:
-            tasks.append(loop_state.active_land.task)
-        if not tasks:
-            return directive
-        await asyncio.gather(*tasks, return_exceptions=True)
+    with patch.object(main.db, "list_runs_by_rollout", AsyncMock(return_value=[])):
+        for _ in range(max_ticks):
+            directive = await main._rollout_wave_tick(
+                ROLLOUT, loop_state=loop_state, **kwargs
+            )
+            tasks = [e.task for e in loop_state.reviews.values()]
+            if loop_state.active_land is not None:
+                tasks.append(loop_state.active_land.task)
+            if not tasks:
+                return directive
+            await asyncio.gather(*tasks, return_exceptions=True)
     return directive
 
 
