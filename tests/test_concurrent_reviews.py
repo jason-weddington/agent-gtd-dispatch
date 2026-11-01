@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import functools
 import logging
 import os
 import signal
@@ -1656,3 +1657,281 @@ class TestHelpers:
             assert pool._max_workers == 4
         finally:
             dispatch.init_executor()
+
+
+# ---------------------------------------------------------------------------
+# Resume behind a deferred exit (item 25e97fff): a lead's resume whose relaunch
+# is refused by the still-live loop must leave that loop driving the rollout.
+# ---------------------------------------------------------------------------
+
+
+def _records(caplog, needle: str) -> list[str]:
+    return [r.getMessage() for r in caplog.records if needle in r.getMessage()]
+
+
+def _blocked_land(item_id: str = "x") -> tuple[asyncio.Event, asyncio.Task[Any]]:
+    release = asyncio.Event()
+
+    async def _land():
+        await release.wait()
+        return _TICK_CONTINUE
+
+    return release, asyncio.create_task(_land())
+
+
+class TestResumeBehindDeferredExit:
+    @pytest.mark.parametrize(
+        ("parked", "step1_status"),
+        [(_TICK_HALTED, "halted"), (_TICK_DONE, "completed")],
+    )
+    async def test_resume_during_land_keeps_the_live_loop_driving(
+        self, tmp_path, caplog, parked, step1_status
+    ) -> None:
+        caplog.set_level(logging.INFO, logger=LOGGER)
+        reviewer = FakeReviewer()
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_launch_reviewer", new=reviewer),
+        ):
+            _wire(ctx, tmp_path)
+            release, land_task = _blocked_land()
+            ls = _RolloutLoopState(
+                slots={0: _ws(tmp_path, 0)},
+                active_land=_ActiveLand("x", 0, land_task, 0.0),
+            )
+            first = _loop_run()
+            first.id = "loop-run-1"
+            first.rollout_id = ROLLOUT
+            ctx.rollout_loops[ROLLOUT] = first
+
+            # Step 1: the rollout halts (or completes) mid-land.
+            _board(ctx, in_progress=["x"], status=step1_status)
+            assert await _tick(ctx, ls) == _TICK_WAIT
+            assert ls.pending_directive == parked
+
+            # Step 2: a resume makes it running; the relaunch is refused.
+            _board(ctx, in_progress=["x"], next_ready=["c"])
+            second = Run(project_name="p", mode="manage", rollout_id=ROLLOUT)
+            assert main._start_rollout_loop(second) is False
+            assert ctx.rollout_loops[ROLLOUT] is first
+            assert "loop-run-1" in ctx.refused
+
+            # Step 3: the land finishes.
+            release.set()
+            await land_task
+
+            # Step 4: the live loop adopts the resume and keeps driving.
+            assert await _tick(ctx, ls) == _TICK_CONTINUE
+            assert ls.pending_directive is None
+            assert ls.active_land is None
+            assert ctx.gtd.dispatch_item.await_args.args[0] == "c"
+            assert "loop-run-1" not in ctx.refused
+            consumed = _records(
+                caplog,
+                f"rollout-loop: resume-mark-consumed rollout_id={ROLLOUT} "
+                f"run_id=loop-run-1 pending={parked} action=dropped",
+            )
+            assert len(consumed) == 1
+            assert any(
+                "Live wave loop adopted the resume"
+                in (list(c.args) + list(c.kwargs.values()))
+                for c in ctx.gtd.update_rollout_state.await_args_list
+            )
+            assert not _records(caplog, "stale-directive-exit")
+            await _cleanup(ls)
+
+    async def test_mark_survives_a_transient_board_error(self, tmp_path) -> None:
+        ls = _RolloutLoopState(
+            slots={0: _ws(tmp_path, 0)},
+            active_land=_ActiveLand("x", 0, _done_task(_TICK_CONTINUE), 0.0),
+            pending_directive=_TICK_HALTED,
+        )
+        await _yield()
+        reviewer = FakeReviewer()
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_launch_reviewer", new=reviewer),
+        ):
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=["x"], next_ready=["c"])
+            running = ctx.gtd.get_rollout.return_value
+            ctx.gtd.get_rollout = AsyncMock(side_effect=[_http_error(503), running])
+            ctx.refused.add("loop-run-1")
+            kwargs: dict[str, Any] = {
+                "project": {"name": "p", "workspace_repos": ["git@h:o/repo-a"]},
+                "loop_state": ls,
+                "reviewer_engine": MagicMock(name="reviewer"),
+                "dispatch_attempts": {},
+                "token": None,
+                "attribution": None,
+                "loop_run_id": "loop-run-1",
+            }
+            result = await main._ride_out_board_outage(
+                main._BoardOutage(ROLLOUT),
+                functools.partial(main._rollout_wave_tick, ROLLOUT, **kwargs),
+            )
+            assert result == _TICK_CONTINUE
+            assert ctx.gtd.dispatch_item.await_args.args[0] == "c"
+            assert ls.pending_directive is None
+            assert "loop-run-1" not in ctx.refused
+            await _cleanup(ls)
+
+    async def test_early_exit_leaves_the_mark(self, tmp_path) -> None:
+        ls = _RolloutLoopState(slots={0: _ws(tmp_path, 0)})
+        with _loop_patch_stack() as ctx:
+            _wire(ctx, tmp_path)
+            ctx.refused.add("loop-run-1")
+            _board(ctx, status="halted")
+            assert await _tick(ctx, ls) == _TICK_HALTED
+            assert "loop-run-1" in ctx.refused
+
+    async def test_consumed_mark_never_drops_a_later_halt(
+        self, tmp_path, caplog
+    ) -> None:
+        caplog.set_level(logging.INFO, logger=LOGGER)
+        ls = _RolloutLoopState(slots={0: _ws(tmp_path, 0)})
+        with _loop_patch_stack() as ctx:
+            _wire(ctx, tmp_path)
+            ctx.refused.add("loop-run-1")
+            _board(ctx, in_progress=["y"], in_flight=["y"])
+            assert await _tick(ctx, ls) in (_TICK_CONTINUE, _TICK_WAIT)
+            assert _records(caplog, "resume-mark-consumed")
+            assert (
+                "pending=none action=noop"
+                in _records(caplog, "resume-mark-consumed")[0]
+            )
+            assert "loop-run-1" not in ctx.refused
+
+            release, land_task = _blocked_land()
+            ls.active_land = _ActiveLand("x", 0, land_task, 0.0)
+            _board(ctx, in_progress=["x"], status="halted")
+            assert await _tick(ctx, ls) == _TICK_WAIT
+            assert ls.pending_directive == _TICK_HALTED
+            release.set()
+            await land_task
+            assert await _tick(ctx, ls) == _TICK_HALTED
+
+    async def test_superseded_is_never_dropped(self, tmp_path, caplog) -> None:
+        caplog.set_level(logging.INFO, logger=LOGGER)
+        release, land_task = _blocked_land()
+        ls = _RolloutLoopState(
+            slots={0: _ws(tmp_path, 0)},
+            active_land=_ActiveLand("x", 0, land_task, 0.0),
+        )
+        with _loop_patch_stack() as ctx:
+            _wire(ctx, tmp_path)
+            ctx.refused.add("loop-run-1")
+            _board(ctx, in_progress=["x"])
+            ctx.gtd.get_rollout.return_value["loop_remote_run_id"] = "other-host-run"
+            assert await _tick(ctx, ls) == _TICK_WAIT
+            assert ls.pending_directive == main._TICK_SUPERSEDED
+            assert not _records(caplog, "resume-mark-consumed")
+            assert "loop-run-1" in ctx.refused
+            release.set()
+            await land_task
+            assert await _tick(ctx, ls) == main._TICK_SUPERSEDED
+
+    @pytest.mark.parametrize("marked", [True, False])
+    async def test_mark_resets_the_counters(self, tmp_path, marked) -> None:
+        ls = _RolloutLoopState(slots={0: _ws(tmp_path, 0)})
+        with _loop_patch_stack() as ctx:
+            _wire(ctx, tmp_path)
+            ctx.redispatches[ROLLOUT] = {"x": main.MAX_ITEM_REDISPATCHES}
+            if marked:
+                ctx.refused.add("loop-run-1")
+            _board(ctx, next_ready=["c"])
+            await _tick(
+                ctx,
+                ls,
+                dispatch_attempts={"c": main._MAX_DISPATCH_ATTEMPTS_PER_ITEM},
+            )
+            if marked:
+                assert ctx.gtd.dispatch_item.await_args.args[0] == "c"
+                ctx.gtd.halt_rollout.assert_not_awaited()
+                assert "x" not in ctx.redispatches.get(ROLLOUT, {})
+            else:
+                ctx.gtd.halt_rollout.assert_awaited()
+
+    async def test_refusal_during_the_exit_tick_defers_the_exit(
+        self, tmp_path, caplog
+    ) -> None:
+        caplog.set_level(logging.INFO, logger=LOGGER)
+        with _loop_patch_stack() as ctx:
+            _wire(ctx, tmp_path)
+            run = _loop_run()
+            ctx.rollout_loops[ROLLOUT] = run
+            ctx.gtd.get_project = AsyncMock(
+                return_value={"name": "p", "workspace_repos": []}
+            )
+            reads = {"n": 0}
+
+            async def _get_rollout(*_a, **_kw):
+                reads["n"] += 1
+                status = "running"
+                if reads["n"] == 2:  # the first loop tick's read
+                    status = "halted"
+                    ctx.refused.add(run.id)
+                return {"project_id": "proj", "status": status, "inFlightBuildRuns": []}
+
+            async def _advance(*_a, **_kw):
+                done = ctx.gtd.dispatch_item.await_count > 0
+                return {
+                    "next_ready": [] if done else ["c"],
+                    "in_progress": [],
+                    "blocked": [],
+                    "graph_complete": done,
+                }
+
+            ctx.gtd.get_rollout = AsyncMock(side_effect=_get_rollout)
+            ctx.gtd.advance_rollout = AsyncMock(side_effect=_advance)
+            result = await asyncio.wait_for(main._drive_rollout(run), 2.0)
+            assert result == _TICK_DONE
+            assert ctx.gtd.dispatch_item.await_args.args[0] == "c"
+            deferred = _records(caplog, "exit-deferred-for-refused-relaunch")
+            assert len(deferred) == 1
+            assert "directive=halted" in deferred[0]
+            assert run.id not in ctx.refused
+
+    async def test_a_mark_defers_at_most_one_exit(self, tmp_path, caplog) -> None:
+        caplog.set_level(logging.INFO, logger=LOGGER)
+        with _loop_patch_stack() as ctx:
+            _wire(ctx, tmp_path)
+            run = _loop_run()
+            ctx.rollout_loops[ROLLOUT] = run
+            ctx.refused.add(run.id)
+            ctx.gtd.get_project = AsyncMock(
+                return_value={"name": "p", "workspace_repos": []}
+            )
+            _board(ctx, status="halted")
+            ctx.gtd.get_rollout.return_value["project_id"] = "proj"
+            result = await asyncio.wait_for(main._drive_rollout(run), 2.0)
+            assert result == _TICK_HALTED
+            assert len(_records(caplog, "exit-deferred-for-refused-relaunch")) == 1
+            assert run.id not in ctx.refused
+
+    @pytest.mark.parametrize(
+        ("outcome", "reason"),
+        [(RuntimeError("boom"), "crashed"), (_TICK_DONE, "done")],
+    )
+    async def test_worker_drops_the_mark_on_exit(self, caplog, outcome, reason) -> None:
+        caplog.set_level(logging.INFO, logger=LOGGER)
+        with _loop_patch_stack() as ctx:
+            run = _loop_run()
+            ctx.rollout_loops[ROLLOUT] = run
+
+            async def _drive(r, **_kw):
+                ctx.refused.add(r.id)
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+
+            with patch.object(
+                main, "_drive_rollout", new=AsyncMock(side_effect=_drive)
+            ):
+                await main._rollout_loop_worker(run)
+            assert run.id not in ctx.refused
+            assert ROLLOUT not in ctx.rollout_loops
+            assert any(
+                "rollout-loop: exit" in m and f"directive={reason}" in m
+                for m in _records(caplog, "rollout-loop: exit ")
+            )

@@ -161,10 +161,42 @@ _retention_task: asyncio.Task[None] | None = None  # handle for clean shutdown
 # relaunch a loop) can start a second loop for a rollout already driven here.
 # A loop deregisters synchronously the moment it decides to exit (see
 # `_drive_rollout`), so a relaunch arriving after that is not refused by a
-# loop that is already leaving.  It is NOT relaunch bookkeeping — the resident-manager keep-alive machinery
+# loop that is already leaving.  A relaunch that IS refused (the loop is
+# still live, e.g. finishing a land behind a halt) marks the live loop in
+# `_refused_relaunch_runs`, so that loop adopts the resume instead of
+# exiting on its stale halt.  It is NOT relaunch bookkeeping — the resident-manager keep-alive machinery
 # that used to share this map (relaunch ladder, staleness watchdog, free-
 # relaunch tallies, retry caps) was retired once the worker owned the loop.
 _rollout_loops: dict[str, Run] = {}
+
+# Run ids of LIVE rollout loops on this host that some second MANAGE run for
+# the same rollout was refused against since the loop last consumed the mark.
+# The loop consumes it in `_rollout_wave_tick` (drops a parked DONE/HALTED and
+# keeps driving) or at its exit point in `_drive_rollout` (defers one exit),
+# so a lead's resume that races a deferred exit never leaves zero loops.
+_refused_relaunch_runs: set[str] = set()
+
+
+def _note_refused_relaunch(
+    rollout_id: str, *, via: Literal["dispatch-409", "choke-point"]
+) -> None:
+    """Mark the live loop driving *rollout_id* as having had a relaunch refused.
+
+    Synchronous on purpose (no await): the mark and the refusal it records are
+    one atomic step on the event loop.  A refusal caused only by a queued
+    ``_pending_queue`` entry marks nothing.
+    """
+    live = _rollout_loops.get(rollout_id)
+    if live is not None:
+        _refused_relaunch_runs.add(live.id)
+    logger.info(
+        "rollout-loop: relaunch-refused rollout_id=%s via=%s live_run_id=%s marked=%s",
+        rollout_id,
+        via,
+        live.id if live is not None else "-",
+        "true" if live is not None else "false",
+    )
+
 
 # Strong references to fire-and-forget bookkeeping tasks (e.g. cancelling a
 # refused loop row from a synchronous caller) so they are not GC'd mid-flight.
@@ -5158,7 +5190,9 @@ async def _halt_teardown(
 
     Tears down every review, drops the land queue WITHOUT landing, and never
     cancels the active land: while one runs, *directive* is parked in
-    ``pending_directive`` and the tick waits for that land to finish.
+    ``pending_directive`` and the tick waits for that land to finish.  A
+    parked DONE/HALTED is dropped instead of returned when a refused relaunch
+    marked this loop before the next running tick (resume-mark-consumed).
     """
     cancelled = await _teardown_reviews(loop_state, rollout_id=rollout_id)
     dropped = [q.item_id for q in loop_state.land_queue]
@@ -5384,7 +5418,9 @@ async def _rollout_wave_tick(
     (``active_land``), lands start in harvest order, and ``_Lander`` rebases
     each onto the LIVE origin tip and gates that exact tree — so a review done
     against an older base is still gated on the post-merge tip.  No halt ever
-    cancels a land: the DONE/HALTED exits wait for it (``pending_directive``).
+    cancels a land: the DONE/HALTED exits wait for it (``pending_directive``),
+    unless a refused relaunch marked this loop (resume-mark-consumed): then the
+    parked DONE/HALTED is dropped and the loop keeps driving the resumed rollout.
 
     Drain parking.  When the board reports the loop's host draining
     (``loop_host_drain_reason`` on ``get_rollout``), the tick starts no new
@@ -5497,6 +5533,39 @@ async def _rollout_wave_tick(
 
     in_flight = _in_flight_build_runs(rollout)
     completed = _completed_build_item_ids(advance, in_flight)
+
+    # Resume adoption.  A lead's resume whose relaunch was refused because
+    # this loop is still live marked it; consume the mark HERE, past every
+    # early exit and every board call in the prologue that can raise, so a
+    # re-run tick still finds it and an early exit leaves it set.  Fully
+    # synchronous from the membership check to the directive change.
+    adopted_resume = False
+    if loop_run_id in _refused_relaunch_runs:
+        _refused_relaunch_runs.discard(loop_run_id)
+        pending_mark = loop_state.pending_directive
+        if pending_mark in (_TICK_HALTED, _TICK_DONE):
+            loop_state.pending_directive = None
+            mark_action = "dropped"
+        elif pending_mark == _TICK_SUPERSEDED:
+            mark_action = "kept-superseded"
+        else:
+            mark_action = "noop"
+        if mark_action != "kept-superseded":
+            dispatch_attempts.clear()
+            _rollout_redispatches.pop(rollout_id, None)
+        logger.info(
+            "rollout-loop: resume-mark-consumed rollout_id=%s run_id=%s "
+            "pending=%s action=%s",
+            rollout_id,
+            loop_run_id,
+            pending_mark or "none",
+            mark_action,
+        )
+        adopted_resume = mark_action == "dropped"
+    if adopted_resume:
+        await _publish_rollout_phase(
+            rollout_id, "warm_up", step="Live wave loop adopted the resume", token=token
+        )
 
     # Merged-but-unrecorded items: drop any that left `in_progress` (recorded
     # by someone else, or reset), retry the due ones, and never re-review them.
@@ -5673,6 +5742,16 @@ async def _rollout_wave_tick(
             return _TICK_WAIT
         directive = loop_state.pending_directive
         loop_state.pending_directive = None
+        if directive in (_TICK_HALTED, _TICK_DONE):
+            # Only reachable after the status == 'running' check: the board
+            # says running yet this loop is about to exit (zero-loop risk).
+            logger.warning(
+                "rollout-loop: stale-directive-exit rollout_id=%s run_id=%s "
+                "directive=%s board_status=running",
+                rollout_id,
+                loop_run_id,
+                directive,
+            )
         return directive
 
     # (c) DRAIN check.
@@ -6296,11 +6375,30 @@ async def _drive_rollout(
                 parked_ticks = 0
                 last_park_warn_at = None
             if directive in (_TICK_DONE, _TICK_HALTED, _TICK_SUPERSEDED):
-                # Deregister NOW, synchronously, before any further await
-                # (workspace cleanup, the worker's db.update_run): a lead's
-                # resume that relaunches the loop after this tick read
-                # 'halted' must start a fresh loop, not be refused by this
-                # one, which is already leaving.
+                # A relaunch refused against this loop while the tick awaited
+                # (the mark) means a resume made the rollout running again:
+                # defer this DONE/HALTED exit once and re-read the board at
+                # once.  The mark is discarded, so it defers at most one exit.
+                # Otherwise deregister NOW.  No await separates the mark check
+                # from _deregister_rollout_loop, so a refusal lands either
+                # before the check (this loop keeps driving) or after the
+                # deregistration (nothing is refused; a fresh loop starts):
+                # never zero loops, never two.
+                if (
+                    directive in (_TICK_DONE, _TICK_HALTED)
+                    and run.id in _refused_relaunch_runs
+                ):
+                    _refused_relaunch_runs.discard(run.id)
+                    dispatch_attempts.clear()
+                    _rollout_redispatches.pop(rollout_id, None)
+                    logger.info(
+                        "rollout-loop: exit-deferred-for-refused-relaunch "
+                        "rollout_id=%s run_id=%s directive=%s",
+                        rollout_id,
+                        run.id,
+                        directive,
+                    )
+                    continue
                 _deregister_rollout_loop(run)
                 return directive
             if directive == _TICK_WAIT:
@@ -6385,10 +6483,12 @@ async def _rollout_loop_worker(run: Run, *, attribution: str | None = None) -> N
     """
     assert run.rollout_id is not None  # noqa: S101
     started = datetime.now(UTC).isoformat()
+    exit_reason = "crashed"
     try:
         await db.update_run(run.id, status=RunStatus.running, started_at=started)
         _publish_run_event(run.id, "running", None)
         directive = await _drive_rollout(run, attribution=attribution)
+        exit_reason = directive
         finished = datetime.now(UTC).isoformat()
         status = RunStatus.succeeded if directive == _TICK_DONE else RunStatus.failed
         await db.update_run(
@@ -6399,6 +6499,7 @@ async def _rollout_loop_worker(run: Run, *, attribution: str | None = None) -> N
         )
         _publish_run_event(run.id, status.value, finished)
     except asyncio.CancelledError:
+        exit_reason = "cancelled"
         cancelled = datetime.now(UTC).isoformat()
         await db.update_run(run.id, status=RunStatus.cancelled, completed_at=cancelled)
         _publish_run_event(run.id, "cancelled", cancelled)
@@ -6417,12 +6518,16 @@ async def _rollout_loop_worker(run: Run, *, attribution: str | None = None) -> N
         _publish_run_event(run.id, "failed", failed)
     finally:
         _parked_rollout_loops.discard(run.id)
+        _refused_relaunch_runs.discard(run.id)
         _active_processes.pop(run.id, None)
         _try_start_pending()
         _run_event_queues.pop(run.id, None)
         _deregister_rollout_loop(run)
         logger.info(
-            "rollout-loop: exit rollout_id=%s run_id=%s", run.rollout_id, run.id
+            "rollout-loop: exit rollout_id=%s run_id=%s directive=%s",
+            run.rollout_id,
+            run.id,
+            exit_reason,
         )
 
 
@@ -6474,6 +6579,7 @@ def _start_rollout_loop(run: Run, *, attribution: str | None = None) -> bool:
             run.id,
             live.id,
         )
+        _note_refused_relaunch(run.rollout_id, via="choke-point")
         return False
     _rollout_loops[run.rollout_id] = run
     task = asyncio.create_task(_rollout_loop_worker(run, attribution=attribution))
@@ -8301,6 +8407,7 @@ async def dispatch_item(
     if body.mode == DispatchMode.MANAGE and body.rollout_id:
         _driver = _live_rollout_driver(body.rollout_id)
         if _driver is not None:
+            _note_refused_relaunch(body.rollout_id, via="dispatch-409")
             raise HTTPException(
                 status_code=409,
                 detail=(

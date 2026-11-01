@@ -73,6 +73,7 @@ def _loop_patch_stack():
         patch("agent_gtd_dispatch.main._rollout_redispatches", {}) as redispatches,
         patch("agent_gtd_dispatch.main._rollout_unrecorded_merges", {}) as unrecorded,
         patch("agent_gtd_dispatch.main._parked_rollout_loops", set()) as parked,
+        patch("agent_gtd_dispatch.main._refused_relaunch_runs", set()) as refused,
     ):
         mock_gtd.update_rollout_state = AsyncMock()
         mock_gtd.post_comment = AsyncMock()
@@ -97,6 +98,7 @@ def _loop_patch_stack():
             redispatches=redispatches,
             unrecorded=unrecorded,
             parked=parked,
+            refused=refused,
         )
 
 
@@ -3209,7 +3211,7 @@ class TestSurvivingManageBehaviour:
 
 class TestOneLoopPerRolloutGuard:
     async def test_choke_point_registers_synchronously_and_refuses_a_duplicate(
-        self,
+        self, caplog
     ) -> None:
         from agent_gtd_dispatch import main
 
@@ -3229,9 +3231,20 @@ class TestOneLoopPerRolloutGuard:
             assert first.id in ctx.active
 
             second = _make_run()
-            assert main._start_rollout_loop(second) is False
+            with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+                assert main._start_rollout_loop(second) is False
             assert ctx.rollout_loops["rollout-abc"] is first
             assert second.id not in ctx.active
+            assert first.id in ctx.refused
+            assert second.id not in ctx.refused
+            marks = [
+                r
+                for r in caplog.records
+                if "relaunch-refused" in r.getMessage()
+                and "via=choke-point" in r.getMessage()
+                and "marked=true" in r.getMessage()
+            ]
+            assert len(marks) == 1
 
             never_finish.set()
             await asyncio.gather(*ctx.active.values())
@@ -3304,6 +3317,32 @@ class TestOneLoopPerRolloutGuard:
             ctx.db.update_run.assert_awaited_once()
             assert ctx.db.update_run.call_args.args[0] == queued.id
             assert ctx.db.update_run.call_args.kwargs["status"] == RunStatus.cancelled
+
+    async def test_queued_refusal_marks_the_live_loop(self) -> None:
+        from agent_gtd_dispatch import main
+        from agent_gtd_dispatch.engines import get_engine
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_pending_queue", []) as queue,
+        ):
+            live = _make_run()
+            ctx.rollout_loops["rollout-abc"] = live
+            queued = _make_run()
+            queue.append(
+                main._PendingDispatch(
+                    run=queued,
+                    engine=get_engine("claude-code"),
+                    max_turns=10,
+                    timeout_seconds=60,
+                    attribution=None,
+                )
+            )
+            main._try_start_pending()
+            await asyncio.gather(*list(main._background_tasks))
+
+            assert live.id in ctx.refused
+            assert queued.id not in ctx.refused
 
     async def test_halted_loop_deregisters_before_its_bookkeeping_awaits(
         self,

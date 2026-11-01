@@ -1990,30 +1990,54 @@ class TestOneLoopPerRollout:
     @patch("agent_gtd_dispatch.main.dispatch")
     @patch("agent_gtd_dispatch.main.gtd_client")
     def test_live_loop_yields_409_and_starts_nothing(
-        self, mock_client, mock_dispatch, mock_loop, client, auth_headers, monkeypatch
+        self,
+        mock_client,
+        mock_dispatch,
+        mock_loop,
+        client,
+        auth_headers,
+        monkeypatch,
+        caplog,
     ) -> None:
         from agent_gtd_dispatch.models import Run
 
         self._mock_upstream(mock_client)
         live = Run(project_name="WaveProject", mode="manage", rollout_id="wr-dup")
         monkeypatch.setattr(main, "_rollout_loops", {"wr-dup": live})
+        refused: set[str] = set()
+        monkeypatch.setattr(main, "_refused_relaunch_runs", refused)
 
-        resp = client.post(
-            "/dispatch",
-            json={"rollout_id": "wr-dup", "mode": "manage", "max_turns": 50},
-            headers=auth_headers,
-        )
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            resp = client.post(
+                "/dispatch",
+                json={"rollout_id": "wr-dup", "mode": "manage", "max_turns": 50},
+                headers=auth_headers,
+            )
 
         assert resp.status_code == 409
         assert "wr-dup" in resp.json()["detail"]
         assert live.id in resp.json()["detail"]
         mock_loop.assert_not_called()
+        assert live.id in refused
+        assert any(
+            "relaunch-refused" in r.getMessage()
+            and "via=dispatch-409" in r.getMessage()
+            and "marked=true" in r.getMessage()
+            for r in caplog.records
+        )
 
     @patch("agent_gtd_dispatch.main._start_rollout_loop")
     @patch("agent_gtd_dispatch.main.dispatch")
     @patch("agent_gtd_dispatch.main.gtd_client")
     def test_queued_manage_entry_yields_409(
-        self, mock_client, mock_dispatch, mock_loop, client, auth_headers, monkeypatch
+        self,
+        mock_client,
+        mock_dispatch,
+        mock_loop,
+        client,
+        auth_headers,
+        monkeypatch,
+        caplog,
     ) -> None:
         from agent_gtd_dispatch.engines import get_engine
         from agent_gtd_dispatch.models import Run
@@ -2030,17 +2054,25 @@ class TestOneLoopPerRollout:
             )
         ]
         monkeypatch.setattr(main, "_pending_queue", queue)
+        refused: set[str] = set()
+        monkeypatch.setattr(main, "_refused_relaunch_runs", refused)
 
-        resp = client.post(
-            "/dispatch",
-            json={"rollout_id": "wr-dup", "mode": "manage", "max_turns": 50},
-            headers=auth_headers,
-        )
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            resp = client.post(
+                "/dispatch",
+                json={"rollout_id": "wr-dup", "mode": "manage", "max_turns": 50},
+                headers=auth_headers,
+            )
 
         assert resp.status_code == 409
         assert queued.id in resp.json()["detail"]
         assert len(queue) == 1
         mock_loop.assert_not_called()
+        assert refused == set()
+        assert any(
+            "relaunch-refused" in r.getMessage() and "marked=false" in r.getMessage()
+            for r in caplog.records
+        )
 
     @patch("agent_gtd_dispatch.main._start_rollout_loop", return_value=False)
     @patch("agent_gtd_dispatch.main.dispatch")
