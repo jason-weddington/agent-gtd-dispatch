@@ -766,6 +766,7 @@ def next_free_fallback_branch(
 ) -> str | None:
     """Return the first ``<branch_name>-r<N>`` (N >= 2) that does not exist on origin.
 
+    Used when no existing ``-r<N>`` is reusable (see :func:`fallback_branch_for`).
     Probed with ``git ls-remote origin refs/heads/<candidate>`` — an empty
     answer means free.  Returns None when origin cannot be queried or every
     candidate up to :data:`FALLBACK_BRANCH_MAX_SUFFIX` is taken.
@@ -790,6 +791,136 @@ def next_free_fallback_branch(
     return None
 
 
+def _canonical_suffix(branch_name: str, ref: str) -> int | None:
+    """Return N when *ref* is ``refs/heads/<branch_name>-r<N>`` with 2 <= N <= 50."""
+    match = re.fullmatch(
+        re.escape(f"refs/heads/{branch_name}-r") + r"([1-9][0-9]*)", ref
+    )
+    if match is None:
+        return None
+    n = int(match.group(1))
+    if 2 <= n <= FALLBACK_BRANCH_MAX_SUFFIX:
+        return n
+    return None
+
+
+def _choose_fallback_branch(
+    repo_path: Path | str, branch_name: str, timeout_seconds: float | None = None
+) -> tuple[str | None, str]:
+    """Pick the fallback branch and the mode (``reuse`` / ``first-free``)."""
+    nested = re.fullmatch(r"(.*)-r([1-9][0-9]*)", branch_name)
+    if nested and 2 <= int(nested.group(2)) <= FALLBACK_BRANCH_MAX_SUFFIX:
+        logger.warning(
+            "push fallback: requested branch %s is already a -rN fallback;"
+            " nested suffix possible",
+            branch_name,
+        )
+    try:
+        listing = subprocess.run(
+            _sudo_wrap(["git", "ls-remote", "origin", f"refs/heads/{branch_name}-r*"]),
+            cwd=repo_path,
+            timeout=timeout_seconds,
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.exception(
+            "push fallback: ls-remote probe failed in %s for %s", repo_path, branch_name
+        )
+        return None, "first-free"
+    if listing.returncode != 0:
+        logger.warning(
+            "push fallback: ls-remote probe failed in %s for %s: rc=%s",
+            repo_path,
+            branch_name,
+            listing.returncode,
+        )
+        return None, "first-free"
+
+    candidates: list[tuple[int, str, str]] = []
+    for line in listing.stdout.decode(errors="replace").splitlines():
+        sha, _, ref = line.partition("\t")
+        n = _canonical_suffix(branch_name, ref.strip())
+        if n is not None and sha:
+            candidates.append((n, sha.strip(), ref.strip()))
+    candidates.sort()
+
+    reusable: list[tuple[int, int, str, str]] = []
+    rejected: list[str] = []
+    for n, sha, ref in candidates:
+        short = ref.removeprefix("refs/heads/")
+        label = f"{short}@{sha[:12]}"
+        try:
+            anc = subprocess.run(
+                _sudo_wrap(["git", "merge-base", "--is-ancestor", sha, "HEAD"]),
+                cwd=repo_path,
+                timeout=timeout_seconds,
+                capture_output=True,
+                check=False,
+            )
+            if anc.returncode != 0:
+                reason = {1: "not-ancestor", 128: "missing-object"}.get(
+                    anc.returncode, f"rc={anc.returncode}"
+                )
+                rejected.append(f"{label}:{reason}")
+                continue
+            count = subprocess.run(
+                _sudo_wrap(["git", "rev-list", "--count", f"{sha}..HEAD"]),
+                cwd=repo_path,
+                timeout=timeout_seconds,
+                capture_output=True,
+                check=False,
+            )
+            if count.returncode != 0:
+                logger.warning(
+                    "push fallback: rev-list failed for %s in %s: rc=%s",
+                    short,
+                    repo_path,
+                    count.returncode,
+                )
+                rejected.append(f"{label}:rc={count.returncode}")
+                continue
+            reusable.append((int(count.stdout.decode().strip()), n, short, sha))
+        except (OSError, subprocess.SubprocessError, ValueError):
+            logger.exception(
+                "push fallback: ancestry check failed for %s in %s", short, repo_path
+            )
+            rejected.append(f"{label}:error")
+
+    reusable.sort()
+    if reusable:
+        chosen: str | None = reusable[0][2]
+        mode = "reuse"
+    else:
+        chosen = next_free_fallback_branch(repo_path, branch_name, timeout_seconds)
+        mode = "first-free"
+    logger.info(
+        "push fallback decision: repo=%s requested=%s chosen=%s mode=%s"
+        " reusable=[%s] rejected=[%s]",
+        repo_path,
+        branch_name,
+        chosen or "none",
+        mode,
+        ", ".join(f"{r[2]}@{r[3][:12]}:{r[0]}" for r in reusable),
+        ", ".join(rejected),
+    )
+    return chosen, mode
+
+
+def fallback_branch_for(
+    repo_path: Path | str, branch_name: str, timeout_seconds: float | None = None
+) -> str | None:
+    """Choose where a non-fast-forwarded push of HEAD should go instead.
+
+    Prefers an existing ``<branch_name>-r<N>`` (2 <= N <= 50) on origin whose tip
+    is an ancestor of HEAD — a fast-forward of the same run's earlier push — with
+    the fewest commits behind HEAD, then the lowest N.  Otherwise the first free
+    one (:func:`next_free_fallback_branch`).  Never fetches, forces or deletes.
+    Returns None when origin cannot be probed or no suffix is available.
+    """
+    return _choose_fallback_branch(repo_path, branch_name, timeout_seconds)[0]
+
+
 def push_with_fallback(
     repo_path: Path | str,
     branch_name: str,
@@ -803,8 +934,8 @@ def push_with_fallback(
     earlier run's branch was never deleted the rebuild's push is rejected — as
     is the rescue's — and gate-green work survives only in the clone.  So when
     the push fails AND :func:`is_non_fast_forward` confirms origin's branch is
-    not an ancestor of HEAD, the same HEAD goes to the smallest free
-    ``<branch_name>-r<N>``.  The existing branch is never force-pushed,
+    not an ancestor of HEAD, the same HEAD goes to an existing ``-r<N>`` whose tip
+    is an ancestor of HEAD (reuse), otherwise to the first free ``-r<N>``.  The existing branch is never force-pushed,
     deleted or rewritten.  Any other rejection (auth, hook, network) returns
     the original failed attempt unchanged.
     """
@@ -819,20 +950,21 @@ def push_with_fallback(
         return PushAttempt(proc, branch_name)
     if not is_non_fast_forward(repo_path, branch_name, timeout_seconds):
         return PushAttempt(proc, branch_name)
-    fallback = next_free_fallback_branch(repo_path, branch_name, timeout_seconds)
+    fallback, mode = _choose_fallback_branch(repo_path, branch_name, timeout_seconds)
     if fallback is None:
         logger.warning(
-            "push fallback: %s in %s is non-fast-forward but no free -rN branch"
-            " could be found",
+            "push fallback: %s in %s is non-fast-forward but a -rN branch"
+            " could not be chosen (probe failed or no free suffix in 2..50)",
             branch_name,
             repo_path,
         )
         return PushAttempt(proc, branch_name)
     logger.warning(
-        "push fallback: %s on origin holds commits not in HEAD (%s); pushing to %s",
+        "push fallback: %s on origin holds commits not in HEAD (%s); pushing to %s (mode=%s)",
         branch_name,
         repo_path,
         fallback,
+        mode,
     )
     retry = subprocess.run(
         _sudo_wrap(_git_push_argv(fallback, no_verify=no_verify)),
@@ -1278,7 +1410,7 @@ def rescue_abandoned_work(
 
     Hooks are SKIPPED (``--no-verify``) on both the commit and the push. This is the deliberate opposite of :func:`main._commit_with_retry`, which must run hooks so fixer hooks can fix, and the two paths must NOT be merged. The difference is what is being committed: the normal path commits work an agent declared finished, where a hook rejection is a real signal worth acting on. This path commits work that is by definition INCOMPLETE and will usually fail a hook — and a blocked commit here does not produce a cleaner tree, it produces no tree at all. Preserving the evidence beats enforcing a standard on something nobody is going to merge as-is.
 
-    It only ever writes to the run's OWN ``feat/*`` branch — the same branch the dispatch worker already pushes to on its success path — so it is a retry of an access that already exists, not a new one. It must never push to a default branch, and never force-push. When that branch already holds an older run's commits (a non-fast-forward rejection), the work goes to ``<branch>-r<N>`` instead, exactly as on the success path (:func:`push_with_fallback`).
+    It only ever writes to the run's OWN ``feat/*`` branch — the same branch the dispatch worker already pushes to on its success path — so it is a retry of an access that already exists, not a new one. It must never push to a default branch, and never force-push. When that branch already holds an older run's commits (a non-fast-forward rejection), the work goes to ``<branch>-r<N>`` instead (an existing one whose tip is an ancestor of HEAD, otherwise the first free one), exactly as on the success path (:func:`push_with_fallback`).
 
     A redundant rescue costs nothing: if the worker already pushed, git refuses the ref update and the result simply records it.
     """

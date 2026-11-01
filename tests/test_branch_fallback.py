@@ -570,3 +570,181 @@ class TestReviewerReceivesFallbackBranch:
         await db.init_db()
         row = {"remote_run_id": "not-on-this-host", "feature_branch": "feat/x-r2"}
         assert await main._review_branch_name("i", {"title": "t"}, row) == "feat/x-r2"
+
+
+def _push_ref(repo: Path, branch: str, ref: str = "HEAD") -> None:
+    _git(repo, "push", "origin", f"{ref}:refs/heads/{branch}")
+
+
+class TestFallbackReuse:
+    def test_two_pushes_land_on_one_branch(self, tmp_path, caplog) -> None:
+        origin = _Origin(tmp_path)
+        old_sha = origin.leave_old_run_on("feat/x")
+        repo = origin.clone("rebuild")
+        _commit(repo, "a.py")
+        first = dispatch.push_unpushed_repo(repo, "feat/x", 60.0)
+        assert (first.branch, first.fell_back) == ("feat/x-r2", True)
+        b = _commit(repo, "b.py")
+        with caplog.at_level("INFO"):
+            second = dispatch.push_unpushed_repo(repo, "feat/x", 60.0)
+        assert (second.branch, second.fell_back) == ("feat/x-r2", True)
+        assert _remote_sha(origin.path, "feat/x-r2") == b
+        assert _remote_sha(origin.path, "feat/x-r3") == ""
+        assert _remote_sha(origin.path, "feat/x") == old_sha
+        assert any(
+            "mode=reuse" in r.getMessage() and "chosen=feat/x-r2" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_rescue_after_backstop_reuses_r2(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        old_sha = origin.leave_old_run_on("feat/x")
+        repo = origin.clone("rebuild")
+        _commit(repo, "a.py")
+        dispatch.push_unpushed_repo(repo, "feat/x", 60.0)
+        (repo / "dirty.txt").write_text("dirty\n")
+        result = dispatch.rescue_abandoned_work("repo-a", repo, "feat/x", "run-1")
+        assert result.pushed is True
+        assert result.branch == "feat/x-r2"
+        assert _remote_sha(origin.path, "feat/x-r2") == _git(repo, "rev-parse", "HEAD")
+        assert _remote_sha(origin.path, "feat/x-r3") == ""
+        assert _remote_sha(origin.path, "feat/x") == old_sha
+
+    def test_foreign_r2_is_skipped_and_r3_reused(self, tmp_path, caplog) -> None:
+        origin = _Origin(tmp_path)
+        origin.leave_old_run_on("feat/x")
+        r2 = origin.leave_old_run_on("feat/x-r2")
+        repo = origin.clone("rebuild")
+        _commit(repo, "a.py")
+        with caplog.at_level("INFO"):
+            first = dispatch.push_unpushed_repo(repo, "feat/x", 60.0)
+        assert first.branch == "feat/x-r3"
+        assert any(
+            "mode=first-free" in r.getMessage() and "chosen=feat/x-r3" in r.getMessage()
+            for r in caplog.records
+        )
+        b = _commit(repo, "b.py")
+        second = dispatch.push_unpushed_repo(repo, "feat/x", 60.0)
+        assert second.branch == "feat/x-r3"
+        assert _remote_sha(origin.path, "feat/x-r3") == b
+        assert _remote_sha(origin.path, "feat/x-r2") == r2
+        assert _remote_sha(origin.path, "feat/x-r4") == ""
+
+    def test_up_to_date_fallback_is_success(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        origin.leave_old_run_on("feat/x")
+        repo = origin.clone("rebuild")
+        _commit(repo, "a.py")
+        dispatch.push_unpushed_repo(repo, "feat/x", 60.0)
+        again = dispatch.push_with_fallback(
+            repo, "feat/x", no_verify=True, timeout_seconds=60.0
+        )
+        assert again.proc.returncode == 0
+        assert (again.branch, again.fell_back) == ("feat/x-r2", True)
+        assert _remote_sha(origin.path, "feat/x-r3") == ""
+
+    def test_fewest_commits_wins(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        origin.leave_old_run_on("feat/x")
+        repo = origin.clone("rebuild")
+        _git(repo, "push", "origin", "main:refs/heads/feat/x-r2")
+        _commit(repo, "a.py")
+        _push_ref(repo, "feat/x-r3")
+        r2 = _remote_sha(origin.path, "feat/x-r2")
+        b = _commit(repo, "b.py")
+        attempt = dispatch.push_unpushed_repo(repo, "feat/x", 60.0)
+        assert attempt.branch == "feat/x-r3"
+        assert _remote_sha(origin.path, "feat/x-r3") == b
+        assert _remote_sha(origin.path, "feat/x-r2") == r2
+
+    def test_lone_ancestor_is_reused(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        origin.leave_old_run_on("feat/x")
+        repo = origin.clone("rebuild")
+        _git(repo, "push", "origin", "main:refs/heads/feat/x-r2")
+        head = _commit(repo, "a.py")
+        attempt = dispatch.push_unpushed_repo(repo, "feat/x", 60.0)
+        assert attempt.branch == "feat/x-r2"
+        assert _remote_sha(origin.path, "feat/x-r2") == head
+
+    def test_bad_names_are_ignored(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        origin.leave_old_run_on("feat/x")
+        repo = origin.clone("rebuild")
+        decoys = ["feat/x-rfoo", "feat/x-r02", "feat/x-r1", "feat/x-r51", "feat/xx-r2"]
+        base = _git(repo, "rev-parse", "main")
+        for d in decoys:
+            _git(repo, "push", "origin", f"main:refs/heads/{d}")
+        head = _commit(repo, "a.py")
+        attempt = dispatch.push_unpushed_repo(repo, "feat/x", 60.0)
+        assert attempt.branch == "feat/x-r2"
+        assert _remote_sha(origin.path, "feat/x-r2") == head
+        for d in decoys:
+            assert _remote_sha(origin.path, d) == base
+
+    def test_glob_probe_failure_returns_none(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        repo = origin.clone("rebuild")
+        _commit(repo, "a.py")
+        real_run = subprocess.run
+
+        def _fail(cmd, *a, **kw):
+            if "ls-remote" in cmd:
+                return subprocess.CompletedProcess(cmd, 128, b"", b"boom")
+            return real_run(cmd, *a, **kw)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run", side_effect=_fail):
+            assert dispatch.fallback_branch_for(repo, "feat/x", 60.0) is None
+
+    def test_glob_probe_timeout_returns_none(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        repo = origin.clone("rebuild")
+        real_run = subprocess.run
+
+        def _timeout(cmd, *a, **kw):
+            if "ls-remote" in cmd:
+                raise subprocess.TimeoutExpired(cmd, 1)
+            return real_run(cmd, *a, **kw)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run", side_effect=_timeout):
+            assert dispatch.fallback_branch_for(repo, "feat/x", 60.0) is None
+
+    def test_no_chosen_branch_keeps_failed_attempt(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        old_sha = origin.leave_old_run_on("feat/x")
+        repo = origin.clone("rebuild")
+        _commit(repo, "a.py")
+        with patch.object(
+            dispatch, "_choose_fallback_branch", return_value=(None, "first-free")
+        ):
+            attempt = dispatch.push_unpushed_repo(repo, "feat/x", 60.0)
+        assert attempt.branch == "feat/x"
+        assert attempt.fell_back is False
+        assert attempt.proc.returncode != 0
+        assert _remote_sha(origin.path, "feat/x-r2") == ""
+        assert _remote_sha(origin.path, "feat/x") == old_sha
+
+    def test_merge_base_oserror_is_nonfatal(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        origin.leave_old_run_on("feat/x")
+        repo = origin.clone("rebuild")
+        _git(repo, "push", "origin", "main:refs/heads/feat/x-r2")
+        _commit(repo, "a.py")
+        real_run = subprocess.run
+
+        def _boom(cmd, *a, **kw):
+            if "merge-base" in cmd:
+                raise OSError("nope")
+            return real_run(cmd, *a, **kw)
+
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run", side_effect=_boom):
+            assert dispatch.fallback_branch_for(repo, "feat/x", 60.0) == "feat/x-r3"
+
+    def test_nested_suffix_warns(self, tmp_path, caplog) -> None:
+        origin = _Origin(tmp_path)
+        origin.leave_old_run_on("feat/x-r2")
+        repo = origin.clone("rebuild", "feat/x-r2")
+        _commit(repo, "a.py")
+        with caplog.at_level("WARNING"):
+            dispatch.push_unpushed_repo(repo, "feat/x-r2", 60.0)
+        assert any("nested suffix possible" in r.getMessage() for r in caplog.records)

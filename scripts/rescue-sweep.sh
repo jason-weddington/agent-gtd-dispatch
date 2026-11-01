@@ -31,6 +31,7 @@
 # the same branch, to the same remote, that the worker pushes on its success
 # path. It is a retry of an existing access, not a new one. Never `main`, never
 # a force-push, never a branch the worker would not have created.
+# When <branch> on origin holds commits this clone does not contain, the push goes to <branch>-r<N> instead (an existing one whose tip is already in HEAD, else the first free N in 2..50): the same fallback the worker applies in dispatch.push_with_fallback, so it is still a branch the worker would have created.
 #
 # HEARTBEAT: every pass logs a line even when it finds nothing, because a silent
 # watchdog and a dead one are indistinguishable. Absence of a recent line means
@@ -46,6 +47,7 @@ log() { logger -t "$TAG" -- "$*"; printf '%s\n' "$*"; }
 
 swept=0
 rescued=0
+fellback=0
 failed=0
 skipped_remote=0
 
@@ -96,13 +98,85 @@ for d in "$WORKSPACE_ROOT"/repos-*/ "$WORKSPACE_ROOT"/ws-*/*/; do
     if git -C "$d" push --no-verify origin "HEAD:refs/heads/$branch" >/dev/null 2>&1; then
         rescued=$((rescued + 1))
         log "RESCUED $d branch=$branch commits=$ahead"
-    else
+        continue
+    fi
+
+    # Non-fast-forward, decided WITHOUT fetching: origin holds a tip that HEAD
+    # does not contain (exit 1, or 128 when the object is not even local).
+    if [ -z "$remote_sha" ] || git -C "$d" merge-base --is-ancestor "$remote_sha" HEAD 2>/dev/null; then
         failed=$((failed + 1))
         log "FAILED to push $d branch=$branch — left in place for a human"
+        continue
+    fi
+
+    # Same rule as dispatch.push_with_fallback: reuse an existing <branch>-r<N>
+    # whose tip is an ancestor of HEAD (fewest commits behind, then lowest N),
+    # else the first free N in 2..50. Never force, never delete.
+    glob_ok=1
+    listing=$(git -C "$d" ls-remote origin "refs/heads/$branch-r*" 2>/dev/null) || glob_ok=0
+    target=""
+    mode=""
+    tip="none"
+    if [ "$glob_ok" -eq 1 ]; then
+        taken=" "
+        best_count=""
+        best_n=""
+        best_sha=""
+        while IFS=$(printf '\t') read -r sha ref; do
+            [ -n "$ref" ] || continue
+            n=${ref#"refs/heads/$branch-r"}
+            [ "$n" = "$ref" ] && continue
+            case "$n" in '' | 0* | *[![:digit:]]*) continue ;; esac
+            if [ "$n" -lt 2 ] || [ "$n" -gt 50 ]; then continue; fi
+            taken="$taken$n "
+            git -C "$d" merge-base --is-ancestor "$sha" HEAD 2>/dev/null || continue
+            cnt=$(git -C "$d" rev-list --count "$sha..HEAD" 2>/dev/null) || continue
+            if [ -z "$best_n" ] || [ "$cnt" -lt "$best_count" ] ||
+                { [ "$cnt" -eq "$best_count" ] && [ "$n" -lt "$best_n" ]; }; then
+                best_count=$cnt
+                best_n=$n
+                best_sha=$sha
+            fi
+        done <<LISTING
+$listing
+LISTING
+        if [ -n "$best_n" ]; then
+            target="$branch-r$best_n"
+            mode="reuse"
+            tip=$(printf '%s' "$best_sha" | cut -c1-12)
+        else
+            n=2
+            while [ "$n" -le 50 ]; do
+                case "$taken" in
+                *" $n "*) ;;
+                *)
+                    target="$branch-r$n"
+                    mode="first-free"
+                    break
+                    ;;
+                esac
+                n=$((n + 1))
+            done
+        fi
+    fi
+    if [ -z "$target" ]; then
+        failed=$((failed + 1))
+        log "FAILED to push $d branch=$branch fallback=none reason=no-free-suffix — left in place for a human"
+        continue
+    fi
+
+    log "fallback: $d requested=$branch target=$target mode=$mode tip=$tip"
+    if git -C "$d" push --no-verify origin "HEAD:refs/heads/$target" >/dev/null 2>&1; then
+        rescued=$((rescued + 1))
+        fellback=$((fellback + 1))
+        log "RESCUED $d branch=$target commits=$ahead fallback_from=$branch mode=$mode"
+    else
+        failed=$((failed + 1))
+        log "FAILED to push $d branch=$branch fallback=$target reason=push-rejected — left in place for a human"
     fi
 done
 
-log "pass complete: clones=$swept rescued=$rescued failed=$failed no_remote=$skipped_remote"
+log "pass complete: clones=$swept rescued=$rescued fellback=$fellback failed=$failed no_remote=$skipped_remote"
 
 # Exit non-zero only on a push failure, so `systemctl status` and OnFailure= show
 # something went wrong. Finding nothing is success.
