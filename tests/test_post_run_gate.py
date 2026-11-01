@@ -1988,13 +1988,78 @@ class TestWorkerItemRoutingTolerance:
         from agent_gtd_dispatch.main import _complete_rollout_item_skipped
 
         with patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd:
-            mock_gtd.complete_item_in_rollout = AsyncMock(
+            mock_gtd.complete_in_rollout = AsyncMock(
                 side_effect=RuntimeError("gtd down")
             )
             mock_gtd.post_comment = AsyncMock()
             await _complete_rollout_item_skipped(
                 "ro-1", "item-x", "run-x", callback_token=None, attribution=None
             )
+        mock_gtd.complete_in_rollout.assert_awaited_once()
+        mock_gtd.post_comment.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rollout_skip_payload_contract(self) -> None:
+        """Talos already-satisfied skip payload sent to the board.
+
+        CONTRACT: mirrored in agent_gtd/tests/test_rollout_routes.py::TestDispatchWorkerSkipContract::test_dispatch_worker_skip_payload_validates
+        """
+        from agent_gtd_dispatch import gtd_client, main
+
+        with (
+            patch(
+                "agent_gtd_dispatch.gtd_client._request",
+                new=AsyncMock(
+                    return_value={"newly_ready": ["item-y"], "graph_complete": False}
+                ),
+            ) as req,
+            patch("agent_gtd_dispatch.gtd_client.post_comment", new=AsyncMock()) as pc,
+        ):
+            await main._complete_rollout_item_skipped(
+                "ro-1", "item-x", "run-x", callback_token=None, attribution=None
+            )
+        assert gtd_client is not None
+        assert req.await_args.args == ("POST", "/rollouts/ro-1/complete-item")
+        assert req.await_args.kwargs["json"] == {
+            "item_id": "item-x",
+            "outcome": "skipped",
+            "merge_actor": "dispatch-worker",
+            "decision_rule": "already-satisfied",
+            "merge_note": "",
+        }
+        pc.assert_awaited_once()
+        text = str(pc.await_args)
+        assert "ro-1" in text
+        assert "item-y" in text
+
+    @pytest.mark.asyncio
+    async def test_rollout_skip_422_logs_response_body(self, caplog) -> None:
+        import httpx
+
+        from agent_gtd_dispatch.main import _complete_rollout_item_skipped
+
+        request = httpx.Request("POST", "http://x/rollouts/ro-1/complete-item")
+        response = httpx.Response(
+            422,
+            text='{"detail":[{"loc":["body","merge_actor"]}]}',
+            request=request,
+        )
+        err = httpx.HTTPStatusError("422", request=request, response=response)
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            caplog.at_level(logging.WARNING),
+        ):
+            mock_gtd.complete_in_rollout = AsyncMock(side_effect=err)
+            mock_gtd.post_comment = AsyncMock()
+            await _complete_rollout_item_skipped(
+                "ro-1", "item-x", "run-x", callback_token=None, attribution=None
+            )
+        hits = [
+            r
+            for r in caplog.records
+            if "422" in r.getMessage() and "merge_actor" in r.getMessage()
+        ]
+        assert len(hits) == 1
         mock_gtd.post_comment.assert_not_awaited()
 
 

@@ -1766,12 +1766,16 @@ async def _complete_rollout_item_skipped(
             decision_rule="already-satisfied",
             token=callback_token,
         )
-    except Exception:
+    except Exception as exc:
+        detail = type(exc).__name__
+        if isinstance(exc, httpx.HTTPStatusError):
+            detail += f" HTTP {exc.response.status_code}: {exc.response.text[:500]}"
         logger.warning(
-            "Failed to complete rollout item %s in rollout %s as skipped (run %s)",
+            "Failed to complete rollout item %s in rollout %s as skipped (run %s): %s",
             item_id,
             rollout_id,
             run_id,
+            detail,
         )
         return
     newly_ready = result.get("newly_ready") if isinstance(result, dict) else None
