@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v2.15.0 (2026-11-01)
+
+### Bug Fixes
+
+- **9f8c3b8b**: Playwright install-deps runs from / in deploy and setup, so an operator's ~/.npmrc
+  can't fail it
+  ([`c0c44a1`](https://github.com/repos/agent-gtd-dispatch/commit/c0c44a1c1f8bca77c0a92a67136cb382bcd1f847))
+
+### Features
+
+- **9b246968**: Rollout reviewer resolves non-documentation squash-merge conflicts itself by keeping
+  both sides, with the land gate rerun on the merged tree, and halts only when the gate fails or a
+  resolution needs judgment
+  ([`beb7788`](https://github.com/repos/agent-gtd-dispatch/commit/beb778831bd4376715b25a57e0c8b86f2a62c1e7))
+
+
 ## v2.14.3 (2026-10-31)
 
 ### Bug Fixes
