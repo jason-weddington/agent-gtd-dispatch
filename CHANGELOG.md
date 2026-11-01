@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v2.14.3 (2026-10-31)
+
+### Bug Fixes
+
+- **9fc79029**: Dispatch: when a run's agent or gate exits on any path, everything it spawned is
+  killed, so a leaked background loop can't outlive the run
+  ([`729faa0`](https://github.com/repos/agent-gtd-dispatch/commit/729faa0b210463a5aff5e2a1fc626f555960acd6))
+
+- **fd2faf19**: Dispatch routing: a host whose load average is above 1.5x its CPU count counts as
+  full, so rank routing spills to the next host
+  ([`4c03084`](https://github.com/repos/agent-gtd-dispatch/commit/4c030848975ef9978c27e73faae5a29b036d5999))
+
+### Testing
+
+- Attachment staging mode check ignores an inherited setgid bit
+  ([`d64a39f`](https://github.com/repos/agent-gtd-dispatch/commit/d64a39fb691390a8f8aa37d3f3904157edfbf6fe))
+
+
 ## v2.14.2 (2026-10-27)
 
 ### Bug Fixes
