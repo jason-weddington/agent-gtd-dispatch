@@ -2167,12 +2167,14 @@ else
     for _pw_ver in "${PLAYWRIGHT_VERSIONS[@]}"; do
         # Sub-action A: system libraries (apt) — needs root, so run as root.
         if $DRY_RUN; then
-            would "run '${_pw_npx}' --yes playwright@${_pw_ver} install-deps ${PLAYWRIGHT_BROWSERS} (as root)"
+            would "run (cd / && '${_pw_npx}' --yes playwright@${_pw_ver} install-deps ${PLAYWRIGHT_BROWSERS}) (as root)"
         else
             # Root runs the AGENT's npx, whose `#!/usr/bin/env node` would otherwise
             # resolve root's node (an old system node; Playwright needs >= 20).
-            env PATH="$(dirname "${_pw_npx}"):${PATH}" "${_pw_npx}" --yes "playwright@${_pw_ver}" install-deps ${PLAYWRIGHT_BROWSERS} \
-                || { warn "playwright@${_pw_ver} install-deps failed for ${AGENT_USER} — continuing"; _pw_failed+=("${_pw_ver} install-deps"); }
+            # The operator's sudo cwd may hold a .npmrc that npm reads as project
+            # config, so run from / (not /tmp: we are root and /tmp is world-writable).
+            ( cd / && env PATH="$(dirname "${_pw_npx}"):${PATH}" "${_pw_npx}" --yes "playwright@${_pw_ver}" install-deps ${PLAYWRIGHT_BROWSERS} ) \
+                || { _rc=$?; warn "playwright@${_pw_ver} install-deps failed (exit ${_rc}) for ${AGENT_USER} — continuing"; _pw_failed+=("${_pw_ver} install-deps (exit ${_rc})"); }
         fi
         # Sub-action B: the browsers themselves, downloaded AS the agent user into
         # the agent's default cache. PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT lifts

@@ -305,9 +305,21 @@ elif [ -z "\$_pw_npx" ]; then
     echo "[WARN] npx not found for ${AGENT_USER} (login shell) — Playwright browser refresh skipped; run 'sudo ./setup-dispatch-host.sh' (Step 4.11) on this host" >&2
 else
     for _v in ${PLAYWRIGHT_VERSION_LIST}; do
-        if ! sudo env PATH="\$(dirname "\$_pw_npx"):/usr/bin:/bin" "\$_pw_npx" --yes "playwright@\$_v" install-deps ${PLAYWRIGHT_BROWSERS:-} >/dev/null 2>&1; then
-            echo "[WARN] playwright@\$_v install-deps failed for ${AGENT_USER} — system libraries for the browsers may be incomplete" >&2
+        # npm reads a .npmrc in the current directory as project config. The ssh
+        # session's cwd is the deploying user's home, whose .npmrc (e.g. a prefix=
+        # line pointing at a missing dir) then fails root's npx with ENOENT (exit
+        # 254). Run from / rather than /tmp: this runs as root and /tmp is
+        # world-writable, so anyone could plant a .npmrc or node_modules there and
+        # redirect root's npx.
+        _pw_deps_log=\$(mktemp)
+        if ( cd / && sudo env PATH="\$(dirname "\$_pw_npx"):/usr/bin:/bin" "\$_pw_npx" --yes "playwright@\$_v" install-deps ${PLAYWRIGHT_BROWSERS:-} ) >"\$_pw_deps_log" 2>&1; then
+            echo "[OK]   playwright@\$_v install-deps (${PLAYWRIGHT_BROWSERS:-})"
+        else
+            _rc=\$?
+            echo "[WARN] playwright@\$_v install-deps failed (exit \$_rc) for ${AGENT_USER} — system libraries for the browsers may be incomplete. Last output:" >&2
+            tail -n 5 "\$_pw_deps_log" >&2 || true
         fi
+        rm -f "\$_pw_deps_log"
         # cd /tmp: the ssh session's cwd is the deploying user's home, which the
         # agent user usually cannot read, and npm then dies with EACCES spawning sh.
         _pw_log=\$(mktemp)
