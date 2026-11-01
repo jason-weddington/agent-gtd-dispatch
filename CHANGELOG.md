@@ -2,6 +2,28 @@
 
 <!-- version list -->
 
+## v2.16.1 (2026-11-01)
+
+### Bug Fixes
+
+- **25e97fff**: Resuming while the halted loop is still finishing a land no longer leaves the
+  rollout running with no loop
+  ([`07d7a0a`](https://github.com/repos/agent-gtd-dispatch/commit/07d7a0a6a0854ee0665afef3c6006bbf8bb272f9))
+
+- **86dab9a6**: The rescue sweep and the -r<N> push fallback reuse a fallback branch the run already
+  owns
+  ([`9307250`](https://github.com/repos/agent-gtd-dispatch/commit/9307250131b22c33cacbc593b56b51c8563b5c2b))
+
+- **d812e583**: Rollouts: a talos run that ends already-satisfied records its rollout item as
+  skipped instead of being rejected 422
+  ([`db8942f`](https://github.com/repos/agent-gtd-dispatch/commit/db8942fbddb2aefd395d034232c0b62b1c193647))
+
+### Testing
+
+- The wave-tick land tests stub the loop-fencing run lookup instead of opening the host's SQLite db
+  ([`c077269`](https://github.com/repos/agent-gtd-dispatch/commit/c0772690b78914e34ca27ad53777dbe05251eeb4))
+
+
 ## v2.16.0 (2026-11-01)
 
 ### Bug Fixes
