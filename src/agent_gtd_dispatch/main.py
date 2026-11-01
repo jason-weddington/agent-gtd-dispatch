@@ -1847,6 +1847,38 @@ _TICK_WAIT = "wait"  # builds in flight — sleep, then re-read
 _TICK_DONE = "done"  # graph_complete, or the rollout left `running`
 _TICK_HALTED = "halted"  # the loop halted the rollout (or it was halted)
 _TICK_PARKED = "parked"  # the loop's host is draining — sleep, then re-read
+# The board names a loop run this host does not hold: the loop was moved to
+# another host (a lead resume), so this one stands down without board writes.
+_TICK_SUPERSEDED = "superseded"
+
+
+def _loop_superseded(rollout: dict[str, Any], local_runs: list[Run]) -> str | None:
+    """Return the board's loop run id when it names a loop this host does not hold.
+
+    The board's ``get_rollout`` reports ``loop_remote_run_id`` (the dispatch
+    host run id of the loop it last routed) and ``loop_run_routing`` (a new
+    loop run is still being routed).  A loop is superseded only when the board
+    names a run id and NO local MANAGE row has that id.  While a new loop is
+    routing, nothing is superseded yet (the board does not know its id).  An
+    absent, None or empty id (an older board, or no loop) is never a
+    supersession.
+
+    Args:
+        rollout: The board's ``get_rollout`` dict.
+        local_runs: This host's runs for the rollout.
+
+    Returns:
+        The board's loop run id when superseded, else None.
+    """
+    if rollout.get("loop_run_routing") is True:
+        return None
+    board_loop = rollout.get("loop_remote_run_id")
+    if not isinstance(board_loop, str) or not board_loop:
+        return None
+    if any(r.mode == DispatchMode.MANAGE and r.id == board_loop for r in local_runs):
+        return None
+    return board_loop
+
 
 # Run ids of rollout loops currently SLEEPING after a parked tick.  Membership
 # means exactly that: a loop is discarded at the top of every iteration, before
@@ -5432,6 +5464,23 @@ async def _rollout_wave_tick(
             rollout_id, loop_state, _TICK_HALTED if status == "halted" else _TICK_DONE
         )
 
+    # Loop fencing: a lead resume may have moved this rollout's loop to another
+    # host.  Once the board names a loop run this host does not hold, stand
+    # down: no halt, no phase publish, no board writes.  An active land still
+    # finishes first (_exit_tick defers behind it).
+    board_loop = _loop_superseded(rollout, await db.list_runs_by_rollout(rollout_id))
+    if board_loop is not None:
+        land = loop_state.active_land
+        logger.warning(
+            "rollout-loop: superseded rollout_id=%s run_id=%s board_loop_run=%s "
+            "active_land=%s",
+            rollout_id,
+            loop_run_id,
+            board_loop,
+            land is not None and not land.task.done(),
+        )
+        return await _exit_tick(rollout_id, loop_state, _TICK_SUPERSEDED)
+
     # Wave completion is READ, not computed. `complete_item_in_rollout` already
     # closes the rollout and signals `graph_complete`, and `advance_rollout`
     # computes the same thing independently. The worker consumes that field and
@@ -6242,7 +6291,7 @@ async def _drive_rollout(
                 parked_since = None
                 parked_ticks = 0
                 last_park_warn_at = None
-            if directive in (_TICK_DONE, _TICK_HALTED):
+            if directive in (_TICK_DONE, _TICK_HALTED, _TICK_SUPERSEDED):
                 # Deregister NOW, synchronously, before any further await
                 # (workspace cleanup, the worker's db.update_run): a lead's
                 # resume that relaunches the loop after this tick read
@@ -6494,6 +6543,14 @@ async def _readopt_running_rollouts() -> None:
     exists for, and it cannot express "steal someone else's".  A host whose
     database is wiped declines to resume rather than guessing, which is the
     correct direction to fail.
+
+    A local MANAGE row is necessary but no longer sufficient: a lead's resume
+    can move a halted rollout's loop to another host, leaving this host's row
+    behind.  So before adopting, the sweep asks the board which loop run owns
+    the rollout (``loop_remote_run_id`` / ``loop_run_routing``) and skips one
+    that is still routing or names a run this host does not hold.  A board
+    that cannot be reached does not block adoption; the loop's first tick
+    re-checks ownership and stands down if superseded.
     """
     try:
         rollouts = await gtd_client.list_running_rollouts()
@@ -6520,6 +6577,31 @@ async def _readopt_running_rollouts() -> None:
             continue
         if not rollout_id or rollout_id in _rollout_loops:
             continue
+        # Ownership fence: a lead resume may have moved the loop to another
+        # host while this one was down.  The board names the loop it routed;
+        # skip when that is still routing or is a run this host does not hold.
+        try:
+            board = await gtd_client.get_rollout(rollout_id)
+        except Exception:
+            logger.warning(
+                "readopt: board_unreachable rollout_id=%s; adopting, first tick "
+                "re-checks ownership",
+                rollout_id,
+            )
+        else:
+            if board.get("loop_run_routing") is True:
+                logger.info("readopt: skip rollout_id=%s reason=routing", rollout_id)
+                continue
+            board_loop = _loop_superseded(
+                board, await db.list_runs_by_rollout(rollout_id)
+            )
+            if board_loop is not None:
+                logger.info(
+                    "readopt: skip rollout_id=%s board_loop_run=%s reason=superseded",
+                    rollout_id,
+                    board_loop,
+                )
+                continue
         run = Run(
             project_name=str(rollout.get("project_name") or ""),
             mode=DispatchMode.MANAGE,

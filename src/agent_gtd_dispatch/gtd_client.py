@@ -175,6 +175,13 @@ async def get_rollout(rollout_id: str, *, token: str | None = None) -> dict[str,
     ``loop_host_url`` (the rollout loop's owning host, or None) and
     ``loop_host_drain_reason`` (that host's drain reason, or None when it is
     not draining; the key is absent on an older board).
+
+    Loop-ownership fence keys (absent on an older board, which means "not
+    superseded"): ``loop_remote_run_id`` (str | None) is the dispatch-host
+    run id of the loop run the board last routed for the rollout, and
+    ``loop_run_routing`` (bool) is True while a newer loop run is still being
+    routed.  The re-adoption sweep and each loop tick use them to stand down
+    a loop that a lead resume moved to another host.
     """
     result: dict[str, Any] = await _request(
         "GET", f"/rollouts/{rollout_id}", token=token

@@ -611,6 +611,7 @@ class TestReadoptionSweep:
             ctx.gtd.list_running_rollouts = AsyncMock(
                 return_value=[{"id": "rollout-abc", "project_name": "p"}]
             )
+            ctx.gtd.get_rollout = AsyncMock(return_value={"status": "running"})
             await _readopt_running_rollouts()
 
         mock_loop.assert_called_once()
@@ -684,6 +685,73 @@ class TestReadoptionSweep:
 
         mock_loop.assert_not_called()
         ctx.db.insert_run.assert_not_called()
+
+    async def _sweep_with_board(self, board: object) -> SimpleNamespace:
+        """Run the sweep for one locally-owned rollout against a board answer.
+
+        ``board`` is the get_rollout return dict, or an exception to raise.
+        """
+        from agent_gtd_dispatch.main import _readopt_running_rollouts
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._start_rollout_loop") as mock_loop,
+        ):
+            ctx.db.list_runs_by_rollout = AsyncMock(return_value=[self._local])
+            ctx.gtd.list_running_rollouts = AsyncMock(
+                return_value=[{"id": "rollout-abc", "project_name": "p"}]
+            )
+            if isinstance(board, BaseException):
+                ctx.gtd.get_rollout = AsyncMock(side_effect=board)
+            else:
+                ctx.gtd.get_rollout = AsyncMock(return_value=board)
+            await _readopt_running_rollouts()
+        ctx.start_loop = mock_loop
+        return ctx
+
+    _local = _make_run()
+
+    async def test_readopt_adopts_when_board_names_a_local_loop(self) -> None:
+        ctx = await self._sweep_with_board(
+            {"status": "running", "loop_remote_run_id": self._local.id}
+        )
+        ctx.db.insert_run.assert_awaited_once()
+        ctx.start_loop.assert_called_once()
+
+    async def test_readopt_skips_a_loop_moved_to_another_host(self, caplog) -> None:
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            ctx = await self._sweep_with_board(
+                {"status": "running", "loop_remote_run_id": "foreign-run"}
+            )
+        ctx.db.insert_run.assert_not_called()
+        ctx.start_loop.assert_not_called()
+        assert any(
+            "board_loop_run=foreign-run reason=superseded" in r.getMessage()
+            for r in caplog.records
+        )
+
+    async def test_readopt_adopts_when_board_has_no_fence_keys(self) -> None:
+        ctx = await self._sweep_with_board({"status": "running"})
+        ctx.db.insert_run.assert_awaited_once()
+        ctx.start_loop.assert_called_once()
+
+    async def test_readopt_adopts_when_board_is_unreachable(self, caplog) -> None:
+        with caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.main"):
+            ctx = await self._sweep_with_board(httpx.ConnectError("down"))
+        ctx.db.insert_run.assert_awaited_once()
+        ctx.start_loop.assert_called_once()
+        assert any("board_unreachable" in r.getMessage() for r in caplog.records)
+
+    async def test_readopt_skips_while_a_new_loop_is_routing(self) -> None:
+        ctx = await self._sweep_with_board(
+            {
+                "status": "running",
+                "loop_remote_run_id": self._local.id,
+                "loop_run_routing": True,
+            }
+        )
+        ctx.db.insert_run.assert_not_called()
+        ctx.start_loop.assert_not_called()
 
     async def test_resumed_loop_does_not_double_dispatch_an_in_flight_item(
         self,
@@ -3843,3 +3911,164 @@ class TestParkedLoopGuards:
 
         mock_loop.assert_called_once()
         assert mock_loop.call_args.args[0].rollout_id == "rollout-abc"
+
+
+class TestLoopSupersession:
+    """A loop whose rollout the board hands to another host stands down."""
+
+    @staticmethod
+    def _board(ctx, **extra) -> None:
+        ctx.gtd.advance_rollout = AsyncMock(
+            return_value={
+                "next_ready": ["item-c"],
+                "in_progress": [],
+                "graph_complete": False,
+            }
+        )
+        ctx.gtd.get_rollout = AsyncMock(
+            return_value={"status": "running", "inFlightBuildRuns": [], **extra}
+        )
+
+    @staticmethod
+    def _local_runs(ctx, *ids: str) -> None:
+        runs = []
+        for run_id in ids:
+            run = _make_run()
+            run.id = run_id
+            runs.append(run)
+        ctx.db.list_runs_by_rollout = AsyncMock(return_value=runs)
+
+    def test_loop_superseded_helper(self) -> None:
+        from agent_gtd_dispatch.main import _loop_superseded
+
+        local = _make_run()
+        build = _make_run(mode="build")
+        assert _loop_superseded({}, [local]) is None
+        assert _loop_superseded({"loop_remote_run_id": None}, [local]) is None
+        assert _loop_superseded({"loop_remote_run_id": ""}, [local]) is None
+        assert _loop_superseded({"loop_remote_run_id": local.id}, [local]) is None
+        assert _loop_superseded({"loop_remote_run_id": "x"}, [local]) == "x"
+        # A child build row with the id is not a loop this host holds.
+        assert (
+            _loop_superseded({"loop_remote_run_id": build.id}, [local, build])
+            == build.id
+        )
+        assert (
+            _loop_superseded(
+                {"loop_remote_run_id": "x", "loop_run_routing": True}, [local]
+            )
+            is None
+        )
+
+    async def test_foreign_board_loop_supersedes_the_tick(self, caplog) -> None:
+        from agent_gtd_dispatch.main import _TICK_SUPERSEDED
+
+        with _loop_patch_stack() as ctx:
+            self._board(ctx, loop_remote_run_id="foreign-run")
+            self._local_runs(ctx, "loop-run-1")
+            with caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.main"):
+                assert await _tick(ctx) == _TICK_SUPERSEDED
+
+        ctx.gtd.dispatch_item.assert_not_awaited()
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        ctx.gtd.update_rollout_state.assert_not_awaited()
+        ctx.dispatch.prepare_rollout_workspace.assert_not_called()
+        assert any(
+            "rollout-loop: superseded" in r.getMessage()
+            and "board_loop_run=foreign-run" in r.getMessage()
+            for r in caplog.records
+        )
+
+    async def test_board_naming_this_loop_proceeds(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_SUPERSEDED
+
+        with _loop_patch_stack() as ctx:
+            self._board(ctx, loop_remote_run_id="loop-run-1")
+            self._local_runs(ctx, "loop-run-1")
+            assert await _tick(ctx) != _TICK_SUPERSEDED
+        ctx.gtd.dispatch_item.assert_awaited()
+
+    async def test_board_naming_an_older_local_loop_proceeds(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_SUPERSEDED
+
+        with _loop_patch_stack() as ctx:
+            self._board(ctx, loop_remote_run_id="orig")
+            self._local_runs(ctx, "orig", "readopt")
+            assert await _tick(ctx, loop_run_id="readopt") != _TICK_SUPERSEDED
+        ctx.gtd.dispatch_item.assert_awaited()
+
+    async def test_routing_loop_without_id_proceeds(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_SUPERSEDED
+
+        with _loop_patch_stack() as ctx:
+            self._board(ctx, loop_remote_run_id=None, loop_run_routing=True)
+            self._local_runs(ctx, "loop-run-1")
+            assert await _tick(ctx) != _TICK_SUPERSEDED
+        ctx.gtd.dispatch_item.assert_awaited()
+
+    async def test_foreign_id_while_routing_proceeds(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_SUPERSEDED
+
+        with _loop_patch_stack() as ctx:
+            self._board(ctx, loop_remote_run_id="foreign-run", loop_run_routing=True)
+            self._local_runs(ctx, "loop-run-1")
+            assert await _tick(ctx) != _TICK_SUPERSEDED
+        ctx.gtd.dispatch_item.assert_awaited()
+
+    async def test_supersession_waits_behind_an_active_land(self) -> None:
+        from agent_gtd_dispatch.main import (
+            _TICK_SUPERSEDED,
+            _TICK_WAIT,
+            _ActiveLand,
+            _RolloutLoopState,
+        )
+
+        release = asyncio.Event()
+
+        async def _land() -> str:
+            await release.wait()
+            return "continue"
+
+        task = asyncio.create_task(_land())
+        loop_state = _RolloutLoopState(
+            slots={0: _fake_workspace()},
+            active_land=_ActiveLand("item-a", 0, task, 0.0),
+        )
+        with _loop_patch_stack() as ctx:
+            self._board(ctx, loop_remote_run_id="foreign-run")
+            self._local_runs(ctx, "loop-run-1")
+            assert await _tick(ctx, loop_state=loop_state) == _TICK_WAIT
+            assert loop_state.pending_directive == _TICK_SUPERSEDED
+            assert not task.cancelled()
+            release.set()
+            await task
+            assert await _tick(ctx, loop_state=loop_state) == _TICK_SUPERSEDED
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        ctx.gtd.dispatch_item.assert_not_awaited()
+
+    async def test_superseded_loop_records_its_run_failed(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_SUPERSEDED, _rollout_loop_worker
+
+        run = Run(
+            project_name="p",
+            mode="manage",
+            rollout_id="rollout-abc",
+            engine="claude-code",
+        )
+        with _loop_patch_stack() as ctx:
+            ctx.gtd.get_rollout = AsyncMock(return_value={"project_id": "proj-1"})
+            ctx.gtd.get_project = AsyncMock(
+                return_value={"name": "P", "workspace_repos": []}
+            )
+            ctx.rollout_loops["rollout-abc"] = run
+            with patch(
+                "agent_gtd_dispatch.main._rollout_wave_tick",
+                new=AsyncMock(return_value=_TICK_SUPERSEDED),
+            ) as tick:
+                await _rollout_loop_worker(run)
+
+        assert tick.await_count == 1
+        last = ctx.db.update_run.await_args
+        assert last.kwargs["status"] == RunStatus.failed
+        assert last.kwargs["error"] == "rollout superseded"
+        assert "rollout-abc" not in ctx.rollout_loops

@@ -801,7 +801,8 @@ What replaces them:
   run and does not halt the rollout.
 - **The reviewer is bounded** by `REVIEW_TIMEOUT_SECONDS`.
 - **Restarts** are covered by the startup re-adoption sweep, which resumes only
-  rollouts this host holds a local MANAGE run row for. The watchdog it replaced
+  rollouts this host holds a local MANAGE run row for, and which the board does
+  not say were moved elsewhere (see loop fencing below). The watchdog it replaced
   scanned every running rollout fleet-wide; on rollout fe1e828d it started a
   second loop on a host that had never owned the rollout, and the two loops
   landed the same item.
@@ -810,9 +811,34 @@ What replaces them:
   /api/rollouts/{id}/resume`) puts the rollout back to `running` and creates a
   new MANAGE run pinned to the rollout's owning host (its pinned host, else the
   host of its latest MANAGE run), emitting `manage_relaunched`. On a `running`
-  rollout it only relaunches a missing loop (one that crashed). Pinning keeps
-  every loop for a rollout on one host, so re-adoption after a restart cannot
-  put a second loop elsewhere.
+  rollout it only relaunches a missing loop (one that crashed), always on the
+  owning host.
+- **A halted, unpinned rollout's loop can move.** When the previous loop host
+  is not registered, draining or unreachable, the board's resume relaunches the
+  loop on another eligible host through normal auto-routing. Before leaving a
+  draining host the board asks its `GET /runs` for a running or pending MANAGE
+  run of the rollout and refuses the resume if one is live or the host cannot
+  answer. Child builds in flight on the old host are adopted by the moved loop
+  through the board's `inFlightBuildRuns`. No host-local state needs moving:
+  `rollout-<id>` slot workspaces are prepared lazily on the new host, and the
+  in-memory redispatch and unrecorded-merge bookkeeping is dropped at every
+  loop exit. An explicitly pinned rollout is never moved.
+- **Loop fencing.** After a move the old host still holds a local MANAGE row
+  for the rollout, so a local row alone no longer proves ownership. The board's
+  `get_rollout` reports `loop_remote_run_id` (the dispatch-host run id of the
+  latest MANAGE run it routed) and `loop_run_routing` (a newer MANAGE run is
+  still pending). `_loop_superseded` treats the loop as superseded when the
+  board names a run id that matches no local MANAGE row and nothing is
+  routing; an absent key (an older board) never supersedes.
+  - The re-adoption sweep reads `get_rollout` before inserting its run row: it
+    skips a rollout whose loop is routing or superseded, and adopts as before
+    when the board cannot be reached (the first tick re-checks).
+  - Every tick checks right after the `status != running` exit. A superseded
+    loop returns `_TICK_SUPERSEDED` through `_exit_tick`: reviews are torn
+    down, queued lands are dropped, and an active land finishes first. It does
+    not halt the rollout, publish a phase or write any board state, and it
+    keeps its slot workspaces. The loop's run ends `failed` with error
+    `rollout superseded`.
 - **One loop per rollout per host.** `_start_rollout_loop` is the single,
   await-free choke point that registers a loop in `_rollout_loops` (before the
   task is created) and refuses a duplicate. `POST /dispatch` returns 409 for a
