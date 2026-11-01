@@ -110,27 +110,35 @@ FEATURE = "feat/996b308e-add-x"
 _MARKER_LINE = "<<<<<<< HEAD\n"
 
 
+def _write_or_delete(clone: Path, name: str, content: str | None) -> None:
+    target = clone / name
+    if content is None:
+        target.unlink(missing_ok=True)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
+
+
 def _conflict_squash(
     clone: Path,
-    files: dict[str, tuple[str, str, str]],
+    files: dict[str, tuple[str | None, str | None, str | None]],
     item_id: str = ITEM,
 ) -> str:
     """Fabricate a reviewer's squash commit whose merge conflicted.
 
     *files* maps path -> (branch content, default-branch content, resolved
-    content).  The default-branch edit is pushed to origin, so origin is the
-    squash commit's parent.
+    content); ``None`` deletes the path on that side or in the resolution.
+    The default-branch edit is pushed to origin, so origin is the squash
+    commit's parent.
     """
     _git(clone, "checkout", "-q", "-b", FEATURE)
     for name, (ours, _theirs, _resolved) in files.items():
-        (clone / name).parent.mkdir(parents=True, exist_ok=True)
-        (clone / name).write_text(ours)
+        _write_or_delete(clone, name, ours)
     _git(clone, "add", "-A")
     _git(clone, "commit", "-m", "feat: branch side")
     _git(clone, "checkout", "-q", "main")
     for name, (_ours, theirs, _resolved) in files.items():
-        (clone / name).parent.mkdir(parents=True, exist_ok=True)
-        (clone / name).write_text(theirs)
+        _write_or_delete(clone, name, theirs)
     _git(clone, "add", "-A")
     _git(clone, "commit", "-m", "docs: default-branch side")
     _git(clone, "push", "-q", "origin", "main")
@@ -142,8 +150,8 @@ def _conflict_squash(
     )
     assert merge.returncode != 0
     for name, (_ours, _theirs, resolved) in files.items():
-        (clone / name).write_text(resolved)
-        _git(clone, "add", name)
+        _write_or_delete(clone, name, resolved)
+        _git(clone, "add", "-A", "--", name)
     _git(
         clone,
         "commit",
@@ -161,6 +169,11 @@ def _conflict_squash(
 
 
 _README = ("branch line\n", "main line\n", "branch line\nmain line\n")
+_REGISTRY = (
+    "ITEMS = [\n    'a',\n    'b',\n]\n",
+    "ITEMS = [\n    'a',\n    'c',\n]\n",
+    "ITEMS = [\n    'a',\n    'b',\n    'c',\n]\n",
+)
 _APP = ("x = 1\n", "x = 2\n", "x = 3\n")
 
 
@@ -387,6 +400,42 @@ class TestHelpers:
     def test_conflict_markers_other_exit_raises(self, mono) -> None:
         with pytest.raises(dispatch.LandGitError, match="git grep failed"):
             dispatch.land_conflict_markers(mono.clone, "no-such-rev", ["a.md"], 30)
+
+    def test_paths_missing_lists_absent_paths(self, mono) -> None:
+        assert dispatch.land_paths_missing(
+            mono.clone, "main", ["f.txt", "gone.py"], 30
+        ) == ["gone.py"]
+
+    def test_merge_base_and_added_and_file_lines(self, mono) -> None:
+        base = _git(mono.clone, "rev-parse", "HEAD")
+        (mono.clone / "f.txt").write_text("a\n  b  \n\n")
+        _git(mono.clone, "commit", "-qam", "edit")
+        assert dispatch.land_merge_base(mono.clone, base, "HEAD", 30) == base
+        assert dispatch.land_added_lines(mono.clone, base, "HEAD", "f.txt", 30) == ["b"]
+        assert dispatch.land_file_lines(mono.clone, "HEAD", "f.txt", 30) == [
+            "a",
+            "b",
+            "",
+        ]
+
+    def test_new_helpers_raise_on_git_errors(self, mono) -> None:
+        with pytest.raises(dispatch.LandGitError, match="merge-base"):
+            dispatch.land_merge_base(mono.clone, "no-such-rev", "main", 30)
+        with pytest.raises(dispatch.LandGitError, match="diff"):
+            dispatch.land_added_lines(mono.clone, "no-such-rev", "main", "f.txt", 30)
+        with pytest.raises(dispatch.LandGitError, match="show"):
+            dispatch.land_file_lines(mono.clone, "main", "nope.txt", 30)
+
+    def test_lockfile_basenames(self) -> None:
+        assert dispatch.LOCKFILE_BASENAMES == (
+            "uv.lock",
+            "poetry.lock",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "Cargo.lock",
+            "go.sum",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -929,13 +978,15 @@ class TestConflictGuard:
         assert f"Item: {ITEM}" in _git(mono.origin, "log", "-1", "--format=%B", "main")
         assert _git(mono.origin, "show", "main:README.md") == "branch line\nmain line"
         comment = gtd.post_comment.await_args.args[1]
-        assert "Reviewer resolved documentation-only merge conflicts in: README.md" in (
-            comment
-        )
         assert (
-            f"Conflict check ({mono.clone.name}): worker found documentation "
-            "conflicts in README.md; reviewer reported resolving README.md"
+            "Reviewer resolved merge conflicts by keeping both sides in: README.md"
         ) in comment
+        assert (
+            f"Conflict check ({mono.clone.name}): worker found conflicts in "
+            "README.md; reviewer resolved keep-both: README.md"
+        ) in comment
+        assert "documentation-only" not in comment
+        assert "documentation conflicts" not in comment
         assert "mismatch" not in comment
         assert "land-conflict-unreported" not in caplog.text
         checks = [
@@ -949,33 +1000,249 @@ class TestConflictGuard:
         assert "base=main~1" in checks[0]
         assert f"tip_ref=refs/heads/{FEATURE}" in checks[0]
 
-    async def test_non_doc_conflict_halts(self, mono, gtd, caplog) -> None:
-        _conflict_squash(mono.clone, {"README.md": _README, "src/app.py": _APP})
+    async def test_resolved_code_conflict_lands(self, mono, gtd, caplog) -> None:
+        _conflict_squash(mono.clone, {"src/registry.py": _REGISTRY})
+        pre = _pre(mono.ws)
+        outcome = _verdict(resolved_conflict_paths=("src/registry.py",))
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, pre, outcome=outcome)
+        assert isinstance(result, ReviewVerdict)
+        gtd.halt_rollout.assert_not_awaited()
+        assert _git(mono.origin, "show", "main:src/registry.py") == _REGISTRY[2].strip()
+        comment = gtd.post_comment.await_args.args[1]
+        assert (
+            f"Conflict check ({mono.clone.name}): worker found conflicts in "
+            "src/registry.py; reviewer resolved keep-both: src/registry.py"
+        ) in comment
+        assert (
+            "Reviewer resolved merge conflicts by keeping both sides in: "
+            "src/registry.py"
+        ) in comment
+        assert "keep-both audit" not in comment
+        assert "decision=resolved" in caplog.text
+        pushed = [line for line in _land_lines(caplog) if "outcome=pushed" in line]
+        assert len(pushed) == 1
+        assert "conflict=code conflict_code_paths=src/registry.py" in pushed[0]
+        audit = [r for r in caplog.records if "land-keepboth-audit" in r.getMessage()]
+        assert len(audit) == 1
+        assert audit[0].levelno == logging.INFO
+        assert "main_dropped=0 branch_dropped=0 outcome=ok" in audit[0].getMessage()
+
+    async def test_resolved_code_conflict_gates_the_pushed_sha(
+        self, mono, gtd, tmp_path: Path
+    ) -> None:
+        _conflict_squash(mono.clone, {"src/registry.py": _REGISTRY})
+        pre = _pre(mono.ws)
+        outcome = _verdict(resolved_conflict_paths=("src/registry.py",))
+        result = await _land(
+            mono.ws,
+            pre,
+            outcome=outcome,
+            gate=f"git rev-parse HEAD > {tmp_path}/gated_sha",
+        )
+        assert isinstance(result, ReviewVerdict)
+        assert (tmp_path / "gated_sha").read_text().strip() == _tip(mono.origin)
+
+    async def test_unreported_code_conflict_halts(self, mono, gtd, caplog) -> None:
+        _conflict_squash(mono.clone, {"src/registry.py": _REGISTRY})
         pre = _pre(mono.ws)
         before = _tip(mono.origin)
-        outcome = _verdict(resolved_conflict_paths=("README.md",))
+        outcome = _verdict(resolved_conflict_paths=())
         with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
             result = await _land(mono.ws, pre, outcome=outcome)
         assert result == main._TICK_HALTED
         assert _halt_reason(gtd) == (
             f"land refused for item {ITEM}: repo {mono.clone.name}: the squash "
-            "merge conflicts on non-documentation paths: src/app.py"
+            "merge conflicts on paths the reviewer did not report resolving: "
+            "src/registry.py"
         )
         assert _tip(mono.origin) == before
-        assert "decision=non_doc_halt" in caplog.text
-        assert "outcome=non_doc_conflict" in caplog.text
+        assert "decision=unreported_halt" in caplog.text
+        assert "outcome=unreported_conflict" in caplog.text
 
-    async def test_reported_non_doc_path_halts(self, mono, gtd) -> None:
-        _squash(mono.clone)
+    async def test_code_conflict_markers_halt(self, mono, gtd, caplog) -> None:
+        resolved = f"ITEMS = [\n{_MARKER_LINE}    'b',\n    'c',\n]\n"
+        _conflict_squash(
+            mono.clone,
+            {"src/registry.py": (_REGISTRY[0], _REGISTRY[1], resolved)},
+        )
+        pre = _pre(mono.ws)
         before = _tip(mono.origin)
-        outcome = _verdict(resolved_conflict_paths=("src/app.py",))
-        result = await _land(mono.ws, mono.pre, outcome=outcome)
+        outcome = _verdict(resolved_conflict_paths=("src/registry.py",))
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, pre, outcome=outcome)
         assert result == main._TICK_HALTED
         assert _halt_reason(gtd).startswith(
-            f"land refused for item {ITEM}: the reviewer reported resolving "
-            "non-documentation conflict paths: src/app.py"
+            f"land refused for item {ITEM}: repo {mono.clone.name}: conflict "
+            "markers remain in: src/registry.py"
         )
         assert _tip(mono.origin) == before
+        assert "decision=markers_halt" in caplog.text
+        assert "outcome=conflict_markers" in caplog.text
+
+    async def test_resolved_code_conflict_gate_failure_halts_without_fix_relaunch(
+        self, mono, gtd, caplog
+    ) -> None:
+        _conflict_squash(mono.clone, {"src/registry.py": _REGISTRY})
+        pre = _pre(mono.ws)
+        before = _tip(mono.origin)
+        outcome = _verdict(resolved_conflict_paths=("src/registry.py",))
+        fixer = AsyncMock()
+        with (
+            patch.object(main, "_launch_reviewer", fixer),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            # Output keeps the halt reason's trailing ": " (an empty tail is
+            # stripped).
+            result = await _land(
+                mono.ws, pre, outcome=outcome, gate="echo gate-red; false"
+            )
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd).startswith(
+            f"land gate failed for item {ITEM} after keep-both conflict "
+            "resolution in src/registry.py: "
+        )
+        assert _tip(mono.origin) == before
+        fixer.assert_not_awaited()
+        assert "land-fix-relaunch-skipped" in caplog.text
+        assert "reason=code_conflict paths=src/registry.py" in caplog.text
+        assert all("fix_relaunches=0" in line for line in _land_lines(caplog))
+
+    def test_gate_halt_heads_name_the_conflict_paths(self, mono) -> None:
+        lander = main._Lander(
+            ROLLOUT,
+            ITEM,
+            _verdict(),
+            project={"name": "P"},
+            workspace=mono.ws,
+            pre_review_origin={},
+            reviewer_engine=get_engine("claude-code-sonnet"),
+            loop_run_id="1",
+            token=None,
+            attribution=None,
+        )
+        timed_out = dispatch.GateResult(None, True, "", 7.0)
+        launch = dispatch.GateResult(None, False, "boom", 0.0)
+        ctx = " after keep-both conflict resolution in a.py, b.py"
+        paths = ["a.py", "b.py"]
+        assert lander._gate_halt(timed_out, paths).head == (
+            f"land gate timed out for item {ITEM}{ctx} after 7s"
+        )
+        assert lander._gate_halt(launch, paths).head == (
+            f"land gate launch error for item {ITEM}{ctx}: boom"
+        )
+        assert lander._gate_halt(timed_out, []).head == (
+            f"land gate timed out for item {ITEM} after 7s"
+        )
+        assert lander._gate_halt(launch).head == (
+            f"land gate launch error for item {ITEM}: boom"
+        )
+
+    async def test_resolved_code_conflict_without_gate_halts(
+        self, mono, gtd, caplog
+    ) -> None:
+        _conflict_squash(mono.clone, {"src/registry.py": _REGISTRY})
+        pre = _pre(mono.ws)
+        before = _tip(mono.origin)
+        outcome = _verdict(resolved_conflict_paths=("src/registry.py",))
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, pre, outcome=outcome, gate="")
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd) == (
+            f"land refused for item {ITEM}: code conflicts were resolved in "
+            "src/registry.py but the project has no gate_command to verify the "
+            "merged tree"
+        )
+        assert _tip(mono.origin) == before
+        assert "decision=no_gate_halt" in caplog.text
+        assert "outcome=conflict_needs_gate" in caplog.text
+
+    async def test_overreported_code_path_lands_with_a_warning(
+        self, mono, gtd, caplog
+    ) -> None:
+        before = _tip(mono.origin)
+        _squash(mono.clone)
+        outcome = _verdict(resolved_conflict_paths=("src/app.py",))
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, mono.pre, outcome=outcome)
+        assert isinstance(result, ReviewVerdict)
+        gtd.halt_rollout.assert_not_awaited()
+        assert (
+            f"land-conflict-overreported rollout_id={ROLLOUT} item_id={ITEM} "
+            f"repo={mono.clone.name} overreported=src/app.py"
+        ) in caplog.text
+        assert _tip(mono.origin) != before
+        assert "decision=clean" in caplog.text
+
+    async def test_lockfile_conflict_halts(self, mono, gtd, caplog) -> None:
+        _conflict_squash(
+            mono.clone, {"uv.lock": ("a = 1\n", "a = 2\n", "a = 1\na = 2\n")}
+        )
+        pre = _pre(mono.ws)
+        before = _tip(mono.origin)
+        outcome = _verdict(resolved_conflict_paths=("uv.lock",))
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, pre, outcome=outcome)
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd) == (
+            f"land refused for item {ITEM}: repo {mono.clone.name}: conflicts on "
+            "lockfiles cannot be resolved by keeping both sides: uv.lock"
+        )
+        assert _tip(mono.origin) == before
+        assert "decision=kind_halt" in caplog.text
+        assert "outcome=unresolvable_conflict_kind" in caplog.text
+
+    async def test_deleted_conflict_path_halts(self, mono, gtd, caplog) -> None:
+        (mono.clone / "src").mkdir()
+        (mono.clone / "src" / "registry.py").write_text("ITEMS = ['a']\n")
+        _git(mono.clone, "add", "-A")
+        _git(mono.clone, "commit", "-m", "chore: add registry")
+        _git(mono.clone, "push", "-q", "origin", "main")
+        _conflict_squash(
+            mono.clone,
+            {
+                "src/registry.py": ("ITEMS = ['a', 'b']\n", None, None),
+                # A clean branch-only file, so the squash commit is not empty.
+                "feature.txt": ("x\n", None, "x\n"),
+            },
+        )
+        pre = _pre(mono.ws)
+        before = _tip(mono.origin)
+        outcome = _verdict(resolved_conflict_paths=("src/registry.py",))
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, pre, outcome=outcome)
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd) == (
+            f"land refused for item {ITEM}: repo {mono.clone.name}: conflicting "
+            "paths are absent from the squash commit (a delete or rename conflict "
+            "needs judgment): src/registry.py"
+        )
+        assert _tip(mono.origin) == before
+        assert "decision=missing_halt" in caplog.text
+        assert "outcome=conflict_path_missing" in caplog.text
+
+    async def test_keepboth_audit_flags_dropped_line(self, mono, gtd, caplog) -> None:
+        branch_only = "ITEMS = [\n    'a',\n    'b',\n]\n"
+        _conflict_squash(
+            mono.clone,
+            {"src/registry.py": (_REGISTRY[0], _REGISTRY[1], branch_only)},
+        )
+        pre = _pre(mono.ws)
+        outcome = _verdict(resolved_conflict_paths=("src/registry.py",))
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, pre, outcome=outcome)
+        assert isinstance(result, ReviewVerdict)
+        gtd.halt_rollout.assert_not_awaited()
+        audit = [r for r in caplog.records if "land-keepboth-audit" in r.getMessage()]
+        assert len(audit) == 1
+        assert audit[0].levelno == logging.WARNING
+        assert "main_dropped=1 branch_dropped=0 outcome=dropped" in (
+            audit[0].getMessage()
+        )
+        comment = gtd.post_comment.await_args.args[1]
+        assert (
+            " (keep-both audit: src/registry.py dropped 1 main / 0 branch added lines)"
+        ) in comment
 
     async def test_missing_feature_branch_halts(self, mono, gtd) -> None:
         _squash(mono.clone)
@@ -1094,11 +1361,11 @@ class TestConflictGuard:
         assert "unreported=README.md" in caplog.text
         comment = gtd.post_comment.await_args.args[1]
         assert (
-            f"Conflict check ({mono.clone.name}): worker found documentation "
-            "conflicts in README.md; reviewer reported resolving none "
+            f"Conflict check ({mono.clone.name}): worker found conflicts in "
+            "README.md; reviewer resolved keep-both: none "
             "(mismatch: unreported README.md)"
         ) in comment
-        assert "Reviewer resolved documentation-only" not in comment
+        assert "Reviewer resolved merge conflicts" not in comment
 
     async def test_leftover_markers_halt(self, mono, gtd, caplog) -> None:
         resolved = f"branch line\n{_MARKER_LINE}main line\n"
@@ -1309,12 +1576,57 @@ class TestWorkspaceProjects:
         assert "land-conflict-unreported" not in caplog.text
         comment = gtd.post_comment.await_args.args[1]
         assert (
-            "Conflict check (repo-a): worker found documentation conflicts in "
-            "README.md; reviewer reported resolving README.md"
+            "Conflict check (repo-a): worker found conflicts in "
+            "README.md; reviewer resolved keep-both: README.md"
         ) in comment
         assert (
-            "Reviewer resolved documentation-only merge conflicts in: repo-a/README.md"
+            "Reviewer resolved merge conflicts by keeping both sides in: "
+            "repo-a/README.md"
         ) in comment
+
+    async def test_keep_both_code_conflict_in_one_repo_lands(
+        self, two_repo, gtd, caplog
+    ) -> None:
+        _conflict_squash(two_repo.clone_a, {"src/registry.py": _REGISTRY})
+        pre = _pre(two_repo.ws)
+        outcome = _verdict(
+            repo_states=(("repo-a", "committed"),),
+            resolved_conflict_paths=("repo-a/src/registry.py",),
+        )
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(two_repo.ws, pre, outcome=outcome)
+        assert isinstance(result, ReviewVerdict)
+        gtd.halt_rollout.assert_not_awaited()
+        assert "decision=resolved" in caplog.text
+        comment = gtd.post_comment.await_args.args[1]
+        assert (
+            "Conflict check (repo-a): worker found conflicts in src/registry.py; "
+            "reviewer resolved keep-both: src/registry.py"
+        ) in comment
+        assert comment.splitlines()[-1] == (
+            "Reviewer resolved merge conflicts by keeping both sides in: "
+            "repo-a/src/registry.py"
+        )
+        assert _git(two_repo.origin_a, "show", "main:src/registry.py") == (
+            _REGISTRY[2].strip()
+        )
+
+    async def test_code_conflict_without_gate_names_the_repo(
+        self, two_repo, gtd
+    ) -> None:
+        _conflict_squash(two_repo.clone_a, {"src/registry.py": _REGISTRY})
+        pre = _pre(two_repo.ws)
+        outcome = _verdict(
+            repo_states=(("repo-a", "committed"),),
+            resolved_conflict_paths=("repo-a/src/registry.py",),
+        )
+        result = await _land(two_repo.ws, pre, outcome=outcome, gate="")
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd) == (
+            f"land refused for item {ITEM}: code conflicts were resolved in "
+            "repo-a/src/registry.py but the project has no gate_command to "
+            "verify the merged tree"
+        )
 
     async def test_both_repos_land(self, two_repo, gtd) -> None:
         _squash(two_repo.clone_a)

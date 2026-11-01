@@ -821,7 +821,7 @@ class TestLaunchReviewer:
             )
         assert outcome.verdict == "merge"
         assert outcome.resolved_conflict_paths == ("README.md",)
-        assert outcome.detail.endswith(" [resolved doc conflicts: README.md]")
+        assert outcome.detail.endswith(" [resolved keep-both conflicts: README.md]")
         completion = json.loads(ctx.db.update_run.await_args.kwargs["completion"])
         assert completion["resolved_conflict_paths"] == ["README.md"]
 
@@ -849,6 +849,10 @@ class TestLaunchReviewer:
         kwargs = ctx.db.update_run.await_args.kwargs
         assert kwargs["status"].value == "succeeded"
         assert json.loads(kwargs["completion"])["verdict"] == "halt"
+        assert (
+            json.loads(kwargs["completion"])["verdict_coerced"]
+            == "malformed_resolved_conflict_paths"
+        )
 
     async def test_malformed_resolved_conflict_paths_ignored_off_merge(self) -> None:
         with _loop_patch_stack() as ctx:
@@ -886,6 +890,143 @@ class TestLaunchReviewer:
         assert outcome.resolved_conflict_paths == ()
         completion = json.loads(ctx.db.update_run.await_args.kwargs["completion"])
         assert "resolved_conflict_paths" not in completion
+
+    async def test_malformed_judgment_conflict_paths_halts_a_merge(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import json
+
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.WARNING, "agent_gtd_dispatch.main"),
+        ):
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "merge",
+                    "rationale": "ok",
+                    "merge_note": "n",
+                    "judgment_conflict_paths": [1],
+                },
+                reason="ok",
+            )
+        assert outcome.verdict == "halt"
+        assert outcome.rationale == (
+            "reviewer returned a malformed judgment_conflict_paths"
+        )
+        assert outcome.detail == "malformed judgment_conflict_paths: [1]"
+        assert outcome.judgment_conflict_paths == ()
+        completion = json.loads(ctx.db.update_run.await_args.kwargs["completion"])
+        assert completion["verdict"] == "halt"
+        assert completion["verdict_coerced"] == "malformed_judgment_conflict_paths"
+        assert "judgment_conflict_paths" not in completion
+        assert (
+            "review-verdict-coerced rollout_id=" in caplog.text
+            and "from=merge to=halt reason=malformed_judgment_conflict_paths"
+            in caplog.text
+        )
+
+    async def test_malformed_judgment_conflict_paths_ignored_off_merge(
+        self,
+    ) -> None:
+        import json
+
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "skip",
+                    "rationale": "not needed",
+                    "judgment_conflict_paths": "x",
+                },
+                reason="ok",
+            )
+        assert outcome.verdict == "skip"
+        assert outcome.rationale == "not needed"
+        assert outcome.judgment_conflict_paths == ()
+        completion = json.loads(ctx.db.update_run.await_args.kwargs["completion"])
+        assert "verdict_coerced" not in completion
+
+    async def test_merge_with_judgment_paths_halts(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import json
+
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.WARNING, "agent_gtd_dispatch.main"),
+        ):
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "merge",
+                    "rationale": "ok",
+                    "merge_note": "n",
+                    "judgment_conflict_paths": ["src/a.py"],
+                },
+                reason="ok",
+            )
+        assert outcome.verdict == "halt"
+        assert outcome.rationale == (
+            "reviewer reported conflicts needing judgment but returned merge"
+        )
+        assert outcome.detail.endswith(" [conflicts needing judgment: src/a.py]")
+        assert outcome.judgment_conflict_paths == ("src/a.py",)
+        completion = json.loads(ctx.db.update_run.await_args.kwargs["completion"])
+        assert completion["verdict_coerced"] == "merge_with_judgment_paths"
+        assert completion["judgment_conflict_paths"] == ["src/a.py"]
+        assert "review-verdict-coerced" in caplog.text
+        assert "reason=merge_with_judgment_paths" in caplog.text
+
+    async def test_halt_with_judgment_paths_is_not_coerced(self) -> None:
+        import json
+
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "halt",
+                    "rationale": "conflict needs a human",
+                    "resolved_conflict_paths": [],
+                    "judgment_conflict_paths": ["src/a.py", "src/b.py"],
+                    "failure": {"kind": "merge_conflict", "detail": "CONFLICT"},
+                },
+                reason="ok",
+            )
+        assert outcome.verdict == "halt"
+        assert outcome.rationale == "conflict needs a human"
+        assert outcome.detail == (
+            "merge_conflict: CONFLICT [conflicts needing judgment: src/a.py, src/b.py]"
+        )
+        completion = json.loads(ctx.db.update_run.await_args.kwargs["completion"])
+        assert "verdict_coerced" not in completion
+
+    async def test_empty_judgment_conflict_paths_leaves_completion_unchanged(
+        self,
+    ) -> None:
+        import json
+
+        with _loop_patch_stack() as ctx:
+            outcome = await self._launch(
+                ctx,
+                verdict_blob={
+                    "schema_version": 1,
+                    "verdict": "merge",
+                    "rationale": "ok",
+                    "merge_note": "n",
+                    "judgment_conflict_paths": [],
+                },
+                reason="ok",
+            )
+        assert outcome.verdict == "merge"
+        assert outcome.judgment_conflict_paths == ()
+        completion = json.loads(ctx.db.update_run.await_args.kwargs["completion"])
+        assert "judgment_conflict_paths" not in completion
+        assert "verdict_coerced" not in completion
 
     async def test_gate_failure_output_reaches_the_prompt(self) -> None:
         with _loop_patch_stack() as ctx:

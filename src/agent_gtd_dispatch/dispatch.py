@@ -4038,12 +4038,26 @@ def land_delete_feature_branch(repo: Path, branch_name: str, timeout: int) -> li
     return notes
 
 
-# The file extensions that count as documentation for the reviewer's
-# conflict allowance: a squash-merge conflict confined to these paths may be
-# resolved by the reviewer; any other conflicting path aborts the merge.  The
+# The file extensions that count as documentation.  The reviewer may resolve
+# any keep-both squash-merge conflict (code or documentation); documentation
+# paths matter because a resolved documentation conflict needs no land gate,
+# while a resolved code conflict lands only through the project gate.  The
 # ONLY copy of the list — the review prompt and the land step's conflict guard
 # both render / test against it.
 DOCUMENTATION_EXTENSIONS: tuple[str, ...] = (".md", ".mdx", ".rst", ".txt")
+
+# Lockfile basenames whose conflicts can never be resolved by keeping both
+# sides: they are always judgment.  The ONLY copy of the list — both the review
+# prompt and the land step's conflict guard use it.
+LOCKFILE_BASENAMES: tuple[str, ...] = (
+    "uv.lock",
+    "poetry.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Cargo.lock",
+    "go.sum",
+)
 
 
 def is_documentation_path(path: str) -> bool:
@@ -4130,6 +4144,61 @@ def land_conflict_markers(
     ]
 
 
+def land_paths_missing(
+    repo: Path, rev: str, paths: list[str], timeout: int
+) -> list[str]:
+    """Those of *paths* that do not exist in *rev*'s tree (``git cat-file -e``).
+
+    A conflicting path absent from the squash commit means one side deleted or
+    renamed it: a shape keeping both sides cannot express.
+    """
+    missing: list[str] = []
+    for p in paths:
+        proc = _land_git(repo, ["cat-file", "-e", f"{rev}:{p}"], timeout)
+        if proc.returncode != 0:
+            missing.append(p)
+    return missing
+
+
+def land_merge_base(repo: Path, a: str, b: str, timeout: int) -> str:
+    """``git merge-base a b``; raises :class:`LandGitError` on failure."""
+    proc = _land_git(repo, ["merge-base", a, b], timeout)
+    if proc.returncode != 0:
+        raise LandGitError("merge-base", git_output_excerpt(proc))
+    return proc.stdout.decode("utf-8", errors="replace").strip()
+
+
+def land_added_lines(
+    repo: Path, old: str, new: str, path: str, timeout: int
+) -> list[str]:
+    """Lines *new* added to *path* relative to *old*, stripped, blanks dropped."""
+    proc = _land_git(
+        repo,
+        ["diff", "--unified=0", "--no-color", old, new, "--", path],
+        timeout,
+    )
+    if proc.returncode != 0:
+        raise LandGitError("diff", git_output_excerpt(proc))
+    added: list[str] = []
+    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            text = line[1:].strip()
+            if text:
+                added.append(text)
+    return added
+
+
+def land_file_lines(repo: Path, rev: str, path: str, timeout: int) -> list[str]:
+    """The stripped lines of *path* at *rev* (``git show <rev>:<path>``)."""
+    proc = _land_git(repo, ["show", f"{rev}:{path}"], timeout)
+    if proc.returncode != 0:
+        raise LandGitError("show", git_output_excerpt(proc))
+    return [
+        line.strip()
+        for line in proc.stdout.decode("utf-8", errors="replace").splitlines()
+    ]
+
+
 def read_review_verdict(workspace_root: Path) -> tuple[dict[str, Any] | None, str]:
     """Read and validate the reviewer's verdict artifact.
 
@@ -4168,40 +4237,59 @@ def read_review_verdict(workspace_root: Path) -> tuple[dict[str, Any] | None, st
     return data, "ok"
 
 
-def _review_conflict_contract_block(*, workspace_mode: bool) -> str:
+def _review_conflict_contract_block(*, workspace_mode: bool, has_gate: bool) -> str:
     """The merge-conflict contract. Verbatim in the prompt.
 
     The reviewer no longer pushes, so the non-fast-forward rejection it used to
     handle is gone from this block: the worker's land step owns the push and
     retries a rejection itself (fetch, rebase, re-gate).  What remains is the
-    local ``git merge --squash`` conflict.  The reviewer resolves it only when
-    EVERY conflicting path is documentation (:data:`DOCUMENTATION_EXTENSIONS`);
-    any conflict touching another path is detected, aborted and reported.  The
-    worker's land step re-checks both halves independently.
+    local ``git merge --squash`` conflict.  The reviewer classifies every
+    conflicting path as ``keep_both`` (both sides added disjoint content, such
+    as appends to the same registry) or ``judgment`` (the sides disagree about
+    the same lines, or the conflict shape is one that keeping both sides cannot
+    express: delete/rename, binary, mode, submodule, or a lockfile in
+    :data:`LOCKFILE_BASENAMES`).  It resolves the conflict, code or
+    documentation, only when every path is ``keep_both``; any ``judgment`` path
+    aborts the whole merge and is reported in ``judgment_conflict_paths``.  A
+    project without a ``gate_command`` makes every non-documentation path
+    ``judgment``, because nothing could verify the merged tree.  The worker's
+    land step re-checks the result independently and reruns the project gate
+    on the exact tree it pushes.
     """
     extensions = ", ".join(f"`{e}`" for e in DOCUMENTATION_EXTENSIONS)
+    lockfiles = ", ".join(f"`{n}`" for n in LOCKFILE_BASENAMES)
     if workspace_mode:
         partial = """\
 
-**Workspace mode.** In the abort case (c), or on any other failure, reset every repo's local default branch to
+**Workspace mode.** In the abort case (d), or on any other failure, reset every repo's local default branch to
 `origin/<default_branch>` and return `halt`; no repo has been pushed, so there
 is no split state. Name every repo in `repo_states` with exactly one of
 `committed`, `failed` or `untouched`, plus `failure.kind` and
-`failure.detail`. A repo whose documentation-only conflict was resolved and
-committed under (b) reports `repo_states[<repo>] = "committed"`, and its paths
-go in `resolved_conflict_paths` prefixed `<repo_dir>/`."""
+`failure.detail`. A repo whose keep_both conflicts were resolved and committed under (c) reports `repo_states[<repo>] = "committed"`, and its paths go in `resolved_conflict_paths` prefixed `<repo_dir>/`.
+If any repo has a judgment path, no repo is resolved: every repo is reset as above and resolved_conflict_paths is [].
+The `<repo_dir>/` prefix applies to both `resolved_conflict_paths` and
+`judgment_conflict_paths`."""
     else:
         partial = """\
 
 **Single repo.** There is no partial state to describe: either the one squash
 commit exists locally or nothing does."""
 
+    if has_gate:
+        gate_rule = ""
+    else:
+        gate_rule = """
+This project has no gate_command, so every non-documentation conflicting path is judgment: abort and halt.
+"""
+
     body = f"""\
 ## Merge Conflict — the contract
 
-A merge conflict that touches any non-documentation path is handled one way:
-**attempt, detect, abort cleanly, report.** Only a conflict confined entirely
-to documentation files may be resolved, and only as described in (b).
+A merge conflict that needs judgment is handled one way:
+**attempt, detect, abort cleanly, report.** A conflict where both sides only
+added disjoint content (keep_both) is resolved by keeping both sides, as
+described in (c); the worker then reruns the project gate on the merged tree
+before anything lands.
 
 **(a) List the conflicting paths.** When `git merge --squash <branch>` exits
 non-zero, list every conflicting path before doing anything else:
@@ -4210,14 +4298,37 @@ non-zero, list every conflicting path before doing anything else:
 git diff --name-only --diff-filter=U
 ```
 
-**(b) Documentation-only conflict — resolve it.** If EVERY listed path ends in
-one of these documentation extensions (case-insensitive, at any depth):
-{extensions}
-then the agent resolves them:
+**(b) Classify every path: keep_both or judgment.** Look at each conflicting
+path's hunks and both sides' changes since the merge base, then classify it:
 
-1. Edit each conflicting file so it integrates BOTH the branch's change and the
-   default branch's change. Never drop either side's text wholesale — keeping
-   only "ours" or only "theirs" is not a resolution.
+- `keep_both`: a text conflict where both sides added or changed disjoint
+  content in the same region, such as both appending entries to a list,
+  registry, enum, settings struct, fixture map or allow-list. The resolution
+  keeps every line each side added, in an order that compiles, and drops
+  nothing either side added.
+- `judgment`: the two sides changed the SAME existing lines or entries
+  differently, or keeping both would duplicate or contradict a definition, or
+  two added entries carry the same version or sequence number (for example two
+  migrations with the same next number).
+
+These are ALWAYS `judgment`, whatever the hunks look like:
+
+- modify/delete and any rename conflict (either side deleted or renamed the
+  path, which shows as `git ls-files -u -- <path>` lacking stage 2 or stage 3);
+- file/directory conflicts;
+- binary files (`git diff --numstat` shows `-`);
+- file-mode or submodule conflicts;
+- any path whose basename is one of these lockfiles: {lockfiles}
+
+Documentation paths (extensions {extensions}, case-insensitive, at any depth)
+that are resolved by integrating both sides' text are `keep_both`.
+{gate_rule}
+**(c) Every path is keep_both: resolve it.** If EVERY listed path is
+`keep_both`, resolve them:
+
+1. Edit each conflicting file so it keeps BOTH sides: every line the branch
+   added and every line the default branch added. Keeping only "ours" or only
+   "theirs" is not a resolution.
 2. Confirm no conflict markers remain; this MUST print nothing:
    `git grep -nE '^(<<<<<<<|>>>>>>>|\\|\\|\\|\\|\\|\\|\\|)( |$)' -- <paths>`
 3. `git add` exactly those paths, and nothing else.
@@ -4225,20 +4336,25 @@ then the agent resolves them:
 5. Continue with the normal squash commit below, and record every resolved
    path in `resolved_conflict_paths`.
 
-**(c) Any non-documentation path conflicts — abort.** If ANY listed path is not
-documentation, today's contract applies unchanged, and nothing is resolved —
-not even the documentation paths:
+You MAY run targeted tests on the resolved files; they are not a substitute for the land gate, which reruns the project gate on the exact tree that is pushed.
+
+**(d) Any judgment path: abort.** If ANY listed path is `judgment`, nothing is
+resolved, not even the keep_both paths:
 
 ```bash
 git merge --abort || git reset --hard HEAD
 git status --porcelain   # MUST be empty before you go on
 ```
 
-Never improvise a resolution of a conflict that touches a non-documentation
-path. Not "just the import block", not "obviously the branch's version wins".
-Such a conflict means two changes disagree about the same lines and nobody has
-decided which is right — that is a human's call, and a reviewer that picks one
-has silently discarded the other.
+Return verdict `halt` with `failure.kind` set to `merge_conflict`, list every
+judgment path in `judgment_conflict_paths`, and leave
+`resolved_conflict_paths` as `[]`.
+
+Never improvise a resolution of a judgment conflict. Not "just the import
+block", not "obviously the branch's version wins". Such a conflict means two
+changes disagree about the same lines and nobody has decided which is right —
+that is a human's call, and a reviewer that picks one has silently discarded
+the other.
 
 **NEVER `git push --force` and NEVER `--force-with-lease`** — and in fact never
 push at all: the worker lands your squash commit.
@@ -4250,10 +4366,13 @@ branch. Verify it; do not assume it.
 **Report it structurally.** On an abort, set `failure.kind` to `merge_conflict`
 and put the git output tail in `failure.detail`.
 
-**(d) The worker checks your work.** Before it lands anything, the worker
+**(e) The worker checks your work.** Before it lands anything, the worker
 independently recomputes the squash merge's conflicting paths and halts the
-rollout if a non-documentation conflict was resolved, or if conflict markers
-remain in a resolved file.
+rollout on: a lockfile conflict, a conflicting path missing from the squash
+commit, leftover conflict markers, a non-documentation conflict you did not
+report in `resolved_conflict_paths`, a project with no gate_command, or a
+failed land gate. A resolved code conflict never lands unless the project gate
+passes on the exact pushed tree.
 {partial}"""
     return _indent_prompt_block(body)
 
@@ -4468,7 +4587,9 @@ record `none` for it and continue — do NOT halt for that alone."""
     envelope = _review_envelope_block(
         item, branch_name, run_status, gate_result, merge_notes
     )
-    conflict_contract = _review_conflict_contract_block(workspace_mode=workspace_mode)
+    conflict_contract = _review_conflict_contract_block(
+        workspace_mode=workspace_mode, has_gate=bool(gate_command)
+    )
     pinned_subject = compose_squash_subject(item)
     if pinned_subject is not None:
         pinned_type = str(item["commit_type"])
@@ -4788,6 +4909,7 @@ uncertain; `merge` frequently is."""
           "commit_type_reason": "{verdict_reason_example}",
           "repo_states": {{"<repo_dir>": "committed"}},
           "resolved_conflict_paths": [],
+          "judgment_conflict_paths": [],
           "failure": {{"kind": "", "detail": ""}}
         }}
         ```
@@ -4800,9 +4922,13 @@ uncertain; `merge` frequently is."""
         - `repo_states` maps each repo directory to exactly one of `committed`,
           `failed`, `untouched`. Required whenever anything was committed or
           attempted.
-        - `resolved_conflict_paths` lists every path whose squash-merge
-          conflict you resolved: repo-relative, prefixed `<repo_dir>/` in
-          workspace mode, and `[]` when nothing was resolved.
+        - `resolved_conflict_paths` lists every path whose squash-merge conflict you resolved by keeping both sides (code or documentation):
+          repo-relative, prefixed `<repo_dir>/` in workspace mode, and `[]`
+          when nothing was resolved.
+        - `judgment_conflict_paths` lists the repo-relative paths (prefixed
+          `<repo_dir>/` in workspace mode) whose squash-merge conflict needs a
+          human's judgment, and is `[]` otherwise. A non-empty list requires
+          verdict `halt`.
         - `failure.kind` is one of `merge_conflict`, `gate_failed`,
           `commit_count_zero`, `ac_not_satisfied`, `sensitive_area`, ``
           (empty when there was no failure).
@@ -4817,8 +4943,9 @@ uncertain; `merge` frequently is."""
           `merge` it must say the build was APPROVED and that the dispatch
           worker lands it — not that it was merged, because nothing has
           reached origin yet.
-          When `resolved_conflict_paths` is non-empty, the item comment lists
-          those paths.
+          When the squash merge conflicted, the item comment has one line per
+          conflicting path, in this format:
+          `<path>: keep_both|judgment: <one-sentence reason naming what each side changed>`
     """
     )
 

@@ -17,7 +17,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import httpx
@@ -1944,9 +1944,14 @@ class ReviewVerdict(NamedTuple):
     branch_name: str = ""  # the feature branch reviewed; the land step deletes it
     # The reviewer's per-repo claim (diagnostic only; the land reads git).
     repo_states: tuple[tuple[str, str], ...] = ()
-    # Paths whose squash-merge conflict the reviewer reports resolving (only
-    # documentation is allowed; the land step's conflict guard re-checks).
+    # Paths whose squash-merge conflict the reviewer reports resolving by
+    # keeping both sides, code or documentation.  The land step's conflict
+    # guard re-checks them, and a resolved code conflict lands only through
+    # the project gate on the exact pushed tree.
     resolved_conflict_paths: tuple[str, ...] = ()
+    # Paths the reviewer classified as needing a human's judgment; non-empty
+    # only on a halt (a merge carrying any is coerced to halt).
+    judgment_conflict_paths: tuple[str, ...] = ()
 
 
 def _completed_build_item_ids(
@@ -2451,6 +2456,7 @@ async def _launch_reviewer(
 
     raw_resolved = verdict_blob.get("resolved_conflict_paths")
     resolved: tuple[str, ...] = ()
+    coerced = ""
     if isinstance(raw_resolved, list) and all(isinstance(p, str) for p in raw_resolved):
         resolved = tuple(raw_resolved)
     elif raw_resolved is not None and verdict == "merge":
@@ -2458,15 +2464,44 @@ async def _launch_reviewer(
         verdict = "halt"
         rationale = "reviewer returned a malformed resolved_conflict_paths"
         detail = f"malformed resolved_conflict_paths: {raw_resolved!r}"[:200]
+        coerced = "malformed_resolved_conflict_paths"
+    raw_judgment = verdict_blob.get("judgment_conflict_paths")
+    judgment: tuple[str, ...] = ()
+    if isinstance(raw_judgment, list) and all(isinstance(p, str) for p in raw_judgment):
+        judgment = tuple(raw_judgment)
+    elif raw_judgment is not None and verdict == "merge":
+        verdict = "halt"
+        rationale = "reviewer returned a malformed judgment_conflict_paths"
+        detail = f"malformed judgment_conflict_paths: {raw_judgment!r}"[:200]
+        coerced = "malformed_judgment_conflict_paths"
+    if judgment and verdict == "merge":
+        # Conflicts that need a human's judgment are never landed.
+        verdict = "halt"
+        rationale = "reviewer reported conflicts needing judgment but returned merge"
+        coerced = "merge_with_judgment_paths"
+    if coerced:
+        logger.warning(
+            "rollout-loop: review-verdict-coerced rollout_id=%s item_id=%s "
+            "from=merge to=halt reason=%s",
+            rollout_id,
+            item_id,
+            coerced,
+        )
     if resolved:
-        detail = f"{detail} [resolved doc conflicts: {', '.join(resolved)}]"
+        detail = f"{detail} [resolved keep-both conflicts: {', '.join(resolved)}]"
+    if judgment:
+        detail = f"{detail} [conflicts needing judgment: {', '.join(judgment)}]"
     completion: dict[str, Any] = {
         "verdict": verdict,
         "rationale": rationale,
         "detail": detail,
     }
+    if coerced:
+        completion["verdict_coerced"] = coerced
     if resolved:
         completion["resolved_conflict_paths"] = list(resolved)
+    if judgment:
+        completion["judgment_conflict_paths"] = list(judgment)
 
     await db.update_run(
         reviewer_run.id,
@@ -2498,6 +2533,7 @@ async def _launch_reviewer(
             else ()
         ),
         resolved,
+        judgment,
     )
 
 
@@ -3188,6 +3224,9 @@ class _Lander:
         self.conflict_found: dict[str, list[str]] = {}
         self.conflict_reported: dict[str, list[str]] = {}
         self.conflict_unreported: dict[str, list[str]] = {}
+        self.conflict_overreported: dict[str, list[str]] = {}
+        # Keep-both audit drops per repo: (path, main_dropped, branch_dropped).
+        self.keepboth_dropped: dict[str, list[tuple[str, int, int]]] = {}
         # Private TMPDIR for the land's gate install and gate run; created in
         # run() and removed in its outer finally.
         self.tmp_dir: Path | None = None
@@ -3245,12 +3284,15 @@ class _Lander:
                 )
 
     def _log_land(self, repo: str, outcome: str, pushed_sha: str = "-") -> None:
+        found = self.conflict_found.get(repo) or []
+        code = [p for p in found if not dispatch.is_documentation_path(p)]
+        conflict = "code" if code else ("doc" if found else "none")
         logger.log(
             logging.INFO if outcome == "pushed" else logging.WARNING,
             "rollout-loop: land rollout_id=%s item_id=%s push_attempt=%d/%d "
             "fix_relaunches=%d repo=%s base_before=%s base_after=%s "
             "origin_advanced=%d gated_sha=%s pushed_sha=%s gate=%s gate_rc=%s "
-            "gate_secs=%.1f outcome=%s",
+            "gate_secs=%.1f outcome=%s conflict=%s conflict_code_paths=%s",
             self.rollout_id,
             self.item_id,
             self.push_round,
@@ -3266,6 +3308,8 @@ class _Lander:
             self.gate_rc,
             self.gate_secs,
             outcome,
+            conflict,
+            ",".join(code) or "-",
         )
 
     # -- the steps --------------------------------------------------------
@@ -3389,22 +3433,22 @@ class _Lander:
     async def _conflict_guard(self) -> None:
         """Fail closed on the reviewer's squash-merge conflict resolution.
 
-        The reviewer may resolve a squash conflict only when every conflicting
-        path is documentation.  The worker does not trust that claim: it
-        recomputes the conflicts with ``git merge-tree`` against the squash
-        commit's parent (what the reviewer merged onto) and the feature
-        branch, and halts on a non-documentation conflict or a leftover
-        conflict marker.  Runs before anything is pushed.
+        The reviewer may resolve any squash conflict it classifies as
+        keep-both (both sides added disjoint content), code or documentation,
+        and reports the paths in ``resolved_conflict_paths``.  The worker does
+        not trust that claim: it recomputes the conflicts with
+        ``git merge-tree`` against the squash commit's parent (what the
+        reviewer merged onto) and the feature branch, then halts on a lockfile
+        conflict, a conflicting path missing from the squash commit, a
+        leftover conflict marker, an unreported code conflict, or a resolved
+        code conflict in a project with no gate_command.  A resolved code
+        conflict otherwise lands only through the land gate on the exact
+        pushed tree.  A keep-both audit warns (never halts) when a side's
+        added lines are missing from the resolution.  Runs before anything is
+        pushed.
         """
         timeout = config.LAND_GIT_TIMEOUT_SECONDS
         resolved = list(self.outcome.resolved_conflict_paths)
-        bad = [p for p in resolved if not dispatch.is_documentation_path(p)]
-        if bad:
-            raise _LandHalt(
-                "non_doc_conflict",
-                f"land refused for item {self.item_id}: the reviewer reported "
-                f"resolving non-documentation conflict paths: {', '.join(bad)}",
-            )
         branch_name = self.outcome.branch_name
         if not branch_name:
             raise _LandHalt(
@@ -3437,6 +3481,7 @@ class _Lander:
             base_sha = await self._git(
                 repo, dispatch.land_resolve_ref, path, base, timeout
             )
+            # (1) The conflicts, the reviewer's claim, and the code subset.
             paths = await self._git(
                 repo, dispatch.land_conflict_paths, path, base, tip, timeout
             )
@@ -3448,6 +3493,7 @@ class _Lander:
                 ]
             else:
                 reported = list(resolved)
+            non_doc = [p for p in paths if not dispatch.is_documentation_path(p)]
 
             log = functools.partial(
                 self._log_conflict_check,
@@ -3459,15 +3505,37 @@ class _Lander:
                 paths=paths,
                 reported=reported,
             )
-            non_doc = [p for p in paths if not dispatch.is_documentation_path(p)]
-            if non_doc:
-                log(decision="non_doc_halt")
+            head = f"land refused for item {self.item_id}: repo {repo}"
+            # (2) Lockfiles are never keep-both.
+            kind = [
+                p for p in paths if PurePosixPath(p).name in dispatch.LOCKFILE_BASENAMES
+            ]
+            if kind:
+                log(decision="kind_halt")
                 raise _LandHalt(
-                    "non_doc_conflict",
-                    f"land refused for item {self.item_id}: repo {repo}: the "
-                    "squash merge conflicts on non-documentation paths: "
-                    f"{', '.join(non_doc)}",
+                    "unresolvable_conflict_kind",
+                    f"{head}: conflicts on lockfiles cannot be resolved by keeping "
+                    f"both sides: {', '.join(kind)}",
                 )
+            # (3) A conflicting path absent from the squash commit was deleted
+            # or renamed by one side: a judgment shape.
+            missing = await self._git(
+                repo,
+                dispatch.land_paths_missing,
+                path,
+                self.branches[repo],
+                paths,
+                timeout,
+            )
+            if missing:
+                log(decision="missing_halt")
+                raise _LandHalt(
+                    "conflict_path_missing",
+                    f"{head}: conflicting paths are absent from the squash commit "
+                    "(a delete or rename conflict needs judgment): "
+                    f"{', '.join(missing)}",
+                )
+            # (4) No conflict marker lands.
             if paths:
                 markers = await self._git(
                     repo,
@@ -3481,9 +3549,31 @@ class _Lander:
                     log(decision="markers_halt")
                     raise _LandHalt(
                         "conflict_markers",
-                        f"land refused for item {self.item_id}: repo {repo}: "
-                        f"conflict markers remain in: {', '.join(markers)}",
+                        f"{head}: conflict markers remain in: {', '.join(markers)}",
                     )
+            # (5) A code conflict the reviewer did not report is not landed.
+            unreported_code = sorted(set(non_doc) - set(reported))
+            if unreported_code:
+                log(decision="unreported_halt")
+                raise _LandHalt(
+                    "unreported_conflict",
+                    f"{head}: the squash merge conflicts on paths the reviewer did "
+                    f"not report resolving: {', '.join(unreported_code)}",
+                )
+            # (6) A resolved code conflict needs a gate to verify the tree.
+            if non_doc and not self.gate_command:
+                log(decision="no_gate_halt")
+                shown = [
+                    f"{repo}/{p}" if self.workspace.workspace_mode else p
+                    for p in non_doc
+                ]
+                raise _LandHalt(
+                    "conflict_needs_gate",
+                    f"land refused for item {self.item_id}: code conflicts were "
+                    f"resolved in {', '.join(shown)} but the project has no "
+                    "gate_command to verify the merged tree",
+                )
+            # (7) Mismatches that do not block the land.
             unreported = sorted(set(paths) - set(reported))
             if unreported:
                 logger.warning(
@@ -3494,10 +3584,89 @@ class _Lander:
                     repo,
                     ",".join(unreported),
                 )
-            log(decision="doc_only" if paths else "clean")
+            overreported = sorted(set(reported) - set(paths))
+            if overreported:
+                logger.warning(
+                    "rollout-loop: land-conflict-overreported rollout_id=%s "
+                    "item_id=%s repo=%s overreported=%s",
+                    self.rollout_id,
+                    self.item_id,
+                    repo,
+                    ",".join(overreported),
+                )
+            self.conflict_overreported[repo] = overreported
+            # (8) Keep-both audit: warn when a side's added lines are gone.
+            self.keepboth_dropped[repo] = await self._keepboth_audit(
+                repo,
+                base=base,
+                base_sha=base_sha,
+                tip=tip,
+                audited=sorted(set(non_doc) & set(reported)),
+            )
+            # (9) Record the outcome.
+            if non_doc:
+                log(decision="resolved")
+            else:
+                log(decision="doc_only" if paths else "clean")
             self.conflict_found[repo] = list(paths)
             self.conflict_reported[repo] = reported
             self.conflict_unreported[repo] = unreported
+
+    async def _keepboth_audit(
+        self, repo: str, *, base: str, base_sha: str, tip: str, audited: list[str]
+    ) -> list[tuple[str, int, int]]:
+        """Count each side's added lines missing from the resolved file.
+
+        Returns ``(path, main_dropped, branch_dropped)`` for every audited path
+        that dropped something.  Warns; never halts.
+        """
+        if not audited:
+            return []
+        timeout = config.LAND_GIT_TIMEOUT_SECONDS
+        path = self._path(repo)
+        mb = await self._git(repo, dispatch.land_merge_base, path, base, tip, timeout)
+        dropped: list[tuple[str, int, int]] = []
+        for p in audited:
+            main_added = await self._git(
+                repo, dispatch.land_added_lines, path, mb, base_sha, p, timeout
+            )
+            branch_added = await self._git(
+                repo, dispatch.land_added_lines, path, mb, tip, p, timeout
+            )
+            lines = await self._git(
+                repo, dispatch.land_file_lines, path, self.branches[repo], p, timeout
+            )
+            have = set(lines)
+            main_dropped = sum(1 for x in main_added if x not in have)
+            branch_dropped = sum(1 for x in branch_added if x not in have)
+            ok = not main_dropped and not branch_dropped
+            logger.log(
+                logging.INFO if ok else logging.WARNING,
+                "rollout-loop: land-keepboth-audit rollout_id=%s item_id=%s "
+                "repo=%s path=%s main_added=%d branch_added=%d main_dropped=%d "
+                "branch_dropped=%d outcome=%s",
+                self.rollout_id,
+                self.item_id,
+                repo,
+                p,
+                len(main_added),
+                len(branch_added),
+                main_dropped,
+                branch_dropped,
+                "ok" if ok else "dropped",
+            )
+            if not ok:
+                dropped.append((p, main_dropped, branch_dropped))
+        return dropped
+
+    def _code_conflict_paths(self) -> list[str]:
+        """Non-documentation conflict paths over the landing repos, in order."""
+        out: list[str] = []
+        for repo in self.landing:
+            for p in self.conflict_found.get(repo) or []:
+                if not dispatch.is_documentation_path(p):
+                    out.append(f"{repo}/{p}" if self.workspace.workspace_mode else p)
+        return out
 
     async def _landing_set(self, *, report_disagreement: bool) -> list[str]:
         timeout = config.LAND_GIT_TIMEOUT_SECONDS
@@ -3689,21 +3858,28 @@ class _Lander:
             ",".join(paths) or "-",
         )
 
-    def _gate_halt(self, result: dispatch.GateResult) -> _LandHalt:
+    def _gate_halt(
+        self, result: dispatch.GateResult, conflict_paths: list[str] | None = None
+    ) -> _LandHalt:
+        ctx = (
+            f" after keep-both conflict resolution in {', '.join(conflict_paths)}"
+            if conflict_paths
+            else ""
+        )
         if result.timed_out:
             return _LandHalt(
                 "gate_timed_out",
-                f"land gate timed out for item {self.item_id} after "
+                f"land gate timed out for item {self.item_id}{ctx} after "
                 f"{result.duration_seconds:.0f}s",
             )
         if result.returncode is None:
             return _LandHalt(
                 "gate_launch_error",
-                f"land gate launch error for item {self.item_id}: {result.output}",
+                f"land gate launch error for item {self.item_id}{ctx}: {result.output}",
             )
         return _LandHalt(
             "gate_failed",
-            f"land gate failed for item {self.item_id}: ",
+            f"land gate failed for item {self.item_id}{ctx}: ",
             tail=result.output,
         )
 
@@ -3831,14 +4007,25 @@ class _Lander:
             if gate_on:
                 result = await self._run_gate()
                 if not result.passed:
+                    code_paths = self._code_conflict_paths()
                     if (
                         self.gate_state == "failed"
                         and not self.pushed
                         and self.fix_relaunches < MAX_LAND_FIX_RELAUNCHES
                     ):
-                        await self._fix_relaunch(result)
-                        continue
-                    raise self._gate_halt(result)
+                        if not code_paths:
+                            await self._fix_relaunch(result)
+                            continue
+                        # A fix agent amending a keep-both resolution would be
+                        # resolving the conflict a second time, unreviewed.
+                        logger.warning(
+                            "rollout-loop: land-fix-relaunch-skipped rollout_id=%s "
+                            "item_id=%s reason=code_conflict paths=%s",
+                            self.rollout_id,
+                            self.item_id,
+                            ",".join(code_paths),
+                        )
+                    raise self._gate_halt(result, code_paths)
                 for repo in remaining:
                     head = await self._git(
                         repo, dispatch.land_rev_parse, self._path(repo), "HEAD", timeout
@@ -3906,17 +4093,27 @@ class _Lander:
                 continue
             reported = self.conflict_reported.get(repo) or []
             line = (
-                f"Conflict check ({repo}): worker found documentation conflicts in "
-                f"{', '.join(found)}; reviewer reported resolving "
+                f"Conflict check ({repo}): worker found conflicts in "
+                f"{', '.join(found)}; reviewer resolved keep-both: "
                 f"{', '.join(reported) if reported else 'none'}"
             )
             unreported = self.conflict_unreported.get(repo) or []
             if unreported:
                 line += f" (mismatch: unreported {', '.join(unreported)})"
+            overreported = self.conflict_overreported.get(repo) or []
+            if overreported:
+                line += f" (mismatch: over-reported {', '.join(overreported)})"
+            for p, main_dropped, branch_dropped in (
+                self.keepboth_dropped.get(repo) or []
+            ):
+                line += (
+                    f" (keep-both audit: {p} dropped {main_dropped} main / "
+                    f"{branch_dropped} branch added lines)"
+                )
             lines.append(line)
         if self.outcome.resolved_conflict_paths:
             lines.append(
-                "Reviewer resolved documentation-only merge conflicts in: "
+                "Reviewer resolved merge conflicts by keeping both sides in: "
                 + ", ".join(self.outcome.resolved_conflict_paths)
             )
         try:

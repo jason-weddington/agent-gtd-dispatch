@@ -5622,7 +5622,7 @@ class TestReviewPromptContract:
         assert "git status --porcelain" in prompt
         assert "attempt, detect, abort cleanly, report" in prompt.lower()
 
-    def test_conflict_contract_allows_documentation_only_resolution(self) -> None:
+    def test_conflict_contract_classifies_keep_both_and_judgment(self) -> None:
         for workspace_mode in (True, False):
             prompt = self._prompt(workspace_mode=workspace_mode)
             norm = " ".join(prompt.split())
@@ -5637,24 +5637,94 @@ class TestReviewPromptContract:
                 "git merge --abort",
                 "git status --porcelain",
                 "merge_conflict",
-                "Never improvise a resolution of a conflict that touches a "
-                "non-documentation path",
+                "Never improvise a resolution of a judgment conflict.",
+                "keep_both",
+                "judgment",
+                "judgment_conflict_paths",
+                "modify/delete",
+                "uv.lock",
+                "git merge --abort || git reset --hard HEAD",
+                "**(a) List the conflicting paths.**",
+                "**(b) Classify every path: keep_both or judgment.**",
+                "**(c) Every path is keep_both: resolve it.**",
+                "**(d) Any judgment path: abort.**",
+                "**(e) The worker checks your work.**",
+                "You MAY run targeted tests on the resolved files; they are not a "
+                "substitute for the land gate, which reruns the project gate on "
+                "the exact tree that is pushed.",
             ):
                 assert phrase in norm, phrase
+            for name in dispatch.LOCKFILE_BASENAMES:
+                assert f"`{name}`" in norm, name
             for gone in (
                 "You do NOT resolve conflicts.",
                 "Never improvise a resolution.",
                 "Claude",
+                "Any non-documentation path conflicts — abort",
             ):
                 assert gone not in norm, gone
             assert '"resolved_conflict_paths": []' in prompt
+            assert '"judgment_conflict_paths": []' in prompt
+            assert (
+                '"resolved_conflict_paths": [], "judgment_conflict_paths": []'
+            ) in norm
 
     def test_workspace_contract_reports_resolved_repos_committed(self) -> None:
         norm = " ".join(self._prompt(workspace_mode=True).split())
         assert (
-            "A repo whose documentation-only conflict was resolved and committed "
-            'under (b) reports `repo_states[<repo>] = "committed"`'
+            "A repo whose keep_both conflicts were resolved and committed under (c) "
+            'reports `repo_states[<repo>] = "committed"`, and its paths go in '
+            "`resolved_conflict_paths` prefixed `<repo_dir>/`."
         ) in norm
+        assert (
+            "If any repo has a judgment path, no repo is resolved: every repo is "
+            "reset as above and resolved_conflict_paths is []."
+        ) in norm
+        assert (
+            "In the abort case (d), or on any other failure, reset every repo's "
+            "local default branch to"
+        ) in norm
+
+    def test_gateless_contract_makes_code_conflicts_judgment(self) -> None:
+        sentence = (
+            "This project has no gate_command, so every non-documentation "
+            "conflicting path is judgment: abort and halt."
+        )
+        gateless = dispatch._review_conflict_contract_block(
+            workspace_mode=False, has_gate=False
+        )
+        gated = dispatch._review_conflict_contract_block(
+            workspace_mode=False, has_gate=True
+        )
+        assert sentence in " ".join(gateless.split())
+        assert sentence not in " ".join(gated.split())
+        assert sentence not in " ".join(self._prompt().split())
+        gateless_prompt = dispatch.build_review_prompt(
+            self.ITEM,
+            {"name": "P"},
+            "rollout-abc",
+            "feat/x",
+            40,
+            Path("/ws"),
+            repo_dirs=["repo-a"],
+            default_branches={"repo-a": "main"},
+        )
+        assert sentence in " ".join(gateless_prompt.split())
+
+    def test_review_prompt_requires_per_path_conflict_comment_lines(self) -> None:
+        prompt = self._prompt()
+        assert (
+            "`<path>: keep_both|judgment: <one-sentence reason naming what each "
+            "side changed>`"
+        ) in prompt
+
+    def test_verdict_bullets_describe_keep_both_and_judgment_paths(self) -> None:
+        norm = " ".join(self._prompt().split())
+        assert (
+            "every path whose squash-merge conflict you resolved by keeping both "
+            "sides (code or documentation)"
+        ) in norm
+        assert "A non-empty list requires verdict `halt`." in norm
 
     def test_conflict_contract_docstring_drops_never_resolve(self) -> None:
         doc = dispatch._review_conflict_contract_block.__doc__ or ""
