@@ -88,6 +88,38 @@ def _popen_ok(write_bytes: bytes = b"ok", rc: int = 0):
 
 
 class TestRunGateCommandMocked:
+    @pytest.mark.parametrize("rc", [0, 3])
+    def test_session_reaped_once_per_call(self, tmp_path, rc: int) -> None:
+        with patch(
+            "agent_gtd_dispatch.dispatch.subprocess.Popen",
+            side_effect=_popen_ok(rc=rc),
+        ):
+            result = dispatch.run_gate_command(
+                tmp_path, "echo hi", 30, CLAUDE, log_context="run_id=r1"
+            )
+        assert result.returncode == rc
+        reap = dispatch.reap_run_session
+        assert isinstance(reap, MagicMock)
+        reap.assert_called_once()
+        assert reap.call_args.kwargs["label"] == "gate"
+        assert reap.call_args.kwargs["context"] == "run_id=r1"
+
+    def test_session_reaped_when_popen_callback_raises(self, tmp_path) -> None:
+        def _boom(_proc):
+            raise RuntimeError("cb failed")
+
+        with (
+            patch(
+                "agent_gtd_dispatch.dispatch.subprocess.Popen",
+                side_effect=_popen_ok(),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            dispatch.run_gate_command(tmp_path, "echo hi", 30, CLAUDE, _boom)
+        reap = dispatch.reap_run_session
+        assert isinstance(reap, MagicMock)
+        reap.assert_called_once()
+
     def test_argv_no_sudo_when_subprocess_user_unset(
         self, tmp_path, monkeypatch
     ) -> None:

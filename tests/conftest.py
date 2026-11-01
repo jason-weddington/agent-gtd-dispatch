@@ -69,3 +69,26 @@ def _isolate_run_tmp_root(tmp_path_factory: pytest.TempPathFactory) -> Iterator[
         os.environ.pop("DISPATCH_RUN_TMP_ROOT", None)
     else:
         os.environ["DISPATCH_RUN_TMP_ROOT"] = saved_env
+
+
+@pytest.fixture(autouse=True)
+def _no_real_session_reap(request: pytest.FixtureRequest) -> Iterator[None]:
+    # Every agent/gate/talos exit path now reaps its session, which runs real
+    # pkill (and sudo in two-user mode).  Mocked tests must not do that, so the
+    # reap is a MagicMock unless the test opts out with @pytest.mark.real_reap.
+    # Restored by hand, not via `monkeypatch`, for the same teardown-order
+    # reason as _isolate_git_env.
+    if request.node.get_closest_marker("real_reap") is not None:
+        yield
+        return
+    from unittest.mock import MagicMock
+
+    from agent_gtd_dispatch import dispatch, main
+
+    saved_dispatch = dispatch.reap_run_session
+    saved_main = main.reap_run_session
+    dispatch.reap_run_session = MagicMock(return_value="clean")  # type: ignore[assignment]
+    main.reap_run_session = MagicMock(return_value="clean")  # type: ignore[assignment]
+    yield
+    dispatch.reap_run_session = saved_dispatch  # type: ignore[assignment]
+    main.reap_run_session = saved_main  # type: ignore[assignment]

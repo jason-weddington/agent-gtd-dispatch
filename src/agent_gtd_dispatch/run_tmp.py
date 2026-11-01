@@ -116,6 +116,18 @@ def _is_removable(path: Path) -> bool:
     )
 
 
+def is_run_tmp_dir(path: Path) -> bool:
+    """Report whether ``path`` is a run tmp dir directly under the root.
+
+    Args:
+        path: Candidate directory.
+
+    Returns:
+        True when ``path`` is ``<RUN_TMP_ROOT>/<run-tmp name>``.
+    """
+    return _is_removable(path)
+
+
 def remove_run_tmp(path: Path, *, kind: RunTmpKind) -> None:
     """Remove a run tmp dir and unregister it.  Never raises."""
     try:

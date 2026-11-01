@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import logging
 import os
 import signal
+import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -866,6 +868,75 @@ class TestHaltTeardown:
             await asyncio.to_thread(captured["cb"], proc)
         kill.assert_called_once_with(proc, signal.SIGKILL)
         assert subprocs == {}
+
+    @pytest.mark.parametrize("cancel", [False, True])
+    async def test_reviewer_teardown_reaps_dirs_before_tmp_removal(
+        self, cancel: bool, tmp_path: Path
+    ) -> None:
+        order: list[tuple[str, Path]] = []
+        reviewer_tmp = tmp_path / "rt-reviewer"
+        started = asyncio.Event()
+
+        async def _run_agent(*_a, **_kw):
+            if cancel:
+                started.set()
+                await asyncio.Event().wait()
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        def _reap(d: Path) -> list[Any]:
+            order.append(("reap", d))
+            return []
+
+        def _remove(p: Path, *, kind: str) -> None:
+            order.append(("remove_tmp", p))
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_active_subprocesses", {}),
+            patch.object(main, "kill_run_session"),
+            patch.object(main, "run_session_has_members", return_value=False),
+            patch.object(main.run_tmp, "create_run_tmp", return_value=reviewer_tmp),
+            patch.object(main.run_tmp, "remove_run_tmp", side_effect=_remove),
+        ):
+            ctx.dispatch.run_agent = AsyncMock(side_effect=_run_agent)
+            ctx.dispatch.reap_workspace_processes = MagicMock(side_effect=_reap)
+            ctx.dispatch.read_review_verdict = MagicMock(return_value=(None, "absent"))
+            ctx.gtd.list_runs_for_item = AsyncMock(return_value=[])
+            ctx.gtd.get_rollout_merge_notes = AsyncMock(return_value=[])
+            ws = SimpleNamespace(
+                root=tmp_path / "slot-0",
+                repo_paths={"r": tmp_path / "slot-0" / "r"},
+                default_branches={"r": "main"},
+                workspace_mode=True,
+            )
+            task = asyncio.create_task(
+                main._launch_reviewer(
+                    ROLLOUT,
+                    "item-a",
+                    project={"name": "p"},
+                    workspace=ws,
+                    reviewer_engine=SimpleNamespace(name="claude-code-sonnet"),
+                    token=None,
+                    attribution=None,
+                    item={"id": "item-a", "title": "t"},
+                )
+            )
+            if cancel:
+                waiter = asyncio.create_task(started.wait())
+                await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                with contextlib.suppress(Exception):
+                    await task
+            log_context = ctx.dispatch.run_agent.await_args.kwargs["log_context"]
+        assert order == [
+            ("reap", tmp_path / "slot-0"),
+            ("reap", reviewer_tmp),
+            ("remove_tmp", reviewer_tmp),
+        ]
+        assert log_context.startswith(f"rollout_id={ROLLOUT} item_id=item-a run_id=")
 
     async def test_terminate_run_session_without_escalation(self) -> None:
         proc = MagicMock()

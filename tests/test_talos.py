@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1514,8 +1515,15 @@ class TestRunTalosWorkerBranch:
         )
         mock_proc.kill = MagicMock()
         mock_proc.wait = MagicMock()
+        mock_proc.poll.return_value = -9
+        kill_session = MagicMock()
+        monkeypatch.setattr(main, "kill_run_session", kill_session)
+        reap = MagicMock(return_value="clean")
+        monkeypatch.setattr(main, "reap_run_session", reap)
 
-        with patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc):
+        with patch(
+            "agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc
+        ) as mock_popen:
             await main._run_talos(
                 run,
                 engine,
@@ -1526,6 +1534,14 @@ class TestRunTalosWorkerBranch:
                 attribution=None,
                 register_cb=lambda _p: None,
             )
+
+        assert mock_popen.call_args_list[0].kwargs["start_new_session"] is True
+        kill_session.assert_called_once_with(mock_proc, signal.SIGKILL)
+        mock_proc.kill.assert_not_called()
+        reap.assert_called_once()
+        assert reap.call_args.args == (mock_proc,)
+        assert reap.call_args.kwargs["label"] == "talos"
+        assert reap.call_args.kwargs["context"] == f"run_id={run.id}"
 
         # Marked timed_out
         call_kwargs = update_run_mock.call_args.kwargs
@@ -1606,8 +1622,13 @@ class TestRunTalosWorkerBranch:
             rc.stderr = b""
             return rc
 
+        mock_proc.poll.return_value = 0
+        reap = MagicMock(return_value="clean")
+        monkeypatch.setattr(main, "reap_run_session", reap)
         with (
-            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch(
+                "agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc
+            ) as mock_popen,
             patch("agent_gtd_dispatch.main.subprocess.run", side_effect=_fake_run),
         ):
             await main._run_talos(
@@ -1620,6 +1641,10 @@ class TestRunTalosWorkerBranch:
                 attribution=None,
                 register_cb=lambda _p: None,
             )
+
+        assert mock_popen.call_args_list[0].kwargs["start_new_session"] is True
+        reap.assert_called_once()
+        assert reap.call_args.kwargs["label"] == "talos"
 
         # Marked succeeded
         assert any(

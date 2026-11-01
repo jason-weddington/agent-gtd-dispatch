@@ -47,6 +47,7 @@ from .dispatch import (
     LandGitError,
     LandGitTimeout,
     kill_run_session,
+    reap_run_session,
     run_session_has_members,
 )
 from .engines import (
@@ -632,21 +633,31 @@ async def _run_talos(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            # Session leader: talos's pid is then the session id, so
+            # kill_run_session can reach it and its whole command tree on
+            # every exit path (normal, nonzero, timeout, cancel) (kb-03965).
+            start_new_session=True,
         )
-        register_cb(proc)
         try:
-            out, err = proc.communicate(
-                input=spec_json.encode("utf-8"), timeout=timeout_seconds
+            register_cb(proc)
+            try:
+                out, err = proc.communicate(
+                    input=spec_json.encode("utf-8"), timeout=timeout_seconds
+                )
+            except subprocess.TimeoutExpired:
+                kill_run_session(proc, signal.SIGKILL)
+                proc.wait()
+                raise
+            return (
+                proc.returncode,
+                out.decode("utf-8", errors="replace"),
+                err.decode("utf-8", errors="replace"),
             )
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            raise
-        return (
-            proc.returncode,
-            out.decode("utf-8", errors="replace"),
-            err.decode("utf-8", errors="replace"),
-        )
+        finally:
+            if proc.poll() is None:
+                kill_run_session(proc, signal.SIGKILL)
+                proc.wait()
+            reap_run_session(proc, label="talos", context=f"run_id={run.id}")
 
     loop = asyncio.get_event_loop()
     try:
@@ -1400,19 +1411,23 @@ def _retained_path(
     return ", ".join(str(p) for p in paths)
 
 
-async def _reap_leaked_processes(run: Run, workspace: Path) -> None:
-    """Kill processes left running from the run's workspace; log and record them.
+async def _reap_leaked_processes(run: Run, *dirs: Path) -> None:
+    """Kill processes left running from the run's dirs; log and record them.
+
+    ``dirs`` (the workspace, then the run tmp dir) are reaped in order.
 
     Best-effort and never raises (runs in the teardown ``finally``). Recorded by
     appending to the run's ``error`` text, which does not change its status.
     """
     try:
         loop = asyncio.get_running_loop()
-        reaped = list(
-            await loop.run_in_executor(
-                dispatch._executor, dispatch.reap_workspace_processes, workspace
+        reaped: list[dispatch.ReapedProcess] = []
+        for d in dirs:
+            reaped.extend(
+                await loop.run_in_executor(
+                    dispatch._executor, dispatch.reap_workspace_processes, d
+                )
             )
-        )
         if not reaped:
             return
         for r in reaped:
@@ -1431,7 +1446,7 @@ async def _reap_leaked_processes(run: Run, workspace: Path) -> None:
         await db.update_run(
             run.id,
             error=(
-                f"{_prefix}reaped {len(reaped)} leaked process(es) from workspace:"
+                f"{_prefix}reaped {len(reaped)} leaked process(es) from run dirs:"
                 f" {detail}"
             )[:ERROR_TEXT_MAX_CHARS],
         )
@@ -2096,6 +2111,42 @@ async def _review_branch_name(
     return make_branch_name(item_id, str(item.get("title") or ""))
 
 
+async def _reap_rollout_dirs(
+    dirs: list[Path], *, rollout_id: str, item_id: str, run_id: str
+) -> None:
+    """Reap leftover processes from each rollout-loop dir in order; never raises.
+
+    Each dir is reaped on the default executor; a failure is logged and never
+    skips the next dir or the caller's run-tmp removal.
+    """
+    for d in dirs:
+        try:
+            reaped = await asyncio.get_running_loop().run_in_executor(
+                None, dispatch.reap_workspace_processes, d
+            )
+        except Exception:
+            logger.exception(
+                "rollout-loop: reaping leaked processes failed rollout_id=%s "
+                "item_id=%s run_id=%s dir=%s",
+                rollout_id,
+                item_id,
+                run_id,
+                d,
+            )
+            continue
+        for r in reaped:
+            logger.warning(
+                "rollout-loop: reaped leaked process rollout_id=%s item_id=%s "
+                "run_id=%s pid=%s cmdline=%r (%s)",
+                rollout_id,
+                item_id,
+                run_id,
+                r.pid,
+                r.cmdline,
+                r.killed_with,
+            )
+
+
 async def _launch_reviewer(
     rollout_id: str,
     item_id: str,
@@ -2281,6 +2332,9 @@ async def _launch_reviewer(
             popen_callback=_on_popen,
             executor=executor,
             tmp_dir=reviewer_tmp,
+            log_context=(
+                f"rollout_id={rollout_id} item_id={item_id} run_id={reviewer_run.id}"
+            ),
         )
         exit_code = result.returncode
     except asyncio.CancelledError:
@@ -2315,6 +2369,14 @@ async def _launch_reviewer(
         )
     finally:
         _active_subprocesses.pop(reviewer_run.id, None)
+        # Backstop for processes that escaped the reviewer's session (setsid,
+        # daemonized): kill anything still running from its dirs.
+        await _reap_rollout_dirs(
+            [workspace.root] + ([reviewer_tmp] if reviewer_tmp is not None else []),
+            rollout_id=rollout_id,
+            item_id=item_id,
+            run_id=reviewer_run.id,
+        )
         if reviewer_tmp is not None:
             await asyncio.get_running_loop().run_in_executor(
                 None,
@@ -3543,6 +3605,9 @@ class _Lander:
                         self.reviewer_engine,
                         _land_popen_cb,
                         tmp_dir=self.tmp_dir,
+                        log_context=(
+                            f"rollout_id={self.rollout_id} item_id={self.item_id}"
+                        ),
                     ),
                 )
             )
@@ -3955,6 +4020,17 @@ class _Lander:
             leftover = _active_subprocesses.get(self.loop_run_id)
             if leftover is not None:
                 await _terminate_run_session(leftover)
+            # _run_gate pops _active_subprocesses in its own finally, so after
+            # a cancel ``leftover`` is None and this backstop is the ONLY thing
+            # that stops the cancelled land's gate tree before its TMPDIR is
+            # removed.
+            await _reap_rollout_dirs(
+                [self.workspace.root]
+                + ([self.tmp_dir] if self.tmp_dir is not None else []),
+                rollout_id=self.rollout_id,
+                item_id=self.item_id,
+                run_id=self.loop_run_id,
+            )
             if self.tmp_dir is not None:
                 await asyncio.get_running_loop().run_in_executor(
                     None,
@@ -6710,6 +6786,7 @@ async def _dispatch_worker(
                             engine_used,
                             _register_subprocess,
                             tmp_dir=run_tmp_dir,
+                            log_context=f"run_id={run.id}",
                         ),
                     )
                     assert _gate_result is not None  # noqa: S101
@@ -7125,8 +7202,9 @@ async def _dispatch_worker(
         # Reap daemons the agent left running from this workspace (detached,
         # own session, so killing the agent tree missed them). After the rescue,
         # before deletion, and even when the workspace is kept.
-        if workspace is not None:
-            await _reap_leaked_processes(run, workspace)
+        dirs = [d for d in (workspace, run_tmp_dir) if d is not None]
+        if dirs:
+            await _reap_leaked_processes(run, *dirs)
 
         # Independent of should_cleanup: a retained workspace keeps the work,
         # never the run's temp files.

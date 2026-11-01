@@ -640,6 +640,56 @@ class TestFixRelaunch:
         reviewer.assert_not_awaited()
         assert _halt_reason(gtd).startswith(f"land gate launch error for item {ITEM}")
 
+    async def test_cancelled_land_reaps_dirs_before_tmp_removal(self, mono) -> None:
+        import threading
+
+        _squash(mono.clone)
+        order: list[tuple[str, object]] = []
+        entered = threading.Event()
+        release = threading.Event()
+        log_contexts: list[str] = []
+
+        def _gate(*_a, tmp_dir=None, log_context=""):
+            log_contexts.append(log_context)
+            entered.set()
+            release.wait(10)
+            return dispatch.GateResult(0, False, "", 0.0)
+
+        def _reap(d):
+            order.append(("reap", d))
+            return []
+
+        real_remove = main.run_tmp.remove_run_tmp
+
+        def _remove(p, *, kind):
+            order.append(("remove_tmp", p))
+            real_remove(p, kind=kind)
+
+        terminate = AsyncMock()
+        try:
+            with (
+                patch.object(dispatch, "run_gate_command", side_effect=_gate),
+                patch.object(dispatch, "reap_workspace_processes", side_effect=_reap),
+                patch.object(main.run_tmp, "remove_run_tmp", side_effect=_remove),
+                patch.object(main, "_terminate_run_session", terminate),
+            ):
+                task = asyncio.create_task(_land(mono.ws, mono.pre))
+                await asyncio.to_thread(entered.wait, 10)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        finally:
+            release.set()
+        assert len(order) == 3, order
+        tmp_dir = order[2][1]
+        assert order == [
+            ("reap", mono.ws.root),
+            ("reap", tmp_dir),
+            ("remove_tmp", tmp_dir),
+        ]
+        terminate.assert_not_awaited()
+        assert log_contexts == [f"rollout_id={ROLLOUT} item_id={ITEM}"]
+
     async def test_gate_install_failure_halts_without_relaunch(self, mono, gtd) -> None:
         before = _tip(mono.origin)
         _squash(mono.clone)

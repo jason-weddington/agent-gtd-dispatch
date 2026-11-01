@@ -7,6 +7,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import pwd
 import re
 import signal
 import subprocess
@@ -33,7 +34,7 @@ from .engines import (
     is_talos_engine,
 )
 from .models import PushStatus, RepoPushStatus
-from .run_tmp import with_tmp_env
+from .run_tmp import is_run_tmp_dir, with_tmp_env
 
 logger = logging.getLogger(__name__)
 
@@ -190,14 +191,18 @@ def _run_pkill_quietly(argv: list[str]) -> int:
         result = subprocess.run(argv, check=True, timeout=10, capture_output=True)
         return result.returncode
     except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        if exc.returncode == 1 and stderr:
+            # sudo itself exits 1 when it refuses (e.g. "a password is
+            # required"); that must not read as "no members" to a probe.
+            logger.warning("pkill of run session: sudo refused (rc=1): %s", stderr)
+            return -2
         if exc.returncode == 1:
             # pkill exit 1 = no process matched — the session is already gone,
             # which is the normal case for an exited run.  Not an error.
             return 1
         logger.warning(
-            "pkill of run session failed (rc=%s): %s",
-            exc.returncode,
-            (exc.stderr or b"").decode("utf-8", errors="replace").strip(),
+            "pkill of run session failed (rc=%s): %s", exc.returncode, stderr
         )
         return exc.returncode
     except subprocess.TimeoutExpired:
@@ -236,11 +241,119 @@ def kill_run_session(proc: subprocess.Popen[bytes], sig: int) -> None:
 def run_session_has_members(proc: subprocess.Popen[bytes]) -> bool:
     """True if any process still runs in the session led by ``proc.pid``.
 
-    Used by the cancel path to decide whether a SIGKILL escalation is needed
+    Used by the cancel path and by reap_run_session on every exit to decide whether a SIGKILL escalation is needed
     even after the wrapper itself has exited (``pkill -0`` probes without
     signalling).
     """
     return _run_pkill_quietly(_pkill_session_argv(proc, ["-0"])) == 0
+
+
+ReapOutcome = Literal["clean", "reaped", "skipped_pid_reuse", "probe_error"]
+
+_REAP_POLL_SECONDS = 0.25
+_REAP_POST_KILL_WAIT_SECONDS = 2.0
+
+
+def _session_id_reused(proc: subprocess.Popen[bytes]) -> bool:
+    """True if ``proc.pid`` may now belong to an unrelated process.
+
+    The kernel never frees a pid number while any process still uses it as a
+    session id, so once the leader is reaped a live process at that number
+    means the old session is empty and the number belongs to someone else
+    (possibly another run's session-leading sudo wrapper).  Signalling
+    ``pkill -s <pid>`` then would hit that other session.  ``kill(pid, 0)`` is
+    used rather than ``/proc/<pid>`` existence because ``/proc`` hides other
+    users' processes under hidepid.  While the leader is not yet reaped
+    (``returncode is None``) its pid is still ours.
+    """
+    if proc.returncode is None:
+        return False
+    try:
+        os.kill(proc.pid, 0)
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def reap_run_session(
+    proc: subprocess.Popen[bytes],
+    *,
+    label: str,
+    context: str = "",
+    grace_seconds: float | None = None,
+) -> ReapOutcome:
+    """Kill whatever is left in ``proc``'s session after it exited; never raises.
+
+    Called on every exit path of an agent/gate subprocess so a background
+    child the run left behind cannot outlive it.  Probes with ``pkill -0``;
+    if members remain, SIGTERM, poll up to ``grace_seconds`` (default
+    ``config.CANCEL_GRACE_SECONDS``), then SIGKILL.  Skips entirely when the
+    session id may have been reused (see :func:`_session_id_reused`).  Emits
+    exactly one ``session-reap:`` log line per call.
+    """
+    try:
+        grace = config.CANCEL_GRACE_SECONDS if grace_seconds is None else grace_seconds
+        escalated = False
+        survivors = False
+        outcome: ReapOutcome
+        if _session_id_reused(proc):
+            outcome = "skipped_pid_reuse"
+        else:
+            probe = _run_pkill_quietly(_pkill_session_argv(proc, ["-0"]))
+            if probe == 1:
+                outcome = "clean"
+            elif probe != 0:
+                outcome = "probe_error"
+            else:
+                outcome = "reaped"
+                kill_run_session(proc, signal.SIGTERM)
+                deadline = time.monotonic() + grace
+                members = True
+                reused = False
+                while True:
+                    if _session_id_reused(proc):
+                        reused = True
+                        break
+                    members = run_session_has_members(proc)
+                    if not members or time.monotonic() >= deadline:
+                        break
+                    time.sleep(_REAP_POLL_SECONDS)
+                if members and not reused:
+                    escalated = True
+                    kill_run_session(proc, signal.SIGKILL)
+                    kill_deadline = time.monotonic() + _REAP_POST_KILL_WAIT_SECONDS
+                    while True:
+                        survivors = run_session_has_members(proc)
+                        if not survivors or time.monotonic() >= kill_deadline:
+                            break
+                        time.sleep(_REAP_POLL_SECONDS)
+                    if survivors:
+                        logger.error(
+                            "session-reap: members survived SIGKILL sid=%s label=%s %s",
+                            proc.pid,
+                            label,
+                            context,
+                        )
+        level = logging.INFO if outcome == "clean" else logging.WARNING
+        logger.log(
+            level,
+            "session-reap: outcome=%s label=%s sid=%s escalated_sigkill=%d "
+            "survivors_after_kill=%d %s",
+            outcome,
+            label,
+            proc.pid,
+            int(escalated),
+            int(survivors),
+            context,
+        )
+        return outcome
+    except Exception:
+        logger.exception(
+            "session-reap failed label=%s sid=%s %s", label, proc.pid, context
+        )
+        return "probe_error"
 
 
 def init_executor() -> None:
@@ -792,6 +905,7 @@ def run_gate_command(
     popen_callback: Callable[[subprocess.Popen[bytes]], None] | None = None,
     *,
     tmp_dir: Path | None = None,
+    log_context: str = "",
 ) -> GateResult:
     """Run the project's post-run quality gate and capture its outcome.
 
@@ -840,7 +954,7 @@ def run_gate_command(
                 stdout=stdout_file,
                 stderr=subprocess.STDOUT,
                 # The sudo wrapper must lead its own session so that on
-                # timeout/cancel the WHOLE tree (agent + its commands, each in
+                # every exit path (normal, nonzero, timeout, cancel) the WHOLE tree (agent + its commands, each in
                 # its own process group since talos 0.15.0-11) can be killed
                 # by session id — see kill_run_session (kb-03965).
                 start_new_session=True,
@@ -853,38 +967,46 @@ def run_gate_command(
                 duration_seconds=time.monotonic() - start,
             )
 
-        if popen_callback is not None:
-            popen_callback(proc)
-
-        def _tail() -> str:
-            size = stdout_file.tell()
-            stdout_file.seek(max(0, size - 4 * GATE_OUTPUT_TAIL_CHARS))
-            data = stdout_file.read()
-            return data.decode("utf-8", errors="replace")[-GATE_OUTPUT_TAIL_CHARS:]
-
         try:
-            proc.wait(timeout=timeout_seconds + 2 * config.CANCEL_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            # Kill the whole session, not just the sudo wrapper: sudo cannot
-            # relay SIGKILL, so proc.kill() alone would orphan the gate's
-            # command tree (kb-03965).
-            kill_run_session(proc, signal.SIGKILL)
-            proc.wait()
-            return GateResult(
-                returncode=None,
-                timed_out=True,
-                output=_tail(),
-                duration_seconds=time.monotonic() - start,
-            )
+            if popen_callback is not None:
+                popen_callback(proc)
 
-        duration = time.monotonic() - start
-        rc = proc.returncode
-        return GateResult(
-            returncode=rc,
-            timed_out=_classify_gate_timeout(rc, duration, timeout_seconds),
-            output=_tail(),
-            duration_seconds=duration,
-        )
+            def _tail() -> str:
+                size = stdout_file.tell()
+                stdout_file.seek(max(0, size - 4 * GATE_OUTPUT_TAIL_CHARS))
+                data = stdout_file.read()
+                return data.decode("utf-8", errors="replace")[-GATE_OUTPUT_TAIL_CHARS:]
+
+            try:
+                proc.wait(timeout=timeout_seconds + 2 * config.CANCEL_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                # Kill the whole session, not just the sudo wrapper: sudo cannot
+                # relay SIGKILL, so proc.kill() alone would orphan the gate's
+                # command tree (kb-03965).
+                kill_run_session(proc, signal.SIGKILL)
+                proc.wait()
+                return GateResult(
+                    returncode=None,
+                    timed_out=True,
+                    output=_tail(),
+                    duration_seconds=time.monotonic() - start,
+                )
+
+            duration = time.monotonic() - start
+            rc = proc.returncode
+            return GateResult(
+                returncode=rc,
+                timed_out=_classify_gate_timeout(rc, duration, timeout_seconds),
+                output=_tail(),
+                duration_seconds=duration,
+            )
+        finally:
+            # Reap the session on EVERY exit path: a gate that exits 0 or
+            # nonzero can still leave background children running.
+            if proc.poll() is None:
+                kill_run_session(proc, signal.SIGKILL)
+                proc.wait()
+            reap_run_session(proc, label="gate", context=log_context)
 
 
 def _detect_default_branch(repo_path: Path) -> str:
@@ -1367,6 +1489,34 @@ def _signal_pid(pid: int, sig: signal.Signals) -> None:
         )
 
 
+def _agent_uid() -> int | None:
+    """Uid the agent subprocesses run as; None if the agent user is unknown."""
+    if config.AGENT_SUBPROCESS_USER:
+        try:
+            return pwd.getpwnam(config.AGENT_SUBPROCESS_USER).pw_uid
+        except KeyError:
+            logger.warning(
+                "reap-backstop: unknown agent user %r", config.AGENT_SUBPROCESS_USER
+            )
+            return None
+    return os.getuid()
+
+
+def _proc_real_uid(pid: int) -> int | None:
+    """Real uid of ``pid`` from ``/proc/<pid>/status``; None if unreadable."""
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return None
+    for line in status.splitlines():
+        if line.startswith("Uid:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
 def reap_workspace_processes(
     workspace: Path, *, term_grace_secs: float = REAP_TERM_GRACE_SECS
 ) -> list[ReapedProcess]:
@@ -1377,8 +1527,9 @@ def reap_workspace_processes(
     ``/proc/<pid>/exe`` or ``cwd`` is the workspace or beneath it — by path only,
     never by name, so other runs' workspaces are untouched (``/ws/repos-a`` does
     not match ``/ws/repos-ab``). The worker and its ancestors are never signalled,
-    and a workspace outside ``config.WORKSPACE_ROOT`` is ignored (same guard as
-    ``cleanup_workspace``). SIGTERM, poll up to ``term_grace_secs``, then SIGKILL
+    and a dir that is neither under ``config.WORKSPACE_ROOT`` nor a run tmp dir
+    (``run_tmp.is_run_tmp_dir``) is ignored. Processes found by the service-side
+    scan are signalled only when their real uid is the agent user's. SIGTERM, poll up to ``term_grace_secs``, then SIGKILL
     survivors; zombies do not count as survivors.
 
     With ``AGENT_SUBPROCESS_USER`` set the agent's processes belong to another
@@ -1388,10 +1539,32 @@ def reap_workspace_processes(
     """
     try:
         workspace = Path(workspace)
-        if config.WORKSPACE_ROOT not in workspace.parents:
+        if config.WORKSPACE_ROOT not in workspace.parents and not is_run_tmp_dir(
+            workspace
+        ):
+            logger.warning(
+                "reap-backstop: ignored dir=%s reason=outside_roots", workspace
+            )
             return []
-        found = _scan_workspace_pids(workspace)
+        agent_uid = _agent_uid()
+        if agent_uid is None:
+            return []
+        found: dict[int, str] = {}
+        for pid, cmd in _scan_workspace_pids(workspace).items():
+            owner = _proc_real_uid(pid)
+            if owner != agent_uid:
+                logger.warning(
+                    "reap-backstop: dropped pid=%s owner_uid=%s agent_uid=%s "
+                    "dir=%s reason=foreign_owner",
+                    pid,
+                    owner,
+                    agent_uid,
+                    workspace,
+                )
+                continue
+            found[pid] = cmd
         if config.AGENT_SUBPROCESS_USER:
+            # Agent-owned by construction: the scan ran as the agent user.
             found.update(_scan_as_agent_user(workspace))
         for pid in _ancestor_pids():
             found.pop(pid, None)
@@ -4824,6 +4997,7 @@ async def run_agent(
     disallowed_tools: list[str] | None = None,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
     tmp_dir: Path | None = None,
+    log_context: str = "",
 ) -> subprocess.CompletedProcess[str]:
     """Run a headless agent CLI as a subprocess.
 
@@ -4892,20 +5066,31 @@ async def run_agent(
                 stderr=subprocess.STDOUT,
                 # Session leader: the sudo wrapper's pid is then the session
                 # id, so kill_run_session can reach the agent and its whole
-                # command tree on timeout/cancel (kb-03965).
+                # command tree on every exit path (normal, nonzero, timeout,
+                # cancel) (kb-03965).
                 start_new_session=True,
             )
-            if popen_callback is not None:
-                popen_callback(proc)
             try:
-                proc.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                # Kill the whole session, not just the sudo wrapper: SIGKILL
-                # cannot be relayed by sudo, so proc.kill() alone orphans the
-                # agent and every command it spawned (kb-03965).
-                kill_run_session(proc, signal.SIGKILL)
-                proc.wait()
-                raise
+                if popen_callback is not None:
+                    popen_callback(proc)
+                try:
+                    proc.wait(timeout=timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    # Kill the whole session, not just the sudo wrapper: SIGKILL
+                    # cannot be relayed by sudo, so proc.kill() alone orphans the
+                    # agent and every command it spawned (kb-03965).
+                    kill_run_session(proc, signal.SIGKILL)
+                    proc.wait()
+                    raise
+            finally:
+                if proc.poll() is None:
+                    kill_run_session(proc, signal.SIGKILL)
+                    proc.wait()
+                reap_run_session(
+                    proc,
+                    label="agent",
+                    context=log_context or (f"run_id={run_id}" if run_id else ""),
+                )
         return subprocess.CompletedProcess(cmd, proc.returncode, stdout="", stderr="")
 
     loop = asyncio.get_event_loop()

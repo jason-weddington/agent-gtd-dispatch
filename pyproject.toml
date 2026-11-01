@@ -96,7 +96,10 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "--strict-markers -v -m 'not sudo_integration'"
-markers = ["sudo_integration: runs real sudo to the agent user; opt-in only, run with -m sudo_integration"]
+markers = [
+    "sudo_integration: runs real sudo to the agent user; opt-in only, run with -m sudo_integration",
+    "real_reap: run the real reap_run_session (unit/real-process tests)",
+]
 filterwarnings = [
     "error::DeprecationWarning",
 ]
@@ -105,7 +108,7 @@ filterwarnings = [
 source = ["agent_gtd_dispatch", "agent_gtd_dispatch_protocol"]
 
 [tool.coverage.report]
-fail_under = 90
+fail_under = 92
 
 [tool.semantic_release]
 # Both the service and the workspace protocol package are versioned in lockstep:
