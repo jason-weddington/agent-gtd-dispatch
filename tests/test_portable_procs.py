@@ -183,7 +183,9 @@ class TestScanWorkspace:
         assert sibling.pid not in res.pids
         assert res.pids[inside.pid].startswith(sys.executable)
         assert res.examined >= 2
-        assert res.unreadable == 0
+        # Not `unreadable == 0`: the scan walks every process on the machine,
+        # and on a multi-user host other users' processes are legitimately
+        # unreadable. Unreadable counting is covered by test_unreadable_counted.
 
     def test_symlinked_workspace(self, spawn, tmp_path: Path) -> None:
         real = tmp_path / "real-ws"
