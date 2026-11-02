@@ -219,6 +219,10 @@ OLLAMA_CLOUD_MODEL: str = "glm-5.3:cloud"
 # "talos-qwen=1").  Empty means no per-engine caps.  A cap of 0 hides the engine.
 ENGINE_SLOTS: dict[str, int] = {}
 
+# Optional allowlist of engines THIS host serves (DISPATCH_ENGINES_ONLY).  None
+# means no allowlist (today's behaviour).  It only ever removes engines.
+ENGINES_ONLY: frozenset[str] | None = None
+
 # Host-local talos-qwen endpoint config.  TALOS_QWEN_BASE_URL empty means
 # "unset" (talos-qwen is then not advertised).  There is NO fallback to
 # OLLAMA_BASE_URL.  The endpoint is never probed.
@@ -264,6 +268,35 @@ def _parse_engine_slots(raw: str) -> dict[str, int]:
             raise ValueError(msg)
         slots[name] = int(value)
     return slots
+
+
+def _parse_engines_only(raw: str) -> frozenset[str] | None:
+    """Parse ``DISPATCH_ENGINES_ONLY`` (comma-separated engine names) or raise."""
+    if not raw.strip():
+        return None
+    from .engines import ENGINES
+
+    seen: list[str] = []
+    for segment in raw.split(","):
+        name = segment.strip()
+        if not name:
+            continue
+        if name not in ENGINES:
+            msg = (
+                f"Invalid DISPATCH_ENGINES_ONLY={raw!r}: unknown engine {name!r}; "
+                f"known engines: {sorted(ENGINES)}"
+            )
+            raise ValueError(msg)
+        if name in seen:
+            msg = (
+                f"Invalid DISPATCH_ENGINES_ONLY={raw!r}: engine {name!r} appears twice"
+            )
+            raise ValueError(msg)
+        seen.append(name)
+    if not seen:
+        msg = f"Invalid DISPATCH_ENGINES_ONLY={raw!r}: no engine names given"
+        raise ValueError(msg)
+    return frozenset(seen)
 
 
 # talos binary discovery: default 'talos', PATH-resolved by the subprocess machinery
@@ -355,6 +388,7 @@ def load() -> None:
     global OLLAMA_CLOUD_API_KEY, OLLAMA_CLOUD_BASE_URL, OLLAMA_CLOUD_MODEL
     global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS, TALOS_MEMORY
     global AGENT_SUBPROCESS_USER
+    global ENGINES_ONLY
     global ENGINE_SLOTS, TALOS_QWEN_BASE_URL, TALOS_QWEN_MODEL, TALOS_QWEN_NUM_CTX
     global TALOS_QWEN_KEEP_ALIVE
     global REVIEWER_ENGINE, REVIEW_MAX_TURNS, REVIEW_TIMEOUT_SECONDS
@@ -488,6 +522,19 @@ def load() -> None:
                 "engine %s hidden: requires DISPATCH_ENGINE_SLOTS cap >= 1",
                 _hidden,
             )
+    ENGINES_ONLY = _parse_engines_only(os.environ.get("DISPATCH_ENGINES_ONLY", ""))
+    logger.info(
+        "engines-only config allowlist=%s",
+        sorted(ENGINES_ONLY) if ENGINES_ONLY is not None else "unset",
+    )
+    if ENGINES_ONLY is not None:
+        for _slot_engine in sorted(ENGINE_SLOTS):
+            if _slot_engine not in ENGINES_ONLY:
+                logger.warning(
+                    "engine-slots config names engine %s outside "
+                    "DISPATCH_ENGINES_ONLY; its cap is inert",
+                    _slot_engine,
+                )
     # NO fallback to OLLAMA_API_KEY — cloud vs. local Ollama servers use distinct
     # credentials and mixing them ships the local key to the cloud.
     OLLAMA_CLOUD_API_KEY = os.environ.get("OLLAMA_CLOUD_API_KEY", "")

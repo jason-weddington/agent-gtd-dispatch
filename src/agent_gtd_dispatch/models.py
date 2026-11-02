@@ -61,6 +61,7 @@ class InfoResponse(BaseModel):
     load_avg_1m: float | None = None
     cpu_count: int | None = None
     engine_slots: dict[str, EngineSlotInfo] = {}
+    engines_only: list[str] | None = None
 
 
 class PushStatus(StrEnum):

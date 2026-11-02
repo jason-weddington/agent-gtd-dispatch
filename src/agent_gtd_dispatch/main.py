@@ -55,6 +55,7 @@ from .engines import (
     Engine,
     get_available_engine_names,
     get_engine,
+    is_engine_allowed,
     is_talos_engine,
 )
 from .models import (
@@ -8647,6 +8648,9 @@ async def info() -> InfoResponse:
             )
             for name, cap in config.ENGINE_SLOTS.items()
         },
+        engines_only=(
+            sorted(config.ENGINES_ONLY) if config.ENGINES_ONLY is not None else None
+        ),
     )
 
 
@@ -8707,6 +8711,28 @@ async def dispatch_item(
         engine = get_engine(effective_engine_name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    # DISPATCH_ENGINES_ONLY: refuse on the REQUESTED engine (the one /info
+    # advertised and the board routed on), not the post-swap effective engine.
+    if not is_engine_allowed(body.engine):
+        _allowed = sorted(config.ENGINES_ONLY or ())
+        logger.warning(
+            "engines-only refuse engine=%s mode=%s item=%s rollout=%s allowed=%s",
+            body.engine,
+            body.mode.value if hasattr(body.mode, "value") else str(body.mode),
+            body.item_id or "-",
+            body.rollout_id or "-",
+            _allowed,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "detail": "Engine not served by this host",
+                "reason": "engine_not_allowed",
+                "engine": body.engine,
+                "allowed_engines": _allowed,
+            },
+        )
 
     # Validate mode-specific requirements
     if body.mode == DispatchMode.REVIEW:

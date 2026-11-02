@@ -6909,6 +6909,7 @@ def _slot_cfg(monkeypatch, tmp_path):
     """Run config.load() against a clean env; restore globals afterwards."""
     for name in (
         "ENGINE_SLOTS",
+        "ENGINES_ONLY",
         "TALOS_QWEN_BASE_URL",
         "TALOS_QWEN_MODEL",
         "TALOS_QWEN_NUM_CTX",
@@ -6917,6 +6918,7 @@ def _slot_cfg(monkeypatch, tmp_path):
         monkeypatch.setattr(config, name, getattr(config, name))
     for name in (
         "DISPATCH_ENGINE_SLOTS",
+        "DISPATCH_ENGINES_ONLY",
         "TALOS_QWEN_BASE_URL",
         "TALOS_QWEN_MODEL",
         "TALOS_QWEN_NUM_CTX",
@@ -7101,3 +7103,75 @@ class TestTalosQwenConfig:
         _slot_cfg.setenv(name, value)
         with pytest.raises(ValueError, match=rf"^Invalid {name}="):
             config.load()
+
+
+class TestEnginesOnlyConfig:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("talos-qwen", frozenset({"talos-qwen"})),
+            (" talos-qwen , claude-code ", frozenset({"talos-qwen", "claude-code"})),
+            ("", None),
+            ("   ", None),
+        ],
+    )
+    def test_valid(self, _slot_cfg, raw, expected) -> None:
+        _slot_cfg.setenv("DISPATCH_ENGINES_ONLY", raw)
+        config.load()
+        assert expected == config.ENGINES_ONLY
+
+    def test_unset(self, _slot_cfg) -> None:
+        config.load()
+        assert config.ENGINES_ONLY is None
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "talos-qwn",
+            "Talos-Qwen",
+            ",",
+            " , ",
+            "talos-qwen,talos-qwen",
+            "claude-code,nope",
+        ],
+    )
+    def test_invalid(self, _slot_cfg, raw) -> None:
+        _slot_cfg.setenv("DISPATCH_ENGINES_ONLY", raw)
+        with pytest.raises(ValueError, match=r"^Invalid DISPATCH_ENGINES_ONLY="):
+            config.load()
+
+    def test_invalid_messages(self, _slot_cfg) -> None:
+        with pytest.raises(ValueError) as exc:
+            config._parse_engines_only("talos-qwn")
+        assert "unknown engine 'talos-qwn'" in str(exc.value)
+        assert "known engines: [" in str(exc.value)
+        with pytest.raises(ValueError, match="appears twice"):
+            config._parse_engines_only("talos-qwen,talos-qwen")
+        with pytest.raises(ValueError, match="no engine names given"):
+            config._parse_engines_only(",")
+
+    def test_log_set(self, _slot_cfg, caplog) -> None:
+        caplog.set_level(logging.INFO)
+        _slot_cfg.setenv("DISPATCH_ENGINES_ONLY", "talos-qwen")
+        config.load()
+        assert "engines-only config allowlist=['talos-qwen']" in caplog.text
+
+    def test_log_unset(self, _slot_cfg, caplog) -> None:
+        caplog.set_level(logging.INFO)
+        config.load()
+        assert "engines-only config allowlist=unset" in caplog.text
+        assert "outside DISPATCH_ENGINES_ONLY" not in caplog.text
+
+    def test_inert_slot_warning(self, _slot_cfg, caplog) -> None:
+        caplog.set_level(logging.INFO)
+        _slot_cfg.setenv("DISPATCH_ENGINES_ONLY", "talos-qwen")
+        _slot_cfg.setenv("DISPATCH_ENGINE_SLOTS", "talos-qwen=1,claude-code=2")
+        config.load()
+        warns = [
+            r.getMessage()
+            for r in caplog.records
+            if "outside DISPATCH_ENGINES_ONLY" in r.getMessage()
+        ]
+        assert len(warns) == 1
+        assert "claude-code" in warns[0]
+        assert "talos-qwen" not in warns[0].replace("DISPATCH_ENGINES_ONLY", "")

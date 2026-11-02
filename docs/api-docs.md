@@ -61,11 +61,12 @@ separate round-trip to `/agents`.
 | `version` | `str` | Service version (from `agent_discovery.SERVICE_VERSION`) |
 | `max_concurrent_runs` | `int` | Configured concurrency limit |
 | `active_runs` | `int` | Currently running (not queued) dispatches, excluding rollout loops parked behind a host drain |
-| `engines` | `list[str]` | Engine names with credentials present in the environment |
+| `engines` | `list[str]` | Engine names with credentials present in the environment and, when `DISPATCH_ENGINES_ONLY` is set, listed in it |
 | `agents` | `list[str]` | Agent names from `list_agents.sh` |
 | `load_avg_1m` | `float \| null` | 1-minute load average from `os.getloadavg`; null when unavailable. Routers treat a host as overloaded above 1.5 x `cpu_count` |
 | `cpu_count` | `int \| null` | Logical CPU count from `os.cpu_count`; null when unknown |
 | `engine_slots` | `object` | Per-engine caps declared by this host (`DISPATCH_ENGINE_SLOTS`), one entry per capped engine, including cap-0 entries. Absent or empty means no per-engine caps. `engine_slots.<engine>.active_runs` counts runs holding a slot, both running and host-queued, so it differs from the top-level `active_runs`; only BUILD-mode runs admitted through `/dispatch` are counted |
+| `engines_only` | `list[str] \| null` | Sorted `DISPATCH_ENGINES_ONLY` allowlist, or null when unset. `engine_slots` is not filtered by it |
 | `parked_rollout_loops` | `int` | Rollout loops parked behind a host drain. They still hold a slot on the host, so routers compute free slots as `max_concurrent_runs - active_runs - parked_rollout_loops` |
 
 ---
@@ -166,12 +167,19 @@ It differs from the upstream-unreachable 503 (whose `detail` has an `upstream_ur
 key) and from general capacity (a 200 that queues the run). Plan, manage and review
 dispatches are never capped. A capped run also consumes one general slot.
 
+When the host sets `DISPATCH_ENGINES_ONLY` and the requested `engine` is not listed, the dispatch is refused before any GTD call, run row or slot reservation with a 422 whose body is distinct from the 503 above:
+
+```json
+{"detail": {"detail": "Engine not served by this host", "reason": "engine_not_allowed", "engine": "claude-code-sonnet", "allowed_engines": ["talos-qwen"]}}
+```
+
 **Error responses:**
 | Status | Condition |
 |---|---|
 | 400 | Unknown engine, missing `item_id` for build/plan, missing `rollout_id` for manage, item has no project, project has no `git_origin` |
 | 401 | Missing or invalid API key |
 | 404 | Item, project, or rollout not found in GTD API |
+| 422 | engine not in this host's `DISPATCH_ENGINES_ONLY` allowlist (reason `engine_not_allowed`) |
 | 502 | Upstream GTD API returned an error or malformed JSON |
 | 503 | Upstream GTD API unreachable, or `reason: "engine_slot_full"` (see above) |
 
