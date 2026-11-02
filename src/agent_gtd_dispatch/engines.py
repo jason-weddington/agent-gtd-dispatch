@@ -626,6 +626,13 @@ def _is_ollama_cloud_engine_available() -> bool:
 SLOT_REQUIRED_ENGINES: frozenset[str] = frozenset({"talos-qwen"})
 
 
+def is_engine_allowed(name: str) -> bool:
+    """Return True if the host's DISPATCH_ENGINES_ONLY allowlist permits ``name``."""
+    from . import config
+
+    return config.ENGINES_ONLY is None or name in config.ENGINES_ONLY
+
+
 def is_engine_available(engine: Engine) -> bool:
     """Return True if this engine can be attempted on the host.
 
@@ -642,6 +649,8 @@ def is_engine_available(engine: Engine) -> bool:
     name = engine.name
     from . import config
 
+    if not is_engine_allowed(name):
+        return False
     if config.ENGINE_SLOTS.get(name) == 0:
         return False
     if name in SLOT_REQUIRED_ENGINES and config.ENGINE_SLOTS.get(name, 0) < 1:

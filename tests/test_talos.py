@@ -310,6 +310,84 @@ class TestTalosEnvOverlay:
         assert talos_env_overlay("talos-glm")["OLLAMA_API_KEY"] == "cloud-secret"
         assert talos_env_overlay("talos-qwen")["OLLAMA_API_KEY"] == "local-secret"
 
+    def test_qwen_keep_alive_absent_when_empty(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "TALOS_QWEN_BASE_URL", "http://gpu.local:11434")
+        monkeypatch.setattr(config, "TALOS_QWEN_KEEP_ALIVE", "")
+        overlay = talos_env_overlay("talos-qwen")
+        assert "TALOS_OLLAMA_KEEP_ALIVE" not in overlay
+        assert "OLLAMA_KEEP_ALIVE" not in overlay
+        assert overlay == {
+            "TALOS_BACKEND": "ollama",
+            "OLLAMA_MODEL": "qwen3.8:27b",
+            "OLLAMA_THINK": "on",
+            "OLLAMA_NUM_CTX": "262144",
+            "OLLAMA_BASE_URL": "http://gpu.local:11434",
+            "OLLAMA_API_KEY": config.OLLAMA_API_KEY,
+        }
+
+    @pytest.mark.parametrize("value", ["-1", "0", "300", "10m", "1h30m"])
+    def test_qwen_keep_alive_verbatim(self, monkeypatch, value) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "TALOS_QWEN_BASE_URL", "http://gpu.local:11434")
+        monkeypatch.setattr(config, "TALOS_QWEN_KEEP_ALIVE", value)
+        overlay = talos_env_overlay("talos-qwen")
+        assert overlay["TALOS_OLLAMA_KEEP_ALIVE"] == value
+        assert "OLLAMA_KEEP_ALIVE" not in overlay
+
+    def test_keep_alive_not_in_other_engines(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "TALOS_QWEN_KEEP_ALIVE", "10m")
+        for name in ("talos-glm", "talos-glm-flash", "talos-sonnet"):
+            overlay = talos_env_overlay(name)
+            assert "TALOS_OLLAMA_KEEP_ALIVE" not in overlay
+            assert "OLLAMA_KEEP_ALIVE" not in overlay
+
+    def test_qwen_keep_alive_log_tokens(self, monkeypatch, caplog) -> None:
+        import logging
+
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "TALOS_QWEN_BASE_URL", "http://gpu:11434")
+        monkeypatch.setattr(config, "TALOS_QWEN_KEEP_ALIVE", "10m")
+        with caplog.at_level(logging.INFO):
+            talos_env_overlay("talos-qwen")
+        assert "keep_alive=10m" in caplog.text
+        assert "base_url=http://gpu:11434" in caplog.text
+        assert "model=" in caplog.text
+        caplog.clear()
+        monkeypatch.setattr(config, "TALOS_QWEN_KEEP_ALIVE", "")
+        with caplog.at_level(logging.INFO):
+            talos_env_overlay("talos-qwen")
+        assert "keep_alive=unset" in caplog.text
+
+    def test_env_overlay_keys_with_keep_alive_are_in_sudoers_env_keep(
+        self, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.engines import TALOS_ENGINES
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "TALOS_QWEN_KEEP_ALIVE", "10m")
+        monkeypatch.setattr(config, "TALOS_QWEN_BASE_URL", "http://127.0.0.1:11434")
+        monkeypatch.setattr(config, "PERSONAL_KB_URL", "http://kb")
+        monkeypatch.setattr(config, "TALOS_PERSONAL_KB_API_KEY", "k")
+        overlay_keys: set[str] = set()
+        for name in TALOS_ENGINES:
+            overlay_keys |= talos_env_overlay(name).keys()
+        tmpl = Path(__file__).parent.parent / "templates" / "sudoers-dispatch-svc.tmpl"
+        line = next(ln for ln in tmpl.read_text().splitlines() if "env_keep +=" in ln)
+        env_keep_keys = set(line[line.index('"') + 1 : line.rindex('"')].split())
+        assert "TALOS_OLLAMA_KEEP_ALIVE" in overlay_keys
+        assert overlay_keys <= env_keep_keys, sorted(overlay_keys - env_keep_keys)
+
     def test_env_overlay_keys_are_subset_of_sudoers_env_keep(self) -> None:
         """Flywheel guard: every key talos_env_overlay() sets must survive the
         sudo boundary — i.e. be listed in the sudoers env_keep directive.

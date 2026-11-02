@@ -2318,3 +2318,168 @@ class TestEngineSlotAdmission:
         with pytest.raises(RuntimeError):
             self._post(client, auth_headers)
         assert main._engine_slot_holders.get("talos-qwen", set()) == set()
+
+
+class TestEnginesOnlyAdmission:
+    """DISPATCH_ENGINES_ONLY admission on POST /dispatch and /info."""
+
+    @pytest.fixture
+    def slots(self, monkeypatch):
+        import asyncio
+
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(main, "_engine_slot_holders", {})
+        monkeypatch.setattr(main, "_engine_slot_admitting", set())
+        monkeypatch.setattr(main, "_active_processes", {})
+        monkeypatch.setattr(main, "_pending_queue", [])
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {})
+        monkeypatch.setattr(config, "ENGINES_ONLY", None)
+        client_mock = AsyncMock()
+        client_mock.get_item = AsyncMock(
+            return_value={"id": "abc123", "title": "T", "project_id": "proj1"}
+        )
+        client_mock.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@git.example.com:repos/test",
+                "gate_command": "true",
+            }
+        )
+        client_mock.get_rollout = AsyncMock()
+        monkeypatch.setattr(main, "gtd_client", client_mock)
+        from unittest.mock import MagicMock
+
+        disp = MagicMock()
+        disp.branch_name_for_item.return_value = "feat/abc123-t"
+        monkeypatch.setattr(main, "dispatch", disp)
+
+        state = {"release": None, "client": client_mock}
+
+        async def _worker(run, *_a, **_kw):
+            if state["release"] is None:
+                state["release"] = asyncio.Event()
+            await state["release"].wait()
+
+        monkeypatch.setattr(main, "_dispatch_worker", _worker)
+        return state
+
+    @staticmethod
+    def _post(client, auth_headers, engine="talos-qwen", mode="build"):
+        body = {"item_id": "abc123", "max_turns": 5, "engine": engine, "mode": mode}
+        if mode == "manage":
+            body = {
+                "rollout_id": "r1",
+                "max_turns": 5,
+                "engine": engine,
+                "mode": "manage",
+            }
+        return client.post("/dispatch", json=body, headers=auth_headers)
+
+    @staticmethod
+    def _only(monkeypatch, names):
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(
+            config, "ENGINES_ONLY", None if names is None else frozenset(names)
+        )
+
+    def test_refused_build(
+        self, client, auth_headers, slots, monkeypatch, caplog
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        self._only(monkeypatch, {"talos-qwen"})
+        r = self._post(client, auth_headers, "claude-code-sonnet")
+        assert r.status_code == 422
+        assert r.json()["detail"] == {
+            "detail": "Engine not served by this host",
+            "reason": "engine_not_allowed",
+            "engine": "claude-code-sonnet",
+            "allowed_engines": ["talos-qwen"],
+        }
+        assert "engines-only refuse engine=claude-code-sonnet" in caplog.text
+        assert "allowed=['talos-qwen']" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("engine", "mode"), [("claude-code", "plan"), ("claude-code", "manage")]
+    )
+    def test_refused_plan_manage(
+        self, client, auth_headers, slots, monkeypatch, engine, mode
+    ) -> None:
+        self._only(monkeypatch, {"talos-qwen"})
+        r = self._post(client, auth_headers, engine, mode)
+        assert r.status_code == 422
+        assert r.json()["detail"]["reason"] == "engine_not_allowed"
+        slots["client"].get_item.assert_not_awaited()
+        slots["client"].get_rollout.assert_not_awaited()
+
+    def test_listed_admitted(self, client, auth_headers, slots, monkeypatch) -> None:
+        self._only(monkeypatch, {"talos-qwen"})
+        assert self._post(client, auth_headers).status_code == 200
+
+    def test_requested_engine_checked_not_swapped(
+        self, client, auth_headers, slots, monkeypatch
+    ) -> None:
+        self._only(monkeypatch, {"claude-code-glm"})
+        r = self._post(client, auth_headers, "claude-code-glm", "plan")
+        assert r.status_code == 200
+        self._only(monkeypatch, {"claude-code"})
+        r = self._post(client, auth_headers, "claude-code-glm", "plan")
+        assert r.status_code == 422
+        d = r.json()["detail"]
+        assert d["engine"] == "claude-code-glm"
+        assert d["allowed_engines"] == ["claude-code"]
+
+    def test_unknown_engine_is_400(
+        self, client, auth_headers, slots, monkeypatch
+    ) -> None:
+        self._only(monkeypatch, {"talos-qwen"})
+        assert self._post(client, auth_headers, "nope").status_code == 400
+
+    def test_unset_unchanged(self, client, auth_headers, slots) -> None:
+        assert self._post(client, auth_headers, "claude-code-sonnet").status_code == 200
+
+    def test_refusal_has_no_side_effects(
+        self, client, auth_headers, slots, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch import config, db
+
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {"claude-code-sonnet": 1})
+        self._only(monkeypatch, {"talos-qwen"})
+        before = len(client.portal.call(db.list_runs))
+        r = self._post(client, auth_headers, "claude-code-sonnet")
+        assert r.status_code == 422
+        assert main._engine_slot_holders == {}
+        assert len(client.portal.call(db.list_runs)) == before
+
+    def test_talos_non_build_check_first(
+        self, client, auth_headers, slots, monkeypatch
+    ) -> None:
+        self._only(monkeypatch, {"claude-code"})
+        r = self._post(client, auth_headers, "talos-qwen", "plan")
+        assert r.status_code == 422
+        assert r.json()["detail"].startswith("Engine 'talos-qwen' is a talos engine")
+
+    def test_review_refused(self, client, auth_headers, slots, monkeypatch) -> None:
+        self._only(monkeypatch, {"talos-qwen"})
+        r = self._post(client, auth_headers, "claude-code", "review")
+        assert r.status_code == 422
+        assert r.json()["detail"]["reason"] == "engine_not_allowed"
+
+    def test_info(self, client, slots, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+
+        self._only(monkeypatch, {"talos-qwen"})
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {"talos-qwen": 1, "claude-code": 2})
+        monkeypatch.setattr(config, "TALOS_QWEN_BASE_URL", "http://127.0.0.1:11434")
+        monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "")
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "")
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "")
+        monkeypatch.delenv("KIRO_API_KEY", raising=False)
+        info = client.get("/info").json()
+        assert info["engines"] == ["talos-qwen"]
+        assert info["engines_only"] == ["talos-qwen"]
+        assert set(info["engine_slots"]) == {"talos-qwen", "claude-code"}
+        self._only(monkeypatch, None)
+        assert client.get("/info").json()["engines_only"] is None

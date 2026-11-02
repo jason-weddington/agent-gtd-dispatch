@@ -86,6 +86,7 @@ class TestInfoEndpoint:
             "load_avg_1m",
             "cpu_count",
             "engine_slots",
+            "engines_only",
         }
 
     def test_engine_slots_empty(self, client, monkeypatch) -> None:

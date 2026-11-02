@@ -118,7 +118,11 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
     - talos-qwen's num_ctx defaults to 262144 and a host can override it with
       ``TALOS_QWEN_NUM_CTX`` (the model likewise via ``TALOS_QWEN_MODEL``, the
       endpoint via ``TALOS_QWEN_BASE_URL``); the talos-glm and talos-glm-flash
-      literals below stay fixed.
+      literals below stay fixed. ``TALOS_QWEN_KEEP_ALIVE`` (optional,
+      host-local) is passed through verbatim as ``TALOS_OLLAMA_KEEP_ALIVE`` for
+      talos-qwen only, never as the unprefixed ``OLLAMA_KEEP_ALIVE`` (which
+      collides with the Ollama server's own variable), and takes effect only
+      with a talos build that reads TALOS_OLLAMA_KEEP_ALIVE.
     - ``OLLAMA_NUM_CTX`` is pinned to each model's FULL context window for both
       Ollama engines, because talos only self-defaults num_ctx for localhost
       URLs (main.rs:328-329) — a remote/cloud Ollama with num_ctx unset silently
@@ -180,12 +184,13 @@ def _engine_env_overlay(engine_name: str) -> dict[str, str]:
         base_url = config.talos_qwen_base_url()
         _parsed = urllib.parse.urlparse(base_url)
         logger.info(
-            "talos-qwen endpoint base_url=%s model=%s num_ctx=%d",
+            "talos-qwen endpoint base_url=%s model=%s num_ctx=%d keep_alive=%s",
             f"{_parsed.scheme}://{_parsed.netloc.rpartition('@')[2]}",
             config.TALOS_QWEN_MODEL,
             config.TALOS_QWEN_NUM_CTX,
+            config.TALOS_QWEN_KEEP_ALIVE or "unset",
         )
-        return {
+        overlay = {
             "TALOS_BACKEND": "ollama",
             # qwen3.8:27b (was qwen3.6:35b until 2026-09-14): on the tier-2
             # production-parity matrix it resolved 21/24 with 2 real false dones
@@ -201,6 +206,9 @@ def _engine_env_overlay(engine_name: str) -> dict[str, str]:
             "OLLAMA_BASE_URL": base_url,
             "OLLAMA_API_KEY": config.OLLAMA_API_KEY,
         }
+        if config.TALOS_QWEN_KEEP_ALIVE:
+            overlay["TALOS_OLLAMA_KEEP_ALIVE"] = config.TALOS_QWEN_KEEP_ALIVE
+        return overlay
     if engine_name == "talos-glm":
         return {
             "TALOS_BACKEND": "ollama",
