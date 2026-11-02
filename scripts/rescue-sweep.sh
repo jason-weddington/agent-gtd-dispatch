@@ -38,6 +38,11 @@
 # marker process (a /proc/<pid>/environ entry AGENT_GTD_RUN_KEY=rt-<key>) is a
 # fallback that only covers phases where a marked process is alive. Only that one
 # entry is matched; nothing else is read from another process's environ.
+# FAIL CLOSED off procfs: when the marker check cannot work on this platform
+# (no readable $PROC_ROOT/<pid>/environ, e.g. macOS), a clone whose rt dir is
+# gone cannot be proved dead, so it is treated as LIVE (live_by=unverifiable)
+# and only ever snapshotted to `<branch>-rescue-<run key>`, never pushed as a
+# deliverable `<branch>` or `<branch>-r<N>`.
 #
 # SNAPSHOTS are recorded in the journal (`journalctl -t dispatch-rescue-sweep`,
 # SNAPSHOT lines) and NOT on the board, because the sweep has no board URL, no
@@ -76,12 +81,31 @@ else
     log "config: run_tmp_root=$RUN_TMP_ROOT exists=no"
     log "WARN run_tmp_root missing — liveness relies on /proc marker only"
 fi
+PROC_ROOT="${DISPATCH_PROC_ROOT:-/proc}"
+
+# probe_marker_liveness: can marker_alive work here? A child carrying a known
+# marker must find that entry in its own $PROC_ROOT/<pid>/environ.
+probe_marker_liveness() {
+    # shellcheck disable=SC2016  # $1 and $$ expand in the child sh, not here.
+    if AGENT_GTD_RUN_KEY=rt-selfprobe sh -c 'tr "\0" "\n" <"$1/$$/environ" | grep -qxF AGENT_GTD_RUN_KEY=rt-selfprobe' sh "$PROC_ROOT" 2>/dev/null; then
+        marker_liveness=available
+    else
+        marker_liveness=unavailable
+    fi
+}
+probe_marker_liveness
+unverifiable=0
+log "config: marker_liveness=$marker_liveness"
+if [ "$marker_liveness" != available ]; then
+    degraded=1
+    log "WARN marker liveness unavailable on this platform - every clone without a run-tmp dir is treated as live (snapshot only)"
+fi
 
 # marker_alive <key>: true when some process carries AGENT_GTD_RUN_KEY=rt-<key>.
 marker_alive() {
     local f pid
-    for f in /proc/[0-9]*/environ; do
-        pid=${f#/proc/}
+    for f in "$PROC_ROOT"/[0-9]*/environ; do
+        pid=${f#"$PROC_ROOT"/}
         pid=${pid%/environ}
         case "$pid" in '' | *[![:digit:]]*) continue ;; esac
         if tr '\0' '\n' <"$f" 2>/dev/null | grep -qxF "AGENT_GTD_RUN_KEY=rt-$1"; then
@@ -195,6 +219,11 @@ for d in "$WORKSPACE_ROOT"/repos-*/ "$WORKSPACE_ROOT"/ws-*/*/; do
         if [ -d "$RUN_TMP_ROOT/rt-$key" ]; then
             liveness=live
             live_by=rt
+        elif [ "$marker_liveness" != available ]; then
+            # Cannot prove the run dead on this platform: fail closed.
+            liveness=live
+            live_by=unverifiable
+            unverifiable=$((unverifiable + 1))
         elif marker_alive "$key"; then
             liveness=live
             live_by=proc
@@ -302,7 +331,7 @@ for d in "$WORKSPACE_ROOT"/repos-*/ "$WORKSPACE_ROOT"/ws-*/*/; do
     fi
 done
 
-log "pass complete: clones=$swept rescued=$rescued fellback=$fellback failed=$failed no_remote=$skipped_remote snapshots=$snapshots snapshot_current=$snapshot_current degraded=$degraded"
+log "pass complete: clones=$swept rescued=$rescued fellback=$fellback failed=$failed no_remote=$skipped_remote snapshots=$snapshots snapshot_current=$snapshot_current degraded=$degraded marker_liveness=$marker_liveness unverifiable=$unverifiable"
 
 # Exit non-zero only on a push failure, so `systemctl status` and OnFailure= show
 # something went wrong. Finding nothing is success.

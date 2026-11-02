@@ -649,3 +649,249 @@ class TestReapWorkspaceScanErrors:
 
     def test_proc_run_marker_unreadable(self) -> None:
         assert dispatch._proc_run_marker(2**31 - 1) == ""
+
+
+# ---------------------------------------------------------------------------
+# Portable (psutil) branch, USE_PROCFS=False on real processes (AC5/AC6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def portable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_gtd_dispatch import platform_support
+
+    monkeypatch.setattr(platform_support, "USE_PROCFS", False)
+
+
+def _marked_env(marker: str | None) -> dict[str, str]:
+    env = _unmarked_env()
+    if marker is not None:
+        env[run_tmp.RUN_MARKER_ENV] = marker
+    return env
+
+
+def _unreadable_field(msg: str) -> tuple[int, int]:
+    field = msg.split(" unreadable=", 1)[1].split()[0]
+    n, _, total = field.partition("/")
+    return int(n), int(total)
+
+
+@pytest.mark.real_reap
+@pytest.mark.usefixtures("portable")
+class TestPortableMarkerReap:
+    def test_escaped_child_reaped_by_marker(
+        self, roots: tuple[Path, Path], tmp_path: Path, caplog
+    ) -> None:
+        ws, _rt = roots
+        tmp_a = run_tmp.create_run_tmp(secrets.token_hex(6))
+        workspace_a = ws / "repos-a"
+        workspace_a.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        pidfile = tmp_path / "child.pid"
+        child = 0
+        try:
+            proc = subprocess.Popen(
+                run_tmp.with_tmp_env(
+                    [sys.executable, "-c", ESCAPE, str(pidfile), str(elsewhere)],
+                    tmp_a,
+                ),
+                cwd=workspace_a,
+                env=_unmarked_env(),
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 5
+            while not pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            child = int(pidfile.read_text())
+            proc.wait(timeout=5)
+            scan = dispatch.scan_marker_pids(tmp_a.name)
+            assert scan.ok and child in scan.pids
+            with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"):
+                mr = dispatch.reap_marker_processes(tmp_a.name, term_grace_secs=2)
+            assert mr.scan_ok is True and mr.survivors == 0
+            assert [r.pid for r in mr.reaped] == [child]
+            assert _gone_within(child)
+            (line,) = [m for m in _msgs(caplog) if m.startswith("reap-marker: marker=")]
+            assert "scan=ok unreadable=" in line
+        finally:
+            if child:
+                _kill(child)
+            run_tmp.remove_run_tmp(tmp_a, kind="build")
+
+    @pytest.mark.parametrize("marker", ["rt-other", None])
+    def test_other_or_no_marker_never_signalled(
+        self, roots: tuple[Path, Path], marker: str | None
+    ) -> None:
+        ws, _rt = roots
+        mine = "rt-" + secrets.token_hex(6)
+        p = _spawn(
+            [sys.executable, "-c", READY_SLEEP], ws / "repos-a", _marked_env(marker)
+        )
+        try:
+            mr = dispatch.reap_marker_processes(mine, term_grace_secs=1)
+            assert mr.reaped == [] and mr.scan_ok is True
+            assert p.poll() is None and _alive(p.pid)
+        finally:
+            _kill(p)
+
+    def test_worker_and_parent_never_targeted(
+        self, roots: tuple[Path, Path], monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch import portable_procs
+
+        ws, _rt = roots
+        marker = "rt-" + secrets.token_hex(6)
+        child = _spawn(
+            [sys.executable, "-c", READY_SLEEP], ws / "repos-a", _marked_env(marker)
+        )
+        try:
+            fake = portable_procs.ScanResult(
+                {os.getpid(): "w", os.getppid(): "p", child.pid: "c"}, 3, 0
+            )
+            monkeypatch.setattr(portable_procs, "scan_marker", lambda _m, _u: fake)
+            seen: list[int] = []
+            monkeypatch.setattr(
+                dispatch, "_signal_pid", lambda pid, _s: seen.append(pid)
+            )
+            assert dispatch.scan_marker_pids(marker).pids == {child.pid: "c"}
+            dispatch.reap_marker_processes(marker, term_grace_secs=0.1)
+            assert seen and set(seen) == {child.pid}
+            assert os.getpid() not in seen and os.getppid() not in seen
+        finally:
+            _kill(child)
+
+    def test_one_unreadable_environ_is_warned(
+        self, roots: tuple[Path, Path], monkeypatch, caplog
+    ) -> None:
+        import psutil
+
+        ws, _rt = roots
+        marker = "rt-" + secrets.token_hex(6)
+        child = _spawn(
+            [sys.executable, "-c", READY_SLEEP], ws / "repos-a", _marked_env(marker)
+        )
+        real = psutil.Process.environ
+
+        def _environ(self):
+            if self.pid == child.pid:
+                raise psutil.AccessDenied(self.pid)
+            return real(self)
+
+        try:
+            monkeypatch.setattr(psutil.Process, "environ", _environ)
+            with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"):
+                mr = dispatch.reap_marker_processes(marker, term_grace_secs=1)
+            assert mr.reaped == [] and mr.scan_ok is True
+            (rec,) = [
+                r
+                for r in caplog.records
+                if r.getMessage().startswith("reap-marker: marker=")
+            ]
+            n, total = _unreadable_field(rec.getMessage())
+            assert 1 <= n < total
+            assert rec.levelno == logging.WARNING
+        finally:
+            _kill(child)
+
+    def test_all_unreadable_is_scan_error(
+        self, roots: tuple[Path, Path], monkeypatch, caplog
+    ) -> None:
+        import psutil
+
+        ws, _rt = roots
+        marker = "rt-" + secrets.token_hex(6)
+        child = _spawn(
+            [sys.executable, "-c", READY_SLEEP], ws / "repos-a", _marked_env(marker)
+        )
+
+        def _deny(self):
+            raise psutil.AccessDenied(self.pid)
+
+        try:
+            monkeypatch.setattr(psutil.Process, "environ", _deny)
+            scan = dispatch.scan_marker_pids(marker)
+            assert scan.ok is False and scan.pids == {}
+            assert scan.error.startswith("environ unreadable for all ")
+            assert scan.error.endswith(" same-uid processes")
+            with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"):
+                mr = dispatch.reap_marker_processes(marker, term_grace_secs=1)
+            assert mr.scan_ok is False and mr.survivors == -1
+            assert child.poll() is None
+            assert any(
+                "scan=error environ unreadable for all" in m for m in _msgs(caplog)
+            )
+            sess = subprocess.Popen(["true"], start_new_session=True)
+            sess.wait()
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"):
+                dispatch.reap_run_session(sess, label="agent", marker=marker)  # type: ignore[arg-type]
+            assert any(
+                "marker_scan=error" in m and m.startswith("session-reap: outcome=")
+                for m in _msgs(caplog)
+            )
+        finally:
+            _kill(child)
+
+    def test_unknown_sid_counts_separately(
+        self, roots: tuple[Path, Path], monkeypatch, caplog
+    ) -> None:
+        ws, _rt = roots
+        marker = "rt-" + secrets.token_hex(6)
+        child = _spawn(
+            [sys.executable, "-c", READY_SLEEP], ws / "repos-a", _marked_env(marker)
+        )
+        try:
+            monkeypatch.setattr(dispatch, "_proc_sid", lambda _p: -1)
+            leader = subprocess.Popen(["true"], start_new_session=True)
+            leader.wait()
+            with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"):
+                out = dispatch.reap_run_session(leader, label="agent", marker=marker)  # type: ignore[arg-type]
+            assert out == "reaped"
+            (line,) = [
+                m for m in _msgs(caplog) if m.startswith("session-reap: outcome=")
+            ]
+            assert "escaped_session=0 sid_unknown=1 " in line
+            assert _gone_within(child.pid)
+        finally:
+            _kill(child)
+
+    @pytest.mark.parametrize("failure", ["import", "process_iter"])
+    def test_whole_scan_failure_fails_closed(
+        self, roots: tuple[Path, Path], monkeypatch, caplog, failure: str
+    ) -> None:
+        import psutil
+
+        from agent_gtd_dispatch import portable_procs
+
+        ws, _rt = roots
+        workspace = ws / "repos-a"
+        workspace.mkdir()
+        if failure == "import":
+
+            def _no() -> None:
+                raise ImportError("no psutil")
+
+            monkeypatch.setattr(portable_procs, "_psutil", _no)
+            prefix = "ImportError"
+        else:
+
+            def _boom(*_a, **_k):
+                raise RuntimeError("boom")
+
+            monkeypatch.setattr(psutil, "process_iter", _boom)
+            prefix = "RuntimeError: boom"
+        killed: list[int] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(pid))
+        scan = dispatch.scan_marker_pids("rt-x")
+        assert scan.ok is False and scan.pids == {}
+        assert scan.error.startswith(prefix)
+        mr = dispatch.reap_marker_processes("rt-x", term_grace_secs=0.1)
+        assert mr.scan_ok is False and mr.survivors == -1
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"):
+            assert dispatch.reap_workspace_processes(workspace) == []
+        assert any(
+            m.startswith("reap-backstop: scanned") and "scan=error unreadable=0" in m
+            for m in _msgs(caplog)
+        )
+        assert killed == []

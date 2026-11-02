@@ -487,3 +487,214 @@ class TestGateLeakRealProcesses:
         finally:
             with contextlib.suppress(Exception):
                 os.kill(int(pidfile.read_text().strip()), signal.SIGKILL)
+
+
+# ---------------------------------------------------------------------------
+# Portable session backend (USE_PROCFS=False): psutil snapshots, never pkill
+# ---------------------------------------------------------------------------
+
+
+def _wait_file(path: Path, timeout: float = 5.0) -> str:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with contextlib.suppress(OSError):
+            text = path.read_text().strip()
+            if text:
+                return text
+        time.sleep(0.02)
+    raise AssertionError(f"{path} never appeared")
+
+
+def _portable_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.getMessage().startswith("session-reap: portable ")
+    ]
+
+
+@pytest.mark.real_reap
+class TestPortableSessionBackend:
+    @pytest.fixture(autouse=True)
+    def _portable(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config, dispatch, platform_support
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(platform_support, "USE_PROCFS", False)
+
+        def _no_pkill(_argv):
+            raise AssertionError("pkill must not run on the portable backend")
+
+        monkeypatch.setattr(dispatch, "_run_pkill_quietly", _no_pkill)
+
+    def test_reaps_every_descendant_and_spares_sibling(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        import psutil
+
+        from agent_gtd_dispatch import dispatch
+
+        sibling = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        proc = subprocess.Popen(
+            ["sh", "-c", "sleep 60 & sleep 60 & wait"], start_new_session=True
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while len(psutil.Process(proc.pid).children()) < 2:
+                assert time.monotonic() < deadline
+                time.sleep(0.02)
+            kids = [c.pid for c in psutil.Process(proc.pid).children()]
+            with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"):
+                out = dispatch.reap_run_session(proc, label="agent", grace_seconds=2)  # type: ignore[arg-type]
+            assert out == "reaped"
+            proc.wait(timeout=5)
+            for pid in kids:
+                assert _wait_gone(pid)
+            assert sibling.poll() is None
+            (line,) = _portable_lines(caplog)
+            assert line.getMessage() == (
+                f"session-reap: portable label=agent sid={proc.pid} leader_reaped=0 "
+                "descendants=2 dropped_foreign_uid=0 marker=none"
+            )
+            assert line.levelno == logging.INFO
+            (reap,) = _reap_records(caplog)
+            assert reap.getMessage().startswith(
+                "session-reap: outcome=reaped label=agent"
+            )
+            assert " sid_unknown=0 " in reap.getMessage()
+            assert proc.pid not in dispatch.portable_procs._SESSIONS
+        finally:
+            sibling.kill()
+            sibling.wait()
+            with contextlib.suppress(OSError):
+                proc.kill()
+            proc.wait()
+
+    def test_exited_leader_without_marker_is_clean_and_warned(self, caplog) -> None:
+        from agent_gtd_dispatch import dispatch
+
+        proc = subprocess.Popen(["true"], start_new_session=True)
+        proc.wait()
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"):
+            out = dispatch.reap_run_session(proc, label="gate")  # type: ignore[arg-type]
+        assert out == "clean"
+        (line,) = _portable_lines(caplog)
+        assert "leader_reaped=1 descendants=0" in line.getMessage()
+        assert line.getMessage().endswith("marker=none")
+        assert line.levelno == logging.WARNING
+
+    def test_sigterm_ignoring_child_escalates_to_sigkill(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        from agent_gtd_dispatch import dispatch
+
+        pidfile = tmp_path / "child.pid"
+        proc = subprocess.Popen(
+            [
+                "sh",
+                "-c",
+                f"(trap '' TERM; exec sh -c 'echo $$ > {pidfile}; exec sleep 60') & wait",
+            ],
+            start_new_session=True,
+        )
+        try:
+            child = int(_wait_file(pidfile))
+            with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"):
+                out = dispatch.reap_run_session(proc, label="agent", grace_seconds=1)  # type: ignore[arg-type]
+            assert out == "reaped"
+            assert _wait_gone(child)
+            (reap,) = _reap_records(caplog)
+            assert "escalated_sigkill=1 survivors_after_kill=0" in reap.getMessage()
+        finally:
+            with contextlib.suppress(OSError):
+                proc.kill()
+            proc.wait()
+
+    def test_realistic_seam_marker_net(self, tmp_path: Path, caplog) -> None:
+        import secrets
+
+        from agent_gtd_dispatch import dispatch
+
+        marker = f"rt-{secrets.token_hex(6)}"
+        pidfile = tmp_path / "bg.pid"
+        proc = subprocess.Popen(
+            ["sh", "-c", f"sleep 60 & echo $! > {pidfile}; exit 0"],
+            env={**os.environ, "AGENT_GTD_RUN_KEY": marker},
+            start_new_session=True,
+        )
+        proc.wait()
+        bg = int(_wait_file(pidfile))
+        try:
+            with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"):
+                out = dispatch.reap_run_session(proc, label="agent", marker=marker)  # type: ignore[arg-type]
+            assert out == "reaped"
+            (reap,) = _reap_records(caplog)
+            assert "marker_reaped=1 marker_scan=ok" in reap.getMessage()
+            (line,) = _portable_lines(caplog)
+            assert "leader_reaped=1" in line.getMessage()
+            assert line.getMessage().endswith("marker=present")
+            assert line.levelno == logging.INFO
+            assert _wait_gone(bg)
+        finally:
+            with contextlib.suppress(OSError):
+                os.kill(bg, signal.SIGKILL)
+
+    async def test_cancel_path_never_calls_pkill(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config, main
+
+        monkeypatch.setattr(config, "CANCEL_GRACE_SECONDS", 0)
+        proc = subprocess.Popen(
+            ["sh", "-c", "trap '' TERM; sleep 60 & wait"], start_new_session=True
+        )
+        try:
+            escalated = await main._terminate_run_session(proc)
+            assert escalated is True
+            proc.wait(timeout=5)
+        finally:
+            with contextlib.suppress(OSError):
+                proc.kill()
+            proc.wait()
+
+    def test_access_denied_probe_is_probe_error_without_signal(
+        self, monkeypatch
+    ) -> None:
+        import psutil
+
+        from agent_gtd_dispatch import dispatch, portable_procs
+
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        try:
+
+            def _deny(pid):
+                raise psutil.AccessDenied(pid)
+
+            monkeypatch.setattr(portable_procs._psutil(), "Process", _deny)
+            out = dispatch.reap_run_session(proc, label="agent", grace_seconds=0.2)  # type: ignore[arg-type]
+            assert out == "probe_error"
+            assert proc.poll() is None
+            assert dispatch.run_session_has_members(proc) is True  # type: ignore[arg-type]
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_kill_run_session_probe_failure_still_signals_leader(
+        self, monkeypatch, caplog
+    ) -> None:
+        from agent_gtd_dispatch import dispatch, portable_procs
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(portable_procs, "session_snapshot", _boom)
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        try:
+            dispatch.kill_run_session(proc, signal.SIGKILL)  # type: ignore[arg-type]
+            assert proc.wait(timeout=5) == -signal.SIGKILL
+            assert any(
+                "session-signal: portable probe failed" in r.getMessage()
+                for r in caplog.records
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                proc.kill()
+            proc.wait()

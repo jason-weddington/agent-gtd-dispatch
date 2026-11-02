@@ -37,6 +37,7 @@ from . import (
     dispatch,
     gates,
     gtd_client,
+    platform_support,
     retention,
     run_tmp,
     talos,
@@ -325,6 +326,67 @@ def _verify_api_key(
     return credentials.credentials
 
 
+_SELF_PROBE_WAIT_SECONDS = 2.0
+
+
+def _reaper_self_probe() -> None:
+    """Prove the portable marker scan can see a marked child; fail closed if not.
+
+    Spawns ``sleep 30`` carrying a throwaway ``AGENT_GTD_RUN_KEY``, scans for
+    it with :func:`dispatch.scan_marker_pids`, then kills it.  A host where
+    the scan cannot find it would silently leak every escaped process, so
+    startup refuses instead.
+
+    Raises:
+        RuntimeError: when the scan fails or does not find the child.
+    """
+    marker = f"rt-selfprobe-{os.urandom(4).hex()}"
+    env = {**os.environ, run_tmp.RUN_MARKER_ENV: marker}
+    error = ""
+    found = 0
+    child: subprocess.Popen[bytes] | None = None
+    try:
+        child = subprocess.Popen(
+            ["sleep", "30"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + _SELF_PROBE_WAIT_SECONDS
+        while True:
+            scan = dispatch.scan_marker_pids(marker)
+            found = int(child.pid in scan.pids)
+            error = scan.error if not scan.ok else ""
+            if found or not scan.ok or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        if not found and not error:
+            error = "marked child not found"
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        if child is not None:
+            with contextlib.suppress(OSError):
+                child.kill()
+            with contextlib.suppress(Exception):
+                child.wait(timeout=5)
+    if found and not error:
+        logger.info("reap-selfprobe: backend=psutil marker_scan=ok found=1")
+        return
+    logger.error(
+        "reap-selfprobe: backend=psutil marker_scan=fail found=%d error=%s"
+        " - marker reaping is blind on this host",
+        found,
+        error,
+    )
+    raise RuntimeError(
+        f"reaper self-probe failed ({error}): marker reaping is blind on this "
+        "host, so processes a run leaves behind could never be reaped. See "
+        "docs/install.md (Running on macOS)."
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Initialize config and DB on startup, cancel tasks on shutdown."""
@@ -334,6 +396,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     # Before config.load() there is no LOG_LEVEL to honour, and after this line
     # every logger.info in the package reaches the journal.
     configure_logging()
+    # Fail closed before anything can run: two-user mode's sudo scan/kill
+    # scripts read /proc and would silently reap nothing elsewhere.
+    platform_support.check_two_user_supported()
+    platform_support.log_platform_line()
+    platform_support.log_gate_timeout_line()
+    if not platform_support.USE_PROCFS:
+        _reaper_self_probe()
     if config.AGENT_SUBPROCESS_USER:
         _check_service_repo()
     dispatch.init_executor()
@@ -8651,6 +8720,7 @@ async def info() -> InfoResponse:
         engines_only=(
             sorted(config.ENGINES_ONLY) if config.ENGINES_ONLY is not None else None
         ),
+        platform=platform_support.platform_info(),
     )
 
 

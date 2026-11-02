@@ -20,6 +20,8 @@ set -euo pipefail
 #   AGENT_GROUP           OS group for the installed binary (default: same as AGENT_USER)
 #
 # Exit code: 0 if every host succeeded.  Non-zero on first failure (remaining hosts skipped).
+# Non-Linux hosts (uname -s preflight, scripts/fleet-hosts.sh) are skipped with a
+# WARN and the run exits 1 after the Linux hosts are done.
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -227,9 +229,21 @@ EOF
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-for host in ${HOSTS}; do
+# Preflight over ALL hosts before any per-host work (scripts/fleet-hosts.sh):
+# only Linux hosts are updated; any other host is skipped and fails the run.
+partition_linux_hosts
+partition_ok=1
+report_host_partition || partition_ok=0
+
+for host in ${LINUX_HOSTS}; do
     update_one "${host}"
 done
+
+if [ "${partition_ok}" -ne 1 ]; then
+    printf "\n"
+    printf "[ERR]  Linux hosts updated; some hosts were skipped or could not be probed (see above).\n" >&2
+    exit 1
+fi
 
 printf "\n"
 info "All hosts updated to talos ${TARGET_TOKEN}."

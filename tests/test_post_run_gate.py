@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -41,6 +42,15 @@ def _env(tmp_path, monkeypatch):
     with patch.dict(os.environ, env):
         config.load()
         yield
+
+
+@pytest.fixture(autouse=True)
+def _clear_gate_tool_cache():
+    from agent_gtd_dispatch import platform_support
+
+    platform_support.gate_timeout_tool.cache_clear()
+    yield
+    platform_support.gate_timeout_tool.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -2184,3 +2194,203 @@ class TestRescueHelperDirectly:
         assert outcome is not None
         assert outcome.ok is False
         assert len(outcome.attempted) == 2
+
+
+# ---------------------------------------------------------------------------
+# Gate timeout tool selection (timeout / gtimeout / Python-side deadline)
+# ---------------------------------------------------------------------------
+
+
+class TestGateTimeoutSelection:
+    @pytest.mark.parametrize(
+        ("found", "shim"),
+        [
+            ({"timeout", "gtimeout"}, dispatch._GATE_SHIM),
+            ({"gtimeout"}, dispatch._GATE_SHIM_GTIMEOUT),
+            (set(), dispatch._GATE_SHIM_PYTHON_DEADLINE),
+        ],
+    )
+    def test_shim_choice(self, tmp_path, monkeypatch, found, shim) -> None:
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda name, **_k: f"/x/{name}" if name in found else None,
+        )
+        with patch(
+            "agent_gtd_dispatch.dispatch.subprocess.Popen", side_effect=_popen_ok()
+        ) as mock_popen:
+            dispatch.run_gate_command(tmp_path, "echo hi", 30, CLAUDE)
+        argv = mock_popen.call_args.args[0]
+        assert argv[2] == shim
+        assert argv[-4:] == [
+            "agent-gtd-gate",
+            f"{config.CANCEL_GRACE_SECONDS}s",
+            "30s",
+            "echo hi",
+        ]
+
+    def test_shim_texts(self) -> None:
+        assert dispatch._GATE_SHIM == (
+            'exec timeout --kill-after="$1" "$2" /bin/sh -c "$3"'
+        )
+        assert dispatch._GATE_SHIM_GTIMEOUT == (
+            'exec gtimeout --kill-after="$1" "$2" /bin/sh -c "$3"'
+        )
+        assert dispatch._GATE_SHIM_PYTHON_DEADLINE == 'exec /bin/sh -c "$3"'
+
+    def test_tool_missing_on_gate_path_falls_back(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        from agent_gtd_dispatch import platform_support
+
+        monkeypatch.setattr(platform_support, "gate_timeout_tool", lambda: "gtimeout")
+        paths: list[str | None] = []
+
+        def _which(name, path=None, **_k):
+            paths.append(path)
+            return None
+
+        monkeypatch.setattr(shutil, "which", _which)
+        with (
+            patch(
+                "agent_gtd_dispatch.dispatch.subprocess.Popen", side_effect=_popen_ok()
+            ) as mock_popen,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"),
+        ):
+            dispatch.run_gate_command(tmp_path, "echo hi", 30, CLAUDE)
+        assert mock_popen.call_args.args[0][2] == dispatch._GATE_SHIM_PYTHON_DEADLINE
+        gate_env = mock_popen.call_args.kwargs["env"]
+        assert paths == [gate_env.get("PATH")]
+        assert any(
+            r.levelno == logging.WARNING
+            and "gate-timeout: tool=gtimeout not found on gate PATH" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.parametrize("tool", ["timeout", "gtimeout"])
+    def test_exit_127_tripwire(self, tmp_path, monkeypatch, caplog, tool) -> None:
+        from agent_gtd_dispatch import platform_support
+
+        monkeypatch.setattr(platform_support, "gate_timeout_tool", lambda: tool)
+        monkeypatch.setattr(shutil, "which", lambda name, **_k: f"/x/{name}")
+        with (
+            patch(
+                "agent_gtd_dispatch.dispatch.subprocess.Popen",
+                side_effect=_popen_ok(rc=127),
+            ),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"),
+        ):
+            result = dispatch.run_gate_command(
+                tmp_path, "echo hi", 30, CLAUDE, log_context="run_id=r9"
+            )
+        assert result.returncode == 127
+        (rec,) = [r for r in caplog.records if "exited 127" in r.getMessage()]
+        assert rec.levelno == logging.ERROR
+        assert rec.getMessage() == (
+            f"gate-timeout: tool={tool} exited 127 - timeout binary not found on "
+            "gate PATH; gate result is not a real verdict run_id=r9"
+        )
+
+    def test_python_deadline_no_tripwire_on_127(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        from agent_gtd_dispatch import platform_support
+
+        monkeypatch.setattr(platform_support, "gate_timeout_tool", lambda: None)
+        with (
+            patch(
+                "agent_gtd_dispatch.dispatch.subprocess.Popen",
+                side_effect=_popen_ok(rc=127),
+            ),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"),
+        ):
+            result = dispatch.run_gate_command(tmp_path, "nope", 30, CLAUDE)
+        assert result.returncode == 127
+        assert not any("exited 127" in r.getMessage() for r in caplog.records)
+
+    def test_python_deadline_sigterm_suffices(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        from agent_gtd_dispatch import platform_support
+
+        monkeypatch.setattr(platform_support, "gate_timeout_tool", lambda: None)
+        kills: list[int] = []
+        monkeypatch.setattr(
+            dispatch, "kill_run_session", lambda _p, sig: kills.append(sig)
+        )
+
+        def _effect(*args, **kwargs):
+            kwargs["stdout"].write(b"partial")
+            proc = MagicMock()
+            proc.wait = MagicMock(
+                side_effect=[subprocess.TimeoutExpired(cmd="x", timeout=1), -15]
+            )
+            proc.poll = MagicMock(return_value=-15)
+            return proc
+
+        with (
+            patch("agent_gtd_dispatch.dispatch.subprocess.Popen", side_effect=_effect),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"),
+        ):
+            result = dispatch.run_gate_command(
+                tmp_path, "sleep 99", 1, CLAUDE, log_context="run_id=r2"
+            )
+        assert result.timed_out is True and result.returncode is None
+        assert result.output == "partial"
+        assert kills == [signal.SIGTERM]
+        (rec,) = [r for r in caplog.records if "gate-timeout: fired" in r.getMessage()]
+        assert rec.levelno == logging.WARNING
+        assert rec.getMessage() == (
+            "gate-timeout: fired tool=python timeout=1s escalated_sigkill=0 run_id=r2"
+        )
+
+
+@pytest.mark.real_reap
+class TestPythonDeadlineRealProcess:
+    @pytest.fixture(autouse=True)
+    def _no_sudo(self, monkeypatch):
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+
+    def test_deadline_kills_tree(self, tmp_path, monkeypatch, caplog) -> None:
+        from agent_gtd_dispatch import platform_support
+
+        monkeypatch.setattr(platform_support, "gate_timeout_tool", lambda: None)
+        monkeypatch.setattr(config, "CANCEL_GRACE_SECONDS", 1)
+        procs: list[subprocess.Popen[bytes]] = []
+        start = time.monotonic()
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"):
+            result = dispatch.run_gate_command(
+                tmp_path, "/bin/sleep 30", 1, CLAUDE, popen_callback=procs.append
+            )
+        assert result.timed_out is True
+        assert result.returncode != 127
+        assert time.monotonic() - start < 10
+        (proc,) = procs
+        assert proc.returncode is not None
+        out = subprocess.run(
+            ["ps", "-o", "pid=", "-s", str(proc.pid)], capture_output=True, text=True
+        )
+        assert out.stdout.strip() == ""
+        assert any(
+            "gate-timeout: fired tool=python" in r.getMessage() for r in caplog.records
+        )
+
+    def test_sigterm_ignoring_gate_escalates(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        from agent_gtd_dispatch import platform_support
+
+        monkeypatch.setattr(platform_support, "gate_timeout_tool", lambda: None)
+        monkeypatch.setattr(config, "CANCEL_GRACE_SECONDS", 1)
+        start = time.monotonic()
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"):
+            result = dispatch.run_gate_command(
+                tmp_path, "trap '' TERM; /bin/sleep 30", 1, CLAUDE
+            )
+        assert result.timed_out is True
+        assert time.monotonic() - start < 10
+        assert any(
+            "gate-timeout: fired tool=python timeout=1s escalated_sigkill=1"
+            in r.getMessage()
+            for r in caplog.records
+        )

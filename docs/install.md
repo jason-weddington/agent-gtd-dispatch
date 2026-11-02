@@ -317,6 +317,60 @@ git host, then re-run the installer with the same arguments to complete Phase 2.
 
 ---
 
+## Running on macOS
+
+macOS is supported in **single-user mode only**, run under a dedicated macOS account created for the service (never your own login). Two-user mode (`DISPATCH_AGENT_SUBPROCESS_USER` set) refuses to start off Linux: its sudo-run process scan and kill scripts read `/proc`, which macOS does not have, and would silently reap nothing.
+
+The installer scripts are Linux-only. `setup-dispatch-host.sh` refuses to run on a non-Linux host (including `--dry-run`), and `deploy.sh` and `talos-update.sh` probe every host with `uname -s` first, skip any non-Linux host with a `[WARN] skipped <host> (<os>): not Linux` line, deploy the Linux hosts, and exit 1. A macOS host is installed and updated by hand.
+
+Manual install, as the dedicated account: `uv tool install --index <your wheel index> agent-gtd-dispatch`. Put the service env (the variables in the [Environment file reference](#environment-file-reference), without `DISPATCH_AGENT_SUBPROCESS_USER`) in `~/.config/agent-gtd-dispatch/env`, one `KEY=value` per line.
+
+Run it as a launchd LaunchAgent. launchd has no `EnvironmentFile` equivalent and `config.load()` reads `os.environ` only, so the job sources the env file itself. Save as `~/Library/LaunchAgents/agent-gtd-dispatch.plist`, create `~/Library/Logs/agent-gtd-dispatch/`, then `launchctl load ~/Library/LaunchAgents/agent-gtd-dispatch.plist`. Replace `/Users/dispatch` with the account's home directory (launchd does not expand `~` in the log paths):
+
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>agent-gtd-dispatch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>set -a &amp;&amp; . "$HOME/.config/agent-gtd-dispatch/env" &amp;&amp; set +a &amp;&amp; exec "$HOME/.local/bin/agent-gtd-dispatch"</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/dispatch/Library/Logs/agent-gtd-dispatch/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dispatch/Library/Logs/agent-gtd-dispatch/stderr.log</string>
+</dict>
+</plist>
+```
+
+Gate timeout: macOS has no GNU `timeout`. `brew install coreutils` provides `gtimeout`, which the post-run gate uses when it is on the gate's PATH; the launchd PATH above must include `/opt/homebrew/bin` for that. Without it the gate falls back to a Python-side deadline (logged at startup as `gate-timeout: tool=python`), which still bounds and kills the gate.
+
+Process reaping: off `/proc` the reaper uses psutil. It cannot read the environment of other users' or SIP-protected processes, and by design it then does not signal them. The `reap-marker:` log line reports that as `unreadable=<n>/<examined>`, and at startup a `reap-selfprobe:` line proves the marker scan can see a marked child; if it cannot, the service refuses to start (`marker reaping is blind on this host`) rather than run without its process net.
+
+Rescue sweep: `scripts/rescue-sweep.sh` reports `marker_liveness=unavailable` on macOS and fails closed: for a clone whose run-tmp dir is gone it only pushes a `<branch>-rescue-<run key>` snapshot, never a deliverable branch. No rescue sweep is scheduled on macOS (no systemd timer); until one is added, unpushed commits in a clone whose worker died are not rescued.
+
+Manual verification checklist for the first macOS host:
+
+1. Start a run and, after its teardown, confirm `ps` shows no leftover processes from it.
+2. Grep the service log for the `platform:` line (expect `procfs=false session_backend=portable`) and the `gate-timeout:` line.
+3. Grep the service log for `reap-selfprobe: backend=psutil marker_scan=ok found=1`.
+4. Grep the service log for `reap-marker:` lines with `scan=ok` and `unreadable=0/`.
+5. Run the sweep once by hand (`DISPATCH_WORKSPACE_ROOT=<workspace root> bash scripts/rescue-sweep.sh`) and confirm it prints `marker_liveness=unavailable`.
+
 ## Authentication & pairing
 
 Before the service can dispatch agents, two credentials must always be present in the env

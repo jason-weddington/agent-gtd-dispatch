@@ -9,6 +9,7 @@ import logging
 import os
 import pwd
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
 from agent_gtd_dispatch_protocol.branches import make_branch_name
 from agent_gtd_dispatch_protocol.models import BuildEngine, DispatchMode
 
-from . import config, gtd_client
+from . import config, gtd_client, platform_support, portable_procs
 from .engines import (
     COMMON_ENV_KEYS,
     FORBIDDEN_ENV_KEYS,
@@ -80,6 +81,13 @@ GATE_ENV_KEYS: frozenset[str] = (
 # authorizes): GNU `timeout` bounds the gate and signals its whole process
 # group, then `/bin/sh -c` runs the gate_command string itself.
 _GATE_SHIM: str = 'exec timeout --kill-after="$1" "$2" /bin/sh -c "$3"'
+# Same shim for hosts whose GNU coreutils install names it ``gtimeout``
+# (Homebrew on macOS), and the bare form used when neither binary is on the
+# gate's PATH: then the deadline is enforced Python-side in run_gate_command.
+# argv positions $1 (kill-after), $2 (timeout) and $3 (command) are the same
+# in all three, so the argv shape never changes.
+_GATE_SHIM_GTIMEOUT: str = 'exec gtimeout --kill-after="$1" "$2" /bin/sh -c "$3"'
+_GATE_SHIM_PYTHON_DEADLINE: str = 'exec /bin/sh -c "$3"'
 
 # ONE budget for every operator-facing run error string.  Two independent
 # truncation layers used to clip these — a 300-char stderr TAIL here and a
@@ -238,9 +246,25 @@ def kill_run_session(proc: subprocess.Popen[bytes], sig: int) -> None:
     reaches the whole tree.  Requires the Popen to have used
     ``start_new_session=True`` so the wrapper's pid IS the session id.
     """
-    # pkill wants the signal name WITHOUT the SIG prefix (-KILL, not -SIGKILL).
-    signame = signal.Signals(sig).name.removeprefix("SIG")
-    _run_pkill_quietly(_pkill_session_argv(proc, [f"-{signame}"]))
+    if platform_support.session_backend() == "portable":
+        # Snapshot BEFORE any signal: once the leader dies its children are
+        # reparented and can no longer be found from it.
+        try:
+            snap = _portable_session(proc)
+        except Exception as exc:
+            logger.warning(
+                "session-signal: portable probe failed sid=%s sig=%s: %s: %s",
+                proc.pid,
+                sig,
+                type(exc).__name__,
+                exc,
+            )
+        else:
+            portable_procs.signal_members(snap, sig)
+    else:
+        # pkill wants the signal name WITHOUT the SIG prefix (-KILL, not -SIGKILL).
+        signame = signal.Signals(sig).name.removeprefix("SIG")
+        _run_pkill_quietly(_pkill_session_argv(proc, [f"-{signame}"]))
     # The wrapper itself may have escaped the pkill (e.g. it already exited its
     # session, or pkill could not see it); signal it directly as well.
     try:
@@ -257,9 +281,42 @@ def run_session_has_members(proc: subprocess.Popen[bytes]) -> bool:
 
     Used by the cancel path and by reap_run_session on every exit to decide whether a SIGKILL escalation is needed
     even after the wrapper itself has exited (``pkill -0`` probes without
-    signalling).
+    signalling).  On the portable backend a probe error reads as True (fail
+    closed: escalate rather than assume the session is empty).
     """
-    return _run_pkill_quietly(_pkill_session_argv(proc, ["-0"])) == 0
+    probe = _session_probe(proc)
+    if platform_support.session_backend() == "portable":
+        return probe != 1
+    return probe == 0
+
+
+def _portable_session(proc: subprocess.Popen[bytes]) -> portable_procs.SessionSnapshot:
+    """The portable session snapshot for ``proc`` (captured on first use)."""
+    return portable_procs.session_snapshot(
+        proc.pid, owner=id(proc), leader_reaped=proc.returncode is not None
+    )
+
+
+def _session_probe(proc: subprocess.Popen[bytes]) -> int:
+    """0 = session members exist, 1 = none, -1 (or another rc) = probe error.
+
+    On the ``pkill`` backend this is today's ``pkill -0 -s <sid>`` unchanged.
+    On the ``portable`` backend it uses the psutil session snapshot and never
+    runs pkill or consults ``os.getsid`` for membership.
+    """
+    if platform_support.session_backend() == "pkill":
+        return _run_pkill_quietly(_pkill_session_argv(proc, ["-0"]))
+    try:
+        snap = _portable_session(proc)
+        return 0 if portable_procs.live_members(snap) else 1
+    except Exception as exc:
+        logger.warning(
+            "session-reap: portable probe error sid=%s: %s: %s",
+            proc.pid,
+            type(exc).__name__,
+            exc,
+        )
+        return -1
 
 
 ReapOutcome = Literal["clean", "reaped", "skipped_pid_reuse", "probe_error"]
@@ -302,7 +359,8 @@ def reap_run_session(
     """Kill whatever is left in ``proc``'s session after it exited; never raises.
 
     Called on every exit path of an agent/gate subprocess so a background
-    child the run left behind cannot outlive it.  Probes with ``pkill -0``;
+    child the run left behind cannot outlive it.  Probes with ``pkill -0``
+    (or, off procfs, the psutil session snapshot: :func:`_session_probe`);
     if members remain, SIGTERM, poll up to ``grace_seconds`` (default
     ``config.CANCEL_GRACE_SECONDS``), then SIGKILL.  Skips the session kill
     when the session id may have been reused (see :func:`_session_id_reused`).
@@ -319,6 +377,54 @@ def reap_run_session(
     probe itself raised, which logs ``session-reap failed``).
     """
     grace = config.CANCEL_GRACE_SECONDS if grace_seconds is None else grace_seconds
+    portable = platform_support.session_backend() == "portable"
+    leader_reaped = proc.returncode is not None
+    try:
+        return _reap_run_session(
+            proc,
+            label=label,
+            context=context,
+            grace=grace,
+            marker=marker,
+            portable=portable,
+            leader_reaped=leader_reaped,
+        )
+    finally:
+        if portable:
+            portable_procs.drop_session(proc.pid)
+
+
+def _log_portable_reap_line(
+    proc: subprocess.Popen[bytes], label: str, marker: str | None, leader_reaped: bool
+) -> None:
+    """Log the portable backend's ``session-reap: portable`` line."""
+    snap = portable_procs._SESSIONS.get(proc.pid)
+    descendants = snap.descendants if snap is not None else 0
+    dropped = snap.dropped_foreign_uid if snap is not None else 0
+    level = logging.WARNING if leader_reaped and not marker else logging.INFO
+    logger.log(
+        level,
+        "session-reap: portable label=%s sid=%s leader_reaped=%d "
+        "descendants=%d dropped_foreign_uid=%d marker=%s",
+        label,
+        proc.pid,
+        int(leader_reaped),
+        descendants,
+        dropped,
+        "present" if marker else "none",
+    )
+
+
+def _reap_run_session(
+    proc: subprocess.Popen[bytes],
+    *,
+    label: str,
+    context: str,
+    grace: float,
+    marker: str | None,
+    portable: bool,
+    leader_reaped: bool,
+) -> ReapOutcome:
     escalated = False
     survivors = False
     outcome: ReapOutcome
@@ -327,7 +433,7 @@ def reap_run_session(
         if _session_id_reused(proc):
             outcome = "skipped_pid_reuse"
         else:
-            probe = _run_pkill_quietly(_pkill_session_argv(proc, ["-0"]))
+            probe = _session_probe(proc)
             if probe == 1:
                 outcome = "clean"
             elif probe != 0:
@@ -368,6 +474,7 @@ def reap_run_session(
         )
         outcome = "probe_error"
         session_failed = True
+    sid_unknown = 0
     if marker is None:
         if session_failed:
             return outcome
@@ -382,10 +489,13 @@ def reap_run_session(
         marker_reaped = len(mr.reaped)
         marker_scan = "ok" if mr.scan_ok else "error"
         escaped = mr.escaped_session
+        sid_unknown = mr.sid_unknown
         survivors_after_kill = mr.survivors + int(survivors) if mr.scan_ok else -1
         if outcome == "clean" and marker_reaped >= 1:
             outcome = "reaped"
     try:
+        if portable:
+            _log_portable_reap_line(proc, label, marker, leader_reaped)
         if survivors_after_kill > 0:
             level = logging.ERROR
         elif outcome != "clean" or marker_reaped > 0 or marker_scan == "error":
@@ -396,7 +506,7 @@ def reap_run_session(
             level,
             "session-reap: outcome=%s label=%s sid=%s escalated_sigkill=%d "
             "survivors_after_kill=%d marker_reaped=%d marker_scan=%s "
-            "escaped_session=%d %s",
+            "escaped_session=%d%s %s",
             outcome,
             label,
             proc.pid,
@@ -405,6 +515,7 @@ def reap_run_session(
             marker_reaped,
             marker_scan,
             escaped,
+            f" sid_unknown={sid_unknown}" if portable else "",
             context,
         )
     except Exception:
@@ -1090,6 +1201,55 @@ def _classify_gate_timeout(
     return returncode in (124, 137, -9) and duration_seconds >= timeout_seconds - 1
 
 
+def _resolve_gate_timeout_tool(env: dict[str, str], log_context: str) -> str | None:
+    """The startup-chosen timeout binary, if it is on the GATE's PATH; else None.
+
+    None selects the Python-side deadline, so a missing binary can never turn
+    into a gate exit 127.
+    """
+    tool = platform_support.gate_timeout_tool()
+    if tool is None:
+        return None
+    if shutil.which(tool, path=env.get("PATH")) is None:
+        logger.warning(
+            "gate-timeout: tool=%s not found on gate PATH; using tool=python %s",
+            tool,
+            log_context,
+        )
+        return None
+    return tool
+
+
+def _wait_python_deadline(
+    proc: subprocess.Popen[bytes], timeout_seconds: int, log_context: str
+) -> bool | None:
+    """Enforce the gate deadline Python-side; None if the gate exited in time.
+
+    On expiry: SIGTERM the session, wait ``CANCEL_GRACE_SECONDS``, then SIGKILL
+    and wait.  Returns True (timed out) after logging ``gate-timeout: fired``.
+    """
+    try:
+        proc.wait(timeout=timeout_seconds)
+        return None
+    except subprocess.TimeoutExpired:
+        pass
+    escalated = False
+    kill_run_session(proc, signal.SIGTERM)
+    try:
+        proc.wait(timeout=config.CANCEL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        escalated = True
+        kill_run_session(proc, signal.SIGKILL)
+        proc.wait()
+    logger.warning(
+        "gate-timeout: fired tool=python timeout=%ss escalated_sigkill=%d %s",
+        timeout_seconds,
+        int(escalated),
+        log_context,
+    )
+    return True
+
+
 def run_gate_command(
     workspace: Path,
     gate_command: str,
@@ -1114,6 +1274,16 @@ def run_gate_command(
 
     The gate runs against the working tree EXACTLY as the agent left it. This function used to ``git stash push`` any uncommitted changes first, on the theory that a gate should only judge committed work. That theory destroyed four runs' worth of real work in one night: agents that had implemented an item but not yet committed it had their entire tree stashed away, at which point the gate passed trivially against the pristine base commit and the worker concluded the work was already done. Stashing is a MUTATION performed on evidence during the act of judging it, and there is no version of that which is safe. A dirty tree is now handled where it belongs — by the rescue path at teardown, which commits and pushes it to the run's own branch rather than hiding it.
     """
+    env = {
+        k: v
+        for k, v in build_env(engine, mode=DispatchMode.BUILD).items()
+        if k in GATE_ENV_KEYS
+    }
+    tool = _resolve_gate_timeout_tool(env, log_context)
+    shim = {
+        "timeout": _GATE_SHIM,
+        "gtimeout": _GATE_SHIM_GTIMEOUT,
+    }.get(tool or "", _GATE_SHIM_PYTHON_DEADLINE)
     # ``tmp_dir`` (the run's private TMPDIR) rides in the argv via
     # /usr/bin/env, inside the sudo wrap: sudo strips TMPDIR from the env.
     argv = _sudo_wrap(
@@ -1121,7 +1291,7 @@ def run_gate_command(
             [
                 "/bin/bash",
                 "-c",
-                _GATE_SHIM,
+                shim,
                 "agent-gtd-gate",
                 f"{config.CANCEL_GRACE_SECONDS}s",
                 f"{timeout_seconds}s",
@@ -1130,11 +1300,6 @@ def run_gate_command(
             tmp_dir,
         )
     )
-    env = {
-        k: v
-        for k, v in build_env(engine, mode=DispatchMode.BUILD).items()
-        if k in GATE_ENV_KEYS
-    }
 
     with tempfile.TemporaryFile() as stdout_file:
         start = time.monotonic()
@@ -1170,6 +1335,17 @@ def run_gate_command(
                 data = stdout_file.read()
                 return data.decode("utf-8", errors="replace")[-GATE_OUTPUT_TAIL_CHARS:]
 
+            if tool is None:
+                deadline_result = _wait_python_deadline(
+                    proc, timeout_seconds, log_context
+                )
+                if deadline_result is not None:
+                    return GateResult(
+                        returncode=None,
+                        timed_out=True,
+                        output=_tail(),
+                        duration_seconds=time.monotonic() - start,
+                    )
             try:
                 proc.wait(timeout=timeout_seconds + 2 * config.CANCEL_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
@@ -1187,6 +1363,13 @@ def run_gate_command(
 
             duration = time.monotonic() - start
             rc = proc.returncode
+            if tool is not None and rc == 127:
+                logger.error(
+                    "gate-timeout: tool=%s exited 127 - timeout binary not found "
+                    "on gate PATH; gate result is not a real verdict %s",
+                    tool,
+                    log_context,
+                )
             return GateResult(
                 returncode=rc,
                 timed_out=_classify_gate_timeout(rc, duration, timeout_seconds),
@@ -1631,6 +1814,8 @@ class ReapedProcess:
 
 
 def _proc_cmdline(pid: int) -> str:
+    if not platform_support.USE_PROCFS:
+        return portable_procs.cmdline(pid)
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
@@ -1641,6 +1826,8 @@ def _proc_cmdline(pid: int) -> str:
 
 def _proc_is_live(pid: int) -> bool:
     """True when pid exists and is not a zombie."""
+    if not platform_support.USE_PROCFS:
+        return portable_procs.is_live(pid)
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
@@ -1651,6 +1838,8 @@ def _proc_is_live(pid: int) -> bool:
 
 
 def _ancestor_pids() -> set[int]:
+    if not platform_support.USE_PROCFS:
+        return portable_procs.ancestor_pids()
     pids = {os.getpid()}
     pid = os.getppid()
     while pid > 1 and pid not in pids:
@@ -1669,6 +1858,20 @@ def _scan_workspace_pids(workspace: Path) -> dict[int, str]:
     Path-component match (``is_relative_to``), never a string prefix. Entries
     that vanish or are unreadable are skipped.
     """
+    return _scan_workspace_detail(workspace)[0]
+
+
+def _scan_workspace_detail(
+    workspace: Path,
+) -> tuple[dict[int, str], portable_procs.ScanResult | None]:
+    """:func:`_scan_workspace_pids` plus the portable scan's counts (None on /proc)."""
+    if not platform_support.USE_PROCFS:
+        result = portable_procs.scan_workspace_pids(workspace)
+        return result.pids, result
+    return _scan_workspace_pids_procfs(workspace), None
+
+
+def _scan_workspace_pids_procfs(workspace: Path) -> dict[int, str]:
     found: dict[int, str] = {}
     try:
         entries = os.listdir("/proc")
@@ -1732,6 +1935,8 @@ def _scan_as_agent_user(workspace: Path) -> tuple[bool, dict[int, tuple[str, str
 
 def _proc_run_marker(pid: int) -> str:
     """Value of ``pid``'s exact ``AGENT_GTD_RUN_KEY=`` environ entry, or ''."""
+    if not platform_support.USE_PROCFS:
+        return portable_procs.run_marker(pid)
     prefix = f"{RUN_MARKER_ENV}=".encode()
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
@@ -1745,6 +1950,8 @@ def _proc_run_marker(pid: int) -> str:
 
 def _proc_ppid(pid: int) -> int:
     """Parent pid of ``pid`` from ``/proc/<pid>/stat``; -1 if unreadable."""
+    if not platform_support.USE_PROCFS:
+        return portable_procs.ppid(pid)
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
         return int(stat.rsplit(")", 1)[-1].split()[1])
@@ -1753,6 +1960,9 @@ def _proc_ppid(pid: int) -> int:
 
 
 def _proc_sid(pid: int) -> int:
+    # os.getsid on BOTH backends: it feeds only the reap-marker log line and
+    # the escaped_session count, never a decision to signal.  -1 = unknown
+    # (BSD returns EPERM across sessions).
     try:
         return os.getsid(pid)
     except OSError:
@@ -1766,6 +1976,10 @@ class MarkerScan:
     ok: bool
     pids: dict[int, str]
     error: str
+    # Portable (psutil) scans only: same-uid processes checked / unreadable.
+    # -1 examined = not measured (the /proc branch).
+    examined: int = -1
+    unreadable: int = 0
 
 
 @dataclass(frozen=True)
@@ -1776,9 +1990,12 @@ class MarkerReap:
     survivors: int
     scan_ok: bool
     escaped_session: int
+    sid_unknown: int = 0
 
 
 def _scan_marker_in_process(marker: str) -> dict[int, str]:
+    if not platform_support.USE_PROCFS:
+        return portable_procs.scan_marker(marker, os.getuid()).pids
     needle = f"{RUN_MARKER_ENV}={marker}".encode()
     uid = os.getuid()
     found: dict[int, str] = {}
@@ -1808,6 +2025,8 @@ def scan_marker_pids(marker: str) -> MarkerScan:
     pids: dict[int, str] = {}
     ok = True
     error = ""
+    examined = -1
+    unreadable = 0
     if config.AGENT_SUBPROCESS_USER:
         try:
             proc = subprocess.run(
@@ -1827,6 +2046,22 @@ def scan_marker_pids(marker: str) -> MarkerScan:
         if proc.returncode != 0 or stderr:
             ok = False
             error = f"rc={proc.returncode} stderr={stderr[:300]}"
+    elif not platform_support.USE_PROCFS:
+        try:
+            result = portable_procs.scan_marker(marker, os.getuid())
+        except Exception as exc:
+            return MarkerScan(False, {}, f"{type(exc).__name__}: {exc}"[:300])
+        examined, unreadable = result.examined, result.unreadable
+        if examined > 0 and unreadable == examined:
+            # Blind, not empty: fail closed so callers report scan=error.
+            return MarkerScan(
+                False,
+                {},
+                f"environ unreadable for all {examined} same-uid processes",
+                examined,
+                unreadable,
+            )
+        pids = dict(result.pids)
     else:
         try:
             pids = _scan_marker_in_process(marker)
@@ -1835,7 +2070,7 @@ def scan_marker_pids(marker: str) -> MarkerScan:
     for pid in _ancestor_pids():
         pids.pop(pid, None)
     pids = {p: c[:_REAP_CMDLINE_MAX_CHARS] for p, c in pids.items() if _proc_is_live(p)}
-    return MarkerScan(ok, pids, error)
+    return MarkerScan(ok, pids, error, examined, unreadable)
 
 
 _REAP_MARKER_LOG_CAP = 20
@@ -1862,10 +2097,13 @@ def reap_marker_processes(
         found = first.pids
         worker = os.getpid()
         escaped = 0
+        sid_unknown = 0
         for i, (pid, cmd) in enumerate(found.items()):
             sid = _proc_sid(pid)
             ppid = _proc_ppid(pid)
-            if session_id is not None and sid != session_id:
+            if sid == -1:
+                sid_unknown += 1
+            elif session_id is not None and sid != session_id:
                 escaped += 1
             if i < _REAP_MARKER_LOG_CAP:
                 logger.warning(
@@ -1920,24 +2158,26 @@ def reap_marker_processes(
             ReapedProcess(p, c, "SIGKILL" if p in killed else "SIGTERM")
             for p, c in found.items()
         ]
+        portable = first.examined >= 0
         if survivors > 0:
             level = logging.ERROR
-        elif found or not scan_ok:
+        elif found or not scan_ok or (portable and first.unreadable > 0):
             level = logging.WARNING
         else:
             level = logging.INFO
         logger.log(
             level,
-            "reap-marker: marker=%s matched=%d sigkilled=%d survivors=%d scan=%s%s %s",
+            "reap-marker: marker=%s matched=%d sigkilled=%d survivors=%d scan=%s%s%s %s",
             marker,
             len(found),
             len(killed),
             survivors,
             "ok" if scan_ok else "error",
             "" if scan_ok else " " + error,
+            f" unreadable={first.unreadable}/{first.examined}" if portable else "",
             context,
         )
-        return MarkerReap(reaped, survivors, scan_ok, escaped)
+        return MarkerReap(reaped, survivors, scan_ok, escaped, sid_unknown)
     except Exception:
         logger.exception("reap-marker: failed marker=%s %s", marker, context)
         return MarkerReap([], -1, False, 0)
@@ -1974,6 +2214,8 @@ def _agent_uid() -> int | None:
 
 def _proc_real_uid(pid: int) -> int | None:
     """Real uid of ``pid`` from ``/proc/<pid>/status``; None if unreadable."""
+    if not platform_support.USE_PROCFS:
+        return portable_procs.real_uid(pid)
     try:
         status = Path(f"/proc/{pid}/status").read_text()
     except OSError:
@@ -2029,8 +2271,9 @@ def reap_workspace_processes(
             return []
         scan_ok = True
         found: dict[int, tuple[str, str]] = {}
+        detail: portable_procs.ScanResult | None = None
         try:
-            local = _scan_workspace_pids(workspace)
+            local, detail = _scan_workspace_detail(workspace)
         except Exception:
             logger.warning(
                 "reap-backstop: scan-error dir=%s rc=exception",
@@ -2088,13 +2331,19 @@ def reap_workspace_processes(
                 reason,
             )
             targets[pid] = cmd
+        unreadable_field = ""
+        if not platform_support.USE_PROCFS:
+            unreadable_field = f" unreadable={detail.unreadable if detail else 0}"
         logger.log(
-            logging.INFO if scan_ok else logging.WARNING,
-            "reap-backstop: scanned dir=%s matched=%d skipped_other_run=%d scan=%s",
+            logging.INFO
+            if scan_ok and not (detail and detail.unreadable)
+            else logging.WARNING,
+            "reap-backstop: scanned dir=%s matched=%d skipped_other_run=%d scan=%s%s",
             workspace,
             len(found),
             skipped,
             "ok" if scan_ok else "error",
+            unreadable_field,
         )
         if not targets:
             return []

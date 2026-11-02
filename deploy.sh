@@ -34,6 +34,8 @@ set -euo pipefail
 #                   user has rustup but no usable default (default: stable)
 #
 # Exit code: 0 if every host succeeded. Non-zero on first failure (other hosts skipped).
+# Non-Linux hosts (uname -s preflight, scripts/fleet-hosts.sh) are never deployed:
+# each gets a WARN and the run exits 1 after the Linux hosts are done.
 
 . "$(dirname "$0")/scripts/fleet-hosts.sh"
 resolve_fleet_hosts || exit 1
@@ -414,9 +416,21 @@ echo "Deploy complete."
 EOF
 }
 
-for host in ${HOSTS}; do
+# Preflight over ALL hosts before any per-host work: only Linux hosts are
+# deployed; a non-Linux host is skipped with a WARN and fails the run at the end.
+partition_linux_hosts
+partition_ok=1
+report_host_partition || partition_ok=0
+
+for host in ${LINUX_HOSTS}; do
     deploy_one "${host}"
 done
+
+if [ "${partition_ok}" -ne 1 ]; then
+    echo
+    echo "[ERR]  Linux hosts deployed; some hosts were skipped or could not be probed (see above)." >&2
+    exit 1
+fi
 
 echo
 echo "All hosts deployed."

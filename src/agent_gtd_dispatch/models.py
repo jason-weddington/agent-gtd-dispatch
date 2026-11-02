@@ -62,6 +62,8 @@ class InfoResponse(BaseModel):
     cpu_count: int | None = None
     engine_slots: dict[str, EngineSlotInfo] = {}
     engines_only: list[str] | None = None
+    # Run-lifecycle platform seam (same keys as the startup ``platform:`` line).
+    platform: dict[str, str] | None = None
 
 
 class PushStatus(StrEnum):

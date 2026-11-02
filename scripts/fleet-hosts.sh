@@ -84,3 +84,47 @@ resolve_fleet_hosts() {
 
     return 0
 }
+
+# partition_linux_hosts: preflight over ALL of ${HOSTS}, before any per-host
+# work. Runs `uname -s` on each host and fills:
+#   LINUX_HOSTS      hosts that answered Linux (the only ones to deploy)
+#   NON_LINUX_HOSTS  "host=os" pairs for hosts that answered anything else
+#   OS_ERROR_HOSTS   hosts whose ssh probe failed (an ERROR, never a skip)
+# The installers and deploy steps assume a remote Linux two-user host; a macOS
+# host gets nothing beyond this probe (manual path: docs/install.md, Running on
+# macOS). Returns 0; callers decide the exit status at the end of their run.
+partition_linux_hosts() {
+    LINUX_HOSTS=""
+    NON_LINUX_HOSTS=""
+    OS_ERROR_HOSTS=""
+    local host os
+    for host in ${HOSTS}; do
+        if os=$(ssh -o BatchMode=yes "${host}" uname -s </dev/null 2>/dev/null); then
+            os=$(printf '%s' "${os}" | tr -d '[:space:]')
+        else
+            os=""
+        fi
+        if [ -z "${os}" ]; then
+            OS_ERROR_HOSTS="${OS_ERROR_HOSTS:+${OS_ERROR_HOSTS} }${host}"
+        elif [ "${os}" = "Linux" ]; then
+            LINUX_HOSTS="${LINUX_HOSTS:+${LINUX_HOSTS} }${host}"
+        else
+            NON_LINUX_HOSTS="${NON_LINUX_HOSTS:+${NON_LINUX_HOSTS} }${host}=${os}"
+        fi
+    done
+    return 0
+}
+
+# report_host_partition: print one line per host partition_linux_hosts held
+# back. Returns 1 when any host was skipped or errored, else 0.
+report_host_partition() {
+    local entry host
+    for entry in ${NON_LINUX_HOSTS}; do
+        host=${entry%=*}
+        echo "[WARN] skipped ${host} (${entry##*=}): not Linux; manual macOS path, docs/install.md (Running on macOS)" >&2
+    done
+    for host in ${OS_ERROR_HOSTS}; do
+        echo "[ERR]  could not determine the OS of ${host}" >&2
+    done
+    [ -z "${NON_LINUX_HOSTS}${OS_ERROR_HOSTS}" ]
+}

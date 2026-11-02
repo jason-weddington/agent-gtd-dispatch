@@ -324,3 +324,112 @@ class TestOwnershipFilter:
 
 def test_module_exports() -> None:
     assert dispatch.REAP_TERM_GRACE_SECS > 0
+
+
+# ---------------------------------------------------------------------------
+# Portable (psutil) branch, USE_PROCFS=False on real processes (AC6 e/f)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def portable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_gtd_dispatch import platform_support
+
+    monkeypatch.setattr(platform_support, "USE_PROCFS", False)
+
+
+@pytest.mark.usefixtures("portable")
+class TestPortableBranch:
+    def test_kills_inside_leaves_prefix_sibling(
+        self, root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mine = _spawn(root / "repos-a" / "sub")
+        sibling = _spawn(root / "repos-ab")
+        try:
+            with caplog.at_level("INFO", logger="agent_gtd_dispatch.dispatch"):
+                out = reap_workspace_processes(root / "repos-a", term_grace_secs=2)
+            assert [r.pid for r in out] == [mine.pid]
+            assert _dead(mine)
+            assert sibling.poll() is None
+        finally:
+            mine.kill()
+            sibling.kill()
+        (line,) = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("reap-backstop: scanned")
+        ]
+        assert "matched=1 skipped_other_run=0 scan=ok unreadable=" in line
+
+    def test_foreign_uid_dropped_never_signalled(
+        self, root: Path, monkeypatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch import portable_procs
+
+        p = _spawn(root / "repos-a")
+        agent_uid = dispatch._agent_uid()
+        assert agent_uid is not None
+        monkeypatch.setattr(portable_procs, "real_uid", lambda _pid: agent_uid + 1)
+        signalled: list[int] = []
+        monkeypatch.setattr(
+            dispatch, "_signal_pid", lambda pid, _s: signalled.append(pid)
+        )
+        try:
+            assert reap_workspace_processes(root / "repos-a", term_grace_secs=1) == []
+            assert p.poll() is None
+            assert signalled == []
+        finally:
+            p.kill()
+        assert any(
+            "reason=foreign_owner" in r.getMessage()
+            and f"pid={p.pid}" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_symlinked_workspace_matches_resolved_cwd(
+        self, root: Path, tmp_path: Path
+    ) -> None:
+        real = tmp_path.resolve() / "real-target"
+        link = root / "repos-link"
+        real.mkdir()
+        link.symlink_to(real)
+        p = _spawn(real)
+        try:
+            out = reap_workspace_processes(link, term_grace_secs=2)
+            assert [r.pid for r in out] == [p.pid]
+            assert _dead(p)
+        finally:
+            p.kill()
+
+    def test_other_live_run_skipped(
+        self, root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import os
+        import secrets
+
+        from agent_gtd_dispatch import run_tmp
+
+        other = run_tmp.create_run_tmp(secrets.token_hex(6))
+        ws = root / "repos-a"
+        ws.mkdir()
+        env = {**os.environ, run_tmp.RUN_MARKER_ENV: other.name}
+        p = subprocess.Popen(
+            [sys.executable, "-c", SLEEP], cwd=ws, env=env, start_new_session=True
+        )
+        time.sleep(0.3)
+        try:
+            with caplog.at_level("INFO", logger="agent_gtd_dispatch.dispatch"):
+                assert (
+                    reap_workspace_processes(ws, term_grace_secs=1, own_marker="rt-x")
+                    == []
+                )
+            assert p.poll() is None
+        finally:
+            p.kill()
+            p.wait()
+            run_tmp.remove_run_tmp(other, kind="build")
+        assert any(
+            f"skipped pid={p.pid} " in r.getMessage()
+            and "reason=other_live_run" in r.getMessage()
+            for r in caplog.records
+        )

@@ -10,6 +10,7 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "aiosqlite>=0.20",
     "pyyaml>=6",
+    "psutil>=5.9",
 ]
 
 [project.scripts]
@@ -26,6 +27,7 @@ dev = [
     "pre-commit>=4",
     "python-semantic-release>=9",
     "types-pyyaml>=6",
+    "types-psutil>=5.9",
 ]
 
 [tool.uv.workspace]

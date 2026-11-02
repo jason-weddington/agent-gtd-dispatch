@@ -454,3 +454,86 @@ class TestLiveSnapshots:
         r = world.sweep({"DISPATCH_RUN_TMP_ROOT": str(world.tmp / "nope")})
         assert r.returncode == 0
         assert "WARN run_tmp_root missing" in r.stdout and "degraded=1" in r.stdout
+
+
+class TestMarkerLivenessFailClosed:
+    """Off procfs the sweep cannot prove a run dead, so it only snapshots (AC10)."""
+
+    @staticmethod
+    def _no_proc(world: _World) -> dict[str, str]:
+        return {"DISPATCH_PROC_ROOT": str(world.tmp / "no-proc")}
+
+    def test_live_run_without_rt_dir_is_snapshot_only(self, world: _World) -> None:
+        clone = world.clone(f"repos-p-{K2}")
+        head = _commit(clone, "a.py")
+        proc = subprocess.Popen(
+            ["sleep", "60"], env={**os.environ, "AGENT_GTD_RUN_KEY": f"rt-{K2}"}
+        )
+        try:
+            r = world.sweep(self._no_proc(world))
+        finally:
+            proc.kill()
+            proc.wait()
+        assert r.returncode == 0, r.stdout
+        assert _remote(world.origin, f"feat/x-rescue-{K2}") == head
+        assert _remote(world.origin, "feat/x") == ""
+        assert _remote(world.origin, "feat/x-r2") == ""
+        for needle in (
+            "live_by=unverifiable",
+            "config: marker_liveness=unavailable",
+            "WARN marker liveness unavailable on this platform",
+            "marker_liveness=unavailable unverifiable=1",
+            "degraded=1",
+        ):
+            assert needle in r.stdout
+
+    def test_foreign_tip_never_pushes_r2(self, world: _World) -> None:
+        foreign = world.foreign("feat/x")
+        clone = world.clone(f"repos-p-{K3}")
+        head = _commit(clone, "a.py")
+        r = world.sweep(self._no_proc(world))
+        assert r.returncode == 0, r.stdout
+        assert _remote(world.origin, "feat/x") == foreign
+        assert _remote(world.origin, "feat/x-r2") == ""
+        assert _remote(world.origin, f"feat/x-rescue-{K3}") == head
+
+    def test_abandoned_clone_still_only_snapshotted(self, world: _World) -> None:
+        clone = world.clone(f"repos-p-{K1}")
+        head = _commit(clone, "a.py")
+        r = world.sweep(self._no_proc(world))
+        assert r.returncode == 0, r.stdout
+        assert _remote(world.origin, f"feat/x-rescue-{K1}") == head
+        assert _remote(world.origin, "feat/x") == ""
+        assert _remote(world.origin, "feat/x-r2") == ""
+        assert "RESCUED" not in r.stdout
+
+    def test_non_hex_key_keeps_unknown_liveness(self, world: _World) -> None:
+        clone = world.clone(CLONE)
+        head = _commit(clone, "a.py")
+        r = world.sweep(self._no_proc(world))
+        assert r.returncode == 0, r.stdout
+        assert "liveness=unknown" in r.stdout and "unverifiable=0" in r.stdout
+        assert _remote(world.origin, "feat/x") == head
+
+    @pytest.mark.parametrize("no_proc", [False, True])
+    def test_rt_dir_present_behaves_identically(
+        self, world: _World, no_proc: bool
+    ) -> None:
+        world.clone(f"repos-p-{K1}")
+        clone = world.root / f"repos-p-{K1}"
+        world.run_tmp(K1)
+        head = _commit(clone, "a.py")
+        r = world.sweep(self._no_proc(world) if no_proc else None)
+        assert r.returncode == 0, r.stdout
+        assert "live_by=rt" in r.stdout and "unverifiable=0" in r.stdout
+        assert _remote(world.origin, f"feat/x-rescue-{K1}") == head
+        assert _remote(world.origin, "feat/x") == ""
+
+    @pytest.mark.skipif(not Path("/proc/self/environ").exists(), reason="needs /proc")
+    def test_default_proc_root_reports_available(self, world: _World) -> None:
+        world.clone(CLONE)
+        r = world.sweep()
+        assert r.returncode == 0
+        assert "config: marker_liveness=available" in r.stdout
+        assert "marker_liveness=available unverifiable=0" in r.stdout
+        assert "WARN marker liveness" not in r.stdout

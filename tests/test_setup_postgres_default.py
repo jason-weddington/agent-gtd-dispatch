@@ -26,6 +26,8 @@ SETUP_SCRIPT = Path(__file__).parent.parent / "setup-dispatch-host.sh"
 
 _REAL_TOOLS = [
     "bash",
+    # the installer refuses non-Linux hosts first thing (uname -s)
+    "uname",
     "cat",
     "cut",
     "dirname",

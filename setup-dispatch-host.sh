@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Linux only, refused before anything else (including --dry-run and the root
+# check): every step below assumes a Linux two-user host (useradd, systemd,
+# apt/dnf, sudoers.d). POSIX syntax on purpose.
+[ "$(uname -s)" = Linux ] || { printf 'setup-dispatch-host.sh: this host is not Linux (%s); the installer supports Linux only. For macOS use the manual path in docs/install.md (Running on macOS).\n' "$(uname -s)" >&2; exit 1; }
 
 # setup-dispatch-host.sh — Idempotent installer for the agent-gtd-dispatch service.
 #
