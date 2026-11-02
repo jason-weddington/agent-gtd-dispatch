@@ -101,6 +101,12 @@ the mode-mismatch guards.
 | `OLLAMA_DEFAULT_MODEL` | `qwen3.6:35b` | Default Ollama model passed to `claude --model` |
 | `OLLAMA_API_KEY` | `ollama` | Dummy auth value (Ollama ignores auth; value is injected as `ANTHROPIC_AUTH_TOKEN`) |
 | `OLLAMA_TIMEOUT_MULTIPLIER` | `2.0` | Multiplier applied to `TIMEOUT_SECONDS` for Ollama runs (local inference is slower) |
+| `DISPATCH_ENGINE_SLOTS` | `""` (no caps) | Per-engine concurrency caps, comma-separated `<engine>=<int>` pairs (e.g. `talos-qwen=1`). Engine names must be valid build engines; duplicates and non-digit values are rejected at startup. A cap of `0` hides the engine and refuses its BUILD dispatches. `talos-qwen` is advertised only with a cap >= 1. |
+| `TALOS_QWEN_BASE_URL` | none | Ollama root URL used by `talos-qwen` on this host. `talos-qwen` is advertised only when this is non-empty; a `127.0.0.1` URL is valid. The endpoint is never probed. There is no fallback to `OLLAMA_BASE_URL`. |
+| `TALOS_QWEN_MODEL` | `qwen3.8:27b` | Model for `talos-qwen`; empty means the default. |
+| `TALOS_QWEN_NUM_CTX` | `262144` | Context window for `talos-qwen` (integer >= 1). |
+
+**Operator note:** Stage `DISPATCH_ENGINE_SLOTS` and the `TALOS_QWEN_*` variables on GPU hosts BEFORE deploying this release; they are inert on older builds. After this release a host without them stops advertising `talos-qwen`, because it requires `DISPATCH_ENGINE_SLOTS` naming `talos-qwen` with a cap of 1 or more plus a non-empty `TALOS_QWEN_BASE_URL`. The template only seeds new hosts, so edit the existing service env.
 
 ### Notes on `ANTHROPIC_API_KEY`
 

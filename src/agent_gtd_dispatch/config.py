@@ -214,6 +214,52 @@ OLLAMA_CLOUD_API_KEY: str = ""
 OLLAMA_CLOUD_BASE_URL: str = "https://ollama.com"
 OLLAMA_CLOUD_MODEL: str = "glm-5.3:cloud"
 
+# Per-engine concurrency caps declared by THIS host (DISPATCH_ENGINE_SLOTS, e.g.
+# "talos-qwen=1").  Empty means no per-engine caps.  A cap of 0 hides the engine.
+ENGINE_SLOTS: dict[str, int] = {}
+
+# Host-local talos-qwen endpoint config.  TALOS_QWEN_BASE_URL empty means
+# "unset" (talos-qwen is then not advertised).  There is NO fallback to
+# OLLAMA_BASE_URL.  The endpoint is never probed.
+TALOS_QWEN_BASE_URL: str = ""
+TALOS_QWEN_MODEL: str = "qwen3.8:27b"
+TALOS_QWEN_NUM_CTX: int = 262144
+
+
+def talos_qwen_base_url() -> str:
+    """Return the host's talos-qwen Ollama base URL ("" when unset)."""
+    return TALOS_QWEN_BASE_URL
+
+
+def _parse_engine_slots(raw: str) -> dict[str, int]:
+    """Parse ``DISPATCH_ENGINE_SLOTS`` (``<engine>=<int>,...``) or raise ValueError."""
+    from agent_gtd_dispatch_protocol.models import BuildEngine
+
+    valid = {e.value for e in BuildEngine}
+    slots: dict[str, int] = {}
+    for segment in raw.split(","):
+        segment = segment.strip()
+        if not segment:
+            continue
+        name, sep, value = segment.partition("=")
+        name = name.strip()
+        value = value.strip()
+        problem = ""
+        if not sep:
+            problem = "expected <engine>=<int>"
+        elif name not in valid:
+            problem = f"unknown engine {name!r}"
+        elif not (value.isascii() and value.isdigit()):
+            problem = f"cap {value!r} is not a non-negative integer"
+        elif name in slots:
+            problem = f"engine {name!r} appears twice"
+        if problem:
+            msg = f"Invalid DISPATCH_ENGINE_SLOTS={raw!r}: {problem}"
+            raise ValueError(msg)
+        slots[name] = int(value)
+    return slots
+
+
 # talos binary discovery: default 'talos', PATH-resolved by the subprocess machinery
 # (mirrors how the 'claude' binary is resolved for claude-code engines). Override via
 # TALOS_BIN env var when the binary lives at a non-default path on the host.
@@ -303,6 +349,7 @@ def load() -> None:
     global OLLAMA_CLOUD_API_KEY, OLLAMA_CLOUD_BASE_URL, OLLAMA_CLOUD_MODEL
     global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS, TALOS_MEMORY
     global AGENT_SUBPROCESS_USER
+    global ENGINE_SLOTS, TALOS_QWEN_BASE_URL, TALOS_QWEN_MODEL, TALOS_QWEN_NUM_CTX
     global REVIEWER_ENGINE, REVIEW_MAX_TURNS, REVIEW_TIMEOUT_SECONDS
     global LAND_GATE_TIMEOUT_SECONDS, LAND_GIT_TIMEOUT_SECONDS
     global ROLLOUT_LOOP_POLL_SECONDS, ROLLOUT_PARK_WARN_SECONDS, MAX_ITEM_REDISPATCHES
@@ -372,6 +419,43 @@ def load() -> None:
             )
             raise ValueError(msg)
     OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "ollama")
+    TALOS_QWEN_BASE_URL = os.environ.get("TALOS_QWEN_BASE_URL", "").strip()
+    if TALOS_QWEN_BASE_URL:
+        _qparsed = urllib.parse.urlparse(TALOS_QWEN_BASE_URL)
+        if _qparsed.scheme not in ("http", "https") or not _qparsed.netloc:
+            msg = (
+                f"Invalid TALOS_QWEN_BASE_URL={TALOS_QWEN_BASE_URL!r}: must start "
+                f"with http:// or https:// and include a hostname. "
+                f"Expected format: http://host:port"
+            )
+            raise ValueError(msg)
+    TALOS_QWEN_MODEL = os.environ.get("TALOS_QWEN_MODEL", "").strip() or "qwen3.8:27b"
+    _qctx = os.environ.get("TALOS_QWEN_NUM_CTX", "").strip()
+    if _qctx:
+        if not (_qctx.isascii() and _qctx.isdigit()) or int(_qctx) < 1:
+            msg = f"Invalid TALOS_QWEN_NUM_CTX={_qctx!r}: must be an integer >= 1"
+            raise ValueError(msg)
+        TALOS_QWEN_NUM_CTX = int(_qctx)
+    else:
+        TALOS_QWEN_NUM_CTX = 262144
+    ENGINE_SLOTS = _parse_engine_slots(os.environ.get("DISPATCH_ENGINE_SLOTS", ""))
+    logger.info(
+        "engine-slots config slots=%s talos_qwen_endpoint_source=%s",
+        ENGINE_SLOTS,
+        "TALOS_QWEN_BASE_URL" if TALOS_QWEN_BASE_URL else "unset",
+    )
+    from .engines import SLOT_REQUIRED_ENGINES
+
+    for _hidden in sorted(SLOT_REQUIRED_ENGINES):
+        if (
+            _hidden == "talos-qwen"
+            and TALOS_QWEN_BASE_URL
+            and ENGINE_SLOTS.get(_hidden, 0) < 1
+        ):
+            logger.warning(
+                "engine %s hidden: requires DISPATCH_ENGINE_SLOTS cap >= 1",
+                _hidden,
+            )
     # NO fallback to OLLAMA_API_KEY — cloud vs. local Ollama servers use distinct
     # credentials and mixing them ships the local key to the cloud.
     OLLAMA_CLOUD_API_KEY = os.environ.get("OLLAMA_CLOUD_API_KEY", "")

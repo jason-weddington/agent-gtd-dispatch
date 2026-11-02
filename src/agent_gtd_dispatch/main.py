@@ -60,6 +60,7 @@ from .engines import (
 from .models import (
     DispatchMode,
     DispatchRequest,
+    EngineSlotInfo,
     EngineSwap,
     InfoResponse,
     PushStatus,
@@ -150,6 +151,67 @@ class _PendingDispatch(NamedTuple):
 
 
 _pending_queue: list[_PendingDispatch] = []
+
+# Per-engine slots (config.ENGINE_SLOTS): engine name -> ids of BUILD runs holding
+# a slot (running or host-queued).  _engine_slot_admitting holds ids between the
+# reservation and the end of the insert_run await, for the audit only.
+_engine_slot_holders: dict[str, set[str]] = {}
+_engine_slot_admitting: set[str] = set()
+
+
+def _try_reserve_engine_slot(engine: str, run_id: str) -> tuple[int, int] | None:
+    """Reserve an engine slot synchronously; return (held, cap) when full."""
+    if engine not in config.ENGINE_SLOTS:
+        return None
+    cap = config.ENGINE_SLOTS[engine]
+    held = len(_engine_slot_holders.get(engine, set()))
+    if held >= cap:
+        return held, cap
+    _engine_slot_holders.setdefault(engine, set()).add(run_id)
+    return None
+
+
+def _release_engine_slot(run_id: str) -> None:
+    """Release every engine slot held by *run_id* (idempotent)."""
+    for engine, holders in _engine_slot_holders.items():
+        if run_id in holders:
+            holders.discard(run_id)
+            logger.info(
+                "engine-slot release run=%s engine=%s held_after=%d",
+                run_id,
+                engine,
+                len(holders),
+            )
+
+
+def _release_on_done(run_id: str) -> Callable[[asyncio.Future[Any]], None]:
+    """Done-callback releasing *run_id*'s slot on completion, error or cancel."""
+
+    def _cb(_task: asyncio.Future[Any]) -> None:
+        _release_engine_slot(run_id)
+
+    return _cb
+
+
+def _audit_engine_slots() -> None:
+    """Log (never repair) leaked or over-admitted engine slots."""
+    live = (
+        set(_active_processes)
+        | {p.run.id for p in _pending_queue}
+        | _engine_slot_admitting
+    )
+    for engine, holders in _engine_slot_holders.items():
+        for rid in sorted(holders - live):
+            logger.error("engine-slot leak engine=%s run=%s", engine, rid)
+        cap = config.ENGINE_SLOTS.get(engine)
+        if cap is not None and len(holders) > cap:
+            logger.error(
+                "engine-slot over-admit engine=%s held=%d cap=%d",
+                engine,
+                len(holders),
+                cap,
+            )
+
 
 _retention_task: asyncio.Task[None] | None = None  # handle for clean shutdown
 
@@ -458,6 +520,7 @@ def _try_start_pending() -> None:
                 attribution=pending.attribution,
             )
         )
+        task.add_done_callback(_release_on_done(pending.run.id))
         _active_processes[pending.run.id] = task
 
 
@@ -8470,6 +8533,7 @@ async def _dispatch_worker(
             should_cleanup = False
     finally:
         _active_processes.pop(run.id, None)
+        _release_engine_slot(run.id)  # before _try_start_pending: visible next tick
         _try_start_pending()  # wake up a queued dispatch now that a slot freed
         _active_subprocesses.pop(run.id, None)
         _run_event_queues.pop(run.id, None)
@@ -8565,6 +8629,7 @@ async def info() -> InfoResponse:
     """
     agent_dicts = await run_list_agents_script()
     load_avg_1m, cpu_count = _host_load()
+    _audit_engine_slots()
     return InfoResponse(
         engine=ENGINE_NAME,
         version=SERVICE_VERSION,
@@ -8575,6 +8640,13 @@ async def info() -> InfoResponse:
         parked_rollout_loops=len(_parked_rollout_loops & _active_processes.keys()),
         load_avg_1m=load_avg_1m,
         cpu_count=cpu_count,
+        engine_slots={
+            name: EngineSlotInfo(
+                max_concurrent_runs=cap,
+                active_runs=len(_engine_slot_holders.get(name, set())),
+            )
+            for name, cap in config.ENGINE_SLOTS.items()
+        },
     )
 
 
@@ -8914,7 +8986,46 @@ async def dispatch_item(
         rollout_id=body.rollout_id,
         callback_token=body.callback_token,
     )
-    await db.insert_run(run)
+    # Per-engine slot: BUILD only, reserved synchronously (no await between the
+    # reservation and the code below) so concurrent requests cannot both pass.
+    if body.mode == DispatchMode.BUILD and effective_engine_name in config.ENGINE_SLOTS:
+        _refused = _try_reserve_engine_slot(effective_engine_name, run.id)
+        if _refused is not None:
+            _held, _cap = _refused
+            logger.warning(
+                "engine-slot refuse run=%s engine=%s held=%d cap=%d holders=%s",
+                run.id,
+                effective_engine_name,
+                _held,
+                _cap,
+                sorted(_engine_slot_holders.get(effective_engine_name, set())),
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "detail": "Engine slot full",
+                    "reason": "engine_slot_full",
+                    "engine": effective_engine_name,
+                    "active_runs": _held,
+                    "max_concurrent_runs": _cap,
+                },
+            )
+        _engine_slot_admitting.add(run.id)
+    try:
+        await db.insert_run(run)
+    except BaseException:
+        _release_engine_slot(run.id)
+        raise
+    finally:
+        _engine_slot_admitting.discard(run.id)
+    logger.info(
+        "engine-slot admit run=%s engine=%s held=%d cap=%d queued=%s",
+        run.id,
+        effective_engine_name,
+        len(_engine_slot_holders.get(effective_engine_name, set())),
+        config.ENGINE_SLOTS.get(effective_engine_name, 0),
+        len(_active_processes) >= config.MAX_CONCURRENT_RUNS,
+    )
 
     if engine_swapped:
         logger.warning(
@@ -8980,6 +9091,7 @@ async def dispatch_item(
                 run, max_turns, engine, timeout_seconds, attribution=body.attribution
             )
         )
+        task.add_done_callback(_release_on_done(run.id))
         _active_processes[run.id] = task
 
     return RunResponse(
@@ -9074,6 +9186,8 @@ async def cancel_run(
     if run.status in _terminal:
         return RunResponse(**run.model_dump())
 
+    # NOT releasing the engine slot here: a host-queued cancelled run is still
+    # promoted later, so it keeps its slot until its worker task ends.
     # Cancel the asyncio task (stops the coroutine at its next await)
     task = _active_processes.get(run_id)
     if task is not None:

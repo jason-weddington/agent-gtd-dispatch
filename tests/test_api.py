@@ -2117,3 +2117,204 @@ class TestOneLoopPerRollout:
 
         assert resp.status_code == 200
         mock_loop.assert_called_once()
+
+
+class TestEngineSlotAdmission:
+    """Per-engine slot admission on POST /dispatch (BUILD mode only)."""
+
+    @pytest.fixture
+    def slots(self, monkeypatch):
+        """Fresh holder state, stubbed gtd_client/dispatch, parked workers."""
+        import asyncio
+
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(main, "_engine_slot_holders", {})
+        monkeypatch.setattr(main, "_engine_slot_admitting", set())
+        monkeypatch.setattr(main, "_active_processes", {})
+        monkeypatch.setattr(main, "_pending_queue", [])
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {"talos-qwen": 1})
+        client_mock = AsyncMock()
+        client_mock.get_item = AsyncMock(
+            return_value={"id": "abc123", "title": "T", "project_id": "proj1"}
+        )
+        client_mock.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@git.example.com:repos/test",
+                "gate_command": "true",
+            }
+        )
+        monkeypatch.setattr(main, "gtd_client", client_mock)
+        from unittest.mock import MagicMock
+
+        disp = MagicMock()
+        disp.branch_name_for_item.return_value = "feat/abc123-t"
+        monkeypatch.setattr(main, "dispatch", disp)
+
+        state = {"release": None}
+
+        async def _worker(run, *_a, **_kw):
+            if state["release"] is None:
+                state["release"] = asyncio.Event()
+            await state["release"].wait()
+
+        monkeypatch.setattr(main, "_dispatch_worker", _worker)
+        return state
+
+    @staticmethod
+    def _post(client, auth_headers, engine="talos-qwen", mode="build"):
+        return client.post(
+            "/dispatch",
+            json={"item_id": "abc123", "max_turns": 5, "engine": engine, "mode": mode},
+            headers=auth_headers,
+        )
+
+    def test_first_admitted_second_refused(
+        self, client, auth_headers, slots, caplog
+    ) -> None:
+        import asyncio
+
+        from agent_gtd_dispatch import db
+
+        caplog.set_level(logging.INFO)
+        first = self._post(client, auth_headers)
+        assert first.status_code == 200
+        second = self._post(client, auth_headers)
+        assert second.status_code == 503
+        assert second.json()["detail"] == {
+            "detail": "Engine slot full",
+            "reason": "engine_slot_full",
+            "engine": "talos-qwen",
+            "active_runs": 1,
+            "max_concurrent_runs": 1,
+        }
+        runs = client.portal.call(db.list_runs)
+        assert [r.id for r in runs] == [first.json()["id"]]
+        assert "engine-slot refuse" in caplog.text
+        assert "engine=talos-qwen held=1 cap=1" in caplog.text
+        assert "engine-slot admit" in caplog.text
+        client.portal.call(asyncio.sleep, 0)
+
+    def test_atomic_across_insert_run_await(
+        self, client, auth_headers, slots, monkeypatch
+    ) -> None:
+        import asyncio
+
+        from agent_gtd_dispatch import db
+
+        real_insert = db.insert_run
+
+        async def run_it() -> tuple[int, int]:
+            entered = asyncio.Event()
+            go = asyncio.Event()
+
+            async def slow_insert(run):
+                entered.set()
+                await go.wait()
+                await real_insert(run)
+
+            monkeypatch.setattr(db, "insert_run", slow_insert)
+            payload = {
+                "item_id": "abc123",
+                "max_turns": 5,
+                "engine": "talos-qwen",
+                "mode": "build",
+            }
+            transport = httpx.ASGITransport(app=main.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                t1 = asyncio.create_task(
+                    c.post("/dispatch", json=payload, headers=auth_headers)
+                )
+                await entered.wait()
+                r2 = await c.post("/dispatch", json=payload, headers=auth_headers)
+                go.set()
+                r1 = await t1
+            return r1.status_code, r2.status_code
+
+        r1, r2 = client.portal.call(run_it)
+        assert (r1, r2) == (200, 503)
+
+    def test_reserve_and_release_unit(self, slots) -> None:
+        assert main._try_reserve_engine_slot("talos-qwen", "a") is None
+        assert main._try_reserve_engine_slot("talos-qwen", "b") == (1, 1)
+        main._release_engine_slot("a")
+        main._release_engine_slot("a")  # idempotent
+        assert main._try_reserve_engine_slot("talos-qwen", "b") is None
+        assert main._try_reserve_engine_slot("claude-code", "c") is None
+
+    def test_no_caps_admits_as_before(
+        self, client, auth_headers, slots, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {})
+        assert self._post(client, auth_headers).status_code == 200
+
+    def test_cap_zero_refuses(self, client, auth_headers, slots, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {"talos-qwen": 0})
+        resp = self._post(client, auth_headers)
+        assert resp.status_code == 503
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "engine_slot_full"
+        assert detail["active_runs"] == 0
+        assert detail["max_concurrent_runs"] == 0
+
+    def test_other_engine_unaffected(self, client, auth_headers, slots) -> None:
+        assert self._post(client, auth_headers).status_code == 200
+        assert (
+            self._post(client, auth_headers, engine="claude-code-sonnet").status_code
+            == 200
+        )
+
+    def test_non_build_not_capped(
+        self, client, auth_headers, slots, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {"claude-code": 0})
+        resp = self._post(client, auth_headers, engine="claude-code", mode="plan")
+        assert resp.status_code != 503 or "engine_slot_full" not in resp.text
+
+    def test_release_on_completion(self, client, auth_headers, slots) -> None:
+        import asyncio
+
+        assert self._post(client, auth_headers).status_code == 200
+        assert main._engine_slot_holders["talos-qwen"]
+
+        async def finish() -> None:
+            slots["release"].set()
+            await asyncio.sleep(0.05)
+
+        client.portal.call(finish)
+        assert main._engine_slot_holders.get("talos-qwen", set()) == set()
+
+    def test_release_on_early_cancel(self, client, auth_headers, slots) -> None:
+        import asyncio
+
+        assert self._post(client, auth_headers).status_code == 200
+        (task,) = main._active_processes.values()
+
+        async def cancel() -> None:
+            task.cancel()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        client.portal.call(cancel)
+        assert main._engine_slot_holders.get("talos-qwen", set()) == set()
+
+    def test_release_on_insert_failure(
+        self, client, auth_headers, slots, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch import db
+
+        async def boom(_run):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(db, "insert_run", boom)
+        with pytest.raises(RuntimeError):
+            self._post(client, auth_headers)
+        assert main._engine_slot_holders.get("talos-qwen", set()) == set()

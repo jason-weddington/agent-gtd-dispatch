@@ -50,7 +50,8 @@ separate round-trip to `/agents`.
   "agents": ["claude-lead-abc", "claude-build-def"],
   "parked_rollout_loops": 1,
   "load_avg_1m": 0.42,
-  "cpu_count": 32
+  "cpu_count": 32,
+  "engine_slots": {"talos-qwen": {"max_concurrent_runs": 1, "active_runs": 0}}
 }
 ```
 
@@ -64,6 +65,7 @@ separate round-trip to `/agents`.
 | `agents` | `list[str]` | Agent names from `list_agents.sh` |
 | `load_avg_1m` | `float \| null` | 1-minute load average from `os.getloadavg`; null when unavailable. Routers treat a host as overloaded above 1.5 x `cpu_count` |
 | `cpu_count` | `int \| null` | Logical CPU count from `os.cpu_count`; null when unknown |
+| `engine_slots` | `object` | Per-engine caps declared by this host (`DISPATCH_ENGINE_SLOTS`), one entry per capped engine, including cap-0 entries. Absent or empty means no per-engine caps. `engine_slots.<engine>.active_runs` counts runs holding a slot, both running and host-queued, so it differs from the top-level `active_runs`; only BUILD-mode runs admitted through `/dispatch` are counted |
 | `parked_rollout_loops` | `int` | Rollout loops parked behind a host drain. They still hold a slot on the host, so routers compute free slots as `max_concurrent_runs - active_runs - parked_rollout_loops` |
 
 ---
@@ -152,6 +154,18 @@ Note: `status` is `"pending"` when the service is at capacity (the run is queued
 transitions to `"running"` when a slot becomes available. The response is **always 200**
 for a valid request — there is no 503 at capacity.
 
+**Per-engine caps (BUILD mode only).** A host that declares `DISPATCH_ENGINE_SLOTS`
+refuses a BUILD dispatch whose engine has no free slot, with HTTP 503 and this body
+(no run row is created):
+
+```json
+{"detail": {"detail": "Engine slot full", "reason": "engine_slot_full", "engine": "talos-qwen", "active_runs": 1, "max_concurrent_runs": 1}}
+```
+
+It differs from the upstream-unreachable 503 (whose `detail` has an `upstream_url`
+key) and from general capacity (a 200 that queues the run). Plan, manage and review
+dispatches are never capped. A capped run also consumes one general slot.
+
 **Error responses:**
 | Status | Condition |
 |---|---|
@@ -159,7 +173,7 @@ for a valid request — there is no 503 at capacity.
 | 401 | Missing or invalid API key |
 | 404 | Item, project, or rollout not found in GTD API |
 | 502 | Upstream GTD API returned an error or malformed JSON |
-| 503 | Upstream GTD API unreachable |
+| 503 | Upstream GTD API unreachable, or `reason: "engine_slot_full"` (see above) |
 
 ---
 

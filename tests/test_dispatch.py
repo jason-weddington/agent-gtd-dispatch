@@ -6894,3 +6894,112 @@ class TestReviewPromptGoldens:
             first = text.splitlines()[0]
             assert first in contract
             assert first in land
+
+
+_SLOT_BASE_ENV = {
+    "DISPATCH_API_KEY": "k",
+    "AGENT_GTD_URL": "http://localhost:9999",
+    "AGENT_GTD_API_KEY": "k",
+    "ANTHROPIC_API_KEY": "k",
+}
+
+
+@pytest.fixture
+def _slot_cfg(monkeypatch, tmp_path):
+    """Run config.load() against a clean env; restore globals afterwards."""
+    for name in (
+        "ENGINE_SLOTS",
+        "TALOS_QWEN_BASE_URL",
+        "TALOS_QWEN_MODEL",
+        "TALOS_QWEN_NUM_CTX",
+    ):
+        monkeypatch.setattr(config, name, getattr(config, name))
+    for name in (
+        "DISPATCH_ENGINE_SLOTS",
+        "TALOS_QWEN_BASE_URL",
+        "TALOS_QWEN_MODEL",
+        "TALOS_QWEN_NUM_CTX",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for k, v in _SLOT_BASE_ENV.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
+    return monkeypatch
+
+
+class TestEngineSlotsConfig:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("talos-qwen=1", {"talos-qwen": 1}),
+            (" talos-qwen = 2 , ", {"talos-qwen": 2}),
+            ("", {}),
+            ("   ", {}),
+            ("talos-qwen=0", {"talos-qwen": 0}),
+        ],
+    )
+    def test_valid(self, _slot_cfg, raw, expected) -> None:
+        _slot_cfg.setenv("DISPATCH_ENGINE_SLOTS", raw)
+        config.load()
+        assert expected == config.ENGINE_SLOTS
+
+    def test_unset(self, _slot_cfg) -> None:
+        config.load()
+        assert config.ENGINE_SLOTS == {}
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "talos-qwen",
+            "talos-qwn=1",
+            "talos-qwen=1_0",
+            "talos-qwen=-1",
+            "talos-qwen=",
+            "talos-qwen=1,talos-qwen=2",
+        ],
+    )
+    def test_invalid(self, _slot_cfg, raw) -> None:
+        _slot_cfg.setenv("DISPATCH_ENGINE_SLOTS", raw)
+        with pytest.raises(ValueError, match=r"^Invalid DISPATCH_ENGINE_SLOTS="):
+            config.load()
+
+    def test_hidden_warning(self, _slot_cfg, caplog) -> None:
+        _slot_cfg.setenv("TALOS_QWEN_BASE_URL", "http://127.0.0.1:11434")
+        config.load()
+        assert "engine talos-qwen hidden" in caplog.text
+
+
+class TestTalosQwenConfig:
+    def test_unset_defaults(self, _slot_cfg) -> None:
+        config.load()
+        assert config.TALOS_QWEN_BASE_URL == ""
+        assert config.TALOS_QWEN_MODEL == "qwen3.8:27b"
+        assert config.TALOS_QWEN_NUM_CTX == 262144
+        assert config.talos_qwen_base_url() == ""
+
+    def test_values(self, _slot_cfg) -> None:
+        _slot_cfg.setenv("TALOS_QWEN_BASE_URL", "http://127.0.0.1:11434")
+        _slot_cfg.setenv("TALOS_QWEN_MODEL", "  qwen3.9:30b ")
+        _slot_cfg.setenv("TALOS_QWEN_NUM_CTX", "131072")
+        config.load()
+        assert config.talos_qwen_base_url() == "http://127.0.0.1:11434"
+        assert config.TALOS_QWEN_MODEL == "qwen3.9:30b"
+        assert config.TALOS_QWEN_NUM_CTX == 131072
+
+    def test_empty_model_is_default(self, _slot_cfg) -> None:
+        _slot_cfg.setenv("TALOS_QWEN_MODEL", "")
+        config.load()
+        assert config.TALOS_QWEN_MODEL == "qwen3.8:27b"
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("TALOS_QWEN_BASE_URL", "ftp://x"),
+            ("TALOS_QWEN_NUM_CTX", "0"),
+            ("TALOS_QWEN_NUM_CTX", "abc"),
+        ],
+    )
+    def test_invalid(self, _slot_cfg, name, value) -> None:
+        _slot_cfg.setenv(name, value)
+        with pytest.raises(ValueError, match=rf"^Invalid {name}="):
+            config.load()

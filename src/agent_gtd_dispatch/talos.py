@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.parse
 from typing import TYPE_CHECKING, Any
 
 from . import config
@@ -114,6 +115,10 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
     Fixed literals (must not be made configurable):
 
     - ``OLLAMA_THINK='on'`` for talos-qwen — the qwen model expects thinking.
+    - talos-qwen's num_ctx defaults to 262144 and a host can override it with
+      ``TALOS_QWEN_NUM_CTX`` (the model likewise via ``TALOS_QWEN_MODEL``, the
+      endpoint via ``TALOS_QWEN_BASE_URL``); the talos-glm and talos-glm-flash
+      literals below stay fixed.
     - ``OLLAMA_NUM_CTX`` is pinned to each model's FULL context window for both
       Ollama engines, because talos only self-defaults num_ctx for localhost
       URLs (main.rs:328-329) — a remote/cloud Ollama with num_ctx unset silently
@@ -172,20 +177,28 @@ def _engine_env_overlay(engine_name: str) -> dict[str, str]:
             "ANTHROPIC_API_KEY": config.ANTHROPIC_API_KEY,
         }
     if engine_name == "talos-qwen":
+        base_url = config.talos_qwen_base_url()
+        _parsed = urllib.parse.urlparse(base_url)
+        logger.info(
+            "talos-qwen endpoint base_url=%s model=%s num_ctx=%d",
+            f"{_parsed.scheme}://{_parsed.netloc.rpartition('@')[2]}",
+            config.TALOS_QWEN_MODEL,
+            config.TALOS_QWEN_NUM_CTX,
+        )
         return {
             "TALOS_BACKEND": "ollama",
             # qwen3.8:27b (was qwen3.6:35b until 2026-09-14): on the tier-2
             # production-parity matrix it resolved 21/24 with 2 real false dones
             # vs qwen3.6's 19/24 and 5 (harness-design kb-03252).
-            "OLLAMA_MODEL": "qwen3.8:27b",
+            "OLLAMA_MODEL": config.TALOS_QWEN_MODEL,
             # Hardcoded literals — see docstring for the num_ctx reasoning.
             "OLLAMA_THINK": "on",
             # qwen3.8:27b's FULL 256k window. It is a dense 27B: at 256k the
             # fp16 KV cache spills ~45% to CPU on the 32 GB host GPU, so the
             # Ollama server runs OLLAMA_KV_CACHE_TYPE=q8_0 +
             # OLLAMA_FLASH_ATTENTION=1 (server-side, not settable here).
-            "OLLAMA_NUM_CTX": "262144",
-            "OLLAMA_BASE_URL": config.OLLAMA_BASE_URL,
+            "OLLAMA_NUM_CTX": str(config.TALOS_QWEN_NUM_CTX),
+            "OLLAMA_BASE_URL": base_url,
             "OLLAMA_API_KEY": config.OLLAMA_API_KEY,
         }
     if engine_name == "talos-glm":

@@ -85,7 +85,36 @@ class TestInfoEndpoint:
             "parked_rollout_loops",
             "load_avg_1m",
             "cpu_count",
+            "engine_slots",
         }
+
+    def test_engine_slots_empty(self, client, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {})
+        assert client.get("/info").json()["engine_slots"] == {}
+
+    def test_engine_slots_content_and_no_leak(
+        self, client, monkeypatch, caplog
+    ) -> None:
+        from agent_gtd_dispatch import config, main
+
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {"talos-qwen": 1})
+        monkeypatch.setattr(main, "_engine_slot_holders", {"talos-qwen": {"r1"}})
+        monkeypatch.setattr(main, "_active_processes", {"r1": object()})
+        data = client.get("/info").json()
+        assert data["engine_slots"] == {
+            "talos-qwen": {"max_concurrent_runs": 1, "active_runs": 1}
+        }
+        assert "engine-slot leak" not in caplog.text
+
+    def test_engine_slots_leak_logged(self, client, monkeypatch, caplog) -> None:
+        from agent_gtd_dispatch import config, main
+
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {"talos-qwen": 1})
+        monkeypatch.setattr(main, "_engine_slot_holders", {"talos-qwen": {"ghost"}})
+        client.get("/info")
+        assert "engine-slot leak engine=talos-qwen" in caplog.text
 
     def test_load_wiring(self, client) -> None:
         with patch("agent_gtd_dispatch.main._host_load", return_value=(551.0, 32)):

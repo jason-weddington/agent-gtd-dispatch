@@ -21,6 +21,13 @@ class EngineSwap(BaseModel):
     reason: str
 
 
+class EngineSlotInfo(BaseModel):
+    """Per-engine slot usage for one capped engine (see InfoResponse)."""
+
+    max_concurrent_runs: int
+    active_runs: int
+
+
 class InfoResponse(BaseModel):
     """Service identity, capacity, and capabilities returned by GET /info.
 
@@ -36,6 +43,12 @@ class InfoResponse(BaseModel):
     ``load_avg_1m`` and ``cpu_count`` report host health.  Routers treat a
     host as overloaded when ``load_avg_1m > 1.5 x cpu_count``; a missing or
     null field means 'unknown, treat as healthy'.
+
+    ``engine_slots`` reports the host's per-engine caps (DISPATCH_ENGINE_SLOTS),
+    one entry per capped engine.  An absent or empty ``engine_slots`` means 'no
+    per-engine caps'.  ``engine_slots.<engine>.active_runs`` counts runs holding
+    a slot, both running and host-queued, so it differs from the top-level
+    ``active_runs``; only BUILD-mode runs admitted through /dispatch are counted.
     """
 
     engine: str
@@ -47,6 +60,7 @@ class InfoResponse(BaseModel):
     parked_rollout_loops: int = 0
     load_avg_1m: float | None = None
     cpu_count: int | None = None
+    engine_slots: dict[str, EngineSlotInfo] = {}
 
 
 class PushStatus(StrEnum):

@@ -68,6 +68,13 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # OLLAMA_API_KEY=ollama
 # OLLAMA_DEFAULT_MODEL=qwen3.6:35b
 
+# Per-engine slots and the host-local talos-qwen endpoint. talos-qwen is
+# advertised only with a cap >= 1 AND a non-empty TALOS_QWEN_BASE_URL.
+# DISPATCH_ENGINE_SLOTS=talos-qwen=1
+# TALOS_QWEN_BASE_URL=
+# TALOS_QWEN_MODEL=qwen3.8:27b
+# TALOS_QWEN_NUM_CTX=262144
+
 # Ollama CLOUD (https://ollama.com) — a single key powers THREE cloud engines:
 #   talos-glm        (talos loop → glm-5.3:cloud, Ollama native /api/chat)
 #   talos-glm-flash  (talos loop → glm-5.3-flash:cloud, Ollama native /api/chat)

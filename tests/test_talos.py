@@ -163,25 +163,45 @@ class TestTalosEnvOverlay:
             "ANTHROPIC_API_KEY": config.ANTHROPIC_API_KEY,
         }
 
-    def test_qwen_overlay_literal_with_think_and_num_ctx(self) -> None:
+    def test_qwen_overlay_literal_with_think_and_num_ctx(self, monkeypatch) -> None:
         from agent_gtd_dispatch import config
         from agent_gtd_dispatch.talos import talos_env_overlay
 
+        monkeypatch.setattr(config, "TALOS_QWEN_BASE_URL", "http://gpu.local:11434")
         assert talos_env_overlay("talos-qwen") == {
             "TALOS_BACKEND": "ollama",
             "OLLAMA_MODEL": "qwen3.8:27b",
             "OLLAMA_THINK": "on",
             "OLLAMA_NUM_CTX": "262144",
-            "OLLAMA_BASE_URL": config.OLLAMA_BASE_URL,
+            "OLLAMA_BASE_URL": "http://gpu.local:11434",
             "OLLAMA_API_KEY": config.OLLAMA_API_KEY,
         }
 
-    def test_qwen_num_ctx_pinned_not_config_derived(self) -> None:
-        """OLLAMA_NUM_CTX is a hardcoded literal pinned to qwen3.8:27b's FULL
-        256k window — talos only self-defaults num_ctx for localhost URLs
-        (main.rs:328-329), so a remote Ollama with num_ctx unset silently
-        shrinks the window.
-        """
+    def test_qwen_overlay_host_overrides_and_redacted_log(
+        self, monkeypatch, caplog
+    ) -> None:
+        import logging
+
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "TALOS_QWEN_NUM_CTX", 131072)
+        monkeypatch.setattr(config, "TALOS_QWEN_BASE_URL", "http://u:p@gpu:11434")
+        monkeypatch.setattr(config, "TALOS_QWEN_MODEL", "qwen3.9:30b")
+        with caplog.at_level(logging.INFO):
+            overlay = talos_env_overlay("talos-qwen")
+        assert overlay["OLLAMA_NUM_CTX"] == "131072"
+        assert overlay["OLLAMA_BASE_URL"] == "http://u:p@gpu:11434"
+        assert overlay["OLLAMA_MODEL"] == "qwen3.9:30b"
+        assert "base_url=http://gpu:11434" in caplog.text
+        assert "model=qwen3.9:30b" in caplog.text
+        assert "u:p@" not in caplog.text
+        assert talos_env_overlay("talos-glm")["OLLAMA_NUM_CTX"] == "1048576"
+        assert talos_env_overlay("talos-glm-flash")["OLLAMA_NUM_CTX"] == "1048576"
+
+    def test_qwen_num_ctx_default(self) -> None:
+        """OLLAMA_NUM_CTX defaults to qwen3.8:27b's FULL 256k window — talos only
+        self-defaults num_ctx for localhost URLs (main.rs:328-329)."""
         from agent_gtd_dispatch.talos import talos_env_overlay
 
         overlay = talos_env_overlay("talos-qwen")
@@ -493,6 +513,8 @@ class TestTalosAvailabilityGating:
         monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-ant")
         monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://x:11434")
         monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud")
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {"talos-qwen": 1})
+        monkeypatch.setattr(config, "TALOS_QWEN_BASE_URL", "http://x:11434")
         names = get_available_engine_names()
         for talos in (
             "talos-haiku",
@@ -531,8 +553,38 @@ class TestTalosAvailabilityGating:
         from agent_gtd_dispatch import config
         from agent_gtd_dispatch.engines import get_available_engine_names
 
-        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "")
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {"talos-qwen": 1})
+        monkeypatch.setattr(config, "TALOS_QWEN_BASE_URL", "")
         assert "talos-qwen" not in get_available_engine_names()
+
+    @pytest.mark.parametrize(
+        ("slots", "url", "ollama_url", "present"),
+        [
+            ({}, "http://127.0.0.1:11434", "http://o:1", False),
+            ({"talos-qwen": 0}, "http://127.0.0.1:11434", "http://o:1", False),
+            ({"talos-qwen": 1}, "http://127.0.0.1:11434", "", True),
+            ({"talos-qwen": 1}, "", "http://o:1", False),
+        ],
+    )
+    def test_talos_qwen_slot_matrix(
+        self, monkeypatch, slots, url, ollama_url, present
+    ) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.engines import get_available_engine_names
+
+        monkeypatch.setattr(config, "ENGINE_SLOTS", slots)
+        monkeypatch.setattr(config, "TALOS_QWEN_BASE_URL", url)
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", ollama_url)
+        assert ("talos-qwen" in get_available_engine_names()) is present
+
+    def test_claude_code_cap_zero_hides_engine(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.engines import get_available_engine_names
+
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {"claude-code": 0})
+        assert "claude-code" not in get_available_engine_names()
+        monkeypatch.setattr(config, "ENGINE_SLOTS", {"claude-code": 2})
+        assert "claude-code" in get_available_engine_names()
 
 
 # ---------------------------------------------------------------------------

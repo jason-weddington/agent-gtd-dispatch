@@ -622,6 +622,10 @@ def _is_ollama_cloud_engine_available() -> bool:
     return True
 
 
+# Engines advertised only on hosts that declare a DISPATCH_ENGINE_SLOTS cap >= 1.
+SLOT_REQUIRED_ENGINES: frozenset[str] = frozenset({"talos-qwen"})
+
+
 def is_engine_available(engine: Engine) -> bool:
     """Return True if this engine can be attempted on the host.
 
@@ -636,6 +640,12 @@ def is_engine_available(engine: Engine) -> bool:
     The Ollama-routed Claude engine requires OLLAMA_BASE_URL to be configured.
     """
     name = engine.name
+    from . import config
+
+    if config.ENGINE_SLOTS.get(name) == 0:
+        return False
+    if name in SLOT_REQUIRED_ENGINES and config.ENGINE_SLOTS.get(name, 0) < 1:
+        return False
     if name in _CLAUDE_CODE_ENGINES:
         return True
     if name == "kiro":
@@ -660,9 +670,7 @@ def is_engine_available(engine: Engine) -> bool:
 
         return bool(config.ANTHROPIC_API_KEY)
     if name == "talos-qwen":
-        from . import config
-
-        return bool(config.OLLAMA_BASE_URL)
+        return bool(config.talos_qwen_base_url())
     return False
 
 
