@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.17.1 (2026-11-02)
+
+### Bug Fixes
+
+- **ae1c715f**: Reap a run's escaped processes by a run-unique environment marker, and record a
+  reviewer timeout as such
+  ([`6f93d62`](https://github.com/repos/agent-gtd-dispatch/commit/6f93d6213869f8eebbf861810b89b01454439d27))
+
+
 ## v2.17.0 (2026-11-01)
 
 ### Features
