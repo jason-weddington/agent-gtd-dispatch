@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.17.0 (2026-11-01)
+
+### Features
+
+- **e57614d8**: The land step takes the board's per-project land lease before its final rebase, gate
+  and push
+  ([`8fc6a24`](https://github.com/repos/agent-gtd-dispatch/commit/8fc6a24e24f0d07dd9458dd91bec8036eca4abde))
+
+
 ## v2.16.1 (2026-11-01)
 
 ### Bug Fixes
