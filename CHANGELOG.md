@@ -2,6 +2,20 @@
 
 <!-- version list -->
 
+## v2.18.0 (2026-11-02)
+
+### Bug Fixes
+
+- **d53e08b6**: The rescue sweep pushes a live run's in-progress work to a -rescue branch, never the
+  -r<N> sequence
+  ([`e829467`](https://github.com/repos/agent-gtd-dispatch/commit/e829467deb3d77acf2191120c89e64b238af3474))
+
+### Features
+
+- **1f4057b0**: Hosts declare per-engine slots and per-host talos-qwen endpoint, model and context
+  ([`063f068`](https://github.com/repos/agent-gtd-dispatch/commit/063f068d0a825fa7c11c8e0cb83286648e8f9a06))
+
+
 ## v2.17.1 (2026-11-02)
 
 ### Bug Fixes
