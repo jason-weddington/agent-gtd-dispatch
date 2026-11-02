@@ -6741,10 +6741,24 @@ async def _rollout_wave_tick(
             )
         elif not (harvested or started or dispatched):
             if in_flight:
+                # Runs the board holds in 'queued' are waiting for a free
+                # engine slot; name them so the wait reads as expected.
+                queued = sum(
+                    1
+                    for e in in_flight
+                    if isinstance(e, dict) and e.get("status") == "queued"
+                )
+                if queued:
+                    step = (
+                        f"Waiting for a free engine slot ({queued} queued); "
+                        f"{len(in_flight) - queued} other in-flight build run(s)"
+                    )[:200]
+                else:
+                    step = f"Waiting on {len(in_flight)} in-flight build run(s)"
                 await _publish_rollout_phase(
                     rollout_id,
                     "polling",
-                    step=f"Waiting on {len(in_flight)} in-flight build run(s)",
+                    step=step,
                     token=token,
                 )
             elif pending:

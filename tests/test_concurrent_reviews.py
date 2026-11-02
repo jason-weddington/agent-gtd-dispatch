@@ -1935,3 +1935,49 @@ class TestResumeBehindDeferredExit:
                 "rollout-loop: exit" in m and f"directive={reason}" in m
                 for m in _records(caplog, "rollout-loop: exit ")
             )
+
+
+class TestQueuedInFlightStepText:
+    """Board-held 'queued' runs are named in the polling step (item a1945933)."""
+
+    async def _polling_step(self, tmp_path, in_flight: list[dict[str, Any]]):
+        ls = _RolloutLoopState(slots={0: _ws(tmp_path, 0)})
+        publish = AsyncMock()
+        halt = AsyncMock()
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_publish_rollout_phase", new=publish),
+            patch.object(main, "_halt_rollout_from_loop", new=halt),
+        ):
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=[e["itemId"] for e in in_flight])
+            ctx.gtd.get_rollout.return_value["inFlightBuildRuns"] = in_flight
+            directive = await _tick(ctx, ls)
+        steps = [
+            c.kwargs.get("step")
+            for c in publish.await_args_list
+            if c.args[1:2] == ("polling",)
+        ]
+        stalled = [c for c in halt.await_args_list if "rollout stalled" in str(c)]
+        return directive, steps, stalled
+
+    async def test_queued_runs_named_in_step(self, tmp_path) -> None:
+        in_flight = [
+            {"runId": f"r-{i}", "itemId": f"q{i}", "status": "queued"} for i in range(3)
+        ] + [{"runId": "r-run", "itemId": "x", "status": "running"}]
+        directive, steps, stalled = await self._polling_step(tmp_path, in_flight)
+        assert directive == _TICK_WAIT
+        assert steps == [
+            "Waiting for a free engine slot (3 queued); 1 other in-flight build run(s)"
+        ]
+        assert stalled == []
+
+    async def test_no_queued_keeps_existing_step(self, tmp_path) -> None:
+        in_flight = [
+            {"runId": "r-a", "itemId": "a", "status": "running"},
+            {"runId": "r-b", "itemId": "b", "status": "pending"},
+        ]
+        directive, steps, stalled = await self._polling_step(tmp_path, in_flight)
+        assert directive == _TICK_WAIT
+        assert steps == ["Waiting on 2 in-flight build run(s)"]
+        assert stalled == []
