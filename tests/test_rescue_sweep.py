@@ -90,7 +90,14 @@ class _World:
         _git(other, "push", "origin", *[f"{sha}:refs/heads/{b}" for b in branches])
         return sha
 
-    def sweep(self) -> subprocess.CompletedProcess[str]:
+    def run_tmp(self, key: str) -> Path:
+        path = self.tmp / "run-tmp" / f"rt-{key}"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def sweep(
+        self, extra_env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         env = {
             **os.environ,
             "PATH": f"{self.shim}:{os.environ['PATH']}",
@@ -98,6 +105,9 @@ class _World:
             "HOME": str(self.tmp / "home"),
             "GIT_CONFIG_NOSYSTEM": "1",
         }
+        env.pop("DISPATCH_RUN_TMP_ROOT", None)
+        env.pop("AGENT_GTD_RUN_KEY", None)
+        env.update(extra_env or {})
         return subprocess.run(
             ["bash", str(SCRIPT)], env=env, capture_output=True, text=True
         )
@@ -258,3 +268,189 @@ class TestSweepFallback:
             )
         assert results[0].status == PushStatus.pushed
         assert _remote(world.origin, "feat/x-r3") == ""
+
+
+K1 = "0123456789ab"
+K2 = "abcdef012345"
+K3 = "fedcba987654"
+NOTE = "mid-run snapshot, not the run's result"
+
+
+def _rescue_env(tmp_path: Path) -> dict[str, str]:
+    return {
+        "DISPATCH_API_KEY": "k",
+        "AGENT_GTD_URL": "http://localhost:9999",
+        "AGENT_GTD_API_KEY": "k",
+        "ANTHROPIC_API_KEY": "k",
+        "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+        "AGENT_SUBPROCESS_USER": "",
+    }
+
+
+class TestLiveSnapshots:
+    def _live(self, world: _World, key: str) -> tuple[Path, str]:
+        clone = world.clone(f"repos-p-{key}")
+        world.run_tmp(key)
+        return clone, _commit(clone, "a.py")
+
+    def test_live_via_rt_dir(self, world: _World) -> None:
+        clone, head = self._live(world, K1)
+        r = world.sweep()
+        assert r.returncode == 0, r.stdout
+        assert _remote(world.origin, f"feat/x-rescue-{K1}") == head
+        assert _remote(world.origin, "feat/x") == ""
+        assert _remote(world.origin, "feat/x-r2") == ""
+        for needle in (
+            "SNAPSHOT",
+            f"branch=feat/x-rescue-{K1}",
+            "mode=direct",
+            NOTE,
+            "liveness=live",
+            "live_by=rt",
+            "snapshots=1",
+        ):
+            assert needle in r.stdout
+        assert (
+            _git(clone, "for-each-ref", f"refs/remotes/origin/feat/x-rescue-{K1}") == ""
+        )
+
+    @pytest.mark.skipif(not Path("/proc/self/environ").exists(), reason="needs /proc")
+    def test_live_via_marker_process(self, world: _World) -> None:
+        clone = world.clone(f"repos-p-{K2}")
+        head = _commit(clone, "a.py")
+        proc = subprocess.Popen(
+            ["sleep", "60"], env={**os.environ, "AGENT_GTD_RUN_KEY": f"rt-{K2}"}
+        )
+        try:
+            r = world.sweep()
+        finally:
+            proc.kill()
+            proc.wait()
+        assert r.returncode == 0, r.stdout
+        assert _remote(world.origin, f"feat/x-rescue-{K2}") == head
+        assert "live_by=proc" in r.stdout and "snapshots=1" in r.stdout
+        assert _remote(world.origin, "feat/x") == ""
+
+    def test_incident_shape(self, world: _World) -> None:
+        foreign = world.foreign("feat/x")
+        _, head = self._live(world, K1)
+        r = world.sweep()
+        assert r.returncode == 0, r.stdout
+        assert _remote(world.origin, f"feat/x-rescue-{K1}") == head
+        assert _remote(world.origin, "feat/x") == foreign
+        assert _remote(world.origin, "feat/x-r2") == ""
+
+    def test_idempotent_then_fast_forward(self, world: _World) -> None:
+        clone, _ = self._live(world, K1)
+        assert world.sweep().returncode == 0
+        r = world.sweep()
+        assert "SNAPSHOT" not in r.stdout
+        assert "snapshot-current:" in r.stdout
+        assert "snapshot_current=1" in r.stdout and "snapshots=0" in r.stdout
+        head2 = _commit(clone, "b.py")
+        r = world.sweep()
+        assert "mode=direct" in r.stdout
+        assert _remote(world.origin, f"feat/x-rescue-{K1}") == head2
+
+    def test_rewrite_goes_to_suffix(self, world: _World) -> None:
+        clone, head = self._live(world, K1)
+        assert world.sweep().returncode == 0
+        _git(clone, "reset", "--hard", "main")
+        head2 = _commit(clone, "c.py")
+        r = world.sweep()
+        assert r.returncode == 0, r.stdout
+        assert "mode=first-free" in r.stdout
+        assert _remote(world.origin, f"feat/x-rescue-{K1}-2") == head2
+        assert _remote(world.origin, f"feat/x-rescue-{K1}") == head
+
+    def test_live_then_abandoned(self, world: _World) -> None:
+        _, head = self._live(world, K1)
+        assert world.sweep().returncode == 0
+        (world.tmp / "run-tmp" / f"rt-{K1}").rmdir()
+        r = world.sweep()
+        assert r.returncode == 0, r.stdout
+        assert "RESCUED" in r.stdout and "liveness=abandoned" in r.stdout
+        assert _remote(world.origin, "feat/x") == head
+        assert _remote(world.origin, f"feat/x-rescue-{K1}") == head
+
+    def test_valid_key_not_live(self, world: _World) -> None:
+        foreign = world.foreign("feat/x")
+        clone = world.clone(f"repos-p-{K3}")
+        head = _commit(clone, "a.py")
+        r = world.sweep()
+        assert r.returncode == 0, r.stdout
+        assert "liveness=abandoned live_by=none" in r.stdout
+        assert _remote(world.origin, "feat/x") == foreign
+        assert _remote(world.origin, "feat/x-r2") == head
+
+    def test_workspace_layout_live(self, world: _World) -> None:
+        clone = world.clone(f"ws-{K1}/repoA")
+        world.run_tmp(K1)
+        head = _commit(clone, "a.py")
+        r = world.sweep()
+        assert r.returncode == 0, r.stdout
+        assert _remote(world.origin, f"feat/x-rescue-{K1}") == head
+
+    def test_sweep_then_worker(self, world: _World, tmp_path: Path) -> None:
+        world.foreign("feat/x")
+        clone, _ = self._live(world, K1)
+        assert world.sweep().returncode == 0
+        snap = _remote(world.origin, f"feat/x-rescue-{K1}")
+        with patch.dict(os.environ, _rescue_env(tmp_path)):
+            config.load()
+            attempt = dispatch.push_unpushed_repo(clone, "feat/x", 60.0)
+        assert (attempt.branch, attempt.fell_back) == ("feat/x-r2", True)
+        assert _remote(world.origin, f"feat/x-rescue-{K1}") == snap
+
+    def test_canonical_suffix_ignores_rescue(self) -> None:
+        for ref in (
+            f"refs/heads/feat/x-rescue-{K1}",
+            f"refs/heads/feat/x-rescue-{K1}-2",
+        ):
+            assert dispatch._canonical_suffix("feat/x", ref) is None
+
+    def test_slug_decoy_not_excluded(self, world: _World) -> None:
+        clone = world.clone(CLONE, "feat/y")
+        _commit(clone, "a.py")
+        _git(clone, "push", "origin", "HEAD:refs/heads/feat/y-rescue-sweep")
+        r = world.sweep()
+        # a non-hex slug is not a snapshot ref, so it hides the commit
+        assert "unpushed:" not in r.stdout
+        assert _remote(world.origin, "feat/y") == ""
+
+    def test_hex_snapshot_ref_still_counts(self, world: _World) -> None:
+        clone = world.clone(CLONE, "feat/y")
+        head = _commit(clone, "a.py")
+        _git(clone, "push", "origin", f"HEAD:refs/heads/feat/y-rescue-{K1}")
+        r = world.sweep()
+        assert "unpushed:" in r.stdout and "RESCUED" in r.stdout
+        assert _remote(world.origin, "feat/y") == head
+
+    def test_run_tmp_root_override(self, world: _World) -> None:
+        clone = world.clone(f"repos-p-{K1}")
+        head = _commit(clone, "a.py")
+        custom = world.tmp / "elsewhere"
+        (custom / f"rt-{K1}").mkdir(parents=True)
+        r = world.sweep({"DISPATCH_RUN_TMP_ROOT": str(custom)})
+        assert r.returncode == 0, r.stdout
+        assert "live_by=rt" in r.stdout
+        assert _remote(world.origin, f"feat/x-rescue-{K1}") == head
+
+    def test_worker_teardown_after_snapshot(
+        self, world: _World, tmp_path: Path
+    ) -> None:
+        clone, head = self._live(world, K1)
+        assert world.sweep().returncode == 0
+        _git(clone, "fetch", "origin")
+        with patch.dict(os.environ, _rescue_env(tmp_path)):
+            config.load()
+            assert dispatch._repo_has_unrescued_work(clone, "feat/x") == (True, False)
+            res = dispatch.rescue_abandoned_work("r", clone, "feat/x", K1)
+        assert res.pushed is True
+        assert _remote(world.origin, "feat/x") == head
+
+    def test_degraded(self, world: _World) -> None:
+        world.clone(CLONE)
+        r = world.sweep({"DISPATCH_RUN_TMP_ROOT": str(world.tmp / "nope")})
+        assert r.returncode == 0
+        assert "WARN run_tmp_root missing" in r.stdout and "degraded=1" in r.stdout

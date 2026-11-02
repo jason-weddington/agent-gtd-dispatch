@@ -56,6 +56,14 @@ _DEFAULT_BRANCH_CANDIDATES: tuple[str, ...] = ("main", "master")
 # failure comment (tail only — the most recent output is the most useful).
 GATE_OUTPUT_TAIL_CHARS: int = 3000
 
+# rev-list excludes for the rescue sweep's mid-run snapshot refs
+# (``<branch>-rescue-<run key>[-<N>]``): work that sits on origin only under a
+# snapshot branch still counts as unrescued. Mirrors scripts/rescue-sweep.sh.
+RESCUE_SNAPSHOT_EXCLUDES: tuple[str, ...] = (
+    "--exclude=origin/*-rescue-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]",
+    "--exclude=origin/*-rescue-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*",
+)
+
 # Env vars passed to the post-run gate subprocess — COMMON_ENV_KEYS minus the
 # secrets an arbitrary project-authored gate_command has no business touching
 # (AGENT_GTD_URL / AGENT_GTD_API_KEY, plus FORBIDDEN_ENV_KEYS as a backstop).
@@ -842,7 +850,10 @@ def next_free_fallback_branch(
 
 
 def _canonical_suffix(branch_name: str, ref: str) -> int | None:
-    """Return N when *ref* is ``refs/heads/<branch_name>-r<N>`` with 2 <= N <= 50."""
+    """Return N when *ref* is ``refs/heads/<branch_name>-r<N>`` with 2 <= N <= 50.
+
+    ``<branch>-rescue-<key>[-<N>]`` sweep snapshots never match, so they are never reused or counted as taken.
+    """
     match = re.fullmatch(
         re.escape(f"refs/heads/{branch_name}-r") + r"([1-9][0-9]*)", ref
     )
@@ -1440,7 +1451,17 @@ def _repo_has_unrescued_work(repo_path: Path, branch_name: str) -> tuple[bool, b
     # untouched repo sits on the base commit, which is already on a remote.
     # Only commits reachable from no remote-tracking ref are real work.
     count = subprocess.run(
-        _sudo_wrap(["git", "rev-list", "--count", "HEAD", "--not", "--remotes"]),
+        _sudo_wrap(
+            [
+                "git",
+                "rev-list",
+                "--count",
+                "HEAD",
+                "--not",
+                *RESCUE_SNAPSHOT_EXCLUDES,
+                "--remotes",
+            ]
+        ),
         cwd=repo_path,
         check=False,
         capture_output=True,
