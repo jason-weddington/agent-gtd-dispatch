@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import urllib.parse
 from pathlib import Path
 
@@ -224,6 +225,11 @@ ENGINE_SLOTS: dict[str, int] = {}
 TALOS_QWEN_BASE_URL: str = ""
 TALOS_QWEN_MODEL: str = "qwen3.8:27b"
 TALOS_QWEN_NUM_CTX: int = 262144
+# Empty means unset; otherwise passed through verbatim to talos as
+# TALOS_OLLAMA_KEEP_ALIVE (talos-qwen only).
+TALOS_QWEN_KEEP_ALIVE: str = ""
+_KEEP_ALIVE_SECONDS_RE = re.compile(r"-?[0-9]+", re.ASCII)
+_KEEP_ALIVE_DURATION_RE = re.compile(r"(?:[0-9]+(?:ns|us|ms|s|m|h))+", re.ASCII)
 
 
 def talos_qwen_base_url() -> str:
@@ -350,6 +356,7 @@ def load() -> None:
     global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS, TALOS_MEMORY
     global AGENT_SUBPROCESS_USER
     global ENGINE_SLOTS, TALOS_QWEN_BASE_URL, TALOS_QWEN_MODEL, TALOS_QWEN_NUM_CTX
+    global TALOS_QWEN_KEEP_ALIVE
     global REVIEWER_ENGINE, REVIEW_MAX_TURNS, REVIEW_TIMEOUT_SECONDS
     global LAND_GATE_TIMEOUT_SECONDS, LAND_GIT_TIMEOUT_SECONDS
     global ROLLOUT_LOOP_POLL_SECONDS, ROLLOUT_PARK_WARN_SECONDS, MAX_ITEM_REDISPATCHES
@@ -438,12 +445,37 @@ def load() -> None:
         TALOS_QWEN_NUM_CTX = int(_qctx)
     else:
         TALOS_QWEN_NUM_CTX = 262144
+    _ka = os.environ.get("TALOS_QWEN_KEEP_ALIVE", "").strip()
+    if _ka:
+        _ka_ok = bool(
+            _KEEP_ALIVE_SECONDS_RE.fullmatch(_ka)
+            and -9223372036854775808 <= int(_ka) <= 9223372036854775807
+        ) or bool(_KEEP_ALIVE_DURATION_RE.fullmatch(_ka))
+        if not _ka_ok:
+            msg = (
+                f"Invalid TALOS_QWEN_KEEP_ALIVE={_ka!r}: must be integer seconds "
+                f"(e.g. -1, 0, 300) or a duration such as 10m or 1h30m"
+            )
+            raise ValueError(msg)
+        TALOS_QWEN_KEEP_ALIVE = _ka
+    else:
+        TALOS_QWEN_KEEP_ALIVE = ""
     ENGINE_SLOTS = _parse_engine_slots(os.environ.get("DISPATCH_ENGINE_SLOTS", ""))
     logger.info(
-        "engine-slots config slots=%s talos_qwen_endpoint_source=%s",
+        "engine-slots config slots=%s talos_qwen_endpoint_source=%s "
+        "talos_qwen_keep_alive=%s",
         ENGINE_SLOTS,
         "TALOS_QWEN_BASE_URL" if TALOS_QWEN_BASE_URL else "unset",
+        TALOS_QWEN_KEEP_ALIVE or "unset",
     )
+    if TALOS_QWEN_KEEP_ALIVE and (
+        not TALOS_QWEN_BASE_URL or ENGINE_SLOTS.get("talos-qwen", 0) < 1
+    ):
+        logger.warning(
+            "TALOS_QWEN_KEEP_ALIVE=%s set but talos-qwen is not runnable on this "
+            "host; keep-alive is inert",
+            TALOS_QWEN_KEEP_ALIVE,
+        )
     from .engines import SLOT_REQUIRED_ENGINES
 
     for _hidden in sorted(SLOT_REQUIRED_ENGINES):

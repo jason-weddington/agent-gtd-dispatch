@@ -6912,6 +6912,7 @@ def _slot_cfg(monkeypatch, tmp_path):
         "TALOS_QWEN_BASE_URL",
         "TALOS_QWEN_MODEL",
         "TALOS_QWEN_NUM_CTX",
+        "TALOS_QWEN_KEEP_ALIVE",
     ):
         monkeypatch.setattr(config, name, getattr(config, name))
     for name in (
@@ -6919,12 +6920,109 @@ def _slot_cfg(monkeypatch, tmp_path):
         "TALOS_QWEN_BASE_URL",
         "TALOS_QWEN_MODEL",
         "TALOS_QWEN_NUM_CTX",
+        "TALOS_QWEN_KEEP_ALIVE",
     ):
         monkeypatch.delenv(name, raising=False)
     for k, v in _SLOT_BASE_ENV.items():
         monkeypatch.setenv(k, v)
     monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", str(tmp_path))
     return monkeypatch
+
+
+_KA_VALID = [
+    "-1",
+    "0",
+    "300",
+    "-5",
+    "-9223372036854775808",
+    "10m",
+    "1h30m",
+    "90s",
+    "500ms",
+    "2h",
+    "1500ns",
+    "10us",
+]
+_KA_INVALID = [
+    "abc",
+    "10x",
+    "1.5h",
+    "-10m",
+    "+5",
+    "1.5",
+    "10 m",
+    "1h30",
+    "10M",
+    "m",
+    "99999999999999999999",
+    "9223372036854775808",
+]
+
+
+class TestTalosQwenKeepAliveConfig:
+    def test_unset(self, _slot_cfg) -> None:
+        config.load()
+        assert config.TALOS_QWEN_KEEP_ALIVE == ""
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_empty_and_whitespace(self, _slot_cfg, raw) -> None:
+        _slot_cfg.setenv("TALOS_QWEN_KEEP_ALIVE", raw)
+        config.load()
+        assert config.TALOS_QWEN_KEEP_ALIVE == ""
+
+    @pytest.mark.parametrize("raw", _KA_VALID)
+    def test_valid_verbatim(self, _slot_cfg, raw) -> None:
+        _slot_cfg.setenv("TALOS_QWEN_KEEP_ALIVE", raw)
+        config.load()
+        assert raw == config.TALOS_QWEN_KEEP_ALIVE
+
+    def test_stripped(self, _slot_cfg) -> None:
+        _slot_cfg.setenv("TALOS_QWEN_KEEP_ALIVE", " 10m ")
+        config.load()
+        assert config.TALOS_QWEN_KEEP_ALIVE == "10m"
+
+    @pytest.mark.parametrize("raw", _KA_INVALID)
+    def test_invalid(self, _slot_cfg, raw) -> None:
+        _slot_cfg.setenv("TALOS_QWEN_KEEP_ALIVE", raw)
+        with pytest.raises(ValueError) as exc:
+            config.load()
+        assert str(exc.value) == (
+            f"Invalid TALOS_QWEN_KEEP_ALIVE={raw!r}: must be integer seconds "
+            "(e.g. -1, 0, 300) or a duration such as 10m or 1h30m"
+        )
+
+    def test_inert_warning_without_base_url(self, _slot_cfg, caplog) -> None:
+        _slot_cfg.setenv("TALOS_QWEN_KEEP_ALIVE", "10m")
+        with caplog.at_level(logging.INFO):
+            config.load()
+        assert config.TALOS_QWEN_KEEP_ALIVE == "10m"
+        assert "keep-alive is inert" in caplog.text
+
+    def test_no_warning_when_runnable(self, _slot_cfg, caplog) -> None:
+        _slot_cfg.setenv("TALOS_QWEN_KEEP_ALIVE", "10m")
+        _slot_cfg.setenv("TALOS_QWEN_BASE_URL", "http://127.0.0.1:11434")
+        _slot_cfg.setenv("DISPATCH_ENGINE_SLOTS", "talos-qwen=1")
+        with caplog.at_level(logging.INFO):
+            config.load()
+        assert "keep-alive is inert" not in caplog.text
+
+    def test_info_line(self, _slot_cfg, caplog) -> None:
+        with caplog.at_level(logging.INFO):
+            config.load()
+        assert "talos_qwen_keep_alive=unset" in caplog.text
+        caplog.clear()
+        _slot_cfg.setenv("TALOS_QWEN_KEEP_ALIVE", "10m")
+        with caplog.at_level(logging.INFO):
+            config.load()
+        assert "talos_qwen_keep_alive=10m" in caplog.text
+
+    def test_reload_resets(self, _slot_cfg) -> None:
+        _slot_cfg.setenv("TALOS_QWEN_KEEP_ALIVE", "10m")
+        config.load()
+        assert config.TALOS_QWEN_KEEP_ALIVE == "10m"
+        _slot_cfg.delenv("TALOS_QWEN_KEEP_ALIVE")
+        config.load()
+        assert config.TALOS_QWEN_KEEP_ALIVE == ""
 
 
 class TestEngineSlotsConfig:
