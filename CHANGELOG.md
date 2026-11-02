@@ -2,6 +2,35 @@
 
 <!-- version list -->
 
+## v2.19.0 (2026-11-02)
+
+### Bug Fixes
+
+- **1ae6f7f2**: Runs: rollout-loop (manage + rollout_id) runs record engine 'rollout-loop' instead
+  of 'claude-code', so usage accounting cannot count token-free loop runs as Opus sessions
+  ([`f447f02`](https://github.com/repos/agent-gtd-dispatch/commit/f447f02f65f9c59a48eb121553978b45c3c4c1da))
+
+- **84bf8d99**: Dispatch: run-lifecycle safety works on macOS (process reaping, run-marker liveness,
+  gate timeout, session probes), and fails closed where it can't
+  ([`4f81ad2`](https://github.com/repos/agent-gtd-dispatch/commit/4f81ad2c0dbd061975323c40459899915243b2cd))
+
+### Features
+
+- **233db098**: Dispatch host: optional DISPATCH_ENGINES_ONLY allowlist makes a host advertise and
+  accept only the listed engines
+  ([`15f0d2b`](https://github.com/repos/agent-gtd-dispatch/commit/15f0d2bda6e2fdfa2134e3b12092966b00879e68))
+
+- **d894df52**: Dispatch: an optional per-host TALOS_QWEN_KEEP_ALIVE lets a GPU host's qwen model
+  unload when idle
+  ([`7db8589`](https://github.com/repos/agent-gtd-dispatch/commit/7db8589533e7355451674cdefee997a45c096415))
+
+### Testing
+
+- **a5795d43**: Test flake: TestDispatchCallbackToken tests let the request's own background task
+  re-call the patched gtd_client; stub the task launch so request-path assertions are deterministic
+  ([`54598cd`](https://github.com/repos/agent-gtd-dispatch/commit/54598cdacb7d7bcd4e37eec26afc5cf50536348b))
+
+
 ## v2.18.0 (2026-11-02)
 
 ### Bug Fixes
