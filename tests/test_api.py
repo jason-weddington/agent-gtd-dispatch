@@ -534,12 +534,22 @@ class TestDispatchCallbackToken:
     get_item ran with the static admin key, which scope-fails for items
     the admin does not own/share. Fix: forward body.callback_token to
     gtd_client.get_item / get_project / get_rollout in the dispatch handler.
+
+    Test isolation: POST /dispatch schedules a real background task
+    (_dispatch_worker in item mode; _start_rollout_loop -> _rollout_loop_worker
+    -> _drive_rollout in manage mode) that re-calls gtd_client.get_item /
+    get_rollout / get_project with the same callback_token. Unpatched, that
+    task races the assert_awaited_once_with checks under CPU load, so every
+    test here patches the background launch. The lifespan
+    _readopt_running_rollouts sweep is NOT a caller: it fails on
+    list_running_rollouts() and returns before any get_rollout.
     """
 
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.dispatch")
     @patch("agent_gtd_dispatch.main.gtd_client")
     def test_callback_token_passed_to_handler_get_item(
-        self, mock_client, mock_dispatch, client, auth_headers
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
     ):
         """POST /dispatch with callback_token → handler-time get_item gets token=<jwt>."""
         mock_client.get_item = AsyncMock(
@@ -578,10 +588,11 @@ class TestDispatchCallbackToken:
             "proj1", token="eyJ-per-run-jwt"
         )
 
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.dispatch")
     @patch("agent_gtd_dispatch.main.gtd_client")
     def test_no_callback_token_passes_none(
-        self, mock_client, mock_dispatch, client, auth_headers
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
     ):
         """Back-compat: omitted callback_token → handler-time get_item gets token=None.
 
@@ -651,11 +662,12 @@ class TestDispatchCallbackToken:
         run_arg = mock_worker.call_args.args[0]
         assert run_arg.callback_token == "eyJ-run-jwt-stored"  # noqa: S105
 
+    @patch("agent_gtd_dispatch.main._start_rollout_loop")
     @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.dispatch")
     @patch("agent_gtd_dispatch.main.gtd_client")
     def test_manage_mode_callback_token_forwarded_to_get_rollout(
-        self, mock_client, mock_dispatch, mock_worker, client, auth_headers
+        self, mock_client, mock_dispatch, mock_worker, mock_loop, client, auth_headers
     ):
         """Manage-mode handler-time get_rollout/get_project forward callback_token too."""
         mock_client.get_rollout = AsyncMock(
@@ -686,6 +698,11 @@ class TestDispatchCallbackToken:
         mock_client.get_project.assert_awaited_once_with(
             "proj1", token="eyJ-manage-jwt"
         )
+        # The handler hands the run (with its token) to the stubbed loop.
+        mock_loop.assert_called_once()
+        started_run = mock_loop.call_args.args[0]
+        assert started_run.callback_token == "eyJ-manage-jwt"  # noqa: S105
+        assert started_run.rollout_id == "wr-abc"
 
 
 class TestMaxConcurrentRunsEnforcement:
