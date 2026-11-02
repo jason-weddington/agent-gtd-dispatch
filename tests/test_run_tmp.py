@@ -782,6 +782,13 @@ def land_env(monkeypatch):
     gtd.halt_rollout = AsyncMock()
     gtd.complete_in_rollout = AsyncMock(return_value={"newly_ready": []})
     gtd.get_item = AsyncMock(return_value={"id": "item", "title": "t"})
+    gtd.acquire_land_lease = AsyncMock(
+        return_value={"acquired": True, "lease": {"lease_id": "L1"}}
+    )
+    gtd.renew_land_lease = AsyncMock(
+        return_value={"renewed": True, "lease": {"lease_id": "L1"}}
+    )
+    gtd.release_land_lease = AsyncMock(return_value={"released": True})
     monkeypatch.setattr(main, "gtd_client", gtd)
     return gtd
 

@@ -1960,6 +1960,24 @@ MAX_LAND_CONFLICT_RELAUNCHES: int = 1
 # locks or a gate.  Nothing in the service reads the heartbeat for liveness
 # any more; it keeps the rollout monitor's "last update" honest.
 LAND_HEARTBEAT_SECONDS: int = 300
+# Board-held per-project land lease (see ``_Lander._acquire_lease``).  It
+# serializes the final fetch+rebase, gate and push ACROSS rollouts and hosts;
+# ``_land_locks`` below only serializes lands on this host.
+# Renewal cadence while the lease is held (the gate runs in an executor
+# thread, so renewals continue during it).
+LAND_LEASE_RENEW_SECONDS: int = 60
+# Retry cadence while another rollout holds the lease (or the board blips).
+LAND_LEASE_POLL_SECONDS: int = 15
+# Lease TTL headroom over the land gate timeout.
+LAND_LEASE_TTL_MARGIN_SECONDS: int = 600
+# Every multiple of this a continuous lease wait logs a wait-long WARNING.
+LAND_LEASE_WAIT_WARN_SECONDS: int = 1800
+
+
+def _land_lease_ttl() -> int:
+    """The land lease TTL: the land gate timeout plus a margin."""
+    return config.LAND_GATE_TIMEOUT_SECONDS + LAND_LEASE_TTL_MARGIN_SECONDS
+
 
 # (normalized origin URL, default branch) -> lock.  Serializes lands to one
 # remote branch on THIS host, so two items cannot both pass the gate against
@@ -3341,6 +3359,20 @@ class _Lander:
         # Private TMPDIR for the land's gate install and gate run; created in
         # run() and removed in its outer finally.
         self.tmp_dir: Path | None = None
+        # Board-held per-project land lease (see _acquire_lease).
+        self.lease_id: str | None = None
+        self.lease_lost = False
+        self.lease_renew_task: asyncio.Task[None] | None = None
+        self.lease_renew_stop: asyncio.Event | None = None
+        self.lease_renew_failures = 0
+        self.lease_last_ok = 0.0
+        self.lease_acquired_at = 0.0
+        self.lease_outage = _BoardOutage(rollout_id)
+        # Lease telemetry, reported in the land comment.
+        self.lease_waited_secs: float = 0.0
+        self.lease_holders_seen: set[str] = set()
+        self.lease_reacquires: int = 0
+        self.lease_held_rejections: int = 0
 
     # -- plumbing ---------------------------------------------------------
 
@@ -4089,6 +4121,18 @@ class _Lander:
             )
             if status == "non_fast_forward":
                 self._log_land(repo, "non_fast_forward")
+                if self.lease_id is not None:
+                    self.lease_held_rejections += 1
+                    logger.warning(
+                        "rollout-loop: land-lease push-rejected-while-held "
+                        "rollout_id=%s item_id=%s lease_id=%s repo=%s "
+                        "push_round=%d",
+                        self.rollout_id,
+                        self.item_id,
+                        self.lease_id,
+                        repo,
+                        self.push_round,
+                    )
                 if self.push_round >= MAX_LAND_PUSH_ATTEMPTS:
                     raise _LandHalt(
                         "push_attempts_exhausted",
@@ -4510,8 +4554,13 @@ class _Lander:
                             f"{repo}: HEAD moved during the gate "
                             f"({self.gated[repo]} -> {head})",
                         )
+            if not await self._confirm_lease():
+                # The lease was lost: re-fetch, re-rebase and re-gate under
+                # the new lease before anything is pushed.
+                continue
             if not await self._push_round(remaining, gate_on=gate_on):
                 break
+        await self._release_lease()
         return await self._finish(gate_on=gate_on)
 
     async def _finish(self, *, gate_on: bool) -> ReviewVerdict:
@@ -4551,6 +4600,12 @@ class _Lander:
             f"fix relaunch: {fix_text})"
             for repo in self.landing
         ]
+        lines.append(
+            f"Land lease: waited {self.lease_waited_secs:.0f}s behind "
+            f"{len(self.lease_holders_seen)} holder(s); reacquires: "
+            f"{self.lease_reacquires}; rejected while lease held: "
+            f"{self.lease_held_rejections}"
+        )
         for repo in self.landing:
             found = self.conflict_found.get(repo) or []
             if not found:
@@ -4626,6 +4681,279 @@ class _Lander:
             return self.outcome._replace(rationale=rationale)
         return self.outcome
 
+    # -- board land lease -------------------------------------------------
+
+    def _lease_aborted(self, status: str) -> _LandHalt:
+        return _LandHalt(
+            "land_lease_aborted",
+            f"land aborted for item {self.item_id}: rollout {status} while "
+            "waiting for the land lease",
+        )
+
+    async def _lease_wait_abort_check(self) -> None:
+        """Abort a lease wait when the rollout was cancelled/completed/superseded.
+
+        A halted rollout keeps waiting, so a land already underway behind a
+        halt still finishes.
+        """
+        if self.pushed:
+            return
+        rollout = await gtd_client.get_rollout(self.rollout_id, token=self.token)
+        status = rollout.get("status")
+        if status in ("cancelled", "completed"):
+            raise self._lease_aborted(str(status))
+        if rollout.get("loop_remote_run_id") and (
+            _loop_superseded(rollout, await db.list_runs_by_rollout(self.rollout_id))
+            is not None
+        ):
+            raise self._lease_aborted("superseded")
+
+    async def _acquire_lease(self) -> str:
+        """Acquire the project's board land lease, waiting behind any holder.
+
+        Waiting is not a failure: it consumes no push attempt and no relaunch
+        budget.  A refused acquire (cancelled/completed rollout) or a
+        cancelled/superseded rollout aborts the land; a board outage longer
+        than ``config.ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS`` or any other error
+        halts it (fail-closed, including a board without the endpoint).
+        """
+        start = time.monotonic()
+        last_holder: str | None = None
+        warned = 0
+        while True:
+            try:
+                resp = await gtd_client.acquire_land_lease(
+                    self.rollout_id,
+                    item_id=self.item_id,
+                    loop_run_id=self.loop_run_id,
+                    ttl_seconds=_land_lease_ttl(),
+                    token=self.token,
+                )
+                if resp.get("acquired"):
+                    lease_id = str(resp["lease"]["lease_id"])
+                    await self._stop_lease_renewal()
+                    if lease_id != self.lease_id:
+                        self.lease_acquired_at = time.monotonic()
+                    self.lease_id = lease_id
+                    self.lease_lost = False
+                    self.lease_last_ok = time.monotonic()
+                    self.lease_renew_failures = 0
+                    self._start_lease_renewal(lease_id)
+                    self.lease_outage.reset()
+                    waited = time.monotonic() - start
+                    self.lease_waited_secs += waited
+                    logger.info(
+                        "rollout-loop: land-lease acquired rollout_id=%s item_id=%s "
+                        "lease_id=%s waited_secs=%.1f",
+                        self.rollout_id,
+                        self.item_id,
+                        lease_id,
+                        waited,
+                    )
+                    return lease_id
+                refused = resp.get("refused")
+                if refused:
+                    raise self._lease_aborted(str(refused).removeprefix("rollout_"))
+                self.lease_outage.reset()
+                holder = resp.get("holder") or {}
+                holder_rollout = holder.get("rollout_id")
+                holder_item = holder.get("item_id")
+                holder_lease = str(holder.get("lease_id"))
+                waited = time.monotonic() - start
+                if holder_lease != last_holder:
+                    last_holder = holder_lease
+                    self.lease_holders_seen.add(holder_lease)
+                    await self.publish(
+                        f"Land: waiting for land lease held by rollout "
+                        f"{holder_rollout} (item {holder_item})"
+                    )
+                    logger.info(
+                        "rollout-loop: land-lease waiting rollout_id=%s item_id=%s "
+                        "holder_rollout_id=%s holder_item_id=%s "
+                        "holder_expires_at=%s",
+                        self.rollout_id,
+                        self.item_id,
+                        holder_rollout,
+                        holder_item,
+                        holder.get("expires_at"),
+                    )
+                multiple = int(waited // LAND_LEASE_WAIT_WARN_SECONDS)
+                if multiple > warned:
+                    warned = multiple
+                    logger.warning(
+                        "rollout-loop: land-lease wait-long rollout_id=%s "
+                        "item_id=%s holder_rollout_id=%s holder_lease_id=%s "
+                        "holder_renewed_at=%s waited_secs=%.0f",
+                        self.rollout_id,
+                        self.item_id,
+                        holder_rollout,
+                        holder_lease,
+                        holder.get("renewed_at"),
+                        waited,
+                    )
+                    await self.publish(
+                        f"Land: waiting {int(waited // 60)}m for land lease held "
+                        f"by rollout {holder_rollout} (item {holder_item})"
+                    )
+                await self._lease_wait_abort_check()
+            except _LandHalt:
+                raise
+            except Exception as exc:
+                if _is_transient_board_error(exc):
+                    if self.lease_outage.absorb(exc):
+                        await asyncio.sleep(LAND_LEASE_POLL_SECONDS)
+                        continue
+                    started = self.lease_outage.started_at
+                    elapsed = _monotonic() - started if started is not None else 0.0
+                    raise _LandHalt(
+                        "land_lease_error",
+                        f"land lease acquire failed for item {self.item_id}: "
+                        f"board unreachable for {elapsed:.0f}s",
+                    ) from exc
+                raise _LandHalt(
+                    "land_lease_error",
+                    f"land lease acquire failed for item {self.item_id}: "
+                    f"{type(exc).__name__}: {exc}",
+                ) from exc
+            await asyncio.sleep(LAND_LEASE_POLL_SECONDS)
+
+    def _start_lease_renewal(self, lease_id: str) -> None:
+        stop = asyncio.Event()
+        self.lease_renew_stop = stop
+        self.lease_renew_task = asyncio.create_task(self._renew_lease(lease_id, stop))
+
+    async def _stop_lease_renewal(self) -> None:
+        task, stop = self.lease_renew_task, self.lease_renew_stop
+        self.lease_renew_task = None
+        self.lease_renew_stop = None
+        if stop is not None:
+            stop.set()
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _renew_lease(self, lease_id: str, stop: asyncio.Event) -> None:
+        """Renew ONE lease every LAND_LEASE_RENEW_SECONDS until stopped or lost."""
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=LAND_LEASE_RENEW_SECONDS)
+                return
+            except TimeoutError:
+                pass
+            try:
+                resp = await gtd_client.renew_land_lease(
+                    self.rollout_id,
+                    lease_id=lease_id,
+                    ttl_seconds=_land_lease_ttl(),
+                    token=self.token,
+                )
+            except Exception as exc:
+                self.lease_renew_failures += 1
+                logger.warning(
+                    "rollout-loop: land-lease renew-error rollout_id=%s item_id=%s "
+                    "lease_id=%s consecutive_failures=%d last_ok_secs_ago=%.0f "
+                    "exc=%s",
+                    self.rollout_id,
+                    self.item_id,
+                    lease_id,
+                    self.lease_renew_failures,
+                    time.monotonic() - self.lease_last_ok,
+                    type(exc).__name__,
+                )
+                continue
+            if resp.get("renewed"):
+                self.lease_renew_failures = 0
+                self.lease_last_ok = time.monotonic()
+                continue
+            if lease_id == self.lease_id:
+                self.lease_lost = True
+            logger.warning(
+                "rollout-loop: land-lease lost rollout_id=%s item_id=%s lease_id=%s",
+                self.rollout_id,
+                self.item_id,
+                lease_id,
+            )
+            return
+
+    def _log_lease_reacquire(self, reason: str) -> None:
+        logger.warning(
+            "rollout-loop: land-lease reacquire rollout_id=%s item_id=%s reason=%s "
+            "last_ok_secs_ago=%.0f",
+            self.rollout_id,
+            self.item_id,
+            reason,
+            time.monotonic() - self.lease_last_ok,
+        )
+
+    async def _confirm_lease(self) -> bool:
+        """Confirm the lease right before a push. False: re-gate first.
+
+        A push happens only after a renew or acquire that returned the SAME
+        lease_id after that tree's gate finished.  Neither path touches
+        push_round.
+        """
+        held = self.lease_id
+        if held is not None and not self.lease_lost:
+            try:
+                resp = await gtd_client.renew_land_lease(
+                    self.rollout_id,
+                    lease_id=held,
+                    ttl_seconds=_land_lease_ttl(),
+                    token=self.token,
+                )
+            except Exception:
+                # Unknown whether we still hold it: ask again.  A held lease
+                # comes back under the same id (a reclaim always mints a new
+                # one), which proves no one else landed meanwhile.
+                lease_id = await self._acquire_lease()
+                if lease_id == held:
+                    self._log_lease_reacquire("renew_error_same_lease")
+                    return True
+                self._log_lease_reacquire("renew_error")
+                self.lease_reacquires += 1
+                return False
+            if resp.get("renewed"):
+                self.lease_last_ok = time.monotonic()
+                self.lease_renew_failures = 0
+                return True
+        self._log_lease_reacquire("lost")
+        self.lease_id = None
+        self.lease_lost = False
+        self.lease_reacquires += 1
+        await self._acquire_lease()
+        return False
+
+    async def _release_lease(self) -> None:
+        """Stop renewing and release the lease (best effort; never raises)."""
+        lease_id = self.lease_id
+        await self._stop_lease_renewal()
+        if lease_id is None:
+            return
+        self.lease_id = None
+        try:
+            await gtd_client.release_land_lease(
+                self.rollout_id, lease_id=lease_id, token=self.token
+            )
+        except Exception as exc:
+            logger.warning(
+                "rollout-loop: land-lease release-failed rollout_id=%s item_id=%s "
+                "lease_id=%s exc=%s",
+                self.rollout_id,
+                self.item_id,
+                lease_id,
+                exc,
+            )
+            return
+        logger.info(
+            "rollout-loop: land-lease released rollout_id=%s item_id=%s lease_id=%s "
+            "held_secs=%.1f",
+            self.rollout_id,
+            self.item_id,
+            lease_id,
+            time.monotonic() - self.lease_acquired_at,
+        )
+
     async def _halt(self, halt: _LandHalt) -> str:
         for repo in self.landing or self.repos:
             if repo not in self.pushed:
@@ -4690,10 +5018,16 @@ class _Lander:
                     acquired_at - wait_start,
                 )
                 await self.publish(f"Land: lock acquired for {self.item_id}")
+                # Host-local locks first, then the board lease: always.
+                await self._acquire_lease()
                 return await self._land()
             except _LandHalt as halt:
                 return await self._halt(halt)
         finally:
+            # Release the board lease BEFORE the host-local locks.
+            await self._stop_lease_renewal()
+            if self.lease_id is not None:
+                await self._release_lease()
             for lock in reversed(held):
                 lock.release()
             if held:
@@ -4764,6 +5098,12 @@ async def _land_reviewed_merge(
     - Per-remote locks (``_land_locks``) for every repo in the workspace,
       acquired in sorted key order and held until the final push or halt, so
       two lands on this host never gate against the same old main.
+    - Then the board-held per-project land lease (``_Lander._acquire_lease``),
+      held through the final fetch+rebase, gate and push and released on
+      success, halt or any exit (before the host-local locks), so lands of
+      DIFFERENT rollouts (any host) on one project never race their pushes.
+      Waiting for it consumes no push attempt; it is confirmed by a renew
+      immediately before every push, and a lost lease re-gates first.
     - A time-scoped reviewer-pushed guard: a commit for this item that reached
       origin after ``pre_review_origin`` halts with nothing pushed.
     - The landing set is read from git (repos exactly one trailer-bearing

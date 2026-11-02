@@ -294,6 +294,69 @@ async def update_rollout_state(
     )
 
 
+async def acquire_land_lease(
+    rollout_id: str,
+    *,
+    item_id: str,
+    loop_run_id: str,
+    ttl_seconds: int,
+    token: str | None = None,
+) -> dict[str, Any]:
+    """POST /api/rollouts/{rollout_id}/land-lease/acquire.
+
+    Returns ``{acquired: True, lease}``, ``{acquired: False, holder}`` or
+    ``{acquired: False, refused}`` (cancelled/completed rollout).
+    """
+    result: dict[str, Any] = await _request(
+        "POST",
+        f"/rollouts/{rollout_id}/land-lease/acquire",
+        token=token,
+        json={
+            "item_id": item_id,
+            "loop_run_id": loop_run_id,
+            "ttl_seconds": ttl_seconds,
+        },
+    )
+    return result
+
+
+async def renew_land_lease(
+    rollout_id: str,
+    *,
+    lease_id: str,
+    ttl_seconds: int,
+    token: str | None = None,
+) -> dict[str, Any]:
+    """POST /api/rollouts/{rollout_id}/land-lease/renew.
+
+    Returns ``{renewed: True, lease}``, or ``{renewed: False}`` when the lease
+    was released or reclaimed.
+    """
+    result: dict[str, Any] = await _request(
+        "POST",
+        f"/rollouts/{rollout_id}/land-lease/renew",
+        token=token,
+        json={"lease_id": lease_id, "ttl_seconds": ttl_seconds},
+    )
+    return result
+
+
+async def release_land_lease(
+    rollout_id: str, *, lease_id: str, token: str | None = None
+) -> dict[str, Any]:
+    """POST /api/rollouts/{rollout_id}/land-lease/release.
+
+    Returns ``{released: bool}``; idempotent.
+    """
+    result: dict[str, Any] = await _request(
+        "POST",
+        f"/rollouts/{rollout_id}/land-lease/release",
+        token=token,
+        json={"lease_id": lease_id},
+    )
+    return result
+
+
 async def reset_rollout_item(
     rollout_id: str, item_id: str, *, token: str | None = None
 ) -> dict[str, Any]:

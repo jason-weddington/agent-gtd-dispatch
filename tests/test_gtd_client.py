@@ -653,3 +653,44 @@ class TestGetRolloutMergeNotes:
         mock_cls.return_value.__aenter__.return_value = mock_client
 
         assert await get_rollout_merge_notes("ro-1", limit=10) == []
+
+
+class TestLandLease:
+    @pytest.mark.parametrize(
+        ("fn", "kwargs", "path", "body"),
+        [
+            (
+                "acquire_land_lease",
+                {"item_id": "I", "loop_run_id": "LR", "ttl_seconds": 2400},
+                "acquire",
+                {"item_id": "I", "loop_run_id": "LR", "ttl_seconds": 2400},
+            ),
+            (
+                "renew_land_lease",
+                {"lease_id": "L1", "ttl_seconds": 2400},
+                "renew",
+                {"lease_id": "L1", "ttl_seconds": 2400},
+            ),
+            (
+                "release_land_lease",
+                {"lease_id": "L1"},
+                "release",
+                {"lease_id": "L1"},
+            ),
+        ],
+    )
+    async def test_posts_to_lease_endpoint(self, fn, kwargs, path, body) -> None:
+        from agent_gtd_dispatch import gtd_client
+
+        mock_client, _ = _make_client_mock(json_data={"ok": True})
+        with patch("agent_gtd_dispatch.gtd_client.httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            result = await getattr(gtd_client, fn)("R1", token="tok", **kwargs)
+        assert result == {"ok": True}
+        args, kw = mock_client.request.call_args
+        assert args == (
+            "POST",
+            f"http://localhost:9999/api/rollouts/R1/land-lease/{path}",
+        )
+        assert kw["json"] == body
+        assert kw["headers"]["Authorization"] == "Bearer tok"

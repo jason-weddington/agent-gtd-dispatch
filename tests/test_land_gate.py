@@ -221,6 +221,13 @@ def _env(monkeypatch):
     gtd.halt_rollout = AsyncMock()
     gtd.complete_in_rollout = AsyncMock(return_value={"newly_ready": []})
     gtd.get_item = AsyncMock(return_value={"id": "item", "title": "t"})
+    gtd.acquire_land_lease = AsyncMock(
+        return_value={"acquired": True, "lease": {"lease_id": "L1"}}
+    )
+    gtd.renew_land_lease = AsyncMock(
+        return_value={"renewed": True, "lease": {"lease_id": "L1"}}
+    )
+    gtd.release_land_lease = AsyncMock(return_value={"released": True})
     monkeypatch.setattr(main, "gtd_client", gtd)
     return gtd
 
@@ -289,6 +296,14 @@ class TestConstants:
         assert main.MAX_LAND_FIX_RELAUNCHES == 1
         assert main.MAX_LAND_CONFLICT_RELAUNCHES == 1
         assert main.LAND_HEARTBEAT_SECONDS == 300
+        assert main.LAND_LEASE_RENEW_SECONDS == 60
+        assert main.LAND_LEASE_POLL_SECONDS == 15
+        assert main.LAND_LEASE_TTL_MARGIN_SECONDS == 600
+        assert main.LAND_LEASE_WAIT_WARN_SECONDS == 1800
+
+    def test_land_lease_ttl(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "LAND_GATE_TIMEOUT_SECONDS", 1800)
+        assert main._land_lease_ttl() == 2400
 
     def test_config_defaults_and_env(self, monkeypatch) -> None:
         monkeypatch.setenv("DISPATCH_API_KEY", "k")
@@ -1432,8 +1447,12 @@ class TestConflictGuard:
         result = await _land(mono.ws, mono.pre)
         assert isinstance(result, ReviewVerdict)
         comment = gtd.post_comment.await_args.args[1]
-        assert "\n" not in comment
-        assert comment.startswith("Landed ")
+        landed, lease = comment.split("\n")
+        assert landed.startswith("Landed ")
+        assert lease == (
+            "Land lease: waited 0s behind 0 holder(s); reacquires: 0; "
+            "rejected while lease held: 0"
+        )
         assert "Conflict check" not in comment
 
 
@@ -2419,3 +2438,427 @@ class TestLandRebaseConflictUnits:
         assert result == main._TICK_HALTED
         assert "HEAD moved across an aborted rebase" in _halt_reason(gtd)
         assert "kind=rebase_abort_moved_head" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Board-held per-project land lease
+# ---------------------------------------------------------------------------
+
+_LEASE_CLEAN = (
+    "Land lease: waited 0s behind 0 holder(s); reacquires: 0; "
+    "rejected while lease held: 0"
+)
+
+
+def _acquired(lease_id: str = "L1") -> dict:
+    return {"acquired": True, "lease": {"lease_id": lease_id}}
+
+
+def _held(rollout: str = "R2", item: str = "I2", lease_id: str = "H1") -> dict:
+    return {
+        "acquired": False,
+        "holder": {
+            "lease_id": lease_id,
+            "rollout_id": rollout,
+            "item_id": item,
+            "expires_at": "2026-11-02T00:00:00+00:00",
+            "renewed_at": "2026-11-01T23:59:00+00:00",
+        },
+    }
+
+
+def _connect_error() -> httpx.ConnectError:
+    return httpx.ConnectError("board down")
+
+
+def _counting_gate(tmp_path: Path) -> tuple[str, Path]:
+    runs = tmp_path / "gate-runs.log"
+    return f"echo run >> {runs}; true", runs
+
+
+def _gate_runs(runs: Path) -> int:
+    return len(runs.read_text().split()) if runs.exists() else 0
+
+
+def _steps(gtd) -> list[str]:
+    return [
+        str(c.kwargs.get("current_step") or "")
+        for c in gtd.update_rollout_state.await_args_list
+    ]
+
+
+@pytest.fixture
+def fast_lease(monkeypatch):
+    monkeypatch.setattr(main, "LAND_LEASE_POLL_SECONDS", 0)
+
+
+class TestLandLease:
+    async def test_green_path_acquires_before_fetch_and_releases(
+        self, mono, gtd
+    ) -> None:
+        _squash(mono.clone)
+        order: list[str] = []
+        real_fetch = dispatch.land_fetch
+
+        def fetch(*a, **kw):
+            order.append("fetch")
+            return real_fetch(*a, **kw)
+
+        async def acquire(*_a, **_kw):
+            order.append("acquire")
+            return _acquired()
+
+        gtd.acquire_land_lease.side_effect = acquire
+        with patch.object(dispatch, "land_fetch", side_effect=fetch):
+            result = await _land(mono.ws, mono.pre)
+        assert isinstance(result, ReviewVerdict)
+        assert order[0] == "acquire"
+        assert order.count("acquire") == 1
+        kw = gtd.acquire_land_lease.await_args.kwargs
+        assert gtd.acquire_land_lease.await_args.args == (ROLLOUT,)
+        assert kw["item_id"] == ITEM
+        assert kw["loop_run_id"] == "100000000001"
+        assert kw["ttl_seconds"] == main._land_lease_ttl()
+        gtd.release_land_lease.assert_awaited_once()
+        assert gtd.release_land_lease.await_args.kwargs["lease_id"] == "L1"
+        comment = gtd.post_comment.await_args.args[1]
+        assert _LEASE_CLEAN in comment
+        # The pre-push confirm renewed the held lease.
+        assert gtd.renew_land_lease.await_args.kwargs["lease_id"] == "L1"
+
+    async def test_lease_wait_does_not_consume_push_attempts(
+        self, mono, gtd, fast_lease, caplog
+    ) -> None:
+        _squash(mono.clone)
+        gtd.acquire_land_lease.side_effect = [_held(), _held(), _acquired()]
+        gtd.get_rollout = AsyncMock(return_value={"status": "running"})
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, mono.pre)
+        assert isinstance(result, ReviewVerdict)
+        gtd.halt_rollout.assert_not_awaited()
+        comment = gtd.post_comment.await_args.args[1]
+        assert "push attempts: 1" in comment
+        assert "behind 1 holder(s)" in comment
+        assert any(
+            "waiting for land lease held by rollout R2 (item I2)" in s
+            for s in _steps(gtd)
+        )
+        waiting = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("rollout-loop: land-lease waiting ")
+        ]
+        assert len(waiting) == 1
+        assert "holder_rollout_id=R2 holder_item_id=I2" in waiting[0]
+        assert "rollout-loop: land-lease acquired rollout_id=" in caplog.text
+        assert "rollout-loop: land-lease released rollout_id=" in caplog.text
+        assert gtd.get_rollout.await_count == 2
+
+    async def test_wait_long_warning(self, mono, gtd, fast_lease, monkeypatch, caplog):
+        _squash(mono.clone)
+        monkeypatch.setattr(main, "LAND_LEASE_WAIT_WARN_SECONDS", 1e-9)
+        gtd.acquire_land_lease.side_effect = [_held(), _acquired()]
+        gtd.get_rollout = AsyncMock(return_value={"status": "halted"})
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, mono.pre)
+        assert isinstance(result, ReviewVerdict)
+        assert "rollout-loop: land-lease wait-long rollout_id=" in caplog.text
+        assert "holder_lease_id=H1" in caplog.text
+        assert any(s.startswith("Land: waiting 0m for land lease") for s in _steps(gtd))
+
+    async def test_lost_lease_before_push_regates_under_new_lease(
+        self, mono, gtd, tmp_path: Path, caplog
+    ) -> None:
+        _squash(mono.clone)
+        gate, runs = _counting_gate(tmp_path)
+        gtd.acquire_land_lease.side_effect = [_acquired("L1"), _acquired("L2")]
+        gtd.renew_land_lease.side_effect = [
+            {"renewed": False},
+            {"renewed": True, "lease": {"lease_id": "L2"}},
+        ]
+        pushes = MagicMock(side_effect=dispatch.land_push)
+        with (
+            patch.object(dispatch, "land_push", pushes),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, mono.pre, gate=gate)
+        assert isinstance(result, ReviewVerdict)
+        assert _gate_runs(runs) == 2
+        assert pushes.call_count == 1
+        comment = gtd.post_comment.await_args.args[1]
+        assert "push attempts: 1" in comment
+        assert "reacquires: 1" in comment
+        renew_ids = [c.kwargs["lease_id"] for c in gtd.renew_land_lease.await_args_list]
+        assert renew_ids == ["L1", "L2"]
+        assert gtd.release_land_lease.await_args.kwargs["lease_id"] == "L2"
+        assert "land-lease reacquire rollout_id=" in caplog.text
+        assert "reason=lost" in caplog.text
+
+    async def test_renew_error_same_lease_pushes_without_regate(
+        self, mono, gtd, tmp_path: Path, caplog
+    ) -> None:
+        _squash(mono.clone)
+        gate, runs = _counting_gate(tmp_path)
+        gtd.renew_land_lease.side_effect = [_connect_error()]
+        pushes = MagicMock(side_effect=dispatch.land_push)
+        with (
+            patch.object(dispatch, "land_push", pushes),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, mono.pre, gate=gate)
+        assert isinstance(result, ReviewVerdict)
+        assert _gate_runs(runs) == 1
+        assert pushes.call_count == 1
+        assert gtd.acquire_land_lease.await_count == 2
+        assert "reason=renew_error_same_lease" in caplog.text
+        assert "reacquires: 0" in gtd.post_comment.await_args.args[1]
+
+    async def test_renew_error_new_lease_regates(
+        self, mono, gtd, tmp_path: Path, caplog
+    ) -> None:
+        _squash(mono.clone)
+        gate, runs = _counting_gate(tmp_path)
+        gtd.acquire_land_lease.side_effect = [_acquired("L1"), _acquired("L2")]
+        gtd.renew_land_lease.side_effect = [
+            _connect_error(),
+            {"renewed": True, "lease": {"lease_id": "L2"}},
+        ]
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, mono.pre, gate=gate)
+        assert isinstance(result, ReviewVerdict)
+        assert _gate_runs(runs) == 2
+        assert "reason=renew_error " in caplog.text
+        comment = gtd.post_comment.await_args.args[1]
+        assert "reacquires: 1" in comment
+        assert "push attempts: 1" in comment
+
+    async def test_halt_releases_lease_after_halting(
+        self, mono, gtd, monkeypatch
+    ) -> None:
+        _squash(mono.clone)
+        monkeypatch.setattr(main, "MAX_LAND_FIX_RELAUNCHES", 0)
+        calls: list[str] = []
+
+        async def halt(*_a, **_kw):
+            calls.append("halt")
+
+        async def release(*_a, **_kw):
+            calls.append("release")
+            return {"released": True}
+
+        gtd.halt_rollout.side_effect = halt
+        gtd.release_land_lease.side_effect = release
+        result = await _land(mono.ws, mono.pre, gate="false")
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd).startswith(f"land gate failed for item {ITEM}")
+        assert calls == ["halt", "release"]
+        assert gtd.release_land_lease.await_args.kwargs["lease_id"] == "L1"
+
+    async def test_release_failure_is_logged_not_raised(
+        self, mono, gtd, monkeypatch, caplog
+    ) -> None:
+        _squash(mono.clone)
+        monkeypatch.setattr(main, "MAX_LAND_FIX_RELAUNCHES", 0)
+        gtd.release_land_lease.side_effect = _connect_error()
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, mono.pre, gate="false")
+        assert result == main._TICK_HALTED
+        assert "rollout-loop: land-lease release-failed rollout_id=" in caplog.text
+
+    async def test_non_transient_acquire_error_halts(self, mono, gtd) -> None:
+        _squash(mono.clone)
+        before = _tip(mono.origin)
+        request = httpx.Request("POST", "http://board/api/x")
+        gtd.acquire_land_lease.side_effect = httpx.HTTPStatusError(
+            "404", request=request, response=httpx.Response(404, request=request)
+        )
+        result = await _land(mono.ws, mono.pre)
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd).startswith(
+            f"land lease acquire failed for item {ITEM}: HTTPStatusError"
+        )
+        assert _tip(mono.origin) == before
+        gtd.release_land_lease.assert_not_awaited()
+
+    async def test_transient_acquire_error_is_retried(
+        self, mono, gtd, fast_lease
+    ) -> None:
+        _squash(mono.clone)
+        gtd.acquire_land_lease.side_effect = [_connect_error(), _acquired()]
+        result = await _land(mono.ws, mono.pre)
+        assert isinstance(result, ReviewVerdict)
+        gtd.halt_rollout.assert_not_awaited()
+        assert gtd.acquire_land_lease.await_count == 2
+
+    async def test_persistent_board_outage_halts(
+        self, mono, gtd, fast_lease, monkeypatch
+    ) -> None:
+        _squash(mono.clone)
+        monkeypatch.setattr(config, "ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS", 0)
+        gtd.acquire_land_lease.side_effect = _connect_error()
+        result = await _land(mono.ws, mono.pre)
+        assert result == main._TICK_HALTED
+        reason = _halt_reason(gtd)
+        assert reason.startswith(f"land lease acquire failed for item {ITEM}")
+        assert "board unreachable for" in reason
+
+    async def _assert_aborted(self, mono, gtd, status: str) -> None:
+        before = _tip(mono.origin)
+        fetch = MagicMock(side_effect=dispatch.land_fetch)
+        push = MagicMock(side_effect=dispatch.land_push)
+        with (
+            patch.object(dispatch, "land_fetch", fetch),
+            patch.object(dispatch, "land_push", push),
+        ):
+            result = await _land(mono.ws, mono.pre)
+        assert result == main._TICK_HALTED
+        fetch.assert_not_called()
+        push.assert_not_called()
+        gtd.release_land_lease.assert_not_awaited()
+        assert _halt_reason(gtd) == (
+            f"land aborted for item {ITEM}: rollout {status} while waiting for "
+            "the land lease"
+        )
+        assert _tip(mono.origin) == before
+
+    async def test_cancelled_rollout_aborts_wait(self, mono, gtd) -> None:
+        _squash(mono.clone)
+        gtd.acquire_land_lease.side_effect = [_held()]
+        gtd.get_rollout = AsyncMock(return_value={"status": "cancelled"})
+        await self._assert_aborted(mono, gtd, "cancelled")
+
+    async def test_refused_acquire_aborts(self, mono, gtd) -> None:
+        _squash(mono.clone)
+        gtd.acquire_land_lease.side_effect = [
+            {"acquired": False, "refused": "rollout_cancelled"}
+        ]
+        await self._assert_aborted(mono, gtd, "cancelled")
+
+    async def test_superseded_loop_aborts_wait(self, mono, gtd, monkeypatch) -> None:
+        _squash(mono.clone)
+        gtd.acquire_land_lease.side_effect = [_held()]
+        gtd.get_rollout = AsyncMock(
+            return_value={"status": "running", "loop_remote_run_id": "OTHER-LOOP"}
+        )
+        monkeypatch.setattr(main.db, "list_runs_by_rollout", AsyncMock(return_value=[]))
+        await self._assert_aborted(mono, gtd, "superseded")
+
+    async def test_cancel_during_gate_releases_lease(self, mono, gtd) -> None:
+        import threading
+
+        _squash(mono.clone)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _gate(*_a, tmp_dir=None, log_context=""):
+            entered.set()
+            release.wait(10)
+            return dispatch.GateResult(0, False, "", 0.0)
+
+        try:
+            with patch.object(dispatch, "run_gate_command", side_effect=_gate):
+                task = asyncio.create_task(_land(mono.ws, mono.pre))
+                await asyncio.to_thread(entered.wait, 10)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        finally:
+            release.set()
+        gtd.release_land_lease.assert_awaited_once()
+        assert gtd.release_land_lease.await_args.kwargs["lease_id"] == "L1"
+
+    async def test_push_rejected_while_held(
+        self, mono, gtd, tmp_path: Path, caplog
+    ) -> None:
+        other = _clone(mono.origin, tmp_path / "other")
+        marker = tmp_path / "raced"
+        gate = (
+            f"if [ ! -f {marker} ]; then touch {marker}; cd {other} && "
+            "echo r > race.txt && git add -A && git commit -qm race && "
+            "git push -q origin main; fi; true"
+        )
+        _squash(mono.clone)
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, mono.pre, gate=gate)
+        assert isinstance(result, ReviewVerdict)
+        held = [
+            r
+            for r in caplog.records
+            if "land-lease push-rejected-while-held" in r.getMessage()
+        ]
+        assert len(held) == 1
+        assert held[0].levelno == logging.WARNING
+        assert "lease_id=L1 repo=repo push_round=1" in held[0].getMessage()
+        comment = gtd.post_comment.await_args.args[1]
+        assert "rejected while lease held: 1" in comment
+        assert "push attempts: 2" in comment
+        gtd.release_land_lease.assert_awaited_once()
+
+    async def test_lands_without_gate_command_take_the_lease(self, mono, gtd) -> None:
+        _squash(mono.clone)
+        result = await _land(mono.ws, mono.pre, gate=None)
+        assert isinstance(result, ReviewVerdict)
+        gtd.acquire_land_lease.assert_awaited_once()
+        gtd.release_land_lease.assert_awaited_once()
+
+
+class TestLeaseRenewTask:
+    def _lander(self, mono) -> main._Lander:
+        return main._Lander(
+            ROLLOUT,
+            ITEM,
+            _verdict(),
+            project={"name": "P"},
+            workspace=mono.ws,
+            pre_review_origin=mono.pre,
+            reviewer_engine=get_engine("claude-code-sonnet"),
+            loop_run_id="100000000001",
+            token=None,
+            attribution=None,
+        )
+
+    async def test_renew_errors_then_ok_then_lost(
+        self, mono, gtd, monkeypatch, caplog
+    ) -> None:
+        monkeypatch.setattr(main, "LAND_LEASE_RENEW_SECONDS", 0)
+        lander = self._lander(mono)
+        lander.lease_id = "L1"
+        failures_seen: list[int] = []
+
+        async def renew(*_a, **kw):
+            failures_seen.append(lander.lease_renew_failures)
+            n = len(failures_seen)
+            if n <= 2:
+                raise _connect_error()
+            if n == 3:
+                return {"renewed": True, "lease": {"lease_id": "L1"}}
+            return {"renewed": False}
+
+        gtd.renew_land_lease.side_effect = renew
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            await asyncio.wait_for(lander._renew_lease("L1", asyncio.Event()), 5)
+        assert failures_seen == [0, 1, 2, 0]
+        assert lander.lease_lost is True
+        assert "consecutive_failures=2" in caplog.text
+        assert "rollout-loop: land-lease renew-error rollout_id=" in caplog.text
+        assert "rollout-loop: land-lease lost rollout_id=" in caplog.text
+        assert all(
+            c.kwargs["lease_id"] == "L1" for c in gtd.renew_land_lease.await_args_list
+        )
+
+    async def test_lost_stale_lease_does_not_flag_current(
+        self, mono, gtd, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(main, "LAND_LEASE_RENEW_SECONDS", 0)
+        lander = self._lander(mono)
+        lander.lease_id = "L2"
+        gtd.renew_land_lease.return_value = {"renewed": False}
+        await asyncio.wait_for(lander._renew_lease("L1", asyncio.Event()), 5)
+        assert lander.lease_lost is False
+
+    async def test_stop_ends_renewal(self, mono, gtd) -> None:
+        lander = self._lander(mono)
+        lander._start_lease_renewal("L1")
+        await lander._stop_lease_renewal()
+        assert lander.lease_renew_task is None
+        gtd.renew_land_lease.assert_not_awaited()
