@@ -2,6 +2,25 @@
 
 <!-- version list -->
 
+## v2.20.0 (2026-11-02)
+
+### Documentation
+
+- Tests must not depend on the dispatch host's state
+  ([`8e5a696`](https://github.com/repos/agent-gtd-dispatch/commit/8e5a696fdbd99a2c655d151cc47439d6175026a9))
+
+### Features
+
+- **a1945933**: The wave loop holds a capped-engine item ready until a slot frees, instead of
+  dispatching it into a wait
+  ([`3b5e09e`](https://github.com/repos/agent-gtd-dispatch/commit/3b5e09ec9693bc4020c5ca87eb41cb8b01a8ff84))
+
+### Testing
+
+- The portable process scan test no longer assumes every process on the machine is readable
+  ([`7696e3f`](https://github.com/repos/agent-gtd-dispatch/commit/7696e3f31bf3ae48f27fab8f031a7de6b7816035))
+
+
 ## v2.19.0 (2026-11-02)
 
 ### Bug Fixes
