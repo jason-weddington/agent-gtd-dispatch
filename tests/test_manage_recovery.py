@@ -628,6 +628,29 @@ class TestReadoptionSweep:
         assert resumed.rollout_id == "rollout-abc"
         assert resumed.mode == "manage"
 
+    async def test_readopted_loop_run_records_rollout_loop_engine(self) -> None:
+        from agent_gtd_dispatch.main import _readopt_running_rollouts
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch("agent_gtd_dispatch.main._start_rollout_loop"),
+        ):
+            ctx.gtd.list_running_rollouts = AsyncMock(
+                return_value=[
+                    {
+                        "id": "rollout-abc",
+                        "project_name": "p",
+                        "reviewer_engine": "claude-code-haiku",
+                    }
+                ]
+            )
+            ctx.gtd.get_rollout = AsyncMock(return_value={"status": "running"})
+            await _readopt_running_rollouts()
+
+        inserted = ctx.db.insert_run.call_args.args[0]
+        assert inserted.engine == "rollout-loop"
+        assert inserted.engine_actual == "rollout-loop"
+
     async def test_sweep_skips_a_rollout_a_live_loop_already_owns(self) -> None:
         from agent_gtd_dispatch.main import _readopt_running_rollouts
 

@@ -332,6 +332,48 @@ class TestDispatch:
         started_run = mock_loop.call_args.args[0]
         assert started_run.mode == "manage"
         assert started_run.rollout_id == "wr-abc"
+        assert started_run.engine == "rollout-loop"
+        assert started_run.engine_actual == "rollout-loop"
+        data = resp.json()
+        assert data["engine"] == "rollout-loop"
+        assert data["engine_actual"] == "rollout-loop"
+
+    def test_rollout_loop_engine_constant(self):
+        from agent_gtd_dispatch import config
+
+        assert config.ROLLOUT_LOOP_ENGINE == "rollout-loop"
+
+    @patch("agent_gtd_dispatch.main._start_rollout_loop")
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
+    def test_manage_without_rollout_id_is_rejected_not_relabelled(
+        self, mock_client, mock_dispatch, mock_worker, mock_loop, client, auth_headers
+    ):
+        mock_client.get_item = AsyncMock(
+            return_value={"id": "abc12345-6789", "title": "T", "project_id": "proj1"}
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "P",
+                "git_origin": "git@git.example.com:repos/p",
+            }
+        )
+        resp = client.post(
+            "/dispatch",
+            json={
+                "item_id": "abc12345-6789",
+                "max_turns": 200,
+                "mode": "manage",
+                "engine": "claude-code",
+            },
+            headers=auth_headers,
+        )
+        # The host refuses a manage dispatch with no rollout_id outright, so no
+        # row exists that could be mislabelled; the relabel keys on rollout_id.
+        assert resp.status_code == 400
+        mock_loop.assert_not_called()
 
     @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.dispatch")

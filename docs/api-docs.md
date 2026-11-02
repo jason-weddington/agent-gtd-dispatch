@@ -293,7 +293,7 @@ All `RunResponse` objects include these fields:
 | `project_name` | Project name from GTD |
 | `branch_name` | Feature branch (null for manage runs) |
 | `engine` | Requested engine name |
-| `engine_actual` | Effective engine after any swap (null if no swap) |
+| `engine_actual` | Effective engine after any swap; `rollout-loop` for a MANAGE rollout-loop run. |
 | `mode` | `"build"`, `"plan"`, or `"manage"` |
 | `rollout_id` | Rollout ID or null |
 | `status` | Current `RunStatus` value |

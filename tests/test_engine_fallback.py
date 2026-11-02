@@ -315,9 +315,9 @@ class TestManageModeEngineSwap:
 
         assert resp.status_code == 200
         data = resp.json()
-        # engine = requested (preserved), engine_actual = effective (rewritten)
-        assert data["engine"] == "claude-code-ollama"
-        assert data["engine_actual"] == "claude-code"
+        # a loop run records the label; the swap is still reported in engine_swap
+        assert data["engine"] == "rollout-loop"
+        assert data["engine_actual"] == "rollout-loop"
         assert data["engine_swap"] is not None
         assert data["engine_swap"]["from_engine"] == "claude-code-ollama"
         assert data["engine_swap"]["to_engine"] == "claude-code"
@@ -325,8 +325,8 @@ class TestManageModeEngineSwap:
 
         run = await db.get_run(data["id"])
         assert run is not None
-        assert run.engine == "claude-code-ollama"
-        assert run.engine_actual == "claude-code"
+        assert run.engine == "rollout-loop"
+        assert run.engine_actual == "rollout-loop"
 
 
 class TestOllamaFallbackDbUpdate:

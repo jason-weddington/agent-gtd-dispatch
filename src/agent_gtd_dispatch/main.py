@@ -7334,7 +7334,10 @@ async def _readopt_running_rollouts() -> None:
             project_name=str(rollout.get("project_name") or ""),
             mode=DispatchMode.MANAGE,
             rollout_id=rollout_id,
-            engine=str(rollout.get("reviewer_engine") or config.REVIEWER_ENGINE),
+            # A loop run launches no agent session: record the label, not the
+            # reviewer engine (that stays on the rollout record).
+            engine=config.ROLLOUT_LOOP_ENGINE,
+            engine_actual=config.ROLLOUT_LOOP_ENGINE,
         )
         try:
             await db.insert_run(run)
@@ -9071,12 +9074,23 @@ async def dispatch_item(
                 ),
             )
 
+    # A MANAGE run with a rollout_id runs the worker-driven wave loop and
+    # launches no agent session: record a label that cannot be read as a model.
+    is_loop_run = bool(body.mode == DispatchMode.MANAGE and body.rollout_id)
+    if is_loop_run:
+        logger.info(
+            "manage run recorded as rollout-loop rollout_id=%s requested_engine=%s",
+            body.rollout_id,
+            body.engine,
+        )
     run = Run(
         item_id=item_id_for_run,
         project_name=project["name"],
         branch_name=branch_name,
-        engine=body.engine,
-        engine_actual=effective_engine_name,
+        engine=config.ROLLOUT_LOOP_ENGINE if is_loop_run else body.engine,
+        engine_actual=(
+            config.ROLLOUT_LOOP_ENGINE if is_loop_run else effective_engine_name
+        ),
         agent_name=body.agent_name,
         mode=body.mode,
         rollout_id=body.rollout_id,

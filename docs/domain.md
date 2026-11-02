@@ -28,8 +28,8 @@ service. Every `POST /dispatch` call creates exactly one Run record.
 | `item_id` | `str \| None` | GTD item being implemented (`None` for manage-mode runs) |
 | `project_name` | `str` | Human-readable project name (from GTD) |
 | `branch_name` | `str \| None` | Feature branch for build/plan mode; `None` for manage mode |
-| `engine` | `str` | Engine requested by the caller (may differ from `engine_actual`) |
-| `engine_actual` | `str \| None` | Engine actually used; set on **every** run at creation (equals `engine` unless a plan/manage ollama swap or runtime ollama-health fallback occurred) |
+| `engine` | `str` | Engine requested by the caller; a MANAGE run with a rollout_id records `rollout-loop` instead, because it runs the worker-driven wave loop and launches no agent session. |
+| `engine_actual` | `str \| None` | Engine actually used; set at creation. Equals engine unless a plan/manage ollama swap or runtime ollama-health fallback occurred; a MANAGE rollout-loop run records `rollout-loop`. Reviewers are separate REVIEW runs recorded with the reviewer engine name. |
 | `agent_name` | `str \| None` | Agent identity passed via `--agent` flag |
 | `mode` | `str` | `"build"`, `"plan"`, or `"manage"` |
 | `rollout_id` | `str \| None` | Rollout this run belongs to (manage and rollout builds) |
@@ -273,3 +273,7 @@ When `POST /dispatch` includes `attribution: str`, the spawned subprocess receiv
 
 This prevents the service account from appearing as the author of agent-written comments
 and enables per-agent audit trails in the GTD item comment history.
+
+## Rollout-loop runs and usage accounting
+
+A MANAGE run with a rollout_id starts the worker-driven wave loop and launches no agent session, so it records `rollout-loop` as both `engine` and `engine_actual`. The reviewer engine stays on the rollout record. Manage rows created before this change record the requested engine (e.g. claude-code) even though no agent ran, so usage accounting must key on mode == 'manage' (with a rollout_id) rather than on the engine value. To audit rows created after the change: `SELECT mode, engine, engine_actual, count(*) FROM claude_runs WHERE created_at >= '<deploy ts>' GROUP BY 1,2,3`. Expected: rollout-loop appears only under mode='manage', and loop runs appear only as ('rollout-loop','rollout-loop').

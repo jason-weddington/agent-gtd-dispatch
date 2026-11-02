@@ -114,6 +114,11 @@ GATE_INSTALL_TIMEOUT_SECONDS: int = 300
 # This is only the floor for a rollout that predates that column.
 REVIEWER_ENGINE: str = "claude-code-sonnet"
 
+# Recording label for a MANAGE run with a rollout_id (the worker-driven wave
+# loop, no agent session).  Never a routable engine.  Must equal the board's
+# ROLLOUT_LOOP_ENGINE in agent_gtd dispatch_constants.py.
+ROLLOUT_LOOP_ENGINE = "rollout-loop"
+
 # Turn budget for one reviewer. Mirrors
 # ``agent_gtd.dispatch_worker.REVIEW_MAX_TURNS`` — a reviewer decides ONE build:
 # read the diff, reconcile the item's ACs, run the gate, merge a handful of
