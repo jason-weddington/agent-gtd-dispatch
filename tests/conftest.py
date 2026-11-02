@@ -87,8 +87,15 @@ def _no_real_session_reap(request: pytest.FixtureRequest) -> Iterator[None]:
 
     saved_dispatch = dispatch.reap_run_session
     saved_main = main.reap_run_session
+    saved_marker = dispatch.reap_marker_processes
     dispatch.reap_run_session = MagicMock(return_value="clean")  # type: ignore[assignment]
     main.reap_run_session = MagicMock(return_value="clean")  # type: ignore[assignment]
+    dispatch.reap_marker_processes = MagicMock(  # type: ignore[assignment]
+        return_value=dispatch.MarkerReap(
+            reaped=[], survivors=0, scan_ok=True, escaped_session=0
+        )
+    )
     yield
     dispatch.reap_run_session = saved_dispatch  # type: ignore[assignment]
     main.reap_run_session = saved_main  # type: ignore[assignment]
+    dispatch.reap_marker_processes = saved_marker  # type: ignore[assignment]

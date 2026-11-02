@@ -884,7 +884,7 @@ class TestHaltTeardown:
                 await asyncio.Event().wait()
             return subprocess.CompletedProcess([], 0, "", "")
 
-        def _reap(d: Path) -> list[Any]:
+        def _reap(d: Path, *, own_marker: str | None = None) -> list[Any]:
             order.append(("reap", d))
             return []
 

@@ -721,7 +721,7 @@ class TestFixRelaunch:
             release.wait(10)
             return dispatch.GateResult(0, False, "", 0.0)
 
-        def _reap(d):
+        def _reap(d, *, own_marker=None):
             order.append(("reap", d))
             return []
 

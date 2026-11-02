@@ -36,6 +36,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 TMP_ENV_KEYS: tuple[str, ...] = ("TMPDIR", "TMP", "TEMP")
+# Run-unique marker every process of a run inherits (through the argv, like
+# TMPDIR).  Its value is the run tmp dir's basename, so it is unique per run
+# and survives setsid/cd: the reaper finds escaped processes by scanning
+# /proc/<pid>/environ for the exact ``AGENT_GTD_RUN_KEY=<value>`` entry.
+RUN_MARKER_ENV: str = "AGENT_GTD_RUN_KEY"
 RUN_TMP_KEY_RE = re.compile(r"^(?:[0-9a-f]{12}|land-[0-9a-f]{12}-[0-9A-Za-z-]{1,64})$")
 RUN_TMP_NAME_RE = re.compile(
     r"^rt-(?:[0-9a-f]{12}|land-[0-9a-f]{12}-[0-9A-Za-z-]{1,64})$"
@@ -50,17 +55,27 @@ _LIVE: set[Path] = set()
 _LOCK = threading.Lock()
 
 
-def with_tmp_env(cmd: list[str], tmp_dir: Path | None) -> list[str]:
-    """Prefix *cmd* with ``/usr/bin/env TMPDIR=.. TMP=.. TEMP=..``.
+def run_marker(tmp_dir: Path | None) -> str | None:
+    """Return the run marker value for *tmp_dir* (its basename), or None."""
+    if tmp_dir is None:
+        return None
+    return tmp_dir.name
 
-    ``tmp_dir=None`` returns a copy of *cmd* unchanged.  Callers wrap the
-    result in ``_sudo_wrap`` so the env prefix runs AFTER sudo's env filter.
+
+def with_tmp_env(cmd: list[str], tmp_dir: Path | None) -> list[str]:
+    """Prefix *cmd* with ``/usr/bin/env TMPDIR=.. TMP=.. TEMP=.. <marker>``.
+
+    The last assignment is ``AGENT_GTD_RUN_KEY=<tmp_dir.name>``, the
+    run-unique marker the reapers match on.  ``tmp_dir=None`` returns a copy
+    of *cmd* unchanged.  Callers wrap the result in ``_sudo_wrap`` so the env
+    prefix runs AFTER sudo's env filter.
     """
     if tmp_dir is None:
         return list(cmd)
     return [
         "/usr/bin/env",
         *(f"{key}={tmp_dir}" for key in TMP_ENV_KEYS),
+        f"{RUN_MARKER_ENV}={tmp_dir.name}",
         *cmd,
     ]
 

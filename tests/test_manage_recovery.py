@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from agent_gtd_dispatch import dispatch as _real_dispatch
 from agent_gtd_dispatch.models import Run, RunStatus
 
 
@@ -84,6 +85,12 @@ def _loop_patch_stack():
         mock_gtd.get_item = AsyncMock(return_value={"id": "item-a", "title": "t"})
         mock_db.insert_run = AsyncMock()
         mock_db.update_run = AsyncMock()
+        # The teardown reapers return real shapes: a bare MagicMock would read
+        # as "reaped something" and append a note via the (mocked) db.
+        mock_dispatch.reap_marker_processes = MagicMock(
+            return_value=_real_dispatch.MarkerReap([], 0, True, 0)
+        )
+        mock_dispatch.reap_workspace_processes = MagicMock(return_value=[])
         # Default: this host HAS a local run row for whatever rollout is under
         # test, i.e. it is resuming its own work. The sweep's ownership check
         # reads this; tests for the not-ours case override it with [].

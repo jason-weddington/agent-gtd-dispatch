@@ -122,7 +122,7 @@ class TestTeardownOrdering:
         async def rescue(*a: object, **k: object) -> None:
             calls.append("rescue")
 
-        def reap(w: Path) -> list[ReapedProcess]:
+        def reap(w: Path, **_: object) -> list[ReapedProcess]:
             calls.append(f"reap:{w}")
             return []
 
@@ -155,7 +155,9 @@ class TestTeardownOrdering:
         db.update_run = AsyncMock()
         with (
             patch.object(main, "db", db),
-            patch.object(main.dispatch, "reap_workspace_processes", lambda w: reaped),
+            patch.object(
+                main.dispatch, "reap_workspace_processes", lambda w, **_: reaped
+            ),
             patch.object(main.dispatch, "_executor", None),
         ):
             await main._reap_leaked_processes(run, tmp_path)
@@ -167,7 +169,7 @@ class TestTeardownOrdering:
         run = MagicMock(id="r1")
         seen: list[Path] = []
 
-        def reap(w: Path) -> list[ReapedProcess]:
+        def reap(w: Path, **_: object) -> list[ReapedProcess]:
             seen.append(w)
             return []
 
@@ -281,7 +283,9 @@ class TestOwnershipFilter:
             patch.object(config, "AGENT_SUBPROCESS_USER", "dispatch"),
             patch.object(dispatch, "_agent_uid", return_value=12345),
             patch.object(dispatch, "_scan_workspace_pids", return_value={}),
-            patch.object(dispatch, "_scan_as_agent_user", return_value={777: "x"}),
+            patch.object(
+                dispatch, "_scan_as_agent_user", return_value=(True, {777: ("", "x")})
+            ),
             patch.object(dispatch, "_proc_is_live", return_value=False),
             patch.object(dispatch, "_proc_real_uid") as uid,
         ):

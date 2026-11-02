@@ -689,7 +689,12 @@ async def _run_talos(
             if proc.poll() is None:
                 kill_run_session(proc, signal.SIGKILL)
                 proc.wait()
-            reap_run_session(proc, label="talos", context=f"run_id={run.id}")
+            reap_run_session(
+                proc,
+                label="talos",
+                context=f"run_id={run.id}",
+                marker=run_tmp.run_marker(tmp_dir),
+            )
 
     loop = asyncio.get_event_loop()
     try:
@@ -1443,10 +1448,15 @@ def _retained_path(
     return ", ".join(str(p) for p in paths)
 
 
-async def _reap_leaked_processes(run: Run, *dirs: Path) -> None:
-    """Kill processes left running from the run's dirs; log and record them.
+async def _reap_leaked_processes(
+    run: Run, *dirs: Path, marker: str | None = None
+) -> None:
+    """Kill processes left running from the run; log and record them.
 
-    ``dirs`` (the workspace, then the run tmp dir) are reaped in order.
+    With ``marker`` (the run's ``AGENT_GTD_RUN_KEY`` value) every process
+    carrying it is reaped first, wherever it went; then ``dirs`` (the
+    workspace, then the run tmp dir) are reaped in order as a secondary net
+    that never crosses into another live run's marker.
 
     Best-effort and never raises (runs in the teardown ``finally``). Recorded by
     appending to the run's ``error`` text, which does not change its status.
@@ -1454,10 +1464,23 @@ async def _reap_leaked_processes(run: Run, *dirs: Path) -> None:
     try:
         loop = asyncio.get_running_loop()
         reaped: list[dispatch.ReapedProcess] = []
+        if marker is not None:
+            mr = await loop.run_in_executor(
+                dispatch._executor,
+                functools.partial(
+                    dispatch.reap_marker_processes,
+                    marker,
+                    context=f"run_id={run.id} label=build-teardown",
+                ),
+            )
+            reaped.extend(mr.reaped)
         for d in dirs:
             reaped.extend(
                 await loop.run_in_executor(
-                    dispatch._executor, dispatch.reap_workspace_processes, d
+                    dispatch._executor,
+                    functools.partial(
+                        dispatch.reap_workspace_processes, d, own_marker=marker
+                    ),
                 )
             )
         if not reaped:
@@ -2207,17 +2230,82 @@ async def _review_branch_name(
 
 
 async def _reap_rollout_dirs(
-    dirs: list[Path], *, rollout_id: str, item_id: str, run_id: str
-) -> None:
-    """Reap leftover processes from each rollout-loop dir in order; never raises.
+    dirs: list[Path],
+    *,
+    rollout_id: str,
+    item_id: str,
+    run_id: str,
+    marker: str | None = None,
+    label: str = "reviewer",
+) -> str:
+    """Reap a rollout-loop run's leftover processes; never raises.
 
-    Each dir is reaped on the default executor; a failure is logged and never
-    skips the next dir or the caller's run-tmp removal.
+    With ``marker`` every process carrying that run marker is reaped first
+    (it finds processes that left both the session and the dirs); then each
+    dir is reaped in order by cwd/exe as a secondary net that skips other
+    live runs' processes.  Each step runs on the default executor; a failure
+    is logged and never skips the next step or the caller's run-tmp removal.
+
+    Returns a note for the run's error text: "" when nothing was reaped and
+    the marker scan was clean, otherwise a summary of what was killed.
     """
+    loop = asyncio.get_running_loop()
+
+    def _log(r: dispatch.ReapedProcess) -> None:
+        logger.warning(
+            "rollout-loop: reaped leaked process rollout_id=%s item_id=%s "
+            "run_id=%s pid=%s cmdline=%r (%s)",
+            rollout_id,
+            item_id,
+            run_id,
+            r.pid,
+            r.cmdline,
+            r.killed_with,
+        )
+
+    def _detail(rs: list[dispatch.ReapedProcess]) -> str:
+        return "; ".join(f"pid {r.pid} `{r.cmdline}` ({r.killed_with})" for r in rs)
+
+    notes: list[str] = []
+    if marker is not None:
+        try:
+            mr = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    dispatch.reap_marker_processes,
+                    marker,
+                    context=(
+                        f"rollout_id={rollout_id} item_id={item_id} "
+                        f"run_id={run_id} label={label}"
+                    ),
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "rollout-loop: marker reap failed rollout_id=%s item_id=%s "
+                "run_id=%s marker=%s",
+                rollout_id,
+                item_id,
+                run_id,
+                marker,
+            )
+        else:
+            for r in mr.reaped:
+                _log(r)
+            if mr.reaped or mr.survivors != 0 or not mr.scan_ok:
+                notes.append(
+                    f"reaped {len(mr.reaped)} leaked process(es) by marker {marker} "
+                    f"(survivors={mr.survivors} "
+                    f"scan={'ok' if mr.scan_ok else 'error'}): " + _detail(mr.reaped)
+                )
+    cwd_reaped: list[dispatch.ReapedProcess] = []
     for d in dirs:
         try:
-            reaped = await asyncio.get_running_loop().run_in_executor(
-                None, dispatch.reap_workspace_processes, d
+            reaped = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    dispatch.reap_workspace_processes, d, own_marker=marker
+                ),
             )
         except Exception:
             logger.exception(
@@ -2230,16 +2318,14 @@ async def _reap_rollout_dirs(
             )
             continue
         for r in reaped:
-            logger.warning(
-                "rollout-loop: reaped leaked process rollout_id=%s item_id=%s "
-                "run_id=%s pid=%s cmdline=%r (%s)",
-                rollout_id,
-                item_id,
-                run_id,
-                r.pid,
-                r.cmdline,
-                r.killed_with,
-            )
+            _log(r)
+        cwd_reaped.extend(reaped)
+    if cwd_reaped:
+        notes.append(
+            f"reaped {len(cwd_reaped)} leaked process(es) from run dirs: "
+            + _detail(cwd_reaped)
+        )
+    return " | ".join(notes)
 
 
 async def _launch_reviewer(
@@ -2399,7 +2485,10 @@ async def _launch_reviewer(
     dispatch.clear_review_verdict(workspace.root)
 
     exit_code: int | None = None
+    timed_out = False
     failure: str = ""
+    reap_note = ""
+    timeout_mins = config.REVIEW_TIMEOUT_SECONDS // 60
     # Set when this review is cancelled.  run_agent's Popen happens on an
     # executor thread, so a cancel can land after the thread picked up the
     # job but before it registered the process: the cancel handler then finds
@@ -2469,6 +2558,20 @@ async def _launch_reviewer(
             1 if escalated else 0,
         )
         raise
+    except subprocess.TimeoutExpired:
+        # Its own outcome, not a generic failure.  No traceback and no repr:
+        # the TimeoutExpired repr embeds the reviewer's full argv.
+        timed_out = True
+        failure = (
+            f"reviewer timed out after {timeout_mins}m "
+            f"(timeout={config.REVIEW_TIMEOUT_SECONDS}s)"
+        )
+        logger.warning(
+            "rollout-loop: reviewer run %s timed out after %dm for item %s",
+            reviewer_run.id,
+            timeout_mins,
+            item_id,
+        )
     except Exception as exc:
         failure = f"reviewer subprocess failed: {type(exc).__name__}: {exc}"
         logger.exception(
@@ -2479,12 +2582,15 @@ async def _launch_reviewer(
     finally:
         _active_subprocesses.pop(reviewer_run.id, None)
         # Backstop for processes that escaped the reviewer's session (setsid,
-        # daemonized): kill anything still running from its dirs.
-        await _reap_rollout_dirs(
+        # daemonized, cd'd away): kill everything carrying its run marker,
+        # then anything still running from its dirs.
+        reap_note = await _reap_rollout_dirs(
             [workspace.root] + ([reviewer_tmp] if reviewer_tmp is not None else []),
             rollout_id=rollout_id,
             item_id=item_id,
             run_id=reviewer_run.id,
+            marker=run_tmp.run_marker(reviewer_tmp),
+            label="reviewer",
         )
         if reviewer_tmp is not None:
             await asyncio.get_running_loop().run_in_executor(
@@ -2498,17 +2604,38 @@ async def _launch_reviewer(
 
     if verdict_blob is None:
         detail = failure or f"verdict artifact {reason} (reviewer exit={exit_code})"
-        # Only when run_agent returned: it truncates transcript.txt on launch,
+        # Only when run_agent launched: it truncates transcript.txt on launch,
         # so before that the file still holds the PREVIOUS reviewer's output.
-        if exit_code is not None:
+        # TimeoutExpired is raised only after the launch, so the file is ours.
+        if exit_code is not None or timed_out:
             agent_said = agent_output_summary(Path(workspace.root) / "transcript.txt")
             if agent_said:
                 detail = f"{detail}; agent said: {agent_said}"
+        suffix = f" | {reap_note}" if reap_note else ""
+        if timed_out:
+            await db.update_run(
+                reviewer_run.id,
+                status=RunStatus.timed_out,
+                completed_at=datetime.now(UTC).isoformat(),
+                error=(f"review_timeout: {detail}" + suffix)[:ERROR_TEXT_MAX_CHARS],
+            )
+            logger.warning(
+                "rollout-loop: reviewer run %s timed out after %dm — treating as halt",
+                reviewer_run.id,
+                timeout_mins,
+            )
+            return ReviewVerdict(
+                "halt",
+                f"reviewer timed out after {timeout_mins}m",
+                "",
+                detail,
+                branch_name=branch_name,
+            )
         await db.update_run(
             reviewer_run.id,
             status=RunStatus.failed,
             completed_at=datetime.now(UTC).isoformat(),
-            error=f"review_no_verdict: {detail}"[:ERROR_TEXT_MAX_CHARS],
+            error=(f"review_no_verdict: {detail}" + suffix)[:ERROR_TEXT_MAX_CHARS],
         )
         logger.warning(
             "rollout-loop: reviewer run %s produced no usable verdict (%s) — "
@@ -2522,6 +2649,15 @@ async def _launch_reviewer(
             "",
             detail,
             branch_name=branch_name,
+        )
+
+    if timed_out:
+        logger.warning(
+            "rollout-loop: reviewer run %s timed out after %dm but wrote verdict=%s "
+            "— acting on it",
+            reviewer_run.id,
+            timeout_mins,
+            verdict_blob.get("verdict"),
         )
 
     verdict = str(verdict_blob["verdict"])
@@ -2613,6 +2749,13 @@ async def _launch_reviewer(
         completed_at=datetime.now(UTC).isoformat(),
         completion=json.dumps(completion),
     )
+    if reap_note:
+        _existing = await db.get_run(reviewer_run.id)
+        _prefix = (_existing.error + " | ") if _existing and _existing.error else ""
+        await db.update_run(
+            reviewer_run.id,
+            error=f"{_prefix}{reap_note}"[:ERROR_TEXT_MAX_CHARS],
+        )
     logger.info(
         "rollout-loop: reviewer verdict rollout_id=%s item_id=%s run_id=%s "
         "verdict=%s exit_code=%s",
@@ -5054,6 +5197,8 @@ class _Lander:
                 rollout_id=self.rollout_id,
                 item_id=self.item_id,
                 run_id=self.loop_run_id,
+                marker=run_tmp.run_marker(self.tmp_dir),
+                label="land",
             )
             if self.tmp_dir is not None:
                 await asyncio.get_running_loop().run_in_executor(
@@ -8371,7 +8516,9 @@ async def _dispatch_worker(
         # before deletion, and even when the workspace is kept.
         dirs = [d for d in (workspace, run_tmp_dir) if d is not None]
         if dirs:
-            await _reap_leaked_processes(run, *dirs)
+            await _reap_leaked_processes(
+                run, *dirs, marker=run_tmp.run_marker(run_tmp_dir)
+            )
 
         # Independent of should_cleanup: a retained workspace keeps the work,
         # never the run's temp files.

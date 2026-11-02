@@ -108,7 +108,7 @@ filterwarnings = [
 source = ["agent_gtd_dispatch", "agent_gtd_dispatch_protocol"]
 
 [tool.coverage.report]
-fail_under = 92
+fail_under = 93
 
 [tool.semantic_release]
 # Both the service and the workspace protocol package are versioned in lockstep:

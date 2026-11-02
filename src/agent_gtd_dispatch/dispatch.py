@@ -34,7 +34,13 @@ from .engines import (
     is_talos_engine,
 )
 from .models import PushStatus, RepoPushStatus
-from .run_tmp import is_run_tmp_dir, with_tmp_env
+from .run_tmp import (
+    RUN_MARKER_ENV,
+    is_run_tmp_dir,
+    live_paths,
+    run_marker,
+    with_tmp_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -283,21 +289,33 @@ def reap_run_session(
     label: str,
     context: str = "",
     grace_seconds: float | None = None,
+    marker: str | None = None,
 ) -> ReapOutcome:
     """Kill whatever is left in ``proc``'s session after it exited; never raises.
 
     Called on every exit path of an agent/gate subprocess so a background
     child the run left behind cannot outlive it.  Probes with ``pkill -0``;
     if members remain, SIGTERM, poll up to ``grace_seconds`` (default
-    ``config.CANCEL_GRACE_SECONDS``), then SIGKILL.  Skips entirely when the
-    session id may have been reused (see :func:`_session_id_reused`).  Emits
-    exactly one ``session-reap:`` log line per call.
+    ``config.CANCEL_GRACE_SECONDS``), then SIGKILL.  Skips the session kill
+    when the session id may have been reused (see :func:`_session_id_reused`).
+
+    When ``marker`` (the run's ``AGENT_GTD_RUN_KEY`` value) is given, a
+    :func:`reap_marker_processes` sweep runs afterwards on EVERY session
+    outcome: it reaches processes that left the session (setsid) and the
+    workspace (cd elsewhere), which neither the session kill nor the cwd
+    backstop can see.  Safety invariant: a run key's subprocesses run
+    sequentially (hook install, agent, gate, commit), so once one has exited
+    nothing else legitimately carries that marker.
+
+    Emits exactly one ``session-reap:`` log line per call (unless the session
+    probe itself raised, which logs ``session-reap failed``).
     """
+    grace = config.CANCEL_GRACE_SECONDS if grace_seconds is None else grace_seconds
+    escalated = False
+    survivors = False
+    outcome: ReapOutcome
+    session_failed = False
     try:
-        grace = config.CANCEL_GRACE_SECONDS if grace_seconds is None else grace_seconds
-        escalated = False
-        survivors = False
-        outcome: ReapOutcome
         if _session_id_reused(proc):
             outcome = "skipped_pid_reuse"
         else:
@@ -336,24 +354,56 @@ def reap_run_session(
                             label,
                             context,
                         )
-        level = logging.INFO if outcome == "clean" else logging.WARNING
-        logger.log(
-            level,
-            "session-reap: outcome=%s label=%s sid=%s escalated_sigkill=%d "
-            "survivors_after_kill=%d %s",
-            outcome,
-            label,
-            proc.pid,
-            int(escalated),
-            int(survivors),
-            context,
-        )
-        return outcome
     except Exception:
         logger.exception(
             "session-reap failed label=%s sid=%s %s", label, proc.pid, context
         )
-        return "probe_error"
+        outcome = "probe_error"
+        session_failed = True
+    if marker is None:
+        if session_failed:
+            return outcome
+        survivors_after_kill = int(survivors)
+        marker_reaped = 0
+        marker_scan = "none"
+        escaped = 0
+    else:
+        mr = reap_marker_processes(marker, session_id=proc.pid, context=context)
+        if session_failed:
+            return outcome
+        marker_reaped = len(mr.reaped)
+        marker_scan = "ok" if mr.scan_ok else "error"
+        escaped = mr.escaped_session
+        survivors_after_kill = mr.survivors + int(survivors) if mr.scan_ok else -1
+        if outcome == "clean" and marker_reaped >= 1:
+            outcome = "reaped"
+    try:
+        if survivors_after_kill > 0:
+            level = logging.ERROR
+        elif outcome != "clean" or marker_reaped > 0 or marker_scan == "error":
+            level = logging.WARNING
+        else:
+            level = logging.INFO
+        logger.log(
+            level,
+            "session-reap: outcome=%s label=%s sid=%s escalated_sigkill=%d "
+            "survivors_after_kill=%d marker_reaped=%d marker_scan=%s "
+            "escaped_session=%d %s",
+            outcome,
+            label,
+            proc.pid,
+            int(escalated),
+            survivors_after_kill,
+            marker_reaped,
+            marker_scan,
+            escaped,
+            context,
+        )
+    except Exception:
+        logger.exception(
+            "session-reap failed label=%s sid=%s %s", label, proc.pid, context
+        )
+    return outcome
 
 
 def init_executor() -> None:
@@ -1138,7 +1188,12 @@ def run_gate_command(
             if proc.poll() is None:
                 kill_run_session(proc, signal.SIGKILL)
                 proc.wait()
-            reap_run_session(proc, label="gate", context=log_context)
+            reap_run_session(
+                proc,
+                label="gate",
+                context=log_context,
+                marker=run_marker(tmp_dir),
+            )
 
 
 def _detect_default_branch(repo_path: Path) -> str:
@@ -1499,21 +1554,48 @@ REAP_TERM_GRACE_SECS = 3.0
 _REAP_CMDLINE_MAX_CHARS = 200
 
 # Run as the agent user (python3 is in the sudoers NOPASSWD list, pkill cannot
-# select by pid): print "<pid>\t<cmdline>" for every process whose exe or cwd
-# lies under argv[1]. Self-contained: the agent user cannot import this package.
+# select by pid): print "<pid>\t<run-marker-or-empty>\t<cmdline>" for every
+# process whose exe or cwd lies under argv[1]. Self-contained: the agent user
+# cannot import this package.
 _SCAN_SCRIPT = (
     "import os,sys\n"
     "from pathlib import Path\n"
     "w=Path(sys.argv[1])\n"
+    "p=b'" + RUN_MARKER_ENV + "='\n"
     "for d in os.listdir('/proc'):\n"
     "  if not d.isdigit(): continue\n"
     "  for l in ('exe','cwd'):\n"
     "    try: t=Path(os.path.realpath('/proc/'+d+'/'+l))\n"
     "    except OSError: continue\n"
     "    if t.is_relative_to(w):\n"
-    "      try: c=open('/proc/'+d+'/cmdline','rb').read().replace(b'\\0',b' ').decode('replace')\n"
+    "      try: c=open('/proc/'+d+'/cmdline','rb').read().replace(b'\\0',b' ').replace(b'\\n',b' ').decode('utf-8','replace')\n"
     "      except OSError: c=''\n"
-    "      print(d+'\\t'+c.strip()); break\n"
+    "      m=''\n"
+    "      try:\n"
+    "        for e in open('/proc/'+d+'/environ','rb').read().split(b'\\0'):\n"
+    "          if e.startswith(p): m=e[len(p):].decode('utf-8','replace'); break\n"
+    "      except OSError: pass\n"
+    "      print(d+'\\t'+m+'\\t'+c.strip()); break\n"
+)
+
+# Run as the agent user: print "<pid>\t<cmdline>" for every process of this
+# uid whose environ holds EXACTLY the entry ``AGENT_GTD_RUN_KEY=<argv[1]>``.
+# Self-contained (stdlib only); unreadable or vanished entries are skipped.
+_MARKER_SCAN_SCRIPT = (
+    "import os,sys\n"
+    "n=b'" + RUN_MARKER_ENV + "='+sys.argv[1].encode()\n"
+    "u=os.getuid()\n"
+    "for d in os.listdir('/proc'):\n"
+    "  if not d.isdigit(): continue\n"
+    "  try:\n"
+    "    if n not in open('/proc/'+d+'/environ','rb').read().split(b'\\0'): continue\n"
+    "    r=-1\n"
+    "    for l in open('/proc/'+d+'/status'):\n"
+    "      if l.startswith('Uid:'): r=int(l.split()[1]); break\n"
+    "    if r!=u: continue\n"
+    "    c=open('/proc/'+d+'/cmdline','rb').read().replace(b'\\0',b' ').replace(b'\\n',b' ').decode('utf-8','replace').strip()\n"
+    "  except (OSError,ValueError): continue\n"
+    "  print(d+'\\t'+c)\n"
 )
 _KILL_SCRIPT = "import os,sys; os.kill(int(sys.argv[1]), int(sys.argv[2]))"
 
@@ -1585,8 +1667,14 @@ def _scan_workspace_pids(workspace: Path) -> dict[int, str]:
     return found
 
 
-def _scan_as_agent_user(workspace: Path) -> dict[int, str]:
-    """Scan /proc as the agent user, whose processes the service user cannot inspect."""
+def _scan_as_agent_user(workspace: Path) -> tuple[bool, dict[int, tuple[str, str]]]:
+    """Scan /proc as the agent user, whose processes the service user cannot inspect.
+
+    Returns ``(ok, {pid: (marker, cmdline)})``.  ``ok`` is False (and a
+    ``reap-backstop: scan-error`` WARNING is logged) when the launch raised,
+    the scan exited non-zero, or it wrote to stderr; every well-formed line is
+    still returned when the subprocess completed.
+    """
     try:
         proc = subprocess.run(
             _sudo_wrap(["python3", "-c", _SCAN_SCRIPT, str(workspace)]),
@@ -1595,14 +1683,243 @@ def _scan_as_agent_user(workspace: Path) -> dict[int, str]:
             timeout=15,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    found: dict[int, str] = {}
-    for line in proc.stdout.splitlines():
-        pid_s, _, cmd = line.partition("\t")
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(
+            "reap-backstop: scan-error dir=%s rc=%s stderr=%s",
+            workspace,
+            type(exc).__name__,
+            str(exc)[:300],
+        )
+        return False, {}
+    found: dict[int, tuple[str, str]] = {}
+    for line in (proc.stdout or "").splitlines():
+        pid_s, _, rest = line.partition("\t")
+        mk, _, cmd = rest.partition("\t")
         if pid_s.isdigit():
-            found[int(pid_s)] = cmd[:_REAP_CMDLINE_MAX_CHARS]
+            found[int(pid_s)] = (mk, cmd[:_REAP_CMDLINE_MAX_CHARS])
+    stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0 or stderr:
+        logger.warning(
+            "reap-backstop: scan-error dir=%s rc=%s stderr=%s",
+            workspace,
+            proc.returncode,
+            stderr[:300],
+        )
+        return False, found
+    return True, found
+
+
+def _proc_run_marker(pid: int) -> str:
+    """Value of ``pid``'s exact ``AGENT_GTD_RUN_KEY=`` environ entry, or ''."""
+    prefix = f"{RUN_MARKER_ENV}=".encode()
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return ""
+    for entry in raw.split(b"\0"):
+        if entry.startswith(prefix):
+            return entry[len(prefix) :].decode("utf-8", "replace")
+    return ""
+
+
+def _proc_ppid(pid: int) -> int:
+    """Parent pid of ``pid`` from ``/proc/<pid>/stat``; -1 if unreadable."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.rsplit(")", 1)[-1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return -1
+
+
+def _proc_sid(pid: int) -> int:
+    try:
+        return os.getsid(pid)
+    except OSError:
+        return -1
+
+
+@dataclass(frozen=True)
+class MarkerScan:
+    """Result of one /proc environ scan for a run marker."""
+
+    ok: bool
+    pids: dict[int, str]
+    error: str
+
+
+@dataclass(frozen=True)
+class MarkerReap:
+    """Result of :func:`reap_marker_processes`."""
+
+    reaped: list[ReapedProcess]
+    survivors: int
+    scan_ok: bool
+    escaped_session: int
+
+
+def _scan_marker_in_process(marker: str) -> dict[int, str]:
+    needle = f"{RUN_MARKER_ENV}={marker}".encode()
+    uid = os.getuid()
+    found: dict[int, str] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            raw = Path(f"/proc/{pid}/environ").read_bytes()
+        except OSError:
+            continue
+        if needle not in raw.split(b"\0"):
+            continue
+        if _proc_real_uid(pid) != uid:
+            continue
+        found[pid] = _proc_cmdline(pid)
     return found
+
+
+def scan_marker_pids(marker: str) -> MarkerScan:
+    """Find the agent user's processes carrying exactly ``AGENT_GTD_RUN_KEY=marker``.
+
+    Single-user mode scans in-process; two-user mode runs
+    :data:`_MARKER_SCAN_SCRIPT` as the agent user.  The worker and its
+    ancestors and non-live (zombie) processes are dropped.  Never raises.
+    """
+    pids: dict[int, str] = {}
+    ok = True
+    error = ""
+    if config.AGENT_SUBPROCESS_USER:
+        try:
+            proc = subprocess.run(
+                _sudo_wrap(["python3", "-c", _MARKER_SCAN_SCRIPT, marker]),
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return MarkerScan(False, {}, f"{type(exc).__name__}: {exc}"[:300])
+        stdout = (proc.stdout or b"").decode("utf-8", "replace")
+        stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        for line in stdout.splitlines():
+            pid_s, _, cmd = line.partition("\t")
+            if pid_s.isdigit():
+                pids[int(pid_s)] = cmd[:_REAP_CMDLINE_MAX_CHARS]
+        if proc.returncode != 0 or stderr:
+            ok = False
+            error = f"rc={proc.returncode} stderr={stderr[:300]}"
+    else:
+        try:
+            pids = _scan_marker_in_process(marker)
+        except Exception as exc:
+            return MarkerScan(False, {}, f"{type(exc).__name__}: {exc}"[:300])
+    for pid in _ancestor_pids():
+        pids.pop(pid, None)
+    pids = {p: c[:_REAP_CMDLINE_MAX_CHARS] for p, c in pids.items() if _proc_is_live(p)}
+    return MarkerScan(ok, pids, error)
+
+
+_REAP_MARKER_LOG_CAP = 20
+
+
+def reap_marker_processes(
+    marker: str,
+    *,
+    term_grace_secs: float = REAP_TERM_GRACE_SECS,
+    session_id: int | None = None,
+    context: str = "",
+) -> MarkerReap:
+    """Kill every agent-user process carrying run marker ``marker``; never raises.
+
+    The marker (``AGENT_GTD_RUN_KEY=<run tmp basename>``) is inherited by
+    everything a run launches, so it finds processes that escaped the run's
+    session (setsid) and left its workspace (cd elsewhere).  SIGTERM, poll up
+    to ``term_grace_secs``, SIGKILL what is still live, wait, then rescan:
+    ``survivors`` is the rescan's count (-1 when either scan failed).
+    ``escaped_session`` counts matches whose sid differs from ``session_id``.
+    """
+    try:
+        first = scan_marker_pids(marker)
+        found = first.pids
+        worker = os.getpid()
+        escaped = 0
+        for i, (pid, cmd) in enumerate(found.items()):
+            sid = _proc_sid(pid)
+            ppid = _proc_ppid(pid)
+            if session_id is not None and sid != session_id:
+                escaped += 1
+            if i < _REAP_MARKER_LOG_CAP:
+                logger.warning(
+                    "reap-marker: kill pid=%d sid=%d ppid=%d marker=%s cmdline=%s %s",
+                    pid,
+                    sid,
+                    ppid,
+                    marker,
+                    cmd,
+                    context,
+                )
+            if ppid == worker:
+                logger.error(
+                    "reap-marker: invariant-violation marker=%s pid=%d "
+                    "reason=worker_child cmdline=%s %s",
+                    marker,
+                    pid,
+                    cmd,
+                    context,
+                )
+        if len(found) > _REAP_MARKER_LOG_CAP:
+            logger.warning(
+                "reap-marker: ... %d more marker=%s %s",
+                len(found) - _REAP_MARKER_LOG_CAP,
+                marker,
+                context,
+            )
+        killed: set[int] = set()
+        if found:
+            for pid in found:
+                _signal_pid(pid, signal.SIGTERM)
+            deadline = time.monotonic() + term_grace_secs
+            alive = set(found)
+            while alive and time.monotonic() < deadline:
+                alive = {p for p in alive if _proc_is_live(p)}
+                if alive:
+                    time.sleep(0.05)
+            alive = {p for p in alive if _proc_is_live(p)}
+            for pid in alive:
+                _signal_pid(pid, signal.SIGKILL)
+            killed = alive
+            kill_deadline = time.monotonic() + _REAP_POST_KILL_WAIT_SECONDS
+            while alive and time.monotonic() < kill_deadline:
+                alive = {p for p in alive if _proc_is_live(p)}
+                if alive:
+                    time.sleep(0.05)
+        second = scan_marker_pids(marker)
+        scan_ok = first.ok and second.ok
+        survivors = len(second.pids) if scan_ok else -1
+        error = first.error if not first.ok else second.error
+        reaped = [
+            ReapedProcess(p, c, "SIGKILL" if p in killed else "SIGTERM")
+            for p, c in found.items()
+        ]
+        if survivors > 0:
+            level = logging.ERROR
+        elif found or not scan_ok:
+            level = logging.WARNING
+        else:
+            level = logging.INFO
+        logger.log(
+            level,
+            "reap-marker: marker=%s matched=%d sigkilled=%d survivors=%d scan=%s%s %s",
+            marker,
+            len(found),
+            len(killed),
+            survivors,
+            "ok" if scan_ok else "error",
+            "" if scan_ok else " " + error,
+            context,
+        )
+        return MarkerReap(reaped, survivors, scan_ok, escaped)
+    except Exception:
+        logger.exception("reap-marker: failed marker=%s %s", marker, context)
+        return MarkerReap([], -1, False, 0)
 
 
 def _signal_pid(pid: int, sig: signal.Signals) -> None:
@@ -1650,7 +1967,10 @@ def _proc_real_uid(pid: int) -> int | None:
 
 
 def reap_workspace_processes(
-    workspace: Path, *, term_grace_secs: float = REAP_TERM_GRACE_SECS
+    workspace: Path,
+    *,
+    term_grace_secs: float = REAP_TERM_GRACE_SECS,
+    own_marker: str | None = None,
 ) -> list[ReapedProcess]:
     """Kill processes left running from a run's workspace; never raises.
 
@@ -1663,6 +1983,11 @@ def reap_workspace_processes(
     (``run_tmp.is_run_tmp_dir``) is ignored. Processes found by the service-side
     scan are signalled only when their real uid is the agent user's. SIGTERM, poll up to ``term_grace_secs``, then SIGKILL
     survivors; zombies do not count as survivors.
+
+    This is the SECONDARY net behind :func:`reap_marker_processes`: a
+    candidate carrying another run's marker whose run tmp dir is still live
+    (``run_tmp.live_paths()``) is skipped, so reaping a shared rollout dir
+    never kills a concurrent sibling run.  ``own_marker`` is this run's.
 
     With ``AGENT_SUBPROCESS_USER`` set the agent's processes belong to another
     user and are invisible to ``/proc/<pid>/{exe,cwd}`` here, so the scan is also
@@ -1681,8 +2006,19 @@ def reap_workspace_processes(
         agent_uid = _agent_uid()
         if agent_uid is None:
             return []
-        found: dict[int, str] = {}
-        for pid, cmd in _scan_workspace_pids(workspace).items():
+        scan_ok = True
+        found: dict[int, tuple[str, str]] = {}
+        try:
+            local = _scan_workspace_pids(workspace)
+        except Exception:
+            logger.warning(
+                "reap-backstop: scan-error dir=%s rc=exception",
+                workspace,
+                exc_info=True,
+            )
+            local = {}
+            scan_ok = False
+        for pid, cmd in local.items():
             owner = _proc_real_uid(pid)
             if owner != agent_uid:
                 logger.warning(
@@ -1694,19 +2030,57 @@ def reap_workspace_processes(
                     workspace,
                 )
                 continue
-            found[pid] = cmd
+            found[pid] = (_proc_run_marker(pid), cmd)
         if config.AGENT_SUBPROCESS_USER:
             # Agent-owned by construction: the scan ran as the agent user.
-            found.update(_scan_as_agent_user(workspace))
+            agent_ok, agent_found = _scan_as_agent_user(workspace)
+            scan_ok = scan_ok and agent_ok
+            found.update(agent_found)
         for pid in _ancestor_pids():
             found.pop(pid, None)
-        found = {p: c for p, c in found.items() if _proc_is_live(p)}
-        if not found:
+        found = {p: mc for p, mc in found.items() if _proc_is_live(p)}
+        live = live_paths() if found else frozenset()
+        targets: dict[int, str] = {}
+        skipped = 0
+        for pid, (mk, cmd) in found.items():
+            if mk and mk != own_marker and (config.RUN_TMP_ROOT / mk) in live:
+                skipped += 1
+                logger.info(
+                    "reap-backstop: skipped pid=%s dir=%s marker=%s "
+                    "reason=other_live_run",
+                    pid,
+                    workspace,
+                    mk,
+                )
+                continue
+            if not mk:
+                reason = "no_marker"
+            elif mk == own_marker:
+                reason = "own_run"
+            else:
+                reason = "dead_run"
+            logger.warning(
+                "reap-backstop: reaping pid=%s dir=%s marker=%s reason=%s",
+                pid,
+                workspace,
+                mk or "none",
+                reason,
+            )
+            targets[pid] = cmd
+        logger.log(
+            logging.INFO if scan_ok else logging.WARNING,
+            "reap-backstop: scanned dir=%s matched=%d skipped_other_run=%d scan=%s",
+            workspace,
+            len(found),
+            skipped,
+            "ok" if scan_ok else "error",
+        )
+        if not targets:
             return []
-        for pid in found:
+        for pid in targets:
             _signal_pid(pid, signal.SIGTERM)
         deadline = time.monotonic() + term_grace_secs
-        alive = set(found)
+        alive = set(targets)
         while alive and time.monotonic() < deadline:
             alive = {p for p in alive if _proc_is_live(p)}
             if alive:
@@ -1718,7 +2092,7 @@ def reap_workspace_processes(
             time.sleep(0.2)
         return [
             ReapedProcess(p, c, "SIGKILL" if p in alive else "SIGTERM")
-            for p, c in found.items()
+            for p, c in targets.items()
         ]
     except Exception:
         logger.exception("reap_workspace_processes failed for %s", workspace)
@@ -5518,6 +5892,7 @@ async def run_agent(
                     proc,
                     label="agent",
                     context=log_context or (f"run_id={run_id}" if run_id else ""),
+                    marker=run_marker(tmp_dir),
                 )
         return subprocess.CompletedProcess(cmd, proc.returncode, stdout="", stderr="")
 

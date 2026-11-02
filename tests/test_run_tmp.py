@@ -20,7 +20,7 @@ from agent_gtd_dispatch import config, db, dispatch, gates, main, run_tmp, talos
 from agent_gtd_dispatch.dispatch import GateResult
 from agent_gtd_dispatch.engines import CLAUDE, TALOS_SONNET
 from agent_gtd_dispatch.models import DispatchMode, Run, RunStatus
-from agent_gtd_dispatch.run_tmp import with_tmp_env
+from agent_gtd_dispatch.run_tmp import run_marker, with_tmp_env
 
 _REQUIRED_ENV = {
     "DISPATCH_API_KEY": "test-key",
@@ -62,9 +62,14 @@ class TestWithTmpEnv:
             f"TMPDIR={p}",
             f"TMP={p}",
             f"TEMP={p}",
+            "AGENT_GTD_RUN_KEY=rt-x",
             "a",
             "b",
         ]
+
+    def test_run_marker(self) -> None:
+        assert run_marker(Path("/x/rt-abc")) == "rt-abc"
+        assert run_marker(None) is None
 
     def test_never_carries_anthropic_key(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
@@ -91,6 +96,7 @@ class TestWithTmpEnv:
             f"TMPDIR={p}",
             f"TMP={p}",
             f"TEMP={p}",
+            "AGENT_GTD_RUN_KEY=rt-x",
             "x",
         ]
 
@@ -373,13 +379,14 @@ class TestLaunchArgv:
             await dispatch.run_agent(CLAUDE, tmp_path, "sys", "T", 5, tmp_dir=tmp)
         argv = popen.call_args.args[0]
         env = popen.call_args.kwargs["env"]
-        assert argv[:4] == [
+        assert argv[:5] == [
             "/usr/bin/env",
             f"TMPDIR={tmp}",
             f"TMP={tmp}",
             f"TEMP={tmp}",
+            f"AGENT_GTD_RUN_KEY={tmp.name}",
         ]
-        assert argv[4] == "claude"
+        assert argv[5] == "claude"
         assert not any("ANTHROPIC_API_KEY" in part for part in argv)
         assert "ANTHROPIC_API_KEY" not in env
 
@@ -408,11 +415,12 @@ class TestLaunchArgv:
             dispatch.run_gate_command(tmp_path, "make gate", 30, CLAUDE, tmp_dir=tmp)
         argv = popen.call_args.args[0]
         assert argv[:8] == dispatch._sudo_wrap([])
-        assert argv[8:13] == [
+        assert argv[8:14] == [
             "/usr/bin/env",
             f"TMPDIR={tmp}",
             f"TMP={tmp}",
             f"TEMP={tmp}",
+            f"AGENT_GTD_RUN_KEY={tmp.name}",
             "/bin/bash",
         ]
         assert argv[-1] == "make gate"
@@ -467,7 +475,7 @@ class TestLaunchArgv:
         others = [c for c in calls if "commit" not in c]
         assert len(commits) == 2
         for c in commits:
-            assert c[:4] == with_tmp_env([], tmp)
+            assert c[:5] == with_tmp_env([], tmp)
         for c in others:
             assert c[0] == "git"
 
