@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.22.1 (2026-11-03)
+
+### Bug Fixes
+
+- **b26871d3**: Dispatch: map talos Truncated and AnswerSchemaExhausted failure modes instead of
+  reporting them as unrecognized
+  ([`27914bf`](https://github.com/repos/agent-gtd-dispatch/commit/27914bf009469a92cdd429a4626f4dc06def44e8))
+
+
 ## v2.22.0 (2026-11-03)
 
 ### Bug Fixes
