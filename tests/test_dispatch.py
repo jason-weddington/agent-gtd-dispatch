@@ -34,6 +34,7 @@ from agent_gtd_dispatch.dispatch import (
 from agent_gtd_dispatch.engines import (
     _MANAGE_EXECUTOR_ENV_KEYS,
     CLAUDE,
+    CLAUDE_DEEPSEEK,
     CLAUDE_GLM,
     CLAUDE_HAIKU,
     CLAUDE_OLLAMA,
@@ -44,6 +45,9 @@ from agent_gtd_dispatch.engines import (
     KIRO,
     TALOS_SONNET,
     Engine,
+    _build_claude_deepseek_command,
+    _claude_deepseek_extra_env,
+    _claude_glm_extra_env,
     build_env,
     get_engine,
 )
@@ -573,6 +577,17 @@ class TestBuildEnv:
         # Sanity: the guard is actually exercising something, not vacuously
         # passing because build_env injects nothing.
         assert injected_keys
+        # Class-wide sweep: the stub engine above cannot see per-engine
+        # extra_env_fn keys (the stub has none), so iterate EVERY engine that
+        # has one and require its injected keys in env_keep as well — a new
+        # capability var added to any engine fails THIS test instead of
+        # silently no-oping on two-user hosts where sudo's env_reset strips it.
+        for eng in ENGINES.values():
+            if eng.extra_env_fn is not None:
+                eng_injected = set(eng.extra_env_fn())
+                assert eng_injected <= env_keep_keys, sorted(
+                    eng_injected - env_keep_keys
+                )
 
     def test_git_identity_vars_are_in_sudoers_env_keep(self) -> None:
         """AC-1/AC-2: the four git identity vars build_env sets (AC3 of the
@@ -1292,6 +1307,42 @@ class TestRunAgent:
         # Parent process env must remain unaffected
         assert "HEADLESS_BUILD_ENGINE" not in os.environ
 
+    @pytest.mark.parametrize(
+        "cloud_model", ["glm-5.3:cloud", "other-model:cloud"], ids=["default", "other"]
+    )
+    async def test_agent_spawn_log_records_deepseek_identity(
+        self, tmp_path, monkeypatch, caplog, cloud_model
+    ) -> None:
+        """The pinned identity is observable in production: one INFO record with
+        engine, the LITERAL model (never config.OLLAMA_CLOUD_MODEL), the base
+        URL host, and the capability override — never the key value."""
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_MODEL", cloud_model)
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_BASE_URL", "https://ollama.com")
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud-secret")
+        mock_proc = _make_mock_proc(0)
+        with (
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"),
+            patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen,
+        ):
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE_DEEPSEEK, tmp_path, "sys", "Title", 20)
+        spawn_records = [
+            r
+            for r in caplog.records
+            if r.name == "agent_gtd_dispatch.dispatch"
+            and "agent spawn run_id=" in r.getMessage()
+        ]
+        assert len(spawn_records) == 1
+        message = spawn_records[0].getMessage()
+        assert "engine=claude-code-deepseek" in message
+        assert "model=deepseek-v4.1-flash:cloud" in message
+        assert "base_url_host=ollama.com" in message
+        assert "capability_override=deepseek*=-mid_conv_system" in message
+        # Neither the key value nor any secret appears in the line.
+        assert "cloud-secret" not in message
+        assert "ANTHROPIC_AUTH_TOKEN" not in message
+
 
 class TestSudoWrapping:
     async def test_run_agent_sudo_prefix_when_user_set(
@@ -1891,7 +1942,7 @@ class TestManageEnvKeys:
 
     @pytest.mark.parametrize(
         "engine",
-        [CLAUDE_SONNET, CLAUDE_HAIKU, CLAUDE_GLM, CLAUDE_OLLAMA],
+        [CLAUDE_SONNET, CLAUDE_HAIKU, CLAUDE_GLM, CLAUDE_OLLAMA, CLAUDE_DEEPSEEK],
         ids=lambda e: e.name,
     )
     def test_build_env_includes_dispatch_keys_for_non_default_claude_family(
@@ -1913,7 +1964,7 @@ class TestManageEnvKeys:
 
     @pytest.mark.parametrize(
         "engine",
-        [CLAUDE_SONNET, CLAUDE_HAIKU, CLAUDE_GLM, CLAUDE_OLLAMA],
+        [CLAUDE_SONNET, CLAUDE_HAIKU, CLAUDE_GLM, CLAUDE_OLLAMA, CLAUDE_DEEPSEEK],
         ids=lambda e: e.name,
     )
     def test_build_env_excludes_dispatch_keys_for_build_claude_family(
@@ -1928,7 +1979,14 @@ class TestManageEnvKeys:
 
     def test_is_claude_code_family_flags(self) -> None:
         """The family check is derived from the binary, not a name allowlist."""
-        for engine in (CLAUDE, CLAUDE_SONNET, CLAUDE_HAIKU, CLAUDE_GLM, CLAUDE_OLLAMA):
+        for engine in (
+            CLAUDE,
+            CLAUDE_SONNET,
+            CLAUDE_HAIKU,
+            CLAUDE_GLM,
+            CLAUDE_OLLAMA,
+            CLAUDE_DEEPSEEK,
+        ):
             assert engine.is_claude_code_family is True
         for engine in (KIRO, TALOS_SONNET):
             assert engine.is_claude_code_family is False
@@ -2315,6 +2373,200 @@ class TestClaudeOllamaEngine:
         cmd = CLAUDE.build_command("sys", "Fix bug", 20, None)
         assert "--model" in cmd
         assert cmd[cmd.index("--model") + 1] == "opus"
+
+
+class TestClaudeDeepseekEngine:
+    """claude-code-deepseek: the HARNESS twin of talos-deepseek."""
+
+    def test_engine_registered(self) -> None:
+        assert get_engine("claude-code-deepseek") is CLAUDE_DEEPSEEK
+
+    def test_binary_is_claude(self) -> None:
+        assert CLAUDE_DEEPSEEK.binary == "claude"
+
+    def test_is_claude_code_family(self) -> None:
+        assert CLAUDE_DEEPSEEK.is_claude_code_family is True
+
+    def test_not_in_claude_code_oauth_engines(self) -> None:
+        """claude-code-deepseek is cloud-key authed, NOT in the always-available
+        claude-code family allowlist (the load-bearing negative)."""
+        import agent_gtd_dispatch.engines as engines_mod
+
+        assert "claude-code-deepseek" not in engines_mod._CLAUDE_CODE_ENGINES
+        assert "claude-code-deepseek" in engines_mod._OLLAMA_CLOUD_ENGINE_NAMES
+
+    def test_argv_without_agent(self) -> None:
+        cmd = _build_claude_deepseek_command("sys", "Title", 20, None)
+        assert cmd == [
+            "claude",
+            "--model",
+            "deepseek-v4.1-flash:cloud",
+            "--dangerously-skip-permissions",
+            "--max-turns",
+            "20",
+            "--system-prompt",
+            "sys",
+            "--output-format",
+            "json",
+            "--print",
+            "Title",
+        ]
+
+    def test_argv_with_agent(self) -> None:
+        cmd = _build_claude_deepseek_command("sys", "Title", 20, "rev")
+        assert cmd == [
+            "claude",
+            "--model",
+            "deepseek-v4.1-flash:cloud",
+            "--dangerously-skip-permissions",
+            "--max-turns",
+            "20",
+            "--system-prompt",
+            "sys",
+            "--output-format",
+            "json",
+            "--print",
+            "--agent",
+            "rev",
+            "Title",
+        ]
+
+    def test_model_literal_ignores_cloud_model_override(self, monkeypatch) -> None:
+        """The model is the PINNED literal — never config.OLLAMA_CLOUD_MODEL
+        (that variable is the GLM model)."""
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_MODEL", "glm-5.3:cloud")
+        cmd = CLAUDE_DEEPSEEK.build_command("sys", "Title", 20, None)
+        assert cmd[cmd.index("--model") + 1] == "deepseek-v4.1-flash:cloud"
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_MODEL", "other-model:cloud")
+        cmd = CLAUDE_DEEPSEEK.build_command("sys", "Title", 20, None)
+        assert cmd[cmd.index("--model") + 1] == "deepseek-v4.1-flash:cloud"
+
+    def test_extra_env_exact_dict_cloud_key_not_local(self, monkeypatch) -> None:
+        """Exactly 3 keys, verbatim; the cloud key — never the local key."""
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_BASE_URL", "https://cloud.example")
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud-secret")
+        monkeypatch.setattr(config, "OLLAMA_API_KEY", "ollama")
+        env = _claude_deepseek_extra_env()
+        assert env == {
+            "ANTHROPIC_BASE_URL": "https://cloud.example",
+            "ANTHROPIC_AUTH_TOKEN": "cloud-secret",
+            "CLAUDE_CODE_MODEL_CAPABILITIES": "deepseek*=-mid_conv_system",
+        }
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "cloud-secret"  # noqa: S105
+        assert env["ANTHROPIC_AUTH_TOKEN"] != "ollama"  # noqa: S105
+
+    def test_extra_env_fn_wired(self) -> None:
+        assert CLAUDE_DEEPSEEK.extra_env_fn is _claude_deepseek_extra_env
+
+    def test_build_env_injects_cloud_endpoint(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_BASE_URL", "https://cloud.example")
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud-secret")
+        env = build_env(CLAUDE_DEEPSEEK)
+        assert env["ANTHROPIC_BASE_URL"] == "https://cloud.example"
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "cloud-secret"  # noqa: S105
+        assert env["CLAUDE_CODE_MODEL_CAPABILITIES"] == "deepseek*=-mid_conv_system"
+
+    def test_build_env_does_not_include_oauth_token(self, monkeypatch) -> None:
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "should-not-appear")
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_BASE_URL", "https://cloud.example")
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud-secret")
+        env = build_env(CLAUDE_DEEPSEEK)
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+
+    def test_build_env_does_not_include_anthropic_api_key(self, monkeypatch) -> None:
+        # Regression guard: ANTHROPIC_API_KEY must never appear (kb-01512).
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_BASE_URL", "https://cloud.example")
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud-secret")
+        env = build_env(CLAUDE_DEEPSEEK)
+        assert "ANTHROPIC_API_KEY" not in env
+
+    def test_rubric_entry_literal(self) -> None:
+        from agent_gtd_dispatch.dispatch import (
+            ENGINE_RUBRIC_DESCRIPTIONS,
+            _render_engine_rubric_list,
+        )
+
+        assert ENGINE_RUBRIC_DESCRIPTIONS["claude-code-deepseek"] == (
+            "Claude Code on DeepSeek via Ollama cloud, cheap, moderate reasoning"
+        )
+        assert (
+            "        - **`claude-code-deepseek`** — Claude Code on DeepSeek via"
+            " Ollama cloud, cheap, moderate reasoning" in _render_engine_rubric_list()
+        )
+
+    def test_glm_capability_override_env(self, monkeypatch) -> None:
+        """AC10: claude-code-glm gets the same fail-safe capability override
+        (mid-conversation system messages break Ollama's prompt cache)."""
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_BASE_URL", "https://cloud.example")
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud-secret")
+        assert _claude_glm_extra_env() == {
+            "ANTHROPIC_BASE_URL": "https://cloud.example",
+            "ANTHROPIC_AUTH_TOKEN": "cloud-secret",
+            "CLAUDE_CODE_MODEL_CAPABILITIES": "glm*=-mid_conv_system",
+        }
+
+    def test_glm_model_follows_cloud_model_config(self, monkeypatch) -> None:
+        """Unlike deepseek, glm's --model follows config.OLLAMA_CLOUD_MODEL."""
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_MODEL", "glm-5.3:cloud")
+        cmd = CLAUDE_GLM.build_command("sys", "Title", 20, None)
+        assert cmd[2] == "glm-5.3:cloud"
+
+    def test_deepseek_keys_in_sudoers_env_keep(self) -> None:
+        """The three injected env vars must survive the sudo boundary."""
+        tmpl = Path(__file__).parent.parent / "templates" / "sudoers-dispatch-svc.tmpl"
+        env_keep_line = next(
+            line for line in tmpl.read_text().splitlines() if "env_keep +=" in line
+        )
+        quoted = env_keep_line[env_keep_line.index('"') + 1 : env_keep_line.rindex('"')]
+        env_keep_keys = set(quoted.split())
+        assert set(_claude_deepseek_extra_env()) <= env_keep_keys
+
+    def test_template_and_docs_enumerations(self) -> None:
+        """AC13: every in-tree enumeration of the claude-family engines is updated."""
+        root = Path(__file__).parent.parent
+
+        dispatch_env = (root / "templates" / "dispatch-env.tmpl").read_text()
+        assert "a single key powers FIVE cloud engines" in dispatch_env
+        assert (
+            "#   claude-code-deepseek  (Claude Code loop → "
+            "deepseek-v4.1-flash:cloud, /v1/messages)" in dispatch_env
+        )
+
+        sudoers = (root / "templates" / "sudoers-dispatch-svc.tmpl").read_text()
+        assert "CLAUDE_CODE_MODEL_CAPABILITIES" in sudoers
+
+        setup_md = (root / "docs" / "setup.md").read_text()
+        assert (
+            "`claude-code-ollama` / `claude-code-glm` / `claude-code-deepseek`"
+            " to `claude-code`" in setup_md
+        )
+
+        api_md = (root / "docs" / "api-docs.md").read_text()
+        assert (
+            "`claude-code-ollama`, `claude-code-glm` or `claude-code-deepseek`"
+            in api_md
+        )
+
+        rollouts_md = (root / "docs" / "rollouts.md").read_text()
+        assert (
+            "`claude-code-ollama`, `claude-code-glm` or `claude-code-deepseek`"
+            in rollouts_md
+        )
+        assert "(`src/agent_gtd_dispatch/main.py:8910-8926`)" in rollouts_md
+
+        setup_sh = (root / "setup-dispatch-host.sh").read_text()
+        assert (
+            "The GLM/DeepSeek cloud engines (talos-glm, claude-code-glm,"
+            " talos-glm-flash, talos-deepseek, claude-code-deepseek) will be"
+            in setup_sh
+        )
+
+        config_py = (root / "src" / "agent_gtd_dispatch" / "config.py").read_text()
+        assert (
+            "# claude-code-deepseek pins deepseek-v4.1-flash:cloud as a literal"
+            " and never reads OLLAMA_CLOUD_MODEL." in config_py
+        )
 
 
 class TestClaudeSonnetEngine:
@@ -4185,6 +4437,7 @@ class TestOutputFormatJsonArgv:
         "claude-code",
         "claude-code-ollama",
         "claude-code-glm",
+        "claude-code-deepseek",
         "claude-code-sonnet",
         "claude-code-haiku",
     ]

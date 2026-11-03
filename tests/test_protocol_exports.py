@@ -45,6 +45,7 @@ class TestProtocolExports:
             "claude-code",
             "claude-code-ollama",
             "claude-code-glm",
+            "claude-code-deepseek",
             "claude-code-sonnet",
             "claude-code-haiku",
             "kiro",
@@ -56,5 +57,6 @@ class TestProtocolExports:
             "talos-glm-flash",
             "talos-deepseek",
         ]
+        assert BuildEngine("claude-code-deepseek") is BuildEngine.CLAUDE_CODE_DEEPSEEK
         assert BuildEngine("talos-glm-flash") is BuildEngine.TALOS_GLM_FLASH
         assert BuildEngine("talos-deepseek") is BuildEngine.TALOS_DEEPSEEK

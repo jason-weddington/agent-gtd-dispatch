@@ -49,6 +49,7 @@ class BuildEngine(StrEnum):
     CLAUDE_CODE = "claude-code"
     CLAUDE_CODE_OLLAMA = "claude-code-ollama"
     CLAUDE_CODE_GLM = "claude-code-glm"
+    CLAUDE_CODE_DEEPSEEK = "claude-code-deepseek"
     CLAUDE_CODE_SONNET = "claude-code-sonnet"
     CLAUDE_CODE_HAIKU = "claude-code-haiku"
     KIRO = "kiro"

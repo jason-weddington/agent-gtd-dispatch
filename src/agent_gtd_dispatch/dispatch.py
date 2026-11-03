@@ -2683,6 +2683,7 @@ ENGINE_RUBRIC_DESCRIPTIONS: dict[str, str] = {
     "claude-code-haiku": "cloud Haiku, very cheap, fast, weaker reasoning",
     "claude-code-ollama": "Claude Code on a local Ollama model, free, weak; not routed by the rubric",
     "claude-code-glm": "Claude Code on a GLM model, cheap, moderate reasoning",
+    "claude-code-deepseek": "Claude Code on DeepSeek via Ollama cloud, cheap, moderate reasoning",
     "kiro": "Kiro CLI engine, alternative agent harness",
     "talos-haiku": "talos harness with Haiku, very cheap, mechanical work",
     "talos-sonnet": "talos harness with Sonnet, medium cost, well-scoped work",
@@ -6295,6 +6296,21 @@ async def run_agent(
     # attribute which engine pulled a whispered map.  This var is set ONLY on the
     # per-subprocess env dict — it is never written to os.environ.
     env["HEADLESS_BUILD_ENGINE"] = engine.name
+    # One INFO record so the pinned engine identity is observable in production
+    # (model literal, base URL host, capability override). Never log the key
+    # value — only its host. Engines whose argv has no --model (kiro) log
+    # model=default.
+    logger.info(
+        "agent spawn run_id=%s engine=%s model=%s base_url_host=%s capability_override=%s",
+        run_id,
+        engine.name,
+        next(
+            (cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--model"),
+            "default",
+        ),
+        urlparse(env.get("ANTHROPIC_BASE_URL", "")).netloc or "api.anthropic.com",
+        env.get("CLAUDE_CODE_MODEL_CAPABILITIES", "absent"),
+    )
 
     cmd = _sudo_wrap(with_tmp_env(cmd, tmp_dir))
     transcript_path = workspace / "transcript.txt"

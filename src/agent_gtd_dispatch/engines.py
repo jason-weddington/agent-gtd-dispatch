@@ -67,9 +67,9 @@ class Engine:
         moment it is registered.  Consumers use this for capability gates that
         belong to the harness (which tools/env a manager needs to drive a
         multi-wave loop), not to a particular model: ``claude-code``,
-        ``claude-code-sonnet``, ``claude-code-haiku``, ``claude-code-ollama``
-        and ``claude-code-glm`` all answer True; ``kiro`` and the talos family
-        answer False.
+        ``claude-code-sonnet``, ``claude-code-haiku``, ``claude-code-ollama``,
+        ``claude-code-glm`` and ``claude-code-deepseek`` all answer True;
+        ``kiro`` and the talos family answer False.
         """
         return self.binary == "claude"
 
@@ -179,8 +179,8 @@ def build_env(
     allowed = COMMON_ENV_KEYS | engine.env_keys
     # Manage-mode env exposure: add dispatch URL + key for ANY claude-code-family
     # manage-mode executor (not just the default `claude-code`), so a manager
-    # running on claude-code-glm / -sonnet / -haiku / -ollama can still dispatch
-    # its children. See Engine.is_claude_code_family.
+    # running on claude-code-glm / -sonnet / -haiku / -ollama / -deepseek can
+    # still dispatch its children. See Engine.is_claude_code_family.
     if engine.is_claude_code_family and mode == DispatchMode.MANAGE:
         allowed = allowed | frozenset(_MANAGE_EXECUTOR_ENV_KEYS)
     # Review-mode: strip the dispatch keys (and re-assert the ANTHROPIC_API_KEY
@@ -307,9 +307,10 @@ def _build_claude_glm_command(
 ) -> list[str]:
     """Build command for claude-code-glm: same as CLAUDE but injects the GLM model.
 
-    Claude Code (the mature harness) driving glm-5.2 on Ollama Cloud — the HARNESS
-    twin of talos-glm (same model + cloud key, different loop). Auth + base URL are
-    injected via ``_claude_glm_extra_env``; here we only pin ``--model``.
+    Claude Code (the mature harness) driving glm-5.3:cloud on Ollama Cloud — the
+    HARNESS twin of talos-glm (same model + cloud key, different loop). Auth +
+    base URL are injected via ``_claude_glm_extra_env``; here we only pin
+    ``--model``.
     """
     from . import config  # local import so module is readable before config.load()
 
@@ -337,12 +338,82 @@ def _claude_glm_extra_env() -> dict[str, str]:
 
     Points Claude Code at Ollama Cloud's Anthropic-compatible /v1/messages endpoint
     using the DISTINCT cloud key (never the local OLLAMA_API_KEY — see config.py).
+
+    The ``CLAUDE_CODE_MODEL_CAPABILITIES`` override (EXTERNAL Claude Code harness
+    contract, seed-asserted here — Claude Code itself owns this variable and the
+    ``glm*=-mid_conv_system`` grammar, so these tests can only prove pass-through):
+    Claude Code sends mid-conversation ``role:system`` messages to non-Claude
+    models, and Ollama renderers can fold them into the leading system turn,
+    breaking the prompt cache so every turn reprocesses the whole prompt.
+    ``-mid_conv_system`` keeps the request append-only. Fail-safe on homelab
+    hosts too: the Ollama-cloud Anthropic endpoint reports no cache usage, so
+    the override is applied unconditionally.
     """
     from . import config  # local import so module is readable before config.load()
 
     return {
         "ANTHROPIC_BASE_URL": config.OLLAMA_CLOUD_BASE_URL,
         "ANTHROPIC_AUTH_TOKEN": config.OLLAMA_CLOUD_API_KEY,
+        "CLAUDE_CODE_MODEL_CAPABILITIES": "glm*=-mid_conv_system",
+    }
+
+
+def _build_claude_deepseek_command(
+    system_prompt: str,
+    title: str,
+    max_turns: int,
+    agent_name: str | None,
+) -> list[str]:
+    """Build command for claude-code-deepseek: injects the DeepSeek model.
+
+    Claude Code (the mature harness) driving deepseek-v4.1-flash:cloud on Ollama
+    Cloud — the HARNESS twin of talos-deepseek (same model + cloud key, different
+    loop). Auth + base URL are injected via ``_claude_deepseek_extra_env``; here
+    we only pin ``--model``. The model is the FIXED LITERAL
+    ``deepseek-v4.1-flash:cloud`` — it deliberately never reads
+    ``config.OLLAMA_CLOUD_MODEL`` (that variable steers the GLM engines).
+    """
+    cmd = [
+        "claude",
+        "--model",
+        "deepseek-v4.1-flash:cloud",
+        "--dangerously-skip-permissions",
+        "--max-turns",
+        str(max_turns),
+        "--system-prompt",
+        system_prompt,
+        "--output-format",
+        "json",
+        "--print",
+    ]
+    if agent_name:
+        cmd.extend(["--agent", agent_name])
+    cmd.append(title)
+    return cmd
+
+
+def _claude_deepseek_extra_env() -> dict[str, str]:
+    """Extra env vars injected into the claude-code-deepseek subprocess.
+
+    Points Claude Code at Ollama Cloud's Anthropic-compatible /v1/messages
+    endpoint using the DISTINCT cloud key (never the local OLLAMA_API_KEY — see
+    config.py).
+
+    The ``CLAUDE_CODE_MODEL_CAPABILITIES`` override is an EXTERNAL Claude Code
+    harness contract: Claude Code itself — not this repo — owns the variable and
+    the ``deepseek*=-mid_conv_system`` grammar, so the tests here can only prove
+    pass-through. It exists because Claude Code sends mid-conversation
+    ``role:system`` messages to non-Claude models (lab finding kb-04035 on
+    qwen3.8), and Ollama renderers can fold them into the leading system turn,
+    breaking the prompt cache so every turn reprocesses the whole prompt;
+    ``-mid_conv_system`` keeps the request append-only.
+    """
+    from . import config  # local import so module is readable before config.load()
+
+    return {
+        "ANTHROPIC_BASE_URL": config.OLLAMA_CLOUD_BASE_URL,
+        "ANTHROPIC_AUTH_TOKEN": config.OLLAMA_CLOUD_API_KEY,
+        "CLAUDE_CODE_MODEL_CAPABILITIES": "deepseek*=-mid_conv_system",
     }
 
 
@@ -437,6 +508,15 @@ CLAUDE_GLM = Engine(
     env_keys=frozenset(),  # no keys inherited from parent env; all via extra_env_fn
     build_command=_build_claude_glm_command,
     extra_env_fn=_claude_glm_extra_env,
+)
+
+CLAUDE_DEEPSEEK = Engine(
+    name="claude-code-deepseek",
+    binary="claude",
+    auth_env_key="",  # auth is injected via extra_env_fn (cloud key), not parent env
+    env_keys=frozenset(),  # no keys inherited from parent env; all via extra_env_fn
+    build_command=_build_claude_deepseek_command,
+    extra_env_fn=_claude_deepseek_extra_env,
 )
 
 CLAUDE_SONNET = Engine(
@@ -544,6 +624,7 @@ ENGINES: dict[str, Engine] = {
     "kiro": KIRO,
     "claude-code-ollama": CLAUDE_OLLAMA,
     "claude-code-glm": CLAUDE_GLM,
+    "claude-code-deepseek": CLAUDE_DEEPSEEK,
     "claude-code-sonnet": CLAUDE_SONNET,
     "claude-code-haiku": CLAUDE_HAIKU,
     "talos-haiku": TALOS_HAIKU,
@@ -579,7 +660,13 @@ _CLAUDE_CODE_ENGINES: frozenset[str] = frozenset(
 # All engine names gated on OLLAMA_CLOUD_API_KEY.  Listed here rather than
 # inline so the error message can enumerate the withheld engines dynamically.
 _OLLAMA_CLOUD_ENGINE_NAMES: frozenset[str] = frozenset(
-    {"claude-code-glm", "talos-glm", "talos-glm-flash", "talos-deepseek"}
+    {
+        "claude-code-glm",
+        "claude-code-deepseek",
+        "talos-glm",
+        "talos-glm-flash",
+        "talos-deepseek",
+    }
 )
 
 # "Logged once" sentinels for the cloud-key availability gate so that
@@ -675,8 +762,9 @@ def is_engine_available(engine: Engine) -> bool:
 
         return bool(config.OLLAMA_BASE_URL)
     # Ollama-cloud engines: all validated through one probe-backed gate.
-    # This consolidates claude-code-glm, talos-glm, and talos-glm-flash (if
-    # present) — see _is_ollama_cloud_engine_available for the full policy.
+    # This consolidates claude-code-glm, claude-code-deepseek, talos-glm and
+    # talos-glm-flash (if present) — see _is_ollama_cloud_engine_available for
+    # the full policy.
     if name in _OLLAMA_CLOUD_ENGINE_NAMES:
         return _is_ollama_cloud_engine_available()
     # Talos family: gate on the credentials the per-engine env overlay consumes

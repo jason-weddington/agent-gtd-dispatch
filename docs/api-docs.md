@@ -125,9 +125,7 @@ if the service is at capacity.
 | `rollout_id` | `str \| None` | `null` | Rollout ID (required for `manage` mode) |
 | `agent_name` | `str \| None` | `null` | Passed to agent via `--agent` flag |
 
-**Automatic engine swap**: if `mode != "build"` and `engine == "claude-code-ollama"`,
-the service swaps to `claude-code` silently and includes an `engine_swap` field in the
-response.
+**Automatic engine swap**: if `mode != "build"` and `engine` is `claude-code-ollama`, `claude-code-glm` or `claude-code-deepseek`, the service swaps to `claude-code` silently and includes an `engine_swap` field in the response.
 
 **Response 200** (`RunResponse`):
 ```json

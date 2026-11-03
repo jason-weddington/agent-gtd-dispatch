@@ -250,6 +250,30 @@ class TestEngineAvailability:
         monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud-key")
         assert is_engine_available(CLAUDE_GLM) is True
 
+    def test_deepseek_requires_cloud_api_key(self, monkeypatch) -> None:
+        # claude-code-deepseek gates on the DISTINCT cloud key, exactly like
+        # claude-code-glm (the shared _OLLAMA_CLOUD_ENGINE_NAMES gate).
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.engines import CLAUDE_DEEPSEEK, is_engine_available
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "")
+        monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://ollama.local:11434")
+        assert is_engine_available(CLAUDE_DEEPSEEK) is False
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud-key")
+        assert is_engine_available(CLAUDE_DEEPSEEK) is True
+
+    def test_info_advertises_deepseek_only_with_cloud_key(
+        self, client, monkeypatch
+    ) -> None:
+        """Endpoint level: /info lists claude-code-deepseek iff the cloud key
+        is set (probe is mocked 'valid' by the autouse fixture)."""
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "k")
+        assert "claude-code-deepseek" in client.get("/info").json()["engines"]
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "")
+        assert "claude-code-deepseek" not in client.get("/info").json()["engines"]
+
     def test_get_available_engine_names_filters(self, monkeypatch) -> None:
         from agent_gtd_dispatch import config
         from agent_gtd_dispatch.engines import get_available_engine_names
@@ -715,10 +739,19 @@ class TestOllamaCloudEngineGating:
             raise AssertionError("probe must not run for empty key")
 
         monkeypatch.setattr(urllib.request, "urlopen", _should_not_call)
+        # Call detector: the gate must short-circuit BEFORE any probe for an
+        # empty key (the class fixture sets _probe_result=None, so asserting it
+        # would be vacuous).
+        monkeypatch.setattr(
+            cloud_auth,
+            "probe_ollama_cloud_key",
+            lambda _k: pytest.fail("probe must not be called for an empty cloud key"),
+        )
 
         assert engines.is_engine_available(engines.TALOS_GLM) is False
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is False
         assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is False
+        assert engines.is_engine_available(engines.CLAUDE_DEEPSEEK) is False
         assert cloud_auth._probe_result is None
 
     def test_valid_probe_makes_engine_available(self, monkeypatch) -> None:
@@ -731,6 +764,7 @@ class TestOllamaCloudEngineGating:
         assert engines.is_engine_available(engines.TALOS_GLM) is True
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is True
         assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is True
+        assert engines.is_engine_available(engines.CLAUDE_DEEPSEEK) is True
 
     def test_one_probe_serves_all_three_cloud_engines(self, monkeypatch) -> None:
         """One network probe backs the availability of ALL three cloud engines."""
@@ -760,10 +794,13 @@ class TestOllamaCloudEngineGating:
         assert engines.is_engine_available(engines.TALOS_GLM) is True
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is True
         assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is True
-        assert len(urlopens) == 1, "the probe must run exactly once for all three"
+        assert engines.is_engine_available(engines.CLAUDE_DEEPSEEK) is True
+        assert len(urlopens) == 1, (
+            "the probe must run exactly once for all four cloud engines"
+        )
 
     def test_invalid_probe_makes_engine_unavailable(self, monkeypatch) -> None:
-        """Key present + probe='invalid' → engine unavailable (both GLM engines)."""
+        """Key present + probe='invalid' → engine unavailable (all cloud engines)."""
         from agent_gtd_dispatch import cloud_auth, config, engines
 
         monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "bad-key")
@@ -772,6 +809,7 @@ class TestOllamaCloudEngineGating:
         assert engines.is_engine_available(engines.TALOS_GLM) is False
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is False
         assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is False
+        assert engines.is_engine_available(engines.CLAUDE_DEEPSEEK) is False
 
     def test_unknown_probe_keeps_engine_available(self, monkeypatch) -> None:
         """Key present + probe='unknown' → engine remains available (network blip)."""
@@ -783,6 +821,7 @@ class TestOllamaCloudEngineGating:
         assert engines.is_engine_available(engines.TALOS_GLM) is True
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is True
         assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is True
+        assert engines.is_engine_available(engines.CLAUDE_DEEPSEEK) is True
 
     def test_invalid_probe_logs_error_once_with_key_length(
         self, monkeypatch, caplog
@@ -808,6 +847,7 @@ class TestOllamaCloudEngineGating:
         assert "talos-glm" in errors[0].message
         assert "talos-glm-flash" in errors[0].message
         assert "talos-deepseek" in errors[0].message
+        assert "claude-code-deepseek" in errors[0].message
 
     def test_unknown_probe_logs_warning_once(self, monkeypatch, caplog) -> None:
         """'unknown' logs exactly one WARNING; no re-log on subsequent calls."""

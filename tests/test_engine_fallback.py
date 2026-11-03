@@ -170,6 +170,60 @@ class TestPlanModeEngineSwap:
     @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.dispatch")
     @patch("agent_gtd_dispatch.main.gtd_client")
+    async def test_plan_mode_deepseek_swaps_to_claude(
+        self, mock_client, mock_dispatch, mock_worker, client, auth_headers, tmp_path
+    ) -> None:
+        # claude-code-deepseek is BUILD-only like claude-code-glm: plan mode
+        # must swap it to claude-code (Ollama-cloud deepseek is unreliable at
+        # planning).
+        from agent_gtd_dispatch import db
+
+        await db.init_db()
+
+        mock_client.get_item = AsyncMock(
+            return_value={
+                "id": "abc12345-6789",
+                "title": "Fix bug",
+                "project_id": "proj1",
+            }
+        )
+        mock_client.get_project = AsyncMock(
+            return_value={
+                "id": "proj1",
+                "name": "TestProject",
+                "git_origin": "git@git.example.com:repos/test",
+            }
+        )
+        mock_dispatch.branch_name_for_item.return_value = "feat/abc12345-fix-bug"
+
+        resp = client.post(
+            "/dispatch",
+            json={
+                "item_id": "abc12345-6789",
+                "max_turns": 50,
+                "engine": "claude-code-deepseek",
+                "mode": "plan",
+            },
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["engine"] == "claude-code-deepseek"
+        assert data["engine_actual"] == "claude-code"
+        assert data["engine_swap"] is not None
+        assert data["engine_swap"]["from_engine"] == "claude-code-deepseek"
+        assert data["engine_swap"]["to_engine"] == "claude-code"
+        assert "plan/manage" in data["engine_swap"]["reason"]
+
+        run = await db.get_run(data["id"])
+        assert run is not None
+        assert run.engine == "claude-code-deepseek"
+        assert run.engine_actual == "claude-code"
+
+    @patch("agent_gtd_dispatch.main._dispatch_worker", new_callable=AsyncMock)
+    @patch("agent_gtd_dispatch.main.dispatch")
+    @patch("agent_gtd_dispatch.main.gtd_client")
     async def test_build_mode_ollama_no_swap(
         self, mock_client, mock_dispatch, mock_worker, client, auth_headers, tmp_path
     ) -> None:

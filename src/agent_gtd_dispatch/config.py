@@ -219,6 +219,7 @@ OLLAMA_CLOUD_API_KEY: str = ""
 # override steers claude-code-glm ONLY — talos-glm never reads it.
 OLLAMA_CLOUD_BASE_URL: str = "https://ollama.com"
 OLLAMA_CLOUD_MODEL: str = "glm-5.3:cloud"
+# claude-code-deepseek pins deepseek-v4.1-flash:cloud as a literal and never reads OLLAMA_CLOUD_MODEL.  # noqa: E501
 
 # Per-engine concurrency caps declared by THIS host (DISPATCH_ENGINE_SLOTS, e.g.
 # "talos-qwen=1").  Empty means no per-engine caps.  A cap of 0 hides the engine.

@@ -8961,9 +8961,10 @@ async def dispatch_item(
 
     # Plan-mode and manage-mode always use Anthropic, regardless of requested engine.
     # The Ollama-routed Claude engines (claude-code-ollama local, claude-code-glm
-    # cloud) are BUILD-only; plan/manage dispatches swap to claude-code so the
-    # existing planner/manager code path runs untouched (small local/cloud
-    # models are unreliable at multi-wave management).
+    # cloud, claude-code-deepseek cloud) are BUILD-only; plan/manage dispatches
+    # swap to claude-code so the existing planner/manager code path runs
+    # untouched (small local/cloud models are unreliable at multi-wave
+    # management).
     effective_engine_name = body.engine
     _engine_swap_reason = ""
     if body.mode != DispatchMode.BUILD and body.engine == "claude-code-ollama":
@@ -8972,6 +8973,9 @@ async def dispatch_item(
     elif body.mode != DispatchMode.BUILD and body.engine == "claude-code-glm":
         effective_engine_name = "claude-code"
         _engine_swap_reason = "plan/manage mode does not support ollama-cloud glm"
+    elif body.mode != DispatchMode.BUILD and body.engine == "claude-code-deepseek":
+        effective_engine_name = "claude-code"
+        _engine_swap_reason = "plan/manage mode does not support ollama-cloud deepseek"
     engine_swapped = body.engine != effective_engine_name
     try:
         engine = get_engine(effective_engine_name)

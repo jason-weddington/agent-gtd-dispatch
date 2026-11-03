@@ -76,9 +76,7 @@ default timeout, and the cleanup policy differ.
   the rubric in the prompt, and move the item to `ready`.
 - **Output:** an item that's ready to dispatch as `mode="build"`.
 
-Plan-mode dispatches never use `claude-code-ollama`; the `/dispatch` endpoint
-swaps the engine to `claude-code` and reports the swap via `EngineSwap` in the
-response (`src/agent_gtd_dispatch/main.py:563-567`).
+Plan-mode dispatches never use `claude-code-ollama`, `claude-code-glm` or `claude-code-deepseek`; the `/dispatch` endpoint swaps the engine to `claude-code` and reports the swap via `EngineSwap` in the response (`src/agent_gtd_dispatch/main.py:8910-8926`).
 
 ### `mode="build"` — implementing a single item
 
