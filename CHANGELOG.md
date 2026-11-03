@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.21.0 (2026-11-03)
+
+### Features
+
+- **659b2748**: Dispatch: talos-deepseek engine (DeepSeek on Ollama cloud) and a per-tick board
+  reviewer override
+  ([`e91bd52`](https://github.com/repos/agent-gtd-dispatch/commit/e91bd526bef43e8720b3db9e94b50f0cb41b8c5e))
+
+
 ## v2.20.0 (2026-11-02)
 
 ### Documentation
