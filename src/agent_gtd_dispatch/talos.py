@@ -377,8 +377,9 @@ def build_talos_argv(
 #   0  → verified Done (RunSummary on stdout, verification passed)
 #   10 → Blocked (RunSummary on stdout, disposition=Blocked)
 #   20 → task failed (RunSummary on stdout, disposition=Failed with mode
-#        Loop|BudgetExhausted|PersistentToolError|StoppedWithoutFinish|
-#        MaxIterations)
+#        Loop|BudgetExhausted|PersistentToolError|TransientInfra|
+#        StoppedWithoutFinish|FinishDiscipline|Truncated|
+#        AnswerSchemaExhausted)
 #   30 → AlreadySatisfied (RunSummary on stdout, disposition=AlreadySatisfied with
 #        a required non-empty reason). This is the talos half of the completion
 #        contract shipped as 48617eb — talos `done` now requires an observed tree
@@ -560,7 +561,8 @@ def parse_disposition_summary(disposition: dict[str, Any]) -> str:
     - Blocked → ``{"Blocked": {"decision_needed": str}}``
     - Failed → ``{"Failed": {"mode": FailureMode, "summary": str}}`` where
       FailureMode ∈ {Loop, BudgetExhausted, PersistentToolError,
-      TransientInfra, StoppedWithoutFinish, FinishDiscipline}. Note: a
+      TransientInfra, StoppedWithoutFinish, FinishDiscipline, Truncated,
+      AnswerSchemaExhausted}. Note: a
       ``MaxIterations`` LoopOutcome surfaces as disposition mode
       ``BudgetExhausted`` (it collapses in ``into_disposition``), so
       ``MaxIterations`` is NOT a disposition mode.
@@ -613,12 +615,35 @@ BUDGET_EXHAUSTED_GUIDANCE = (
     "raise the budget and resume/re-dispatch (do not distrust the output)"
 )
 
+# talos FailureMode variants this module maps beyond the original six
+# (run_record.rs FailureMode, talos 2c6b7ed — talos is NOT vendored in this
+# workspace, so the strings below are the wire contract, not local code).
+TRUNCATED_MODE = "Truncated"
+
+TRUNCATED_GUIDANCE = (
+    "output truncated — a turn hit the per-turn max_tokens cap before any "
+    "tool call; the task is not the problem. Re-dispatch, ideally on a larger-context "
+    "host or another engine"
+)
+
+ANSWER_SCHEMA_EXHAUSTED_MODE = "AnswerSchemaExhausted"
+
+ANSWER_SCHEMA_EXHAUSTED_GUIDANCE = (
+    "answer schema exhausted — answer mode only: the model could not satisfy "
+    "the answer schema across the rejection-streak cap with identical errors, "
+    "which points at a broken transport or an unsatisfiable schema. Do NOT "
+    "blind-retry: fix the schema or switch backend lane first, and read the "
+    "talos run record under ${XDG_STATE_HOME:-~/.local/state}/talos/<task-id>/ "
+    "(run.sqlite + JSONL transcript)"
+)
+
 
 def failure_mode_guidance(mode: str) -> str:
     """Map a talos FailureMode string to an actionable caller hint.
 
-    Pure and total — takes the mode string only, never raises, does no JSON
-    parsing. Buckets are pinned to the harness's
+    Total — takes the mode string only, never raises, does no JSON parsing; the
+    unmapped branch emits exactly one WARNING so talos enum drift is visible in
+    the journal. Buckets are pinned to the harness's
     ``crates/harness/src/run_record.rs`` FailureMode doc-comments and
     ``crates/harness/src/engine.rs::into_disposition``:
 
@@ -631,11 +656,26 @@ def failure_mode_guidance(mode: str) -> str:
     - RE-DISPATCH (the spec looks sound; re-run or fix the environment):
       ``Loop``, ``FinishDiscipline``, ``TransientInfra``, and
       ``PersistentToolError``.
+    - RE-DISPATCH (TRUNCATED, the task is not at fault): ``Truncated`` → a turn
+      hit the per-turn ``max_tokens`` cap before any tool call, so the task is
+      not the problem; re-dispatch, preferably on a larger-context host or
+      another engine.
+    - DO NOT BLIND-RETRY (ANSWER SCHEMA): ``AnswerSchemaExhausted`` → answer
+      mode only; the model could not satisfy the answer schema across the
+      rejection-streak cap with identical errors, which points at a broken
+      transport or an unsatisfiable schema; fix the schema or switch backend
+      lane before re-dispatching, and read the talos run record (see
+      build_talos_argv). Source: run_record.rs FailureMode, talos 2c6b7ed —
+      not vendored in this workspace.
     - any unrecognized mode → a defensible fallback that echoes the mode and
       asks the caller to inspect the run record.
     """
     if mode == BUDGET_EXHAUSTED_MODE:
         return BUDGET_EXHAUSTED_GUIDANCE
+    if mode == TRUNCATED_MODE:
+        return TRUNCATED_GUIDANCE
+    if mode == ANSWER_SCHEMA_EXHAUSTED_MODE:
+        return ANSWER_SCHEMA_EXHAUSTED_GUIDANCE
     if mode == "StoppedWithoutFinish":
         return (
             "stalled / no convergence — consider re-decomposing into smaller "
@@ -645,6 +685,7 @@ def failure_mode_guidance(mode: str) -> str:
         return (
             "run failed (spec looks sound) — re-dispatch, or fix the environment first"
         )
+    logger.warning("talos failure-mode unmapped mode=%s", mode)
     return f"unrecognized failure mode '{mode}' — inspect the run record"
 
 
@@ -712,8 +753,12 @@ def build_comment_body(
 
 
 __all__ = [
+    "ANSWER_SCHEMA_EXHAUSTED_GUIDANCE",
+    "ANSWER_SCHEMA_EXHAUSTED_MODE",
     "BUDGET_EXHAUSTED_GUIDANCE",
     "BUDGET_EXHAUSTED_MODE",
+    "TRUNCATED_GUIDANCE",
+    "TRUNCATED_MODE",
     "build_comment_body",
     "build_talos_argv",
     "failure_mode_guidance",

@@ -1304,8 +1304,15 @@ async def _run_talos(
                 _summary = json.loads(stdout_line)
                 _mode = _summary["disposition"]["Failed"]["mode"]
                 if isinstance(_mode, str):
+                    logger.info("talos run %s failure mode=%s", run.id, _mode)
                     error = f"{comment_header}\n{talos.failure_mode_guidance(_mode)}"
             except (json.JSONDecodeError, KeyError, TypeError):
+                logger.warning(
+                    "talos run %s exit %s: RunSummary unparseable — "
+                    "failure-mode guidance lost",
+                    run.id,
+                    exit_code,
+                )
                 error = comment_header
         await db.update_run(
             run.id,

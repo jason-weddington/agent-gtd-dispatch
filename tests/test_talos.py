@@ -1240,7 +1240,7 @@ class TestParseDispositionSummary:
 
 
 class TestFailureModeGuidance:
-    """`failure_mode_guidance` — pure RE-DECOMPOSE / RE-DISPATCH / unknown map."""
+    """`failure_mode_guidance` — full mode map: budget wind-down / re-decompose / re-dispatch / truncated / answer-schema / unknown."""
 
     def test_redecompose_bucket_modes(self) -> None:
         from agent_gtd_dispatch.talos import failure_mode_guidance
@@ -1274,12 +1274,133 @@ class TestFailureModeGuidance:
             out = failure_mode_guidance(mode)
             assert "re-dispatch" in out, mode
 
+    def test_truncated_has_own_guidance(self) -> None:
+        from agent_gtd_dispatch.talos import TRUNCATED_GUIDANCE, failure_mode_guidance
+
+        expected = (
+            "output truncated — a turn hit the per-turn max_tokens cap before any "
+            "tool call; the task is not the problem. Re-dispatch, ideally on a "
+            "larger-context host or another engine"
+        )
+        out = failure_mode_guidance("Truncated")
+        assert out == expected
+        assert out == TRUNCATED_GUIDANCE
+        assert "stalled / no convergence" not in out
+        assert "re-decomposing" not in out
+        assert "unrecognized failure mode" not in out
+
+    def test_answer_schema_exhausted_has_own_guidance(self) -> None:
+        from agent_gtd_dispatch.talos import (
+            ANSWER_SCHEMA_EXHAUSTED_GUIDANCE,
+            failure_mode_guidance,
+        )
+
+        expected = (
+            "answer schema exhausted — answer mode only: the model could not "
+            "satisfy the answer schema across the rejection-streak cap with "
+            "identical errors, which points at a broken transport or an "
+            "unsatisfiable schema. Do NOT blind-retry: fix the schema or switch "
+            "backend lane first, and read the talos run record under "
+            "${XDG_STATE_HOME:-~/.local/state}/talos/<task-id>/ "
+            "(run.sqlite + JSONL transcript)"
+        )
+        out = failure_mode_guidance("AnswerSchemaExhausted")
+        assert out == expected
+        assert out == ANSWER_SCHEMA_EXHAUSTED_GUIDANCE
+        assert "stalled / no convergence" not in out
+        assert "re-decomposing" not in out
+        assert "unrecognized failure mode" not in out
+
+    def test_every_failure_mode_variant_is_mapped(self) -> None:
+        from agent_gtd_dispatch.talos import failure_mode_guidance
+
+        modes = (
+            "Loop",
+            "BudgetExhausted",
+            "PersistentToolError",
+            "TransientInfra",
+            "StoppedWithoutFinish",
+            "FinishDiscipline",
+            "Truncated",
+            "AnswerSchemaExhausted",
+        )
+        assert len(modes) == 8
+        for mode in modes:
+            out = failure_mode_guidance(mode)
+            assert isinstance(out, str), mode
+            assert out, mode
+            assert not out.startswith("unrecognized failure mode"), mode
+
+    def test_unmapped_mode_warns_once(self, caplog) -> None:
+        import logging
+
+        from agent_gtd_dispatch.talos import failure_mode_guidance
+
+        with caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.talos"):
+            out = failure_mode_guidance("Nonsense")
+        warnings = [
+            r
+            for r in caplog.records
+            if r.name == "agent_gtd_dispatch.talos" and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].getMessage() == "talos failure-mode unmapped mode=Nonsense"
+        assert out == "unrecognized failure mode 'Nonsense' — inspect the run record"
+
+    def test_mapped_modes_do_not_warn(self, caplog) -> None:
+        import logging
+
+        from agent_gtd_dispatch.talos import failure_mode_guidance
+
+        modes = (
+            "Loop",
+            "BudgetExhausted",
+            "PersistentToolError",
+            "TransientInfra",
+            "StoppedWithoutFinish",
+            "FinishDiscipline",
+            "Truncated",
+            "AnswerSchemaExhausted",
+        )
+        with caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.talos"):
+            for mode in modes:
+                caplog.clear()
+                failure_mode_guidance(mode)
+                warnings = [
+                    r
+                    for r in caplog.records
+                    if r.name == "agent_gtd_dispatch.talos"
+                    and r.levelno == logging.WARNING
+                ]
+                assert warnings == [], mode
+
+    def test_docstrings_enumerate_every_failure_mode(self) -> None:
+        from agent_gtd_dispatch.talos import (
+            failure_mode_guidance,
+            parse_disposition_summary,
+        )
+
+        modes = (
+            "Loop",
+            "BudgetExhausted",
+            "PersistentToolError",
+            "TransientInfra",
+            "StoppedWithoutFinish",
+            "FinishDiscipline",
+            "Truncated",
+            "AnswerSchemaExhausted",
+        )
+        for mode in modes:
+            assert mode in (failure_mode_guidance.__doc__ or ""), mode
+            assert mode in (parse_disposition_summary.__doc__ or ""), mode
+
     def test_unrecognized_mode_echoed(self) -> None:
         from agent_gtd_dispatch.talos import failure_mode_guidance
 
         out = failure_mode_guidance("Nonsense")
         assert "unrecognized failure mode" in out
         assert "Nonsense" in out
+        assert out == "unrecognized failure mode 'Nonsense' — inspect the run record"
 
 
 # ---------------------------------------------------------------------------
@@ -3023,6 +3144,27 @@ _BUDGET_EXHAUSTED_SUMMARY = json.dumps(
     }
 )
 
+_TRUNCATED_SUMMARY = json.dumps(
+    {
+        "outcome": "Finished",
+        "iterations": 12,
+        "disposition": {"Failed": {"mode": "Truncated", "summary": "hit the cap"}},
+    }
+)
+
+_ANSWER_SCHEMA_EXHAUSTED_SUMMARY = json.dumps(
+    {
+        "outcome": "Finished",
+        "iterations": 12,
+        "disposition": {
+            "Failed": {
+                "mode": "AnswerSchemaExhausted",
+                "summary": "schema never satisfied",
+            }
+        },
+    }
+)
+
 
 class TestBudgetExhaustedSurface:
     def test_comment_body_has_guidance_and_recovery_facts(self) -> None:
@@ -3074,6 +3216,161 @@ class TestBudgetExhaustedSurface:
         error = failed[-1].kwargs["error"]
         assert "raise the budget" in error
         assert "stalled / no convergence" not in error
+
+
+class TestNewFailureModeSurfaces:
+    """Truncated / AnswerSchemaExhausted reach both the comment and runs.error.
+
+    Ground truth: ``crates/harness/src/run_record.rs`` FailureMode (talos
+    2c6b7ed) — the two variants dispatch used to report as unrecognized.
+    """
+
+    @pytest.mark.parametrize(
+        ("mode", "summary", "needle"),
+        [
+            ("Truncated", _TRUNCATED_SUMMARY, "larger-context host or another engine"),
+            (
+                "AnswerSchemaExhausted",
+                _ANSWER_SCHEMA_EXHAUSTED_SUMMARY,
+                "Do NOT blind-retry",
+            ),
+        ],
+    )
+    def test_comment_body_carries_guidance_for_new_mode(
+        self, mode: str, summary: str, needle: str
+    ) -> None:
+        from agent_gtd_dispatch.talos import build_comment_body
+
+        body = build_comment_body(20, summary, "", "feat/x")
+        assert f"Failed ({mode}):" in body
+        assert needle in body
+        assert "iterations=12" in body
+        assert "Recovery facts" not in body
+        assert "unrecognized failure mode" not in body
+
+        # Exit 1 (engine broke) still renders the Failed line but must NOT
+        # carry the exit-20 guidance.
+        body_exit_1 = build_comment_body(1, summary, "", None)
+        assert f"Failed ({mode}):" in body_exit_1
+        assert needle not in body_exit_1
+        assert "unrecognized failure mode" not in body_exit_1
+        assert "Recovery facts" not in body_exit_1
+
+    @pytest.mark.parametrize(
+        ("mode", "summary", "needle"),
+        [
+            ("Truncated", _TRUNCATED_SUMMARY, "larger-context host or another engine"),
+            (
+                "AnswerSchemaExhausted",
+                _ANSWER_SCHEMA_EXHAUSTED_SUMMARY,
+                "Do NOT blind-retry",
+            ),
+        ],
+    )
+    async def test_run_error_carries_guidance_for_new_mode(
+        self, tmp_path, monkeypatch, caplog, mode: str, summary: str, needle: str
+    ) -> None:
+        import logging
+
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        run, engine, item, project = _make_talos_run()
+        update_run_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", AsyncMock())
+        monkeypatch.setattr(gtd_client, "set_item_status", AsyncMock())
+
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (summary.encode(), b"")
+        mock_proc.returncode = 20
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", MagicMock()),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+        failed = [
+            c
+            for c in update_run_mock.await_args_list
+            if c.kwargs.get("status") == RunStatus.failed
+        ]
+        assert failed
+        error = failed[-1].kwargs["error"]
+        assert needle in error
+        assert "unrecognized failure mode" not in error
+        mode_logs = [
+            r
+            for r in caplog.records
+            if r.name == "agent_gtd_dispatch.main"
+            and r.levelno == logging.INFO
+            and r.getMessage() == f"talos run {run.id} failure mode={mode}"
+        ]
+        assert len(mode_logs) == 1
+
+    async def test_exit_20_unparseable_summary_warns_and_keeps_header(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        import logging
+
+        from agent_gtd_dispatch import config, db, gtd_client, main
+        from agent_gtd_dispatch.models import RunStatus
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        run, engine, item, project = _make_talos_run()
+        update_run_mock = AsyncMock()
+        monkeypatch.setattr(db, "update_run", update_run_mock)
+        monkeypatch.setattr(gtd_client, "post_comment", AsyncMock())
+        monkeypatch.setattr(gtd_client, "set_item_status", AsyncMock())
+
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (b"not json", b"")
+        mock_proc.returncode = 20
+        with (
+            patch("agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc),
+            patch("agent_gtd_dispatch.main.subprocess.run", MagicMock()),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=60,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+        failed = [
+            c
+            for c in update_run_mock.await_args_list
+            if c.kwargs.get("status") == RunStatus.failed
+        ]
+        assert failed
+        error = failed[-1].kwargs["error"]
+        assert error == "talos task failed"
+        warning_logs = [
+            r
+            for r in caplog.records
+            if r.name == "agent_gtd_dispatch.main"
+            and r.levelno == logging.WARNING
+            and r.getMessage()
+            == (
+                f"talos run {run.id} exit 20: RunSummary unparseable — "
+                "failure-mode guidance lost"
+            )
+        ]
+        assert len(warning_logs) == 1
 
 
 class TestGitFailureErrorKeepsHead:
