@@ -4626,6 +4626,179 @@ def land_fetch_feature_branch(repo: Path, branch_name: str, timeout: int) -> boo
     raise LandGitError("fetch origin", excerpt)
 
 
+def refresh_feature_branch_refs(
+    workspace: RolloutWorkspace, branch_name: str, timeout: int
+) -> dict[str, str]:
+    """Force-refresh every repo's ``refs/remotes/origin/<branch>`` before a review.
+
+    Reviewer clones are single-branch, so a plain ``git fetch origin
+    <branch>`` only writes FETCH_HEAD and the stale tracking ref the reviewer
+    (or a stale local branch) would otherwise squash.  Per repo the helper:
+
+    1. records the tracking ref's sha ("" when absent),
+    2. re-runs :func:`land_fetch_feature_branch` (forced refspec) — the ONLY
+       step that can change the recorded result,
+    3. on any non-refreshed result, deletes the tracking ref so a stale one
+       cannot survive a failed refresh,
+    4. ALWAYS deletes a local ``refs/heads/<branch>`` if one exists (a stale
+       branch an earlier attempt left behind), and
+    5. records the tracking ref's sha again for the log line.
+
+    Returns repo name -> exactly one of ``'refreshed'``, ``'absent'``,
+    ``'fetch_failed'``, ``'skipped'``, in ``workspace.repo_paths`` order.
+    The helper NEVER raises: steps 1, 3, 4 and 5 swallow their own git
+    errors (and a ``git branch -D`` failing because the branch is checked
+    out), and the whole per-repo body is wrapped so one failing repo never
+    stops the others.  It never touches the default branch, HEAD, the index
+    or the working tree.  Synchronous — call via ``loop.run_in_executor``.
+    """
+    repos = list(workspace.repo_paths)
+    if not branch_name or branch_name in set(workspace.default_branches.values()):
+        logger.warning(
+            "rollout-loop: review-branch-refresh skipped branch=%r reason=protected",
+            branch_name,
+        )
+        return dict.fromkeys(repos, "skipped")
+    results: dict[str, str] = {}
+    for repo in repos:
+        # A failure outside the fetch must leave the fetch-derived result in
+        # place; a failure of the fetch itself (or before it) is 'fetch_failed'.
+        state: dict[str, str] = {"result": "fetch_failed"}
+        try:
+            _refresh_one_branch_ref(
+                repo, workspace.repo_paths[repo], branch_name, timeout, state
+            )
+        except Exception as exc:  # contract: never raises
+            logger.warning(
+                "rollout-loop: review-branch-refresh repo=%s branch=%s error=%s",
+                repo,
+                branch_name,
+                exc,
+            )
+        results[repo] = state["result"]
+    return results
+
+
+def _quiet_ref_sha(
+    path: Path, ref: str, timeout: int, *, repo: str, branch: str
+) -> str:
+    """``git rev-parse --verify --quiet <ref>``; "" when absent or on any error."""
+    try:
+        proc = _land_git(path, ["rev-parse", "--verify", "--quiet", ref], timeout)
+    except (LandGitError, LandGitTimeout, OSError) as exc:
+        logger.warning(
+            "rollout-loop: review-branch-refresh repo=%s branch=%s ref=%s error=%s",
+            repo,
+            branch,
+            ref,
+            exc,
+        )
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.decode("utf-8", errors="replace").strip()
+
+
+def _refresh_one_branch_ref(
+    repo: str,
+    path: Path,
+    branch_name: str,
+    timeout: int,
+    state: dict[str, str],
+) -> None:
+    """Refresh/delete ONE repo's feature-branch refs.
+
+    See :func:`refresh_feature_branch_refs` for the pinned sequence.  The
+    recorded result is written to ``state['result']`` as soon as the fetch
+    outcome is known, so a later failure leaves that result in place.
+    """
+    tracking_ref = f"refs/remotes/origin/{branch_name}"
+    local_ref = f"refs/heads/{branch_name}"
+    tracking_before = _quiet_ref_sha(
+        path, tracking_ref, timeout, repo=repo, branch=branch_name
+    )
+    fetch_error: str | None = None
+    try:
+        fetched = land_fetch_feature_branch(path, branch_name, timeout)
+    except (LandGitError, LandGitTimeout, OSError) as exc:
+        fetched = False
+        fetch_error = str(exc)
+    result = (
+        "fetch_failed"
+        if fetch_error is not None
+        else ("refreshed" if fetched else "absent")
+    )
+    state["result"] = result
+    if result != "refreshed":
+        try:
+            proc = _land_git(path, ["update-ref", "-d", tracking_ref], timeout)
+            if proc.returncode != 0:
+                logger.warning(
+                    "rollout-loop: review-branch-refresh repo=%s branch=%s "
+                    "stale-tracking-ref-delete error=%s",
+                    repo,
+                    branch_name,
+                    git_output_excerpt(proc),
+                )
+        except (LandGitError, LandGitTimeout, OSError) as exc:
+            logger.warning(
+                "rollout-loop: review-branch-refresh repo=%s branch=%s "
+                "stale-tracking-ref-delete error=%s",
+                repo,
+                branch_name,
+                exc,
+            )
+    local_branch_deleted = False
+    try:
+        local_probe = _land_git(
+            path, ["rev-parse", "--verify", "--quiet", local_ref], timeout
+        )
+        if local_probe.returncode == 0:
+            proc = _land_git(path, ["branch", "-D", branch_name], timeout)
+            if proc.returncode == 0:
+                local_branch_deleted = True
+            else:
+                logger.warning(
+                    "rollout-loop: review-branch-refresh repo=%s branch=%s "
+                    "local-branch-delete error=%s",
+                    repo,
+                    branch_name,
+                    git_output_excerpt(proc),
+                )
+    except (LandGitError, LandGitTimeout, OSError) as exc:
+        logger.warning(
+            "rollout-loop: review-branch-refresh repo=%s branch=%s "
+            "local-branch-delete error=%s",
+            repo,
+            branch_name,
+            exc,
+        )
+    tracking_after = _quiet_ref_sha(
+        path, tracking_ref, timeout, repo=repo, branch=branch_name
+    )
+    stale_corrected = bool(
+        tracking_before and tracking_after and tracking_before != tracking_after
+    )
+    message = (
+        "rollout-loop: review-branch-refresh repo=%s branch=%s result=%s "
+        "tracking_before=%s tracking_after=%s local_branch_deleted=%s "
+        "stale_corrected=%s"
+    )
+    args = (
+        repo,
+        branch_name,
+        result,
+        tracking_before or "none",
+        tracking_after or "none",
+        "true" if local_branch_deleted else "false",
+        "true" if stale_corrected else "false",
+    )
+    if result == "fetch_failed":
+        logger.warning(message + " error=%s", *args, fetch_error)
+    else:
+        logger.info(message, *args)
+
+
 def land_rev_parse(repo: Path, ref: str, timeout: int) -> str:
     """``git rev-parse <ref>``; raises on failure or timeout."""
     return _land_git_ok(repo, ["rev-parse", ref], timeout)
@@ -5608,7 +5781,8 @@ record `none` for it and continue — do NOT halt for that alone."""
                 ## Step 3 — Reconcile the acceptance criteria against the diff
 
                 ```bash
-                git checkout {branch_name}
+                git fetch origin +refs/heads/{branch_name}:refs/remotes/origin/{branch_name}
+                git checkout -B {branch_name} origin/{branch_name}
                 git diff origin/<default_branch>...{branch_name}
                 ```
 
@@ -5682,7 +5856,7 @@ record `none` for it and continue — do NOT halt for that alone."""
                 Immediately before each repo's squash, run the commit-count guard using
                 THAT repo's recorded default branch:
                 ```bash
-                git fetch origin {branch_name}
+                git fetch origin +refs/heads/{branch_name}:refs/remotes/origin/{branch_name}
                 commit_count=$(git rev-list origin/<default_branch>..{branch_name} --count)
                 ```
                 `commit_count == 0` with a child status of `already_satisfied` is a

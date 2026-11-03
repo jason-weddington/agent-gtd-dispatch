@@ -122,7 +122,8 @@ discarded four agents' worth of real work in a single night.
 ## Step 3 — Reconcile the acceptance criteria against the diff
 
 ```bash
-git checkout feat/11111111-golden
+git fetch origin +refs/heads/feat/11111111-golden:refs/remotes/origin/feat/11111111-golden
+git checkout -B feat/11111111-golden origin/feat/11111111-golden
 git diff origin/<default_branch>...feat/11111111-golden
 ```
 
@@ -208,7 +209,7 @@ commit is created.
 Immediately before each repo's squash, run the commit-count guard using
 THAT repo's recorded default branch:
 ```bash
-git fetch origin feat/11111111-golden
+git fetch origin +refs/heads/feat/11111111-golden:refs/remotes/origin/feat/11111111-golden
 commit_count=$(git rev-list origin/<default_branch>..feat/11111111-golden --count)
 ```
 `commit_count == 0` with a child status of `already_satisfied` is a

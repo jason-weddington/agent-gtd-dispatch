@@ -2539,6 +2539,43 @@ async def _launch_reviewer(
     run_row = await _latest_run_for_item(item_id, rollout_id, token=token)
     branch_name = await _review_branch_name(item_id, item, run_row)
 
+    # Force-refresh the feature branch's tracking ref in every landing repo
+    # BEFORE the run row exists: a cancel or error during the refresh then
+    # leaves no orphan run row, and the reviewer can no longer squash a
+    # stale ref (rollout clones are single-branch, so the reviewer's own
+    # plain fetch only writes FETCH_HEAD).  Normal launches only: the fix
+    # mode and land-conflict relaunches re-work the SAME squash commit the
+    # first reviewer already built, so their prompts deliberately do not
+    # fetch the feature branch at all.
+    if gate_failure_output is None and land_conflict is None:
+        results = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                dispatch.refresh_feature_branch_refs,
+                workspace,
+                branch_name,
+                config.LAND_GIT_TIMEOUT_SECONDS,
+            ),
+        )
+        if not any(value == "refreshed" for value in results.values()):
+            logger.warning(
+                "rollout-loop: review-branch-refresh none-refreshed "
+                "rollout_id=%s item_id=%s branch=%s results=%s",
+                rollout_id,
+                item_id,
+                branch_name,
+                ",".join(f"{repo}:{value}" for repo, value in results.items()),
+            )
+    else:
+        logger.info(
+            "rollout-loop: review-branch-refresh skipped reason=%s rollout_id=%s "
+            "item_id=%s branch=%s",
+            "fix_mode" if gate_failure_output is not None else "land_conflict",
+            rollout_id,
+            item_id,
+            branch_name,
+        )
+
     try:
         merge_notes = await gtd_client.get_rollout_merge_notes(
             rollout_id, limit=dispatch.MERGE_NOTE_CONTEXT_LIMIT, token=token
@@ -3897,6 +3934,15 @@ class _Lander:
             )
             if not tip:
                 tip_ref = f"refs/heads/{branch_name}"
+                # Tripwire (log only, never halts): the origin ref did not
+                # resolve, so the conflict check is running against a LOCAL
+                # feature branch — exactly the stale-ref shape that made a
+                # reviewer squash a pre-merge commit (rollout aed487a7).
+                logger.warning(
+                    "rollout-loop: land-feature-tip-fallback repo=%s branch=%s",
+                    repo,
+                    branch_name,
+                )
                 tip = await self._git(
                     repo, dispatch.land_resolve_ref, path, tip_ref, timeout
                 )
@@ -3907,6 +3953,13 @@ class _Lander:
                     f"{repo}: feature branch {branch_name} not found locally or "
                     "on origin",
                 )
+            logger.info(
+                "rollout-loop: land-feature-tip repo=%s branch=%s tip=%s tip_ref=%s",
+                repo,
+                branch_name,
+                tip,
+                tip_ref,
+            )
             base = f"{self.branches[repo]}~1"
             base_sha = await self._git(
                 repo, dispatch.land_resolve_ref, path, base, timeout
