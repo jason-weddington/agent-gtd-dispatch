@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v2.22.0 (2026-11-03)
+
+### Bug Fixes
+
+- **cb688a04**: Rollout reviewer squashes a stale feature-branch ref: the worker force-refreshes
+  feature-branch refs before every review and the review prompt forces its own fetch
+  ([`80c3dfe`](https://github.com/repos/agent-gtd-dispatch/commit/80c3dfea1a119ef9d856a836d9d7f1afcfb22449))
+
+### Features
+
+- **afb8a8fb**: Dispatch: claude-code-deepseek engine (Claude Code harness on DeepSeek via Ollama
+  cloud) and the mid-conversation-system capability override for claude-code-glm
+  ([`98e1c20`](https://github.com/repos/agent-gtd-dispatch/commit/98e1c202224bc543e37aaf34b8c65834e1142373))
+
+
 ## v2.21.0 (2026-11-03)
 
 ### Features
