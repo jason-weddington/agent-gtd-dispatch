@@ -506,7 +506,7 @@ owned by `dispatch-svc`. In single-user mode it is installed at
 
 ## Talos engine provisioning (--with-talos)
 
-Step 4.5b of the installer optionally builds and installs the `talos` binary for the agent user. This binary powers the `talos-*` engine family (`talos-haiku`, `talos-sonnet`, `talos-opus`, `talos-qwen`, `talos-glm`, `talos-glm-flash`). The step is **opt-in** — pass `--with-talos` to enable it. Without the flag the step prints a single `[SKIP]` line and mutates nothing.
+Step 4.5b of the installer optionally builds and installs the `talos` binary for the agent user. This binary powers the `talos-*` engine family (`talos-haiku`, `talos-sonnet`, `talos-opus`, `talos-qwen`, `talos-glm`, `talos-glm-flash`, `talos-deepseek`). The step is **opt-in** — pass `--with-talos` to enable it. Without the flag the step prints a single `[SKIP]` line and mutates nothing.
 
 ### When to use it
 

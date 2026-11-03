@@ -57,6 +57,7 @@ from .engines import (
     get_available_engine_names,
     get_engine,
     is_engine_allowed,
+    is_engine_available,
     is_talos_engine,
 )
 from .models import (
@@ -5660,6 +5661,11 @@ class _RolloutLoopState:
     halt_cancelled_reviews: int = 0
     # Quiets the drain-finishing INFO line after the first tick that logs it.
     drain_finishing_logged: bool = False
+    # Per-tick reviewer-engine override bookkeeping (AC7): the resolved engine
+    # name and ignore-reason of the LAST tick, so transition log lines and the
+    # ignored-override phase post fire exactly once per change, not per tick.
+    applied_reviewer_engine: str | None = None
+    applied_reviewer_engine_reason: str | None = None
 
 
 def _held_slots(loop_state: _RolloutLoopState) -> list[int]:
@@ -6007,6 +6013,116 @@ def _start_land(
     )
 
 
+async def _tick_reviewer_engine(
+    rollout: dict[str, Any],
+    current: Engine,
+    loop_state: _RolloutLoopState | None = None,
+    *,
+    token: str | None = None,
+) -> Engine:
+    """Resolve THIS tick's reviewer engine from the board's override (AC7).
+
+    Reads ``effective_reviewer_engine`` off the freshly fetched rollout.  A
+    missing or blank value (an older board, or the board having cleared the
+    override) keeps *current* — the BASE engine the loop resolved once in
+    :func:`_drive_rollout` (stored ``reviewer_engine``, else
+    ``config.REVIEWER_ENGINE``) — so clearing the override reverts a live
+    loop.  The override is honoured only for a claude-code-family engine
+    that is available on this host; otherwise *current* is kept and the
+    reason is one of ``unknown-engine``, ``not-claude-code-family`` (which
+    covers every talos engine and kiro) or ``unavailable-on-host``.
+
+    Logging is on TRANSITION only: with a *loop_state*, the switch / revert /
+    ignored line is logged once per change — when the resolved engine name or
+    the ignore reason differs from the previous tick's — and a newly ignored
+    override also names the engine and reason in one
+    :func:`_publish_rollout_phase` post.  ``applied_reviewer_engine`` /
+    ``applied_reviewer_engine_reason`` carry the previous tick's values.
+    Without a *loop_state* (direct calls, e.g. from tests) the line always
+    fires.  Reviews already in flight are never touched; only the engine
+    returned here, which the tick uses for every review start and land that
+    follows.
+    """
+    override = str(rollout.get("effective_reviewer_engine") or "").strip()
+    reason: str | None = None
+    resolved = current
+    candidate: Engine | None = None
+    if override and override != current.name:
+        try:
+            candidate = get_engine(override)
+        except ValueError:
+            reason = "unknown-engine"
+    if candidate is not None and reason is None:
+        if not candidate.is_claude_code_family:
+            reason = "not-claude-code-family"
+        elif not is_engine_available(candidate):
+            reason = "unavailable-on-host"
+        else:
+            resolved = candidate
+
+    rollout_id = str(rollout.get("id") or "")
+    if reason is not None:
+        # Ignored override: once per (engine, reason) change.
+        transition = (
+            loop_state is None
+            or loop_state.applied_reviewer_engine != current.name
+            or loop_state.applied_reviewer_engine_reason != reason
+        )
+        if transition:
+            logger.warning(
+                "rollout-loop: reviewer-engine-override-ignored rollout_id=%s "
+                "engine=%s reason=%s",
+                rollout_id,
+                override,
+                reason,
+            )
+            await _publish_rollout_phase(
+                rollout_id,
+                "polling",
+                step=(
+                    f"Reviewer engine override {override} ignored "
+                    f"(reason={reason}); using {current.name}"
+                ),
+                token=token,
+            )
+    elif resolved is not current:
+        # Switch to the override engine: once per resolved-engine change.
+        transition = (
+            loop_state is None
+            or loop_state.applied_reviewer_engine != resolved.name
+            or loop_state.applied_reviewer_engine_reason != reason
+        )
+        if transition:
+            from_name = (
+                loop_state.applied_reviewer_engine
+                if loop_state is not None
+                and loop_state.applied_reviewer_engine is not None
+                else current.name
+            )
+            logger.info(
+                "rollout-loop: reviewer-engine-switch rollout_id=%s from=%s to=%s",
+                rollout_id,
+                from_name,
+                resolved.name,
+            )
+    else:
+        # Staying on the base engine: log ONLY a revert (the loop previously
+        # resolved to the override engine); never a quiet first tick or a
+        # board with no override.
+        prev = loop_state.applied_reviewer_engine if loop_state is not None else None
+        if prev is not None and prev != current.name:
+            logger.info(
+                "rollout-loop: reviewer-engine-switch rollout_id=%s from=%s to=%s",
+                rollout_id,
+                prev,
+                resolved.name,
+            )
+    if loop_state is not None:
+        loop_state.applied_reviewer_engine = resolved.name
+        loop_state.applied_reviewer_engine_reason = reason
+    return resolved
+
+
 async def _rollout_wave_tick(
     rollout_id: str,
     *,
@@ -6110,6 +6226,16 @@ async def _rollout_wave_tick(
             _TICK_HALTED if reread_status == "halted" else _TICK_DONE,
         )
     rollout = await gtd_client.get_rollout(rollout_id, token=token)
+    # Re-read the board's reviewer-engine override EVERY tick (AC7): a
+    # reviewer-overflow switch reaches this live loop on its next tick, and a
+    # cleared override reverts to the base engine the loop resolved at start.
+    # Rebind the tick-local engine so every review started, land and
+    # _launch_reviewer call from here on in the tick uses it; reviews
+    # already in flight (loop_state.reviews) keep the engine they started
+    # with.
+    reviewer_engine = await _tick_reviewer_engine(
+        rollout, reviewer_engine, loop_state, token=token
+    )
 
     status = str(rollout.get("status") or "")
     if status != "running":

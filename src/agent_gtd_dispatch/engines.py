@@ -530,6 +530,15 @@ TALOS_GLM_FLASH = Engine(
     build_command=_talos_build_command_stub,
 )
 
+TALOS_DEEPSEEK = Engine(
+    name="talos-deepseek",
+    binary="talos",
+    # ollama-cloud-routed: auth flows via env overlay (OLLAMA_API_KEY=cloud key)
+    auth_env_key="",
+    env_keys=frozenset(),
+    build_command=_talos_build_command_stub,
+)
+
 ENGINES: dict[str, Engine] = {
     "claude-code": CLAUDE,
     "kiro": KIRO,
@@ -543,13 +552,15 @@ ENGINES: dict[str, Engine] = {
     "talos-qwen": TALOS_QWEN,
     "talos-glm": TALOS_GLM,
     "talos-glm-flash": TALOS_GLM_FLASH,
+    "talos-deepseek": TALOS_DEEPSEEK,
 }
 
 # Talos-family engine names. is_talos_engine is the canonical branch discriminator
 # used in main._dispatch_worker to route talos runs down the talos.py subprocess
 # path instead of the shared run_agent + verify_pushes path used by the claude
-# family. get_engine() must still succeed for all six so the /dispatch endpoint's
-# up-front get_engine(effective_engine_name) call resolves before the branch.
+# family. get_engine() must still succeed for all of them so the /dispatch
+# endpoint's up-front get_engine(effective_engine_name) call resolves before the
+# branch.
 TALOS_ENGINES: frozenset[str] = frozenset(
     m.value for m in BuildEngine if m.value.startswith("talos-")
 )
@@ -568,7 +579,7 @@ _CLAUDE_CODE_ENGINES: frozenset[str] = frozenset(
 # All engine names gated on OLLAMA_CLOUD_API_KEY.  Listed here rather than
 # inline so the error message can enumerate the withheld engines dynamically.
 _OLLAMA_CLOUD_ENGINE_NAMES: frozenset[str] = frozenset(
-    {"claude-code-glm", "talos-glm", "talos-glm-flash"}
+    {"claude-code-glm", "talos-glm", "talos-glm-flash", "talos-deepseek"}
 )
 
 # "Logged once" sentinels for the cloud-key availability gate so that

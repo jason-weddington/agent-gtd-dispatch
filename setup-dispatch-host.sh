@@ -890,7 +890,7 @@ else
             echo ""
             warn "OLLAMA_CLOUD_API_KEY in ${SERVICE_ENV} was REJECTED by ollama.com (HTTP ${_probe_code})."
             warn "Key length: ${#_ollama_cloud_key} chars (a valid key is typically 57 chars)."
-            warn "The GLM-family engines (talos-glm, claude-code-glm, talos-glm-flash) will be"
+            warn "The GLM/DeepSeek cloud engines (talos-glm, claude-code-glm, talos-glm-flash, talos-deepseek) will be"
             warn "UNAVAILABLE until this is fixed. Update OLLAMA_CLOUD_API_KEY in ${SERVICE_ENV}"
             warn "with a valid key from https://ollama.com, then: systemctl restart ${SERVICE_NAME}"
             echo ""

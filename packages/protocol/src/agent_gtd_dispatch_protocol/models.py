@@ -58,6 +58,7 @@ class BuildEngine(StrEnum):
     TALOS_QWEN = "talos-qwen"
     TALOS_GLM = "talos-glm"
     TALOS_GLM_FLASH = "talos-glm-flash"
+    TALOS_DEEPSEEK = "talos-deepseek"
 
 
 class DispatchRequest(BaseModel):

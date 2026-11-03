@@ -718,6 +718,7 @@ class TestOllamaCloudEngineGating:
 
         assert engines.is_engine_available(engines.TALOS_GLM) is False
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is False
+        assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is False
         assert cloud_auth._probe_result is None
 
     def test_valid_probe_makes_engine_available(self, monkeypatch) -> None:
@@ -729,6 +730,37 @@ class TestOllamaCloudEngineGating:
 
         assert engines.is_engine_available(engines.TALOS_GLM) is True
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is True
+        assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is True
+
+    def test_one_probe_serves_all_three_cloud_engines(self, monkeypatch) -> None:
+        """One network probe backs the availability of ALL three cloud engines."""
+        import urllib.request
+
+        from agent_gtd_dispatch import cloud_auth, config, engines
+
+        monkeypatch.setattr(cloud_auth, "_probe_result", None)
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "valid-key")
+        urlopens: list[object] = []
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self) -> _Resp:
+                return self
+
+            def __exit__(self, *args: object) -> bool:
+                return False
+
+        def _fake_urlopen(req: object, timeout: float) -> _Resp:
+            urlopens.append(req)
+            return _Resp()
+
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+        assert engines.is_engine_available(engines.TALOS_GLM) is True
+        assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is True
+        assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is True
+        assert len(urlopens) == 1, "the probe must run exactly once for all three"
 
     def test_invalid_probe_makes_engine_unavailable(self, monkeypatch) -> None:
         """Key present + probe='invalid' → engine unavailable (both GLM engines)."""
@@ -739,6 +771,7 @@ class TestOllamaCloudEngineGating:
 
         assert engines.is_engine_available(engines.TALOS_GLM) is False
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is False
+        assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is False
 
     def test_unknown_probe_keeps_engine_available(self, monkeypatch) -> None:
         """Key present + probe='unknown' → engine remains available (network blip)."""
@@ -749,6 +782,7 @@ class TestOllamaCloudEngineGating:
 
         assert engines.is_engine_available(engines.TALOS_GLM) is True
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is True
+        assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is True
 
     def test_invalid_probe_logs_error_once_with_key_length(
         self, monkeypatch, caplog
@@ -770,6 +804,10 @@ class TestOllamaCloudEngineGating:
         assert len(errors) == 1, "ERROR must be logged exactly once"
         assert "51" in errors[0].message  # key length present
         assert key not in errors[0].message  # key value absent
+        # The withheld list names every registered cloud engine.
+        assert "talos-glm" in errors[0].message
+        assert "talos-glm-flash" in errors[0].message
+        assert "talos-deepseek" in errors[0].message
 
     def test_unknown_probe_logs_warning_once(self, monkeypatch, caplog) -> None:
         """'unknown' logs exactly one WARNING; no re-log on subsequent calls."""

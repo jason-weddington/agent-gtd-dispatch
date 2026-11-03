@@ -71,7 +71,7 @@ def project_fixture() -> dict:
 
 
 class TestTalosEngineRoster:
-    def test_all_six_talos_engines_registered(self) -> None:
+    def test_all_talos_engines_registered(self) -> None:
         from agent_gtd_dispatch.engines import (
             TALOS_ENGINES,
             get_engine,
@@ -84,6 +84,7 @@ class TestTalosEngineRoster:
             "talos-qwen",
             "talos-glm",
             "talos-glm-flash",
+            "talos-deepseek",
         }
         assert frozenset(expected) == TALOS_ENGINES
         for name in expected:
@@ -100,7 +101,7 @@ class TestTalosEngineRoster:
     def test_talos_ollama_engines_have_empty_auth_env(self) -> None:
         from agent_gtd_dispatch.engines import get_engine
 
-        for name in ("talos-qwen", "talos-glm", "talos-glm-flash"):
+        for name in ("talos-qwen", "talos-glm", "talos-glm-flash", "talos-deepseek"):
             assert get_engine(name).auth_env_key == ""
 
     def test_talos_build_command_raises_not_implemented(self) -> None:
@@ -122,6 +123,7 @@ class TestTalosEngineRoster:
         assert is_talos_engine("talos-haiku")
         assert is_talos_engine("talos-glm")
         assert is_talos_engine("talos-glm-flash")
+        assert is_talos_engine("talos-deepseek")
         assert not is_talos_engine("claude-code")
         assert not is_talos_engine("claude-code-ollama")
         assert not is_talos_engine("")
@@ -253,6 +255,37 @@ class TestTalosEnvOverlay:
         glm_overlay = talos_env_overlay("talos-glm")
         assert overlay["OLLAMA_MODEL"] != glm_overlay["OLLAMA_MODEL"]
 
+    def test_deepseek_overlay_literal_exact_dict(self) -> None:
+        """talos-deepseek overlay is an exact-dict with deepseek-v4.1-flash:cloud."""
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        # KB config empty in the test env: the overlay must be EXACTLY the
+        # six cloud keys, no PERSONAL_KB_* keys.
+        overlay = talos_env_overlay("talos-deepseek")
+        assert overlay == {
+            "TALOS_BACKEND": "ollama",
+            "OLLAMA_MODEL": "deepseek-v4.1-flash:cloud",
+            "OLLAMA_BASE_URL": "https://ollama.com",
+            "OLLAMA_NUM_CTX": "1048576",
+            "OLLAMA_THINK": "high",
+            "OLLAMA_API_KEY": config.OLLAMA_CLOUD_API_KEY,
+        }
+        # No fallback to OLLAMA_API_KEY
+        assert overlay["OLLAMA_API_KEY"] != config.OLLAMA_API_KEY
+
+    def test_deepseek_model_ignores_cloud_model_override(self, monkeypatch) -> None:
+        # The model is a fixed literal; OLLAMA_CLOUD_MODEL steers
+        # claude-code-glm only and must not retarget talos-deepseek.
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_MODEL", "other-model:cloud")
+        assert (
+            talos_env_overlay("talos-deepseek")["OLLAMA_MODEL"]
+            == "deepseek-v4.1-flash:cloud"
+        )
+
     def test_glm_think_pinned_high(self) -> None:
         """OLLAMA_THINK='high' is pinned for BOTH glm engines — never unset."""
         from agent_gtd_dispatch.talos import talos_env_overlay
@@ -294,6 +327,7 @@ class TestTalosEnvOverlay:
             "talos-qwen",
             "talos-glm",
             "talos-glm-flash",
+            "talos-deepseek",
         ):
             overlay = talos_env_overlay(name)
             for key in overlay:
@@ -308,6 +342,7 @@ class TestTalosEnvOverlay:
         monkeypatch.setattr(config, "OLLAMA_API_KEY", "local-secret")
         monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud-secret")
         assert talos_env_overlay("talos-glm")["OLLAMA_API_KEY"] == "cloud-secret"
+        assert talos_env_overlay("talos-deepseek")["OLLAMA_API_KEY"] == "cloud-secret"
         assert talos_env_overlay("talos-qwen")["OLLAMA_API_KEY"] == "local-secret"
 
     def test_qwen_keep_alive_absent_when_empty(self, monkeypatch) -> None:
@@ -601,6 +636,7 @@ class TestTalosAvailabilityGating:
             "talos-qwen",
             "talos-glm",
             "talos-glm-flash",
+            "talos-deepseek",
         ):
             assert talos in names
 

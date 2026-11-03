@@ -2690,6 +2690,7 @@ ENGINE_RUBRIC_DESCRIPTIONS: dict[str, str] = {
     "talos-qwen": "talos harness with Qwen, cheap, moderate reasoning",
     "talos-glm": "talos harness with GLM, cheap, moderate reasoning",
     "talos-glm-flash": "talos harness with GLM Flash, cheapest, mechanical work",
+    "talos-deepseek": "talos harness with DeepSeek on Ollama cloud, cheap, moderate reasoning",
 }
 
 

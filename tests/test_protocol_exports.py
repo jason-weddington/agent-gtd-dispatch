@@ -54,5 +54,7 @@ class TestProtocolExports:
             "talos-qwen",
             "talos-glm",
             "talos-glm-flash",
+            "talos-deepseek",
         ]
         assert BuildEngine("talos-glm-flash") is BuildEngine.TALOS_GLM_FLASH
+        assert BuildEngine("talos-deepseek") is BuildEngine.TALOS_DEEPSEEK

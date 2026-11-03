@@ -117,12 +117,13 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
     - ``OLLAMA_THINK='on'`` for talos-qwen — the qwen model expects thinking.
     - talos-qwen's num_ctx defaults to 262144 and a host can override it with
       ``TALOS_QWEN_NUM_CTX`` (the model likewise via ``TALOS_QWEN_MODEL``, the
-      endpoint via ``TALOS_QWEN_BASE_URL``); the talos-glm and talos-glm-flash
-      literals below stay fixed. ``TALOS_QWEN_KEEP_ALIVE`` (optional,
-      host-local) is passed through verbatim as ``TALOS_OLLAMA_KEEP_ALIVE`` for
-      talos-qwen only, never as the unprefixed ``OLLAMA_KEEP_ALIVE`` (which
-      collides with the Ollama server's own variable), and takes effect only
-      with a talos build that reads TALOS_OLLAMA_KEEP_ALIVE.
+      endpoint via ``TALOS_QWEN_BASE_URL``); the talos-glm, talos-glm-flash
+      and talos-deepseek literals below stay fixed. ``TALOS_QWEN_KEEP_ALIVE``
+      (optional, host-local) is passed through verbatim as
+      ``TALOS_OLLAMA_KEEP_ALIVE`` for talos-qwen only, never as the unprefixed
+      ``OLLAMA_KEEP_ALIVE`` (which collides with the Ollama server's own
+      variable), and takes effect only with a talos build that reads
+      TALOS_OLLAMA_KEEP_ALIVE.
     - ``OLLAMA_NUM_CTX`` is pinned to each model's FULL context window for both
       Ollama engines, because talos only self-defaults num_ctx for localhost
       URLs (main.rs:328-329) — a remote/cloud Ollama with num_ctx unset silently
@@ -132,17 +133,20 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
       ``ContextLengthExceeded`` instead of silent truncation. Values:
       ``262144`` (256k) for talos-qwen (qwen3.8:27b's full window — fits the
       5090 host only with the Ollama server's 8-bit KV cache, see below) and
-      ``1048576`` (1M) for talos-glm / talos-glm-flash (glm-5.3:cloud /
-      glm-5.3-flash:cloud are 1M-context models).
-    - ``OLLAMA_BASE_URL='https://ollama.com'`` for talos-glm and talos-glm-flash
-      — glm-5.3:cloud and glm-5.3-flash:cloud live only on Ollama Cloud; no
-      operator override.
-    - ``OLLAMA_THINK='high'`` for talos-glm (model=glm-5.3:cloud) and
-      talos-glm-flash (model=glm-5.3-flash:cloud) — PINNED at 'high' for both.
+      ``1048576`` (1M) for talos-glm / talos-glm-flash / talos-deepseek
+      (glm-5.3:cloud / glm-5.3-flash:cloud / deepseek-v4.1-flash:cloud are
+      1M-context models).
+    - ``OLLAMA_BASE_URL='https://ollama.com'`` for talos-glm, talos-glm-flash
+      and talos-deepseek — glm-5.3:cloud, glm-5.3-flash:cloud and
+      deepseek-v4.1-flash:cloud live only on Ollama Cloud; no operator
+      override.
+    - ``OLLAMA_THINK='high'`` for talos-glm (model=glm-5.3:cloud),
+      talos-glm-flash (model=glm-5.3-flash:cloud) and talos-deepseek
+      (model=deepseek-v4.1-flash:cloud) — PINNED at 'high' for all of them.
       glm-5.3 defaults to max when unset (2.3x tokens, 3-6x wall vs. @high on
       hard fixtures, one MaxIterations miss); flash@low produced a false-done
-      where flash@high had none. Never leave OLLAMA_THINK unset for either GLM
-      engine.
+      where flash@high had none. Never leave OLLAMA_THINK unset for any of
+      these Ollama-cloud engines.
 
     KB access: talos runs get ``PERSONAL_KB_URL`` + ``PERSONAL_KB_API_KEY``. The
     key comes from ``TALOS_PERSONAL_KB_API_KEY`` in the service env (a key minted
@@ -240,6 +244,25 @@ def _engine_env_overlay(engine_name: str) -> dict[str, str]:
             # Pinned at 'high' — flash@low produced a false-done; see docstring.
             "OLLAMA_THINK": "high",
             # No fallback to config.OLLAMA_API_KEY — see config.py comment.
+            "OLLAMA_API_KEY": config.OLLAMA_CLOUD_API_KEY,
+        }
+    if engine_name == "talos-deepseek":
+        return {
+            "TALOS_BACKEND": "ollama",
+            # Fixed literal: deepseek-v4.1-flash:cloud is the pinned DeepSeek
+            # cloud model; never read from config (see the talos-glm branch —
+            # OLLAMA_CLOUD_MODEL steers claude-code-glm only).
+            "OLLAMA_MODEL": "deepseek-v4.1-flash:cloud",
+            # The only hardcoded base URL — deepseek-v4.1-flash:cloud lives on
+            # Ollama Cloud.
+            "OLLAMA_BASE_URL": "https://ollama.com",
+            # DeepSeek's FULL 1M window — same pin and reasoning as talos-glm.
+            "OLLAMA_NUM_CTX": "1048576",
+            # Pinned at 'high' — see docstring (never leave OLLAMA_THINK unset
+            # for the GLM/DeepSeek cloud engines).
+            "OLLAMA_THINK": "high",
+            # Distinct cloud key — no fallback to config.OLLAMA_API_KEY (see
+            # config.py comment on OLLAMA_CLOUD_API_KEY).
             "OLLAMA_API_KEY": config.OLLAMA_CLOUD_API_KEY,
         }
     msg = f"Not a talos engine: {engine_name!r}"
