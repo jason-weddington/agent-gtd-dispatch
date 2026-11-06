@@ -69,6 +69,7 @@ DEV_TOOLCHAIN_APT_PKGS=(
   libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev  # Tauri 2
   libayatana-appindicator3-dev librsvg2-dev libxdo-dev file                        # Tauri 2
   shellcheck python3                             # shell linting + scripts in project gates (poolhouse vm-harness-selftest)
+  gcc-arm-linux-gnueabihf                       # armv7 C cross compiler (aws-lc-sys in a 32-bit cross-check gate)
 )
 DEV_TOOLCHAIN_NPM_GLOBAL_PKGS=(
   "pnpm|pnpm"   # JS package manager used by Tauri app frontends

@@ -18,6 +18,7 @@ DEPLOY_SCRIPT = REPO_ROOT / "deploy.sh"
 
 REQUIRED_APT = {
     "cmake",
+    "gcc-arm-linux-gnueabihf",
     "libasound2-dev",
     "libclang-dev",
     "pkg-config",
