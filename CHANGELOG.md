@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.22.2 (2026-11-06)
+
+### Bug Fixes
+
+- **87a71352**: Rollout loop: a transient board outage during a re-dispatch retries instead of
+  halting the rollout
+  ([`33bb86a`](https://github.com/repos/agent-gtd-dispatch/commit/33bb86a464c8035e4a11d010d0bdb2be570efd7b))
+
+
 ## v2.22.1 (2026-11-03)
 
 ### Bug Fixes
