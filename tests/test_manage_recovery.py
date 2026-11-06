@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections import deque
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,6 +83,17 @@ def _loop_patch_stack():
         mock_gtd.dispatch_item = AsyncMock(return_value={"id": "child-run"})
         mock_gtd.reset_rollout_item = AsyncMock(return_value={})
         mock_gtd.complete_in_rollout = AsyncMock(return_value={"newly_ready": []})
+        # The re-dispatch branch re-reads the item's runs and the wave before it
+        # touches the board; a bare MagicMock would raise on the first `await`.
+        mock_gtd.list_runs_for_item = AsyncMock(return_value=[])
+        mock_gtd.advance_rollout = AsyncMock(
+            return_value={
+                "next_ready": [],
+                "in_progress": ["item-a"],
+                "blocked": [],
+                "graph_complete": False,
+            }
+        )
         mock_gtd.get_item = AsyncMock(return_value={"id": "item-a", "title": "t"})
         mock_db.insert_run = AsyncMock()
         mock_db.update_run = AsyncMock()
@@ -2897,6 +2909,427 @@ class TestTickIsSafeToReRunAfterATimeout:
             )
             ctx.gtd.get_item.assert_not_awaited()
         assert ctx.dispatch.build_review_prompt.call_args.args[0] is item
+
+
+class _FakeBoard:
+    """A stateful stand-in for the board endpoints a re-dispatch touches.
+
+    A ``SimpleNamespace`` of fixed ``return_value``s cannot express the reset /
+    advance / dispatch coupling these tests need: the reset moves the item to
+    ``ready``, the dispatch moves it back to ``dispatched`` and appends a run,
+    and ``advance_rollout`` reports whichever list the item's status implies.
+    Install with ``board.install(ctx)``; each per-call failure deque holds the
+    exceptions the *next* call of that kind raises.
+    """
+
+    def __init__(self) -> None:
+        self.item_status = "dispatched"
+        self.runs: list[dict[str, object]] = [
+            {
+                "id": "run-0",
+                "rollout_id": "rollout-abc",
+                "status": "failed",
+                "created_at": "2026-11-03T10:00:00Z",
+            }
+        ]
+        self.reset_calls = 0
+        self.dispatch_calls = 0
+        self.list_runs_errors: deque[BaseException] = deque()
+        self.reset_errors: deque[BaseException] = deque()
+        self.reset_landed_errors: deque[BaseException] = deque()
+        self.dispatch_errors: deque[BaseException] = deque()
+        self.dispatch_landed_errors: deque[BaseException] = deque()
+        self.advance_error: BaseException | None = None
+
+    def install(self, ctx) -> None:
+        ctx.gtd.list_runs_for_item = AsyncMock(side_effect=self.list_runs_for_item)
+        ctx.gtd.advance_rollout = AsyncMock(side_effect=self.advance_rollout)
+        ctx.gtd.reset_rollout_item = AsyncMock(side_effect=self.reset_rollout_item)
+        ctx.gtd.dispatch_item = AsyncMock(side_effect=self.dispatch_item)
+
+    async def list_runs_for_item(
+        self, item_id: str, *, token: str | None = None
+    ) -> list[dict[str, object]]:
+        # NEWEST FIRST, mirroring the real endpoint's ORDER BY created_at DESC:
+        # the ids ascend while the order descends, so picking by position fails.
+        if self.list_runs_errors:
+            raise self.list_runs_errors.popleft()
+        return sorted(self.runs, key=lambda r: str(r["created_at"]), reverse=True)
+
+    async def advance_rollout(
+        self, rollout_id: str, *, token: str | None = None
+    ) -> dict[str, object]:
+        if self.advance_error is not None:
+            raise self.advance_error
+        if self.item_status == "dispatched":
+            next_ready: list[str] = []
+            in_progress = ["item-a"]
+        elif self.item_status in ("pending", "ready"):
+            next_ready = ["item-a"]
+            in_progress = []
+        else:
+            next_ready = []
+            in_progress = []
+        return {
+            "next_ready": next_ready,
+            "in_progress": in_progress,
+            "blocked": [],
+            "graph_complete": False,
+        }
+
+    async def reset_rollout_item(
+        self, rollout_id: str, item_id: str, *, token: str | None = None
+    ) -> dict[str, object]:
+        self.reset_calls += 1
+        if self.reset_errors:
+            raise self.reset_errors.popleft()
+        if self.item_status != "dispatched":
+            raise _http_error(422)
+        self.item_status = "ready"
+        if self.reset_landed_errors:
+            raise self.reset_landed_errors.popleft()
+        return {"rollout_id": rollout_id, "item_id": item_id, "status": "ready"}
+
+    async def dispatch_item(
+        self, item_id: str, *, rollout_id: str, token: str | None = None
+    ) -> dict[str, object]:
+        self.dispatch_calls += 1
+        if any(
+            str(r["status"]) in ("pending", "queued", "cloning", "running")
+            for r in self.runs
+        ):
+            raise _http_error(409)
+        if self.dispatch_errors:
+            raise self.dispatch_errors.popleft()
+        n = len(self.runs)
+        self.runs.append(
+            {
+                "id": f"run-{n}",
+                "rollout_id": rollout_id,
+                "status": "pending",
+                "created_at": f"2026-11-03T10:00:{n:02d}Z",
+            }
+        )
+        # The board INSERTs the run unconditionally and only then links it with
+        # `... AND status = 'ready'`, so dispatching a non-ready item yields an
+        # orphan run — modelling that is what makes a skipped reset visible.
+        if self.item_status == "ready":
+            self.item_status = "dispatched"
+        if self.dispatch_landed_errors:
+            raise self.dispatch_landed_errors.popleft()
+        return {"id": f"run-{n}"}
+
+
+class TestRedispatchRidesOutBoardOutages:
+    """Regression for rollout f4e44899 (2026-11-03).
+
+    A transient board/network outage during a 09:15-10:15Z LAN/git outage
+    halted the rollout through the loop's RE-DISPATCH path, right after the
+    reviewer chose re-dispatch because the build's git push had failed. The
+    two board calls of that verdict must ride out an outage like the rest of
+    the tick, and the retry must not dispatch the item twice.
+    """
+
+    @staticmethod
+    async def _redispatch(ctx) -> str:
+        from agent_gtd_dispatch.main import ReviewVerdict, _act_on_verdict
+
+        return await _act_on_verdict(
+            "rollout-abc",
+            "item-a",
+            ReviewVerdict("re-dispatch", "because", "note", ""),
+            token=None,
+            attribution=None,
+        )
+
+    @pytest.mark.parametrize("failures", [0, 1, 3])
+    async def test_transient_dispatch_errors_are_retried_then_the_item_is_dispatched(
+        self, failures: int, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        caplog.set_level(logging.INFO, logger="agent_gtd_dispatch.main")
+        board = _FakeBoard()
+        # A raised call creates nothing: exactly one run can ever land.
+        board.dispatch_errors = deque([_read_timeout()] * failures)
+        with _loop_patch_stack() as ctx:
+            board.install(ctx)
+            assert await self._redispatch(ctx) == _TICK_CONTINUE
+            ctx.gtd.halt_rollout.assert_not_awaited()
+            # Host-state independence: nothing on the host was touched.
+            ctx.dispatch.prepare_rollout_workspace.assert_not_called()
+            ctx.db.insert_run.assert_not_awaited()
+
+        assert ctx.sleep.await_count == failures
+        assert [c.args for c in ctx.sleep.await_args_list] == [
+            (config.ROLLOUT_LOOP_POLL_SECONDS,)
+        ] * failures
+        assert board.dispatch_calls == failures + 1
+        # One bare read per attempt: `_latest_run_for_item` is not on the path.
+        assert ctx.gtd.list_runs_for_item.await_count == failures + 1
+        assert board.reset_calls == 1
+        assert len(board.runs) == 2
+        assert board.runs[1]["id"] == "run-1"
+
+        unavailable = [
+            r for r in caplog.records if "board-unavailable" in r.getMessage()
+        ]
+        assert len(unavailable) == failures
+        if failures:
+            assert "scope=redispatch" in unavailable[0].getMessage()
+        retried = [
+            r.getMessage()
+            for r in caplog.records
+            if "redispatch-retried" in r.getMessage()
+        ]
+        if failures == 0:
+            assert retried == []
+        else:
+            assert retried == [
+                "rollout-loop: redispatch-retried rollout_id=rollout-abc "
+                f"item_id=item-a failures={failures}"
+            ]
+        recovered = [
+            r.getMessage()
+            for r in caplog.records
+            if "board-outage-recovered" in r.getMessage()
+        ]
+        assert len(recovered) == (1 if failures else 0)
+
+    async def test_baseline_read_rides_out_an_outage(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        board = _FakeBoard()
+        # The FIRST read — the baseline capture — times out before returning.
+        board.list_runs_errors = deque([_read_timeout()])
+        with _loop_patch_stack() as ctx:
+            board.install(ctx)
+            assert await self._redispatch(ctx) == _TICK_CONTINUE
+            ctx.gtd.halt_rollout.assert_not_awaited()
+
+        assert ctx.sleep.await_count == 1
+        assert board.reset_calls == 1
+        assert board.dispatch_calls == 1
+        assert len(board.runs) == 2
+
+    async def test_dispatch_landed_then_response_lost_is_not_re_dispatched(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        caplog.set_level(logging.INFO, logger="agent_gtd_dispatch.main")
+        board = _FakeBoard()
+        # The POST commits its row, THEN raises: the response was lost.
+        board.dispatch_landed_errors = deque([_read_timeout()])
+        with _loop_patch_stack() as ctx:
+            board.install(ctx)
+            assert await self._redispatch(ctx) == _TICK_CONTINUE
+            ctx.gtd.halt_rollout.assert_not_awaited()
+
+        assert board.dispatch_calls == 1
+        assert len(board.runs) == 2
+        assert board.runs[1]["id"] == "run-1"
+        assert board.reset_calls == 1
+        assert ctx.sleep.await_count == 1
+        ctx.gtd.post_comment.assert_awaited()
+        messages = [r.getMessage() for r in caplog.records]
+        assert [m for m in messages if "redispatch-retried" in m] == [
+            "rollout-loop: redispatch-retried rollout_id=rollout-abc "
+            "item_id=item-a failures=1"
+        ]
+        assert [m for m in messages if "board-outage-recovered" in m] == [
+            "rollout-loop: board-outage-recovered rollout_id=rollout-abc "
+            "scope=redispatch item_id=item-a failures=1"
+        ]
+        assert len([m for m in messages if "re-dispatched" in m]) == 1
+
+    async def test_reset_landed_then_response_lost_is_not_reset_twice(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        board = _FakeBoard()
+        # The reset sets the item to `ready`, THEN raises.
+        board.reset_landed_errors = deque([_read_timeout()])
+        with _loop_patch_stack() as ctx:
+            board.install(ctx)
+            assert await self._redispatch(ctx) == _TICK_CONTINUE
+            ctx.gtd.halt_rollout.assert_not_awaited()
+
+        # The second attempt sees the item in next_ready and skips the reset.
+        assert board.reset_calls == 1
+        assert board.dispatch_calls == 1
+        assert len(board.runs) == 2
+        assert ctx.sleep.await_count == 1
+
+    async def test_first_attempt_reset_422_halts(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        board = _FakeBoard()
+        board.reset_errors = deque([_http_error(422)])
+        with _loop_patch_stack() as ctx:
+            board.install(ctx)
+            assert await self._redispatch(ctx) == _TICK_HALTED
+            assert (
+                ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+                == "re-dispatch of item item-a failed: HTTPStatusError: 422"
+            )
+            ctx.sleep.assert_not_awaited()
+
+        assert board.reset_calls == 1
+        assert board.dispatch_calls == 0
+
+    async def test_409_backed_by_a_new_run_lands(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent_gtd_dispatch.main import _TICK_CONTINUE
+
+        caplog.set_level(logging.INFO, logger="agent_gtd_dispatch.main")
+        board = _FakeBoard()
+        board.dispatch_landed_errors = deque([_http_error(409)])
+        with _loop_patch_stack() as ctx:
+            board.install(ctx)
+            assert await self._redispatch(ctx) == _TICK_CONTINUE
+            ctx.gtd.halt_rollout.assert_not_awaited()
+            ctx.sleep.assert_not_awaited()
+
+        assert board.dispatch_calls == 1
+        assert len(board.runs) == 2
+        # Nothing was absorbed: the run the refused POST created proves it landed.
+        assert not any("redispatch-retried" in r.getMessage() for r in caplog.records)
+
+    async def test_409_not_backed_by_a_run_halts(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        board = _FakeBoard()
+        board.dispatch_errors = deque([_http_error(409)])
+        with _loop_patch_stack() as ctx:
+            board.install(ctx)
+            assert await self._redispatch(ctx) == _TICK_HALTED
+            assert (
+                ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+                == "re-dispatch of item item-a failed: HTTPStatusError: 409"
+            )
+            ctx.sleep.assert_not_awaited()
+
+        assert board.dispatch_calls == 1
+        assert len(board.runs) == 1
+
+    async def test_dispatch_400_halts_with_the_unchanged_reason(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        board = _FakeBoard()
+        board.dispatch_errors = deque([_http_error(400)])
+        with _loop_patch_stack() as ctx:
+            board.install(ctx)
+            assert await self._redispatch(ctx) == _TICK_HALTED
+            assert (
+                ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+                == "re-dispatch of item item-a failed: HTTPStatusError: 400"
+            )
+            ctx.sleep.assert_not_awaited()
+
+        assert board.dispatch_calls == 1
+
+    async def test_dispatch_500_halts(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        board = _FakeBoard()
+        board.dispatch_errors = deque([_http_error(500)])
+        with _loop_patch_stack() as ctx:
+            board.install(ctx)
+            assert await self._redispatch(ctx) == _TICK_HALTED
+            assert (
+                ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+                == "re-dispatch of item item-a failed: HTTPStatusError: 500"
+            )
+            ctx.sleep.assert_not_awaited()
+
+        assert board.dispatch_calls == 1
+
+    async def test_item_in_neither_list_halts(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        board = _FakeBoard()
+        with _loop_patch_stack() as ctx:
+            board.install(ctx)
+            ctx.gtd.advance_rollout = AsyncMock(
+                return_value={
+                    "next_ready": [],
+                    "in_progress": [],
+                    "blocked": [],
+                    "graph_complete": False,
+                }
+            )
+            assert await self._redispatch(ctx) == _TICK_HALTED
+            assert ctx.gtd.halt_rollout.await_args.kwargs["reason"] == (
+                "re-dispatch of item item-a failed: RuntimeError: re-dispatch of "
+                "item item-a: rollout item is neither ready nor in progress"
+            )
+            ctx.sleep.assert_not_awaited()
+
+        assert board.reset_calls == 0
+        assert board.dispatch_calls == 0
+
+    async def test_advance_422_halts(self) -> None:
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        board = _FakeBoard()
+        board.advance_error = _http_error(422)
+        with _loop_patch_stack() as ctx:
+            board.install(ctx)
+            assert await self._redispatch(ctx) == _TICK_HALTED
+            assert (
+                ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+                == "re-dispatch of item item-a failed: HTTPStatusError: 422"
+            )
+            ctx.sleep.assert_not_awaited()
+
+        assert board.reset_calls == 0
+        assert board.dispatch_calls == 0
+
+    async def test_an_exhausted_window_halts_the_rollout(
+        self, monkeypatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import itertools
+
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.main import _TICK_HALTED
+
+        caplog.set_level(logging.INFO, logger="agent_gtd_dispatch.main")
+        monkeypatch.setattr(config, "ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS", 100)
+        clock = itertools.count(0, 60)
+        board = _FakeBoard()
+        board.dispatch_errors = deque([_read_timeout() for _ in range(3)])
+        with (
+            _loop_patch_stack() as ctx,
+            patch(
+                "agent_gtd_dispatch.main._monotonic", side_effect=lambda: next(clock)
+            ),
+        ):
+            board.install(ctx)
+            assert await self._redispatch(ctx) == _TICK_HALTED
+
+        reason = ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+        assert reason.startswith("re-dispatch of item item-a failed: ReadTimeout")
+        # t=0 starts the streak, t=60 is inside the window, t=120 exceeds it.
+        assert ctx.sleep.await_count == 2
+        assert board.dispatch_calls == 3
+        assert board.reset_calls == 1
+        exceeded = [
+            r.getMessage()
+            for r in caplog.records
+            if "board-outage-exceeded" in r.getMessage()
+        ]
+        assert len(exceeded) == 1
+        for fragment in (
+            "scope=redispatch",
+            "item_id=item-a",
+            "consecutive=3",
+            "total=3",
+            "elapsed_secs=120",
+            "window_secs=100",
+        ):
+            assert fragment in exceeded[0]
 
 
 # ---------------------------------------------------------------------------

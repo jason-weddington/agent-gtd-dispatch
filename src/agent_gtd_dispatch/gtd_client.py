@@ -401,7 +401,13 @@ async def dispatch_item(
 async def list_runs_for_item(
     item_id: str, *, token: str | None = None
 ) -> list[dict[str, Any]]:
-    """GET /api/runs?item_id={item_id} → the item's runs, newest last.
+    """GET /api/runs?item_id={item_id} → the item's runs, NEWEST FIRST.
+
+    The endpoint orders ``created_at DESC``, so the first element is the newest.
+    Callers must not rely on the order, though: pick a run by
+    ``max(..., key=created_at)`` (as :func:`_latest_run_for_item` does) rather
+    than by position, and compare ids and timestamps as strings — the board
+    mixes ``Z`` and ``+00:00`` forms in ``created_at``.
 
     The wave loop needs the run record for an item whose build has gone
     terminal — branch name, status and ``error_msg`` (which carries the

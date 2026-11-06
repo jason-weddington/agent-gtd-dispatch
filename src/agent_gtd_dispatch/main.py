@@ -3445,6 +3445,15 @@ async def _act_on_verdict(
 
     *halt_suffix* is appended to the reason of any halt issued here (the
     rollout loop names the queued merge verdicts the halt discards).
+
+    A ``re-dispatch`` verdict's reset + dispatch goes through
+    :func:`_redispatch_item`, which retries both calls IN PLACE on a transient
+    board error under the loop's usual ``ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS``
+    window.  That retry is idempotent: the item's run list and the rollout
+    item's status are re-read before each attempt, so a reset or a dispatch
+    whose response was lost after it landed is not issued twice.  Only a
+    non-transient error, or an exhausted window, halts — with the unchanged
+    ``re-dispatch of item <id> failed: ...`` reason.
     """
     if outcome.verdict == "halt":
         reason = f"reviewer halted item {item_id}: {outcome.rationale}"
@@ -3540,8 +3549,7 @@ async def _act_on_verdict(
         )
     _rollout_redispatches[rollout_id][item_id] = used + 1
     try:
-        await gtd_client.reset_rollout_item(rollout_id, item_id, token=token)
-        await gtd_client.dispatch_item(item_id, rollout_id=rollout_id, token=token)
+        await _redispatch_item(rollout_id, item_id, token=token)
     except Exception as exc:
         return await _halt_rollout_from_loop(
             rollout_id,
@@ -5513,18 +5521,29 @@ class _BoardOutage:
     of the streak.  A call that completes without a transient error ends it.
     """
 
-    def __init__(self, rollout_id: str) -> None:
+    def __init__(
+        self, rollout_id: str, *, item_id: str | None = None, scope: str = "loop"
+    ) -> None:
         """Start with no outage in progress."""
         self.rollout_id = rollout_id
+        self.item_id = item_id
+        self.scope = scope
         self.count = 0
+        # Survives ``reset()``: how many board blips this instance absorbed in
+        # total, so a caller can tell "it retried once and succeeded" from "it
+        # never noticed".
+        self.total = 0
         self.started_at: float | None = None
 
     def reset(self) -> None:
         """A clean call: the streak is over."""
         if self.count:
             logger.info(
-                "rollout-loop: board-outage-recovered rollout_id=%s failures=%d",
+                "rollout-loop: board-outage-recovered rollout_id=%s scope=%s "
+                "item_id=%s failures=%d",
                 self.rollout_id,
+                self.scope,
+                self.item_id or "-",
                 self.count,
             )
         self.count = 0
@@ -5536,22 +5555,29 @@ class _BoardOutage:
         if self.started_at is None:
             self.started_at = now
         self.count += 1
+        self.total += 1
         elapsed = now - self.started_at
         if elapsed > config.ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS:
             logger.error(
-                "rollout-loop: board-outage-exceeded rollout_id=%s exc=%s "
-                "consecutive=%d elapsed_secs=%.0f window_secs=%d",
+                "rollout-loop: board-outage-exceeded rollout_id=%s scope=%s "
+                "item_id=%s exc=%s consecutive=%d total=%d elapsed_secs=%.0f "
+                "window_secs=%d",
                 self.rollout_id,
+                self.scope,
+                self.item_id or "-",
                 type(exc).__name__,
                 self.count,
+                self.total,
                 elapsed,
                 config.ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS,
             )
             return False
         logger.warning(
-            "rollout-loop: board-unavailable rollout_id=%s exc=%s consecutive=%d "
-            "elapsed_secs=%.0f — will retry in %ds",
+            "rollout-loop: board-unavailable rollout_id=%s scope=%s item_id=%s "
+            "exc=%s consecutive=%d elapsed_secs=%.0f — will retry in %ds",
             self.rollout_id,
+            self.scope,
+            self.item_id or "-",
             type(exc).__name__,
             self.count,
             elapsed,
@@ -5580,6 +5606,64 @@ async def _ride_out_board_outage[T](
             continue
         outage.reset()
         return result
+
+
+async def _redispatch_item(rollout_id: str, item_id: str, *, token: str | None) -> None:
+    """Reset *item_id* and dispatch a fresh build for it, riding out a blip.
+
+    The two board calls of a ``re-dispatch`` verdict are retried IN PLACE on a
+    transient board error (see :func:`_is_transient_board_error`), under the
+    loop's usual ``ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS`` window, so an outage
+    pauses the loop instead of halting the rollout.  The retry is idempotent:
+    the item's run list and the rollout item's own status are re-read before
+    every attempt, so a reset or a dispatch that landed before its response was
+    lost is not issued twice.  Only a non-transient error, or an exhausted
+    window, escapes — the caller halts on it exactly as before.
+    """
+    baseline_run_id: str | None = None
+    captured = False
+
+    def _newest(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
+        matching = [r for r in runs if str(r.get("rollout_id") or "") == rollout_id]
+        if not matching:
+            return None
+        return max(matching, key=lambda r: str(r.get("created_at") or ""))
+
+    async def _attempt() -> None:
+        nonlocal baseline_run_id, captured
+        newest = _newest(await gtd_client.list_runs_for_item(item_id, token=token))
+        if not captured:
+            baseline_run_id = None if newest is None else str(newest["id"])
+            captured = True
+        elif newest is not None and str(newest["id"]) != baseline_run_id:
+            return
+        advance = await gtd_client.advance_rollout(rollout_id, token=token)
+        if item_id in (advance.get("in_progress") or []):
+            await gtd_client.reset_rollout_item(rollout_id, item_id, token=token)
+        elif item_id not in (advance.get("next_ready") or []):
+            raise RuntimeError(
+                f"re-dispatch of item {item_id}: "
+                "rollout item is neither ready nor in progress"
+            )
+        try:
+            await gtd_client.dispatch_item(item_id, rollout_id=rollout_id, token=token)
+        except httpx.HTTPStatusError as exc:
+            if _http_status(exc) != 409:
+                raise
+            landed = _newest(await gtd_client.list_runs_for_item(item_id, token=token))
+            if landed is not None and str(landed["id"]) != baseline_run_id:
+                return
+            raise
+
+    outage = _BoardOutage(rollout_id, scope="redispatch", item_id=item_id)
+    await _ride_out_board_outage(outage, _attempt)
+    if outage.total:
+        logger.info(
+            "rollout-loop: redispatch-retried rollout_id=%s item_id=%s failures=%d",
+            rollout_id,
+            item_id,
+            outage.total,
+        )
 
 
 async def _park_or_halt_on_dispatch_refusal(
@@ -6251,7 +6335,17 @@ async def _rollout_wave_tick(
       error instead of raising, and ``complete_in_rollout`` is idempotent by
       item id; a merge whose record still fails is tracked in
       ``_rollout_unrecorded_merges`` and never re-reviewed.
-    - Re-dispatch (reset + dispatch): any error halts, so it never escapes.
+    - A re-dispatch VERDICT (reset + dispatch): the two board calls are retried
+      IN PLACE on a transient error — same exception set, same
+      ROLLOUT_LOOP_POLL_SECONDS sleep, same ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS
+      window as the rest of the loop — so a board blip there pauses the loop
+      instead of halting the rollout.  While the window has room the error never
+      escapes this branch; past it the last error is re-raised and the branch
+      halts with the unchanged ``re-dispatch of item <id> failed: ...`` reason,
+      exactly as a non-transient error does.  The retry is idempotent because
+      the item's own run list and the rollout's in-progress/ready lists are
+      re-read before each attempt, so a reset or a dispatch that landed before
+      its response was lost is not repeated.
     - Dispatching a ready item: a transient error escapes and the tick is
       re-run.  A dispatch that landed moved the item out of ``next_ready``, so
       it is not dispatched again.
@@ -6677,6 +6771,8 @@ async def _rollout_wave_tick(
             _HOST_DRAINING_MARKER in str(latest_run.get("error_msg") or "")
         ):
             try:
+                # NOT retried in place and NOT reconciled: a lost response here
+                # can re-reset an already-ready item (422) -> halt; separate item.
                 await gtd_client.reset_rollout_item(rollout_id, item_id, token=token)
                 await gtd_client.dispatch_item(
                     item_id, rollout_id=rollout_id, token=token
