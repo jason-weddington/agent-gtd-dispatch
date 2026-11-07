@@ -1,6 +1,8 @@
 """Fixed inputs for the review-prompt golden files (item 21106de8, AC-12).
 
-The squash and fix-mode goldens were re-captured for item aa262ade
+The squash and fix-mode goldens were re-captured for item 1f92702f
+(gate exemption, run-the-gate paragraph, gate-installed note) and, before
+that, for item aa262ade
 (Bash timeout paragraph, origin-based squash source).
 
 The goldens under ``tests/fixtures/review_prompt_golden/`` were captured from
@@ -56,6 +58,7 @@ def render_prompt(*, fix_mode: bool) -> str:
         gate_failure_output="boom" if fix_mode else None,
         engine_name="claude-code",
         review_timeout_seconds=2700,
+        gate_installed=True,
     )
 
 

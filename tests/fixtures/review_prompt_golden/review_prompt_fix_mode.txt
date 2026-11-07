@@ -82,7 +82,7 @@ Do exactly this:
    that needs the fix, so the squash commit keeps its subject and both its
    `Rollout:` and `Item:` trailers and stays the ONLY commit ahead of origin.
    Run the `git commit --amend --no-edit` as ONE foreground Bash call with the Bash tool `timeout` parameter set to 2700000; NEVER set `run_in_background` for it. This commit is exempt from the 5-minute rule in Step 4.
-3. Re-run the gate yourself to confirm it is green.
+3. Re-run the gate yourself to confirm it is green. Run it as ONE foreground Bash call with the Bash tool `timeout` parameter set to 2700000; NEVER set `run_in_background` for it, and do not pipe it through `tail`, `head` or any other command. The gate is exempt from the 5-minute limit; it can take 20 minutes or more, wait for it.
 
 FORBIDDEN in this mode: `git checkout`, `git reset`, `git rebase`, `git merge`
 and `git push`. The worker owns the branch layout and the push; it re-fetches,

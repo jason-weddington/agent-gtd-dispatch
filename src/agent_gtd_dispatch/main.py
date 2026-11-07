@@ -2662,6 +2662,72 @@ async def _reap_rollout_dirs(
     return " | ".join(notes)
 
 
+@dataclass
+class _GateInstallResult:
+    """Outcome of one :func:`_run_gate_install` call."""
+
+    outcome: Literal["installed", "no-steps", "failed"]
+    failure: gates.GateFailure | None = None
+    detail: str = ""
+    duration_ms: int = 0
+
+
+async def _run_gate_install(
+    workspace: dispatch.RolloutWorkspace,
+    project: dict[str, Any],
+    *,
+    run_id: str,
+    tmp_dir: Path | None,
+    executor: concurrent.futures.ThreadPoolExecutor | None,
+) -> _GateInstallResult:
+    """Run the gate install step in a rollout clone (shared by land and review).
+
+    Never raises except for cancellation: detect/run exceptions come back as
+    outcome ``failed`` with an ``exception: ...`` detail.
+    """
+    started = time.monotonic()
+
+    def _ms() -> int:
+        return int((time.monotonic() - started) * 1000)
+
+    try:
+        root = workspace.root
+        if workspace.workspace_mode:
+            gate_repos = [(d, root / d) for d in workspace.repo_paths]
+        else:
+            gate_repos = [
+                (
+                    dispatch.repo_name_from_origin(str(project.get("git_origin", ""))),
+                    root,
+                )
+            ]
+        steps = gates.detect_gate_steps(gate_repos, run_id=run_id)
+        if not steps:
+            return _GateInstallResult("no-steps", duration_ms=_ms())
+        failure = await asyncio.get_running_loop().run_in_executor(
+            executor if executor is not None else dispatch._executor,
+            functools.partial(
+                gates.run_gate_steps,
+                steps,
+                config.GATE_INSTALL_TIMEOUT_SECONDS,
+                run_id=run_id,
+                tmp_dir=tmp_dir,
+            ),
+        )
+    except Exception as exc:
+        return _GateInstallResult(
+            "failed", detail=f"exception: {exc}", duration_ms=_ms()
+        )
+    if failure is not None:
+        return _GateInstallResult(
+            "failed",
+            failure=failure,
+            detail=f"{failure.repo_label}: {failure.step}: {failure.reason}",
+            duration_ms=_ms(),
+        )
+    return _GateInstallResult("installed", duration_ms=_ms())
+
+
 async def _launch_reviewer(
     rollout_id: str,
     item_id: str,
@@ -2790,6 +2856,35 @@ async def _launch_reviewer(
         )
         merge_notes = []
 
+    has_gate = bool((project.get("gate_command") or "").strip())
+    gate_installed = False
+    install_state = "skipped-no-gate"
+    install_ms = 0
+    if gate_failure_output is not None:
+        install_state = "skipped-fix-mode"
+    elif land_conflict is not None:
+        install_state = "skipped-land-conflict"
+    elif has_gate:
+        install = await _run_gate_install(
+            workspace,
+            project,
+            run_id=f"review-install-{item_id}",
+            tmp_dir=None,
+            executor=executor,
+        )
+        install_state = install.outcome
+        install_ms = install.duration_ms
+        gate_installed = install.outcome in ("installed", "no-steps")
+        if install.outcome == "failed":
+            logger.warning(
+                "rollout-loop: review-gate-install-failed rollout_id=%s "
+                "item_id=%s run_id=%s detail=%s",
+                rollout_id,
+                item_id,
+                f"review-install-{item_id}",
+                install.detail[:300],
+            )
+
     used = _rollout_redispatches.get(rollout_id, {}).get(item_id, 0)
     repo_dirs = list(workspace.repo_paths)
     raw_review_timeout = project.get("review_timeout_seconds")
@@ -2837,12 +2932,14 @@ async def _launch_reviewer(
         gate_failure_output=gate_failure_output,
         land_conflict=land_conflict,
         review_timeout_seconds=review_timeout_seconds,
+        gate_installed=gate_installed,
     )
     pinned_subject = dispatch.compose_squash_subject(item)
     logger.info(
         "rollout-loop: review-prompt rollout_id=%s item_id=%s "
         "commit_type_mode=%s subject=%r review_timeout_s=%d "
-        "review_timeout_source=%s prompt_bash_timeout_ms=%d",
+        "review_timeout_source=%s prompt_bash_timeout_ms=%d "
+        "review_gate_install=%s gate_installed=%s review_gate_install_ms=%d",
         rollout_id,
         item_id,
         "pinned" if pinned_subject is not None else "derived",
@@ -2850,6 +2947,9 @@ async def _launch_reviewer(
         review_timeout_seconds,
         review_timeout_source,
         review_timeout_seconds * 1000,
+        install_state,
+        gate_installed,
+        install_ms,
     )
 
     reviewer_run = Run(
@@ -2885,6 +2985,7 @@ async def _launch_reviewer(
     # never be credited with the PREVIOUS item's answer.
     dispatch.clear_review_verdict(workspace.root)
 
+    spawn_monotonic = time.monotonic()
     exit_code: int | None = None
     timed_out = False
     failure: str = ""
@@ -3159,12 +3260,14 @@ async def _launch_reviewer(
         )
     logger.info(
         "rollout-loop: reviewer verdict rollout_id=%s item_id=%s run_id=%s "
-        "verdict=%s exit_code=%s",
+        "verdict=%s exit_code=%s review_gate_install=%s elapsed_s=%d",
         rollout_id,
         item_id,
         reviewer_run.id,
         verdict,
         exit_code,
+        install_state,
+        int(time.monotonic() - spawn_monotonic),
     )
     return ReviewVerdict(
         verdict,
@@ -4645,32 +4748,23 @@ class _Lander:
         return landing
 
     async def _install_gate(self) -> None:
-        root = self.workspace.root
-        if self.workspace.workspace_mode:
-            gate_repos = [(d, root / d) for d in self.repos]
-        else:
-            gate_repos = [
-                (
-                    dispatch.repo_name_from_origin(
-                        str(self.project.get("git_origin", ""))
-                    ),
-                    root,
-                )
-            ]
-        steps = gates.detect_gate_steps(gate_repos, run_id=self.loop_run_id)
-        if not steps:
-            return
-        failure = await asyncio.get_running_loop().run_in_executor(
-            dispatch._executor,
-            functools.partial(
-                gates.run_gate_steps,
-                steps,
-                config.GATE_INSTALL_TIMEOUT_SECONDS,
-                run_id=self.loop_run_id,
-                tmp_dir=self.tmp_dir,
-            ),
+        result = await _run_gate_install(
+            self.workspace,
+            self.project,
+            run_id=self.loop_run_id,
+            tmp_dir=self.tmp_dir,
+            executor=dispatch._executor,
         )
-        if failure is not None:
+        if result.outcome == "failed":
+            failure = result.failure
+            if failure is None:
+                # detect/run raised: preserve the exception instead of halting
+                # with a half-built message.
+                raise _LandHalt(
+                    "gate_install_failed",
+                    f"land gate install failed for item {self.item_id}: "
+                    f"{result.detail}",
+                )
             raise _LandHalt(
                 "gate_install_failed",
                 f"land gate install failed for item {self.item_id}: "

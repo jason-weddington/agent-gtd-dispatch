@@ -5808,7 +5808,7 @@ Do exactly this:
    that needs the fix, so the squash commit keeps its subject and both its
    `Rollout:` and `Item:` trailers and stays the ONLY commit ahead of origin.
    Run the `git commit --amend --no-edit` as ONE foreground Bash call with the Bash tool `timeout` parameter set to {bash_timeout_ms}; NEVER set `run_in_background` for it. This commit is exempt from the 5-minute rule in Step 4.
-3. Re-run the gate yourself to confirm it is green.
+3. Re-run the gate yourself to confirm it is green. Run it as ONE foreground Bash call with the Bash tool `timeout` parameter set to {bash_timeout_ms}; NEVER set `run_in_background` for it, and do not pipe it through `tail`, `head` or any other command. The gate is exempt from the 5-minute limit; it can take 20 minutes or more, wait for it.
 
 FORBIDDEN in this mode: `git checkout`, `git reset`, `git rebase`, `git merge`
 and `git push`. The worker owns the branch layout and the push; it re-fetches,
@@ -5930,6 +5930,7 @@ def build_review_prompt(
     engine_name: str | None = None,
     land_conflict: dict[str, list[str]] | None = None,
     review_timeout_seconds: int | None = None,
+    gate_installed: bool = False,
 ) -> str:
     """System prompt for REVIEW mode — review ONE build, then approve or refuse.
 
@@ -6003,6 +6004,28 @@ again:
 
 {conflict_bullets}"""
 
+    if gate_installed:
+        install_note = (
+            "The dispatch worker has already run the gate install step (the same "
+            "step it runs before landing: the repo's .agent-gtd/setup override, "
+            "else lefthook, pre-commit or husky hook install) in every repo clone "
+            "before you started. Do not install tools or dependencies yourself."
+        )
+    else:
+        install_note = (
+            "The worker could not run the gate install step in your clone, so the "
+            "gate may fail for missing tools or dependencies. If the gate fails "
+            "for an environment reason (a missing tool or dependency, not a code "
+            "defect), return `halt` naming the missing piece instead of fixing "
+            "the environment."
+        )
+    gate_exemption = (
+        " The one exception is the stored `gate_command` and the squash commit: "
+        "both are exempt from this 5-minute limit."
+        if gate_command and not fix_mode and not conflict_mode
+        else ""
+    )
+
     if gate_command:
         gate_block = f"""\
 The merge bar is the project's stored `gate_command`. It is NOT something you
@@ -6017,7 +6040,11 @@ verbatim from {where}:
 Do not derive a different test/lint command from `CLAUDE.md` or `README.md` and
 approve against that instead. Two reviewers inferring two different bars for
 the same repo apply two different standards to consecutive items — that is a
-correctness problem, not a style one."""
+correctness problem, not a style one.
+
+Run the gate as ONE foreground Bash call with the Bash tool `timeout` parameter set to {bash_timeout_ms}; NEVER set `run_in_background` for it, and do not pipe it through `tail`, `head` or any other command. It can take 20 minutes or more; wait for it. Returning `halt` because the gate seems slow is wrong.
+
+{install_note}"""
     else:
         gate_block = f"""\
 This project has NO stored `gate_command`, so you are in FALLBACK mode: read
@@ -6179,7 +6206,7 @@ record `none` for it and continue — do NOT halt for that alone."""
                 verification to check an acceptance criterion: no mutation testing
                 (e.g. `cargo mutants`, `mutmut`, `stryker`), no benchmarks, no
                 soak or load runs, and no single command you expect to take more
-                than 5 minutes. Judge such criteria from the diff, the tests the
+                than 5 minutes.{{gate_exemption}} Judge such criteria from the diff, the tests the
                 build added, the build agent's reported evidence in its final
                 comment, and the post-run gate. If a criterion can only be
                 confirmed by such a run and the build reported no evidence for
@@ -6246,6 +6273,7 @@ record `none` for it and continue — do NOT halt for that alone."""
         # title and shell braces, either of which would break format().
         steps = (
             steps.replace("{gate_block}", _indent_prompt_block(gate_block))
+            .replace("{gate_exemption}", gate_exemption)
             .replace("{commit_type}", commit_type)
             .replace("{conflict_contract}", conflict_contract)
         )

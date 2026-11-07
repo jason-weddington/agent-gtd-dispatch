@@ -180,11 +180,15 @@ approve against that instead. Two reviewers inferring two different bars for
 the same repo apply two different standards to consecutive items — that is a
 correctness problem, not a style one.
 
+Run the gate as ONE foreground Bash call with the Bash tool `timeout` parameter set to 2700000; NEVER set `run_in_background` for it, and do not pipe it through `tail`, `head` or any other command. It can take 20 minutes or more; wait for it. Returning `halt` because the gate seems slow is wrong.
+
+The dispatch worker has already run the gate install step (the same step it runs before landing: the repo's .agent-gtd/setup override, else lefthook, pre-commit or husky hook install) in every repo clone before you started. Do not install tools or dependencies yourself.
+
 **No long-running verification.** Do not run long-running
 verification to check an acceptance criterion: no mutation testing
 (e.g. `cargo mutants`, `mutmut`, `stryker`), no benchmarks, no
 soak or load runs, and no single command you expect to take more
-than 5 minutes. Judge such criteria from the diff, the tests the
+than 5 minutes. The one exception is the stored `gate_command` and the squash commit: both are exempt from this 5-minute limit. Judge such criteria from the diff, the tests the
 build added, the build agent's reported evidence in its final
 comment, and the post-run gate. If a criterion can only be
 confirmed by such a run and the build reported no evidence for
