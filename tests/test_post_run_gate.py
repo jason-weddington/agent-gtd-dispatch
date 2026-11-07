@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -518,6 +519,47 @@ class TestPostRunGateMinSecondsConfig:
         with patch.dict(os.environ, env, clear=True):
             config.load()
             assert config.POST_RUN_GATE_MIN_SECONDS == 45
+
+
+class TestPostRunGateTimeoutConfig:
+    def _env(self, tmp_path, **extra):
+        env = {
+            "DISPATCH_API_KEY": "k",
+            "AGENT_GTD_URL": "http://x",
+            "AGENT_GTD_API_KEY": "k",
+            "ANTHROPIC_API_KEY": "a",
+            "DISPATCH_WORKSPACE_ROOT": str(tmp_path),
+        }
+        env.update(extra)
+        return env
+
+    def test_default(self, tmp_path) -> None:
+        with patch.dict(os.environ, self._env(tmp_path), clear=True):
+            config.load()
+            assert config.POST_RUN_GATE_TIMEOUT_SECONDS == 3600
+
+    def test_override(self, tmp_path) -> None:
+        env = self._env(tmp_path, DISPATCH_POST_RUN_GATE_TIMEOUT_SECONDS="45")
+        with patch.dict(os.environ, env, clear=True):
+            config.load()
+            assert config.POST_RUN_GATE_TIMEOUT_SECONDS == 45
+
+    @pytest.mark.parametrize(
+        ("post", "land", "mn", "seconds", "source"),
+        [
+            (3600, 1800, 600, 3600, "post_run"),
+            (1000, 1800, 600, 1800, "land"),
+            (100, 1800, 600, 1800, "land"),
+            (10, 20, 600, 600, "min"),
+            (5000, 1800, 600, 5000, "post_run"),
+        ],
+    )
+    def test_helpers(self, monkeypatch, post, land, mn, seconds, source) -> None:
+        monkeypatch.setattr(config, "POST_RUN_GATE_TIMEOUT_SECONDS", post)
+        monkeypatch.setattr(config, "LAND_GATE_TIMEOUT_SECONDS", land)
+        monkeypatch.setattr(config, "POST_RUN_GATE_MIN_SECONDS", mn)
+        assert config.post_run_gate_timeout_seconds() == seconds
+        assert config.post_run_gate_timeout_source() == source
 
 
 # ---------------------------------------------------------------------------
@@ -1356,83 +1398,87 @@ class TestWorkerPostRunGate:
         mock_run_talos.assert_called_once()
         mock_dispatch.run_gate_command.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_timeout_floor_applied(
-        self, tmp_path, caplog: pytest.LogCaptureFixture, monkeypatch
-    ) -> None:
+    async def _run_gate_case(
+        self, tmp_path, tag: str, timeout_seconds: int, gate_result
+    ):
         from agent_gtd_dispatch.main import _dispatch_worker
 
-        monkeypatch.setattr(config, "POST_RUN_GATE_MIN_SECONDS", 30)
+        run = Run(
+            item_id=f"item-{tag}",
+            project_name="TestProject",
+            branch_name=f"feat/{tag}",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+        fake_workspace = tmp_path / f"repos-testproj-{tag}"
+        fake_workspace.mkdir()
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+        ):
+            _install_common_mocks(
+                mock_gtd,
+                mock_dispatch,
+                item_id=f"item-{tag}",
+                project=_default_project(),
+                fake_workspace=fake_workspace,
+            )
+            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
+            mock_dispatch.verify_pushes = MagicMock(
+                return_value=[_pushed(branch=f"feat/{tag}")]
+            )
+            mock_dispatch.run_gate_command = MagicMock(return_value=gate_result)
+            await _dispatch_worker(run, 50, CLAUDE, timeout_seconds)
+        return mock_dispatch.run_gate_command.call_args.args[2]
+
+    @pytest.mark.asyncio
+    async def test_gate_timeout_floor_and_log_fields(
+        self, tmp_path, caplog: pytest.LogCaptureFixture, monkeypatch
+    ) -> None:
         gate_result = GateResult(
             returncode=0, timed_out=False, output="ok", duration_seconds=1.0
         )
-
         await db.init_db()
+        caplog.set_level(logging.INFO, logger="agent_gtd_dispatch.main")
 
-        # Case 1: timeout_seconds=5 -> floor applied, args[2] == 30
-        run1 = Run(
-            item_id="item-i1",
-            project_name="TestProject",
-            branch_name="feat/i1",
-            mode=DispatchMode.BUILD,
-        )
-        await db.insert_run(run1)
-        fake_workspace1 = tmp_path / "repos-testproj-i1"
-        fake_workspace1.mkdir()
-        with (
-            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
-            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
-            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
-        ):
-            _install_common_mocks(
-                mock_gtd,
-                mock_dispatch,
-                item_id="item-i1",
-                project=_default_project(),
-                fake_workspace=fake_workspace1,
-            )
-            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
-            mock_dispatch.verify_pushes = MagicMock(
-                return_value=[_pushed(branch="feat/i1")]
-            )
-            mock_dispatch.run_gate_command = MagicMock(return_value=gate_result)
+        monkeypatch.setattr(config, "POST_RUN_GATE_TIMEOUT_SECONDS", 10)
+        monkeypatch.setattr(config, "LAND_GATE_TIMEOUT_SECONDS", 20)
+        monkeypatch.setattr(config, "POST_RUN_GATE_MIN_SECONDS", 30)
+        assert await self._run_gate_case(tmp_path, "i1", 5, gate_result) == 30
+        assert "timeout_s=30" in caplog.text
+        assert "timeout_source=min" in caplog.text
+        assert "build_remaining_s=" in caplog.text
+        assert "legacy_timeout_s=" in caplog.text
+        assert "floor_applied" not in caplog.text
 
-            await _dispatch_worker(run1, 50, CLAUDE, 5)
-
-        assert mock_dispatch.run_gate_command.call_args.args[2] == 30
-        assert "floor_applied=True" in caplog.text
-
-        # Case 2: timeout_seconds=600 -> no floor, args[2] roughly 600
         caplog.clear()
-        run2 = Run(
-            item_id="item-i2",
-            project_name="TestProject",
-            branch_name="feat/i2",
-            mode=DispatchMode.BUILD,
+        monkeypatch.setattr(config, "POST_RUN_GATE_TIMEOUT_SECONDS", 3600)
+        monkeypatch.setattr(config, "LAND_GATE_TIMEOUT_SECONDS", 1800)
+        monkeypatch.setattr(config, "POST_RUN_GATE_MIN_SECONDS", 600)
+        assert await self._run_gate_case(tmp_path, "i2", 600, gate_result) == 3600
+        assert "timeout_source=post_run" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_gate_budget_independent_of_build_elapsed(
+        self, tmp_path, caplog: pytest.LogCaptureFixture, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "POST_RUN_GATE_TIMEOUT_SECONDS", 3600)
+        monkeypatch.setattr(config, "LAND_GATE_TIMEOUT_SECONDS", 1800)
+        monkeypatch.setattr(config, "POST_RUN_GATE_MIN_SECONDS", 600)
+        gate_result = GateResult(
+            returncode=0, timed_out=False, output="ok", duration_seconds=1.0
         )
-        await db.insert_run(run2)
-        fake_workspace2 = tmp_path / "repos-testproj-i2"
-        fake_workspace2.mkdir()
-        with (
-            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
-            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
-        ):
-            _install_common_mocks(
-                mock_gtd,
-                mock_dispatch,
-                item_id="item-i2",
-                project=_default_project(),
-                fake_workspace=fake_workspace2,
-            )
-            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
-            mock_dispatch.verify_pushes = MagicMock(
-                return_value=[_pushed(branch="feat/i2")]
-            )
-            mock_dispatch.run_gate_command = MagicMock(return_value=gate_result)
+        await db.init_db()
+        caplog.set_level(logging.INFO, logger="agent_gtd_dispatch.main")
 
-            await _dispatch_worker(run2, 50, CLAUDE, 600)
-
-        assert mock_dispatch.run_gate_command.call_args.args[2] in range(590, 601)
+        assert await self._run_gate_case(tmp_path, "j1", 60, gate_result) == 3600
+        assert "timeout_source=post_run" in caplog.text
+        assert "timeout_s=3600" in caplog.text
+        assert "legacy_timeout_s=600" in caplog.text
+        assert "build_remaining_s=" in caplog.text
+        assert re.search(r"build_remaining_s=(5\d|60)\b", caplog.text)
+        assert await self._run_gate_case(tmp_path, "j2", 1, gate_result) == 3600
+        assert await self._run_gate_case(tmp_path, "j3", 600, gate_result) == 3600
 
     @pytest.mark.asyncio
     async def test_dirty_repo_is_gated_as_is_and_never_stashed(self, tmp_path) -> None:

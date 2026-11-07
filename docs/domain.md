@@ -135,8 +135,9 @@ Every run has a `mode` that controls the system prompt and workspace lifecycle.
   agent starts
 - **Post-run gate**: after push verification succeeds, when the project has a non-empty
   `gate_command` and at least one repo was pushed, the worker (for every non-talos engine)
-  runs that command once from the workspace root, bounded by the run's remaining timeout
-  (floored at `POST_RUN_GATE_MIN_SECONDS`). Exit 0 → the run proceeds to `succeeded` as
+  runs that command once from the workspace root, bounded by its own budget,
+  `max(POST_RUN_GATE_TIMEOUT_SECONDS, LAND_GATE_TIMEOUT_SECONDS, POST_RUN_GATE_MIN_SECONDS)`
+  (default 3600s). Exit 0 → the run proceeds to `succeeded` as
   above. A non-zero exit, a timeout, or a launch error → the run is `failed` (error starts
   with `post-run gate`) even though the branch is already on origin. Talos engines are
   exempt — they self-gate via their own `gate_command` run before minting the commit.

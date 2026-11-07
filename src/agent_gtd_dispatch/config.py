@@ -93,9 +93,11 @@ SHUTDOWN_GRACE_SECONDS: int = 45
 # at all — not enough time left to plausibly succeed (e.g. a slow pre-push hook).
 PUSH_BACKSTOP_MIN_SECONDS: int = 10
 
-# Minimum seconds granted to the post-run gate even when the build used most of
-# its run timeout — a build that finishes with only seconds left on the clock
-# still gets a real shot at running the project's quality gate.
+# Dedicated post-run gate budget, independent of build elapsed time.
+POST_RUN_GATE_TIMEOUT_SECONDS: int = 3600
+
+# Lower bound of the post-run gate budget: the effective budget is never below
+# this, whatever the other settings say.
 POST_RUN_GATE_MIN_SECONDS: int = 600
 
 # Per-subprocess timeout for the pre-launch gate install (hook-manager install,
@@ -357,6 +359,33 @@ TALOS_MEMORY: str = "off"
 LOG_LEVEL: str = "INFO"
 
 
+def _post_run_gate_budget() -> tuple[int, str]:
+    """Pick the post-run gate budget and the term that supplied it.
+
+    Ties break in the order post_run > land > min.
+    """
+    terms = (
+        ("post_run", POST_RUN_GATE_TIMEOUT_SECONDS),
+        ("land", LAND_GATE_TIMEOUT_SECONDS),
+        ("min", POST_RUN_GATE_MIN_SECONDS),
+    )
+    source, seconds = terms[0]
+    for name, value in terms[1:]:
+        if value > seconds:
+            source, seconds = name, value
+    return seconds, source
+
+
+def post_run_gate_timeout_seconds() -> int:
+    """Effective post-run gate budget in seconds."""
+    return _post_run_gate_budget()[0]
+
+
+def post_run_gate_timeout_source() -> str:
+    """Which term (post_run, land, min) determines the gate budget."""
+    return _post_run_gate_budget()[1]
+
+
 def timeout_seconds_for_mode(mode: str) -> int:
     """Return the default run timeout for *mode* when none was supplied.
 
@@ -422,6 +451,7 @@ def load() -> None:
     global OLLAMA_BASE_URL, OLLAMA_API_KEY, OLLAMA_DEFAULT_MODEL
     global OLLAMA_TIMEOUT_MULTIPLIER, CANCEL_GRACE_SECONDS, PUSH_BACKSTOP_MIN_SECONDS
     global GATE_INSTALL_TIMEOUT_SECONDS, POST_RUN_GATE_MIN_SECONDS
+    global POST_RUN_GATE_TIMEOUT_SECONDS
     global OLLAMA_CLOUD_API_KEY, OLLAMA_CLOUD_BASE_URL, OLLAMA_CLOUD_MODEL
     global TALOS_BIN, TALOS_GATE_TIMEOUT_SECS, TALOS_MEMORY
     global AGENT_SUBPROCESS_USER
@@ -596,6 +626,9 @@ def load() -> None:
     )
     GATE_INSTALL_TIMEOUT_SECONDS = int(
         os.environ.get("DISPATCH_GATE_INSTALL_TIMEOUT_SECONDS", "300")
+    )
+    POST_RUN_GATE_TIMEOUT_SECONDS = int(
+        os.environ.get("DISPATCH_POST_RUN_GATE_TIMEOUT_SECONDS", "3600")
     )
     POST_RUN_GATE_MIN_SECONDS = int(
         os.environ.get("DISPATCH_POST_RUN_GATE_MIN_SECONDS", "600")

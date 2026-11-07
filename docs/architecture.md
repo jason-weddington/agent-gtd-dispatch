@@ -403,10 +403,15 @@ strips it. The gate is skipped — logged, no item comment — when either:
 - no repo in the run actually reached `pushed` status (`skipped_no_pushed_repo`), or
 - `gate_command` is empty/unset (`skipped_no_gate_command`).
 
-**Timeout.** `gate_timeout = max(timeout_seconds - elapsed_since_run_start,
-config.POST_RUN_GATE_MIN_SECONDS)` — the gate always gets at least
-`POST_RUN_GATE_MIN_SECONDS` (env `DISPATCH_POST_RUN_GATE_MIN_SECONDS`, default 600s),
-even when the build agent used almost the entire run timeout.
+**Timeout.** The gate has a dedicated budget, independent of how long the build ran:
+`gate_timeout = max(POST_RUN_GATE_TIMEOUT_SECONDS, LAND_GATE_TIMEOUT_SECONDS,
+POST_RUN_GATE_MIN_SECONDS)` (env `DISPATCH_POST_RUN_GATE_TIMEOUT_SECONDS`, default 3600s;
+`DISPATCH_POST_RUN_GATE_MIN_SECONDS`, default 600s, is only the lower bound). A run's total
+wall-clock may therefore exceed `timeout_seconds` by up to the gate budget (default 3600s,
+or the larger land gate timeout if raised). This is documented, not enforced, and the
+board's unreachable-host reaper slack (`REAPER_UNREACHABLE_SLACK_MINUTES`, now 90 minutes)
+is sized to cover it. The `post-run gate:` log line reports `timeout_source`,
+`build_remaining_s`, `legacy_timeout_s` and `run_overrun_s` alongside `timeout_s`.
 
 **Launch shim.** The gate does not run the project's command directly. It runs
 `/bin/bash -c 'exec timeout --kill-after="$1" "$2" /bin/sh -c "$3"' agent-gtd-gate

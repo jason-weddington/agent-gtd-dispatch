@@ -444,6 +444,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     platform_support.check_two_user_supported()
     platform_support.log_platform_line()
     platform_support.log_gate_timeout_line()
+    logger.info(
+        "post-run gate budget: effective_s=%d source=%s post_run_s=%d"
+        " land_s=%d min_s=%d",
+        config.post_run_gate_timeout_seconds(),
+        config.post_run_gate_timeout_source(),
+        config.POST_RUN_GATE_TIMEOUT_SECONDS,
+        config.LAND_GATE_TIMEOUT_SECONDS,
+        config.POST_RUN_GATE_MIN_SECONDS,
+    )
     if not platform_support.USE_PROCFS:
         _reaper_self_probe()
     if config.AGENT_SUBPROCESS_USER:
@@ -8926,7 +8935,9 @@ async def _dispatch_worker(
                     1 for r in push_results_list if r.status == PushStatus.pushed
                 )
                 _gate_timeout: int | None = None
-                _gate_remaining: float | None = None
+                _build_remaining: int | None = None
+                _legacy_timeout: int | None = None
+                _run_overrun: int | None = None
                 _gate_rc: int | None = None
                 _gate_timed_out: bool | None = None
                 _gate_duration: float | None = None
@@ -8946,13 +8957,14 @@ async def _dispatch_worker(
 
                 if decision is None:
                     assert workspace is not None  # noqa: S101
-                    _gate_remaining = (
+                    _build_remaining = int(
                         timeout_seconds
                         - (datetime.now(UTC) - _run_start_dt).total_seconds()
                     )
-                    _gate_timeout = max(
-                        int(_gate_remaining), config.POST_RUN_GATE_MIN_SECONDS
+                    _legacy_timeout = max(
+                        _build_remaining, config.POST_RUN_GATE_MIN_SECONDS
                     )
+                    _gate_timeout = config.post_run_gate_timeout_seconds()
                     logger.info(
                         "run %s: post-run gate starting (timeout %ds)",
                         run.id,
@@ -8973,7 +8985,11 @@ async def _dispatch_worker(
                         ),
                     )
                     assert _gate_result is not None  # noqa: S101
-                    completed = datetime.now(UTC).isoformat()
+                    _gate_end = datetime.now(UTC)
+                    completed = _gate_end.isoformat()
+                    _run_overrun = int(
+                        (_gate_end - _run_start_dt).total_seconds() - timeout_seconds
+                    )
                     _gate_rc = _gate_result.returncode
                     _gate_timed_out = _gate_result.timed_out
                     _gate_duration = _gate_result.duration_seconds
@@ -8988,7 +9004,8 @@ async def _dispatch_worker(
 
                 logger.info(
                     "post-run gate: run_id=%s decision=%s project=%s"
-                    " pushed_repos=%d timeout_s=%s floor_applied=%s"
+                    " pushed_repos=%d timeout_s=%s timeout_source=%s"
+                    " build_remaining_s=%s legacy_timeout_s=%s run_overrun_s=%s"
                     " returncode=%s timed_out=%s duration_s=%s"
                     " log_path=%s log_bytes=%s failure_lines_matched=%d"
                     " failure_lines_shown=%d",
@@ -8997,11 +9014,12 @@ async def _dispatch_worker(
                     project.get("name"),
                     _n_pushed,
                     _gate_timeout or None,
-                    (
-                        _gate_remaining is not None
-                        and _gate_remaining < config.POST_RUN_GATE_MIN_SECONDS
-                    )
-                    or None,
+                    config.post_run_gate_timeout_source()
+                    if _gate_timeout is not None
+                    else None,
+                    _build_remaining,
+                    _legacy_timeout,
+                    _run_overrun,
                     _gate_rc or None,
                     _gate_timed_out or None,
                     (f"{_gate_duration:.1f}" if _gate_duration is not None else None),

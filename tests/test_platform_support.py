@@ -213,6 +213,15 @@ class TestPlatformLine:
         assert len(_msgs(caplog, "platform:")) == 1
         assert len(_msgs(caplog, "gate-timeout: tool=")) == 1
 
+    @pytest.mark.usefixtures("_env")
+    def test_lifespan_logs_gate_budget_line(self, caplog) -> None:
+        caplog.set_level(logging.INFO)
+        with TestClient(main.app):
+            pass
+        lines = _msgs(caplog, "post-run gate budget:")
+        assert len(lines) == 1
+        assert "effective_s=3600 source=post_run" in lines[0].getMessage()
+
 
 _HELPERS = [
     ("_proc_cmdline", "cmdline", (1,), "c"),
