@@ -2038,6 +2038,11 @@ MAX_ITEM_REDISPATCHES: int = config.MAX_ITEM_REDISPATCHES
 # halting a rollout that a restart happened to interrupt.
 _rollout_redispatches: dict[str, dict[str, int]] = {}
 
+# rollout_id -> item_id -> {merge_base, behind} for items whose reviewer halt was
+# converted into a re-dispatch by the base-drift rule.  Lets a later repeat halt
+# say the drift re-dispatch did not help.
+_rollout_drift_redispatched: dict[str, dict[str, dict[str, Any]]] = {}
+
 # Handle for the startup re-adoption sweep, held only so shutdown can cancel it.
 _readoption_task: asyncio.Task[None] | None = None
 
@@ -3408,6 +3413,131 @@ def _with_suffix(reason: str, suffix: str) -> str:
     return (head + suffix)[:ERROR_TEXT_MAX_CHARS]
 
 
+def _drift_owning_repos(
+    workspace: dispatch.RolloutWorkspace, paths: tuple[str, ...]
+) -> list[str] | None:
+    """Repos owning at least one judgment path (sorted); None on an unowned path."""
+    owners: set[str] = set()
+    for path in paths:
+        if workspace.workspace_mode:
+            owner = path.split("/", 1)[0] if "/" in path else ""
+        else:
+            owner = next(iter(workspace.repo_paths), "")
+        if owner not in workspace.repo_paths:
+            return None
+        owners.add(owner)
+    return sorted(owners)
+
+
+def _base_drift_rationale(
+    workspace: dispatch.RolloutWorkspace, n_paths: int, drift: dispatch.BaseDrift
+) -> str:
+    """The pinned base-drift re-dispatch rationale."""
+    default = (
+        workspace.default_branches.get(drift.repo)
+        or dispatch._DEFAULT_BRANCH_CANDIDATES[0]
+    )
+    return (
+        f"base drift: {n_paths} conflicting paths, merge-base {drift.merge_base} "
+        f"is {drift.behind} commits behind origin/{default}"
+    )
+
+
+async def _convert_halt_for_base_drift(
+    rollout_id: str,
+    item_id: str,
+    outcome: ReviewVerdict,
+    workspace: dispatch.RolloutWorkspace | None,
+) -> tuple[ReviewVerdict, str] | None:
+    """Return (re-dispatch outcome, drifted_repos) when the halt is base drift."""
+    used = _rollout_redispatches.get(rollout_id, {}).get(item_id, 0)
+    owners: list[str] | None = None
+    drifts: dict[str, dispatch.BaseDrift | None] = {}
+    measure_ms = 0
+    if used >= MAX_ITEM_REDISPATCHES:
+        reason = "budget_exhausted"
+    elif workspace is None:
+        reason = "no_workspace"
+    elif not outcome.branch_name:
+        reason = "no_branch"
+    else:
+        owners = _drift_owning_repos(workspace, outcome.judgment_conflict_paths)
+        if owners is None:
+            reason = "unowned_path"
+        else:
+            reason = "drifted"
+            started = time.monotonic()
+            try:
+                ws, branch, repos = workspace, outcome.branch_name, owners
+                drifts = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        None,
+                        lambda: dispatch.measure_base_drift(
+                            ws, branch, repos, config.LAND_GIT_TIMEOUT_SECONDS
+                        ),
+                    ),
+                    timeout=config.LAND_GIT_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "rollout-loop: base-drift measure error rollout_id=%s "
+                    "item_id=%s err=%s: %s",
+                    rollout_id,
+                    item_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                reason = "measure_error"
+            measure_ms = int((time.monotonic() - started) * 1000)
+            if reason == "drifted" and any(drifts.get(r) is None for r in owners):
+                reason = "not_drifted"
+    converted = reason == "drifted"
+    logger.info(
+        "rollout-loop: base-drift-decision rollout_id=%s item_id=%s decision=%s "
+        "reason=%s paths=%d owning_repos=%s used=%d cap=%d",
+        rollout_id,
+        item_id,
+        "redispatch" if converted else "halt",
+        reason,
+        len(outcome.judgment_conflict_paths),
+        ",".join(owners or []),
+        used,
+        MAX_ITEM_REDISPATCHES,
+    )
+    if not converted or workspace is None or owners is None:
+        return None
+    found = [d for r in owners if (d := drifts.get(r)) is not None]
+    best = min(found, key=lambda d: (-d.behind, d.repo))
+    rationale = _base_drift_rationale(
+        workspace, len(outcome.judgment_conflict_paths), best
+    )
+    drifted_repos = ",".join(
+        f"{d.repo}:{d.behind}" for d in sorted(found, key=lambda d: d.repo)
+    )
+    default = (
+        workspace.default_branches.get(best.repo)
+        or dispatch._DEFAULT_BRANCH_CANDIDATES[0]
+    )
+    logger.info(
+        "rollout-loop: base-drift-redispatch rollout_id=%s item_id=%s paths=%d "
+        "repo=%s default=%s merge_base=%s behind=%d drifted_repos=%s measure_ms=%d",
+        rollout_id,
+        item_id,
+        len(outcome.judgment_conflict_paths),
+        best.repo,
+        default,
+        best.merge_base,
+        best.behind,
+        drifted_repos,
+        measure_ms,
+    )
+    _rollout_drift_redispatched.setdefault(rollout_id, {})[item_id] = {
+        "merge_base": best.merge_base,
+        "behind": best.behind,
+    }
+    return outcome._replace(verdict="re-dispatch", rationale=rationale), drifted_repos
+
+
 async def _act_on_verdict(
     rollout_id: str,
     item_id: str,
@@ -3417,6 +3547,7 @@ async def _act_on_verdict(
     attribution: str | None,
     workspace: dispatch.RolloutWorkspace | None = None,
     halt_suffix: str = "",
+    consider_drift: bool = False,
 ) -> str:
     """Apply a reviewer's verdict. The WORKER acts; the reviewer only decided.
 
@@ -3455,10 +3586,32 @@ async def _act_on_verdict(
     non-transient error, or an exhausted window, halts — with the unchanged
     ``re-dispatch of item <id> failed: ...`` reason.
     """
+    drifted_repos = ""
+    if outcome.verdict == "halt" and consider_drift and outcome.judgment_conflict_paths:
+        converted = await _convert_halt_for_base_drift(
+            rollout_id, item_id, outcome, workspace
+        )
+        if converted is not None:
+            outcome, drifted_repos = converted
+
     if outcome.verdict == "halt":
         reason = f"reviewer halted item {item_id}: {outcome.rationale}"
         if outcome.detail:
             reason = f"{reason} ({outcome.detail})"
+        prior = _rollout_drift_redispatched.get(rollout_id, {}).get(item_id)
+        if prior is not None and outcome.judgment_conflict_paths:
+            logger.warning(
+                "rollout-loop: base-drift-redispatch-ineffective rollout_id=%s "
+                "item_id=%s prior_merge_base=%s repeat_paths=%d",
+                rollout_id,
+                item_id,
+                prior["merge_base"],
+                len(outcome.judgment_conflict_paths),
+            )
+            reason = (
+                f"{reason} (after base-drift re-dispatch: merge-base "
+                f"{prior['merge_base']} was {prior['behind']} behind)"
+            )
         return await _halt_rollout_from_loop(
             rollout_id,
             _with_suffix(reason, halt_suffix),
@@ -3568,13 +3721,18 @@ async def _act_on_verdict(
         used + 1,
         MAX_ITEM_REDISPATCHES,
     )
+    comment = (
+        f"Rollout `{rollout_id}`: reviewer verdict `re-dispatch` "
+        f"({used + 1}/{MAX_ITEM_REDISPATCHES}) — {outcome.rationale}"
+    )
+    if outcome.detail:
+        comment = f"{comment} ({outcome.detail})"
+    if drifted_repos:
+        comment = f"{comment} drifted_repos={drifted_repos}"
     try:
         await gtd_client.post_comment(
             item_id,
-            (
-                f"Rollout `{rollout_id}`: reviewer verdict `re-dispatch` "
-                f"({used + 1}/{MAX_ITEM_REDISPATCHES}) — {outcome.rationale}"
-            ),
+            comment,
             created_by=attribution or "agent-gtd-dispatch",
             token=token,
         )
@@ -6451,6 +6609,7 @@ async def _rollout_wave_tick(
         if mark_action != "kept-superseded":
             dispatch_attempts.clear()
             _rollout_redispatches.pop(rollout_id, None)
+            _rollout_drift_redispatched.pop(rollout_id, None)
         logger.info(
             "rollout-loop: resume-mark-consumed rollout_id=%s run_id=%s "
             "pending=%s action=%s",
@@ -6575,6 +6734,7 @@ async def _rollout_wave_tick(
             attribution=attribution,
             workspace=loop_state.slots.get(entry.slot),
             halt_suffix=_queued_land_suffix(loop_state),
+            consider_drift=True,
         )
         if directive == _TICK_HALTED:
             return await _halt_teardown(
@@ -7305,6 +7465,7 @@ async def _drive_rollout(
                     _refused_relaunch_runs.discard(run.id)
                     dispatch_attempts.clear()
                     _rollout_redispatches.pop(rollout_id, None)
+                    _rollout_drift_redispatched.pop(rollout_id, None)
                     logger.info(
                         "rollout-loop: exit-deferred-for-refused-relaunch "
                         "rollout_id=%s run_id=%s directive=%s",
@@ -7354,6 +7515,7 @@ async def _drive_rollout(
                 land.task.cancel()
             await asyncio.gather(land.task, return_exceptions=True)
         _rollout_redispatches.pop(rollout_id, None)
+        _rollout_drift_redispatched.pop(rollout_id, None)
         _rollout_unrecorded_merges.pop(rollout_id, None)
         logger.info(
             "rollout-loop: concurrency-summary rollout_id=%s run_id=%s limit=%d "
