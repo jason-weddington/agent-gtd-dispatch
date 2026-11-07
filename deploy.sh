@@ -73,6 +73,21 @@ if [ -f "${TOOLCHAIN_CONF}" ]; then
     done
     # Substitute {version} locally; {arch} is resolved on each host from `uname -m`.
     GITLEAKS_URL_VERSIONED="${GITLEAKS_URL_TEMPLATE//\{version\}/${GITLEAKS_VERSION}}"
+    # macOS cross-check toolchain: zig pin, pinned crates, rust targets (same pattern).
+    ZIG_ARCH_MAP_LIST=""
+    for _e in "${ZIG_ARCH_MAP[@]}"; do
+        ZIG_ARCH_MAP_LIST="${ZIG_ARCH_MAP_LIST}'${_e}' "
+    done
+    ZIG_URL_VERSIONED="${ZIG_URL_TEMPLATE//\{version\}/${ZIG_VERSION}}"
+    ZIG_INSTALL_DIR="${ZIG_INSTALL_DIR_TEMPLATE//\{version\}/${ZIG_VERSION}}"
+    CARGO_PINNED_LIST=""
+    for _e in "${DEV_TOOLCHAIN_CARGO_PINNED_PKGS[@]}"; do
+        CARGO_PINNED_LIST="${CARGO_PINNED_LIST}'${_e}' "
+    done
+    RUST_TARGET_LIST=""
+    for _e in "${DEV_TOOLCHAIN_RUST_TARGETS[@]}"; do
+        RUST_TARGET_LIST="${RUST_TARGET_LIST}'${_e}' "
+    done
     # Playwright pins, same single-quoted-entry interpolation pattern as above.
     PLAYWRIGHT_VERSION_LIST=""
     for _e in "${PLAYWRIGHT_VERSIONS[@]}"; do
@@ -86,6 +101,13 @@ else
     GITLEAKS_ARCH_MAP_LIST=""
     GITLEAKS_URL_VERSIONED=""
     GITLEAKS_VERSION=""
+    ZIG_VERSION=""
+    ZIG_ARCH_MAP_LIST=""
+    ZIG_URL_VERSIONED=""
+    ZIG_INSTALL_DIR=""
+    ZIG_BIN_LINK=""
+    CARGO_PINNED_LIST=""
+    RUST_TARGET_LIST=""
     PLAYWRIGHT_VERSION_LIST=""
     PLAYWRIGHT_BROWSERS=""
 fi
@@ -253,6 +275,37 @@ else
             _tc_failed="\${_tc_failed} \$_crate"
         fi
     done
+    # Pinned crates ("<crate>|<binary>|<version>"): install only when the binary is
+    # absent or does not report the pinned version as a whole token. Absolute path:
+    # sudo -u -H has no login PATH.
+    for _entry in ${CARGO_PINNED_LIST}; do
+        _crate="\${_entry%%|*}"
+        _prest="\${_entry#*|}"
+        _bin="\${_prest%%|*}"
+        _ver="\${_prest#*|}"
+        if sudo -u ${AGENT_USER} -H "/home/${AGENT_USER}/.cargo/bin/\$_bin" --version 2>/dev/null | grep -q -F -w "\$_ver"; then
+            echo "[OK]   \$_bin \$_ver present for ${AGENT_USER}"
+        elif _TC_OUT=\$(sudo -u ${AGENT_USER} -H "\$_cargo" binstall -y --force "\$_crate@=\$_ver" 2>&1); then
+            echo "[OK]   \$_crate \$_ver installed for ${AGENT_USER}"
+        else
+            echo "[WARN] cargo binstall \$_crate@=\$_ver failed for ${AGENT_USER} — continuing. Last output:" >&2
+            printf '%s\n' "\$_TC_OUT" | tail -n 5 | sed 's/^/[WARN]   /' >&2
+            _tc_failed="\${_tc_failed} \$_crate"
+        fi
+    done
+    # Rust targets on EVERY installed toolchain.
+    for _tc in \$(sudo -u ${AGENT_USER} -H "\$_rustup" toolchain list 2>/dev/null | awk '{print \$1}' | grep -v -x -e no -e '' || true); do
+        for _t in ${RUST_TARGET_LIST}; do
+            if sudo -u ${AGENT_USER} -H "\$_rustup" target list --toolchain "\$_tc" --installed 2>/dev/null | grep -qx "\$_t"; then
+                echo "[OK]   \$_t (\$_tc) present"
+            elif sudo -u ${AGENT_USER} -H "\$_rustup" target add "\$_t" --toolchain "\$_tc" >/dev/null 2>&1; then
+                echo "[OK]   \$_t (\$_tc) added"
+            else
+                echo "[WARN] rustup target add \$_t --toolchain \$_tc failed for ${AGENT_USER} — continuing" >&2
+                _tc_failed="\${_tc_failed} \$_t@\$_tc"
+            fi
+        done
+    done
     if [ -n "\$_tc_failed" ]; then
         echo "[WARN] Dev toolchain incomplete for ${AGENT_USER}:\${_tc_failed} — run 'sudo ./setup-dispatch-host.sh' to retry" >&2
     fi
@@ -286,6 +339,82 @@ else
     fi
     rm -rf "\$_gl_tmp"
 fi
+
+# zig: re-install only when the installed version differs from the pinned version.
+_zig_machine=\$(uname -m)
+_zig_arch=""
+_zig_sha=""
+for _e in ${ZIG_ARCH_MAP_LIST}; do
+    _m="\${_e%%|*}"; _rest="\${_e#*|}"; _zarch="\${_rest%%|*}"; _zsha="\${_rest#*|}"
+    if [ "\$_m" = "\$_zig_machine" ]; then
+        _zig_arch="\$_zarch"
+        _zig_sha="\$_zsha"
+    fi
+done
+_zig_have=\$(sudo -u ${AGENT_USER} -H bash -lc 'zig version' 2>/dev/null | tr -d '[:space:]' || true)
+if [ -z "${ZIG_VERSION}" ]; then
+    echo "[WARN] no zig pin available (templates/dev-toolchain.sh missing) — skipping zig refresh" >&2
+elif [ -z "\$_zig_arch" ]; then
+    echo "[WARN] zig: architecture \$_zig_machine not in ZIG_ARCH_MAP — skipped" >&2
+elif [ "\$_zig_have" = "${ZIG_VERSION}" ]; then
+    echo "[OK]   zig: found=\${_zig_have:-none} pinned=${ZIG_VERSION} arch=\$_zig_machine action=skip"
+    echo "[OK]   zig (${AGENT_USER}): \$_zig_have"
+else
+    echo "[OK]   zig: found=\${_zig_have:-none} pinned=${ZIG_VERSION} arch=\$_zig_machine action=install"
+    _zig_url=\$(printf '%s' '${ZIG_URL_VERSIONED}' | sed "s/{arch}/\$_zig_arch/")
+    _zig_tmp=\$(mktemp -d)
+    _zig_reason=""
+    if ! curl -fsSL "\$_zig_url" -o "\$_zig_tmp/zig.tar.xz"; then
+        _zig_reason="download of \$_zig_url failed"
+    else
+        _zig_actual=\$(sha256sum "\$_zig_tmp/zig.tar.xz" | awk '{print \$1}')
+        if [ "\$_zig_actual" != "\$_zig_sha" ]; then
+            _zig_reason="sha256 mismatch: expected \$_zig_sha got \$_zig_actual"
+        elif _zig_stage=\$(sudo mktemp -d "/opt/.zig-${ZIG_VERSION}.XXXXXX") \
+            && sudo tar -xJf "\$_zig_tmp/zig.tar.xz" -C "\$_zig_stage" --strip-components=1 \
+            && sudo rm -rf "${ZIG_INSTALL_DIR}" \
+            && sudo mv "\$_zig_stage" "${ZIG_INSTALL_DIR}" \
+            && sudo chmod 0755 "${ZIG_INSTALL_DIR}" \
+            && sudo ln -sfn "${ZIG_INSTALL_DIR}/zig" "${ZIG_BIN_LINK}"; then
+            :
+        else
+            _zig_reason="extract/install step failed"
+            [ -n "\${_zig_stage:-}" ] && sudo rm -rf "\$_zig_stage"
+        fi
+    fi
+    rm -rf "\$_zig_tmp"
+    if [ -n "\$_zig_reason" ]; then
+        echo "[WARN] zig ${ZIG_VERSION} install failed (\$_zig_reason) — agent keeps its current binary" >&2
+    else
+        echo "[OK]   zig (${AGENT_USER}): \$(sudo -u ${AGENT_USER} -H bash -lc 'zig version' 2>/dev/null || echo unknown)"
+    fi
+fi
+
+# State line: one summary of the cross-check toolchain, same shape as setup Step 4.9.
+_st_zig=\$(sudo -u ${AGENT_USER} -H bash -lc 'zig version' 2>/dev/null | tr -d '[:space:]' || true)
+_st_pin_name=""
+_st_pin_ver=""
+for _entry in ${CARGO_PINNED_LIST}; do
+    _st_pin_name="\${_entry#*|}"; _st_pin_name="\${_st_pin_name%%|*}"
+    break
+done
+if [ -n "\$_st_pin_name" ]; then
+    _st_pin_ver=\$(sudo -u ${AGENT_USER} -H "/home/${AGENT_USER}/.cargo/bin/\$_st_pin_name" --version 2>/dev/null | awk '{print \$NF}' || true)
+fi
+_st_missing=""
+for _t in ${RUST_TARGET_LIST}; do
+    _t_ok=0
+    for _tc in \$([ -x "\$_rustup" ] && sudo -u ${AGENT_USER} -H "\$_rustup" toolchain list 2>/dev/null | awk '{print \$1}' | grep -v -x -e no -e '' || true); do
+        if sudo -u ${AGENT_USER} -H "\$_rustup" target list --toolchain "\$_tc" --installed 2>/dev/null | grep -qx "\$_t"; then
+            _t_ok=1
+        else
+            _t_ok=0
+            break
+        fi
+    done
+    if [ "\$_t_ok" = 0 ]; then _st_missing="\${_st_missing:+\$_st_missing,}\$_t"; fi
+done
+echo "[STATE] cross-toolchain zig=\${_st_zig:-MISSING} \${_st_pin_name:-pinned-crate}=\${_st_pin_ver:-MISSING} rust_targets_missing=\${_st_missing:-none}"
 
 # Refresh the agent user's Playwright browsers (setup-dispatch-host.sh Step 4.11).
 # Dispatched repos run Playwright e2e suites (camera-profiles apps/desktop,

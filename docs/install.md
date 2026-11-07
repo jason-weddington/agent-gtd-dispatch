@@ -973,7 +973,12 @@ for t in cog typos cargo-sort cargo-deny cargo-llvm-cov cargo-machete cargo-next
     sudo -u dispatch -H bash -lc "$t --version" || echo "MISSING: $t"
 done
 sudo -u dispatch -H bash -lc 'gitleaks version' || echo "MISSING: gitleaks"
+sudo -u dispatch -H bash -lc 'zig version' || echo "MISSING: zig"
+sudo -u dispatch -H bash -lc 'cargo-zigbuild --version' || echo "MISSING: cargo-zigbuild"
+sudo -u dispatch -H bash -lc 'rustup target list --installed | grep -x aarch64-apple-darwin' || echo "MISSING: aarch64-apple-darwin"
 ```
+
+The macOS cross-check pieces: `sudo -u dispatch -H bash -lc 'zig version'` must print `0.15.2`, `sudo -u dispatch -H bash -lc 'cargo-zigbuild --version'` must print `0.23.4`, and the `rustup target list --installed | grep -x aarch64-apple-darwin` line must print the target. Both setup and deploy also end Step 4.9 with one `[STATE] cross-toolchain zig=... cargo-zigbuild=... rust_targets_missing=...` line.
 
 ### No default rust toolchain
 
@@ -994,6 +999,26 @@ sudo -u dispatch -H bash -lc 'rustup default stable'
 **Policy decision recorded here**: a failing `cargo binstall` for one crate in the Step 4.9 loop now **WARNs and continues** (matching `deploy.sh`'s existing behaviour) rather than aborting provisioning with `die`, because a `die` there skips Steps 5a–8 and leaves the host without sudoers, systemd unit, or health verification. The counter-cost: a host can now finish provisioning with a dev-toolchain tool missing, which surfaces later as a hook failure inside a dispatched build rather than at provision time — hence the end-of-run `Dev toolchain incomplete` summary WARN, the `Dev toolchain:` line in the Summary block, and the yellow `Setup complete (with warnings)` banner, all meant to make that state visible to whoever ran the installer.
 
 **Limitation**: the gitleaks sub-action (Step 4.9 sub-action C) remains fatal after this change — a gitleaks failure still aborts the script before Step 5a. Step 4.9 is therefore not uniformly non-fatal; only the per-crate `cargo binstall` loop was changed.
+
+**Limitation (zig)**: a zig sha256 mismatch (Step 4.9 sub-action D) is fatal by design and likewise skips Steps 5a–8.
+
+### macOS cross-check toolchain (zig, cargo-zigbuild, aarch64-apple-darwin)
+
+So that a project gate can compile `cfg(target_os = "macos")` code on the Linux fleet, Step 4.9 (and `deploy.sh`) provisions:
+
+- **zig 0.15.2** — pinned upstream tarball, sha256-verified **before** extraction, extracted to `/opt/zig-0.15.2` and symlinked at `/usr/local/bin/zig`. The x86_64 and aarch64 tarballs are both pinned in `ZIG_ARCH_MAP`.
+- **cargo-zigbuild 0.23.4** — `cargo binstall -y --force cargo-zigbuild@=0.23.4` for the agent user (`DEV_TOOLCHAIN_CARGO_PINNED_PKGS`).
+- **the `aarch64-apple-darwin` rustup target** (`DEV_TOOLCHAIN_RUST_TARGETS`) added to every installed toolchain.
+
+All of them are data in `templates/dev-toolchain.sh` and idempotent (an up-to-date host runs no download and no install).
+
+**Bumping**: edit `ZIG_VERSION` plus **both** sha256 values in `ZIG_ARCH_MAP` (the `shasum` fields of <https://ziglang.org/download/index.json>), and the version in `DEV_TOOLCHAIN_CARGO_PINNED_PKGS`; then re-run setup or `./deploy.sh`.
+
+**Fatality policy**: a sha256 mismatch dies by design; a download failure or an unlisted architecture is a non-fatal warning.
+
+**Toolchains created later**: targets are applied only to toolchains present at setup/deploy time. A repo that pins a toolchain via `rust-toolchain.toml` should list `targets = ["aarch64-apple-darwin"]` there, or wait for the next `./deploy.sh`.
+
+**macOS hosts** are not provisioned by setup or deploy. Either the requesting project's gate skips zigbuild when `uname -s` is Darwin (plain `cargo clippy --target aarch64-apple-darwin` works natively), or the [Running on macOS](#running-on-macos) manual path gains `brew install zig && cargo binstall -y --force cargo-zigbuild@=0.23.4`.
 
 ---
 
@@ -1212,6 +1237,11 @@ sudo -u dispatch -H bash -lc 'cargo uninstall cargo-nextest cargo-llvm-cov cargo
 
 # gitleaks (plain binary, not a cargo crate):
 sudo rm -f /home/dispatch/.local/bin/gitleaks
+
+# macOS cross-check toolchain:
+sudo rm -rf /opt/zig-0.15.2 /usr/local/bin/zig
+sudo -u dispatch -H bash -lc 'cargo uninstall cargo-zigbuild'
+sudo -u dispatch -H bash -lc 'rustup target remove aarch64-apple-darwin --toolchain <tc>'
 
 # Optional — remove the Rust bootstrap entirely (ONLY if --with-talos is not in use;
 # Step 4.5b builds talos with the same toolchain):

@@ -1902,9 +1902,11 @@ fi
 #
 # The tool list is data, not code: see templates/dev-toolchain.sh. Adding a tool a
 # future repo needs is a one-line change there — never edit the loop below.
+# The macOS cross-check pieces (ZIG_*, DEV_TOOLCHAIN_CARGO_PINNED_PKGS,
+# DEV_TOOLCHAIN_RUST_TARGETS) are data in templates/dev-toolchain.sh too.
 # ===========================================================================
 echo ""
-echo "--- Step 4.9: Dev toolchain (system build packages, Rust tools + gitleaks, agent user) ---"
+echo "--- Step 4.9: Dev toolchain (system build packages, Rust tools, gitleaks, zig + darwin cross target, agent user) ---"
 
 TOOLCHAIN_CONF="${TMPL_DIR}/dev-toolchain.sh"
 if [[ ! -f "$TOOLCHAIN_CONF" ]]; then
@@ -1977,6 +1979,57 @@ for _tc_entry in "${DEV_TOOLCHAIN_CARGO_PKGS[@]}"; do
         fi
     fi
 done
+# Sub-action B2: version-pinned crates, "<crate>|<binary>|<version>". Skipped when
+# `<binary> --version` already contains the pinned version as a whole token;
+# `--force` plus the exact `@=` requirement make a version bump converge.
+for _pp_entry in "${DEV_TOOLCHAIN_CARGO_PINNED_PKGS[@]}"; do
+    _pp_crate="${_pp_entry%%|*}"
+    _pp_rest="${_pp_entry#*|}"
+    _pp_bin="${_pp_rest%%|*}"
+    _pp_ver="${_pp_rest#*|}"
+    if runuser -l "$AGENT_USER" -c "'${_pp_bin}' --version" 2>/dev/null | grep -q -F -w "$_pp_ver"; then
+        skip "${_pp_bin} ${_pp_ver} (${_pp_crate}) already installed for ${AGENT_USER} — already configured"
+    elif $DRY_RUN; then
+        would "runuser -l ${AGENT_USER} -- ${_agent_cargo} binstall -y --force ${_pp_crate}@=${_pp_ver}"
+    else
+        runuser -l "$AGENT_USER" -c "'${_agent_cargo}' binstall -y --force '${_pp_crate}@=${_pp_ver}'" \
+            || { warn "cargo binstall ${_pp_crate}@=${_pp_ver} failed for ${AGENT_USER} — continuing"; _tc_failed+=("${_pp_crate}"); continue; }
+        if runuser -l "$AGENT_USER" -c "'${_pp_bin}' --version" 2>/dev/null | grep -q -F -w "$_pp_ver"; then
+            info "Installed ${_pp_crate} ${_pp_ver} for ${AGENT_USER}"
+        else
+            warn "cargo binstall ${_pp_crate}@=${_pp_ver} ran but '${_pp_bin}' does not report ${_pp_ver} — continuing"
+            _tc_failed+=("${_pp_crate}")
+        fi
+    fi
+done
+
+# Sub-action B3: rustup targets for every toolchain the agent user has installed.
+_agent_rustup="${AGENT_HOME}/.cargo/bin/rustup"
+_rt_toolchains=()
+if [[ ! -x "$_agent_rustup" ]]; then
+    warn "${_agent_rustup} not executable (fresh host in --dry-run?) — skipping DEV_TOOLCHAIN_RUST_TARGETS"
+else
+    while IFS= read -r _rt_line; do
+        [[ -n "$_rt_line" ]] && _rt_toolchains+=("$_rt_line")
+    done < <(runuser -l "$AGENT_USER" -c "'$_agent_rustup' toolchain list" 2>/dev/null | awk '{print $1}' | grep -v -x -e no -e '' || true)
+    if [[ ${#_rt_toolchains[@]} -eq 0 ]]; then
+        info "no rustup toolchains for ${AGENT_USER} — skipping DEV_TOOLCHAIN_RUST_TARGETS"
+    fi
+fi
+for _rt_tc in "${_rt_toolchains[@]+"${_rt_toolchains[@]}"}"; do
+    for _rt_target in "${DEV_TOOLCHAIN_RUST_TARGETS[@]}"; do
+        if runuser -l "$AGENT_USER" -c "'$_agent_rustup' target list --toolchain '${_rt_tc}' --installed" 2>/dev/null | grep -q -F -x "$_rt_target"; then
+            skip "rust target ${_rt_target} (${_rt_tc}) already installed for ${AGENT_USER} — already configured"
+        elif $DRY_RUN; then
+            would "runuser -l ${AGENT_USER} -- ${_agent_rustup} target add ${_rt_target} --toolchain ${_rt_tc}"
+        else
+            runuser -l "$AGENT_USER" -c "'$_agent_rustup' target add '${_rt_target}' --toolchain '${_rt_tc}'" \
+                || { warn "rustup target add ${_rt_target} --toolchain ${_rt_tc} failed for ${AGENT_USER} — continuing"; _tc_failed+=("${_rt_target}@${_rt_tc}"); continue; }
+            info "Added rust target ${_rt_target} to ${_rt_tc} for ${AGENT_USER}"
+        fi
+    done
+done
+
 if [[ ${#_tc_failed[@]} -gt 0 ]]; then
     warn "Dev toolchain incomplete for ${AGENT_USER}: ${_tc_failed[*]} — provisioning continued; re-run 'sudo ./setup-dispatch-host.sh' to retry"
 fi
@@ -2019,6 +2072,93 @@ else
         die "gitleaks installed at ${_gl_dest} but reports '${_gl_now}' instead of the pinned ${GITLEAKS_VERSION}"
     fi
 fi
+
+# Sub-action D: zig — pinned upstream tarball, sha256-verified, installed as root.
+# Runs as root in both two-user and single-user mode; the agent user only runs it.
+_zig_machine="$(uname -m)"
+_zig_arch=""
+_zig_sha=""
+for _e in "${ZIG_ARCH_MAP[@]}"; do
+    _m="${_e%%|*}"; _rest="${_e#*|}"; _zarch="${_rest%%|*}"; _zsha="${_rest#*|}"
+    if [[ "$_m" == "$_zig_machine" ]]; then
+        _zig_arch="$_zarch"
+        _zig_sha="$_zsha"
+    fi
+done
+_zig_url="${ZIG_URL_TEMPLATE//\{version\}/${ZIG_VERSION}}"
+_zig_url="${_zig_url//\{arch\}/${_zig_arch}}"
+_zig_dir="${ZIG_INSTALL_DIR_TEMPLATE//\{version\}/${ZIG_VERSION}}"
+_zig_have="$(runuser -l "$AGENT_USER" -c 'zig version' 2>/dev/null | tr -d '[:space:]' || true)"
+
+if [[ -z "$_zig_arch" ]]; then
+    warn "unsupported architecture '${_zig_machine}' for zig — skipping"
+elif [[ "$_zig_have" == "$ZIG_VERSION" ]]; then
+    skip "zig ${ZIG_VERSION} already installed at ${ZIG_BIN_LINK} — already configured"
+elif $DRY_RUN; then
+    would "download ${_zig_url}, verify sha256 ${_zig_sha}, extract to ${_zig_dir}, symlink ${ZIG_BIN_LINK}"
+else
+    _zig_tmp="$(mktemp -d)"
+    _zig_tarball="${_zig_tmp}/zig.tar.xz"
+    if ! curl -fsSL "$_zig_url" -o "$_zig_tarball"; then
+        warn "Failed to download zig ${ZIG_VERSION} from ${_zig_url} — skipping zig"
+        _tc_failed+=("zig")
+        rm -rf "$_zig_tmp"
+    else
+        _zig_actual="$(sha256sum "$_zig_tarball" | awk '{print $1}')"
+        if [[ "$_zig_actual" != "$_zig_sha" ]]; then
+            rm -rf "$_zig_tmp"
+            die "zig ${ZIG_VERSION} sha256 mismatch for ${_zig_url}: expected ${_zig_sha} got ${_zig_actual}"
+        fi
+        _zig_stage=$(mktemp -d "/opt/.zig-${ZIG_VERSION}.XXXXXX")
+        tar -xJf "$_zig_tarball" -C "$_zig_stage" --strip-components=1 \
+            || { rm -rf "$_zig_stage" "$_zig_tmp"; die "Failed to extract zig ${ZIG_VERSION} tarball (${_zig_url})"; }
+        rm -rf "$_zig_dir"
+        mv "$_zig_stage" "$_zig_dir"
+        chmod 0755 "$_zig_dir"   # mktemp -d makes it 0700, which would stop the agent user running zig
+        ln -sfn "${_zig_dir}/zig" "${ZIG_BIN_LINK}"
+        rm -rf "$_zig_tmp"
+        _zig_now="$(runuser -l "$AGENT_USER" -c 'zig version' 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ "$_zig_now" == "$ZIG_VERSION" ]]; then
+            info "Installed zig ${ZIG_VERSION} (${_zig_arch}): ${_zig_dir} → ${ZIG_BIN_LINK}"
+        else
+            die "zig installed at ${_zig_dir} but '${AGENT_USER}' sees '${_zig_now}' instead of the pinned ${ZIG_VERSION} (another zig earlier on PATH?)"
+        fi
+    fi
+fi
+
+# State line (always exactly one, on skip, install and failure paths alike).
+_st_zig="$(runuser -l "$AGENT_USER" -c 'zig version' 2>/dev/null | tr -d '[:space:]' || true)"
+_st_pin_name=""
+_st_pin_ver=""
+for _pp_entry in "${DEV_TOOLCHAIN_CARGO_PINNED_PKGS[@]}"; do
+    _st_pin_name="${_pp_entry#*|}"; _st_pin_name="${_st_pin_name%%|*}"
+    break
+done
+if [[ -n "$_st_pin_name" ]]; then
+    _st_pin_ver="$(runuser -l "$AGENT_USER" -c "'${_st_pin_name}' --version" 2>/dev/null | awk '{print $NF}' || true)"
+fi
+_st_missing=()
+for _rt_target in "${DEV_TOOLCHAIN_RUST_TARGETS[@]}"; do
+    _rt_have=false
+    if [[ -x "$_agent_rustup" ]]; then
+        for _rt_tc in "${_rt_toolchains[@]+"${_rt_toolchains[@]}"}"; do
+            if runuser -l "$AGENT_USER" -c "'$_agent_rustup' target list --toolchain '${_rt_tc}' --installed" 2>/dev/null | grep -q -F -x "$_rt_target"; then
+                _rt_have=true
+            else
+                _rt_have=false
+                break
+            fi
+        done
+        [[ ${#_rt_toolchains[@]} -eq 0 ]] && _rt_have=false
+    fi
+    $_rt_have || _st_missing+=("$_rt_target")
+done
+_st_missing_csv="none"
+if [[ ${#_st_missing[@]} -gt 0 ]]; then
+    _st_missing_csv="$(IFS=,; echo "${_st_missing[*]}")"
+fi
+# The pinned-crate label comes from the data file's binary name (no hard-coded name here).
+echo "[STATE] cross-toolchain zig=${_st_zig:-MISSING} ${_st_pin_name:-pinned-crate}=${_st_pin_ver:-MISSING} rust_targets_missing=${_st_missing_csv}"
 
 # ===========================================================================
 # Step 4.10: personal-kb-hook (agent user)

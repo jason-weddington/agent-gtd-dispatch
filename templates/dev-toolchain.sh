@@ -70,6 +70,7 @@ DEV_TOOLCHAIN_APT_PKGS=(
   libayatana-appindicator3-dev librsvg2-dev libxdo-dev file                        # Tauri 2
   shellcheck python3                             # shell linting + scripts in project gates (poolhouse vm-harness-selftest)
   gcc-arm-linux-gnueabihf                       # armv7 C cross compiler (aws-lc-sys in a 32-bit cross-check gate)
+  xz-utils                                      # .tar.xz extraction (zig tarball)
 )
 DEV_TOOLCHAIN_NPM_GLOBAL_PKGS=(
   "pnpm|pnpm"   # JS package manager used by Tauri app frontends
@@ -116,6 +117,44 @@ GITLEAKS_ARCH_MAP=(
   "x86_64|x64"     # x86_64 hosts
   "aarch64|arm64"  # Pi 5-class hosts
 )
+
+# ---------------------------------------------------------------------------
+# macOS cross-check toolchain — zig, cargo-zigbuild, aarch64-apple-darwin target
+# ---------------------------------------------------------------------------
+# WHY: lets a project gate compile cfg(target_os = "macos") code on the Linux fleet
+# (`cargo zigbuild` / `cargo clippy --target aarch64-apple-darwin`).
+#
+# zig is installed from a pinned upstream tarball, verified against a pinned sha256
+# BEFORE extraction (a mismatch is fatal by design; nothing is ever downloaded
+# without a pinned sha256). It is extracted to ZIG_INSTALL_DIR_TEMPLATE and
+# symlinked at ZIG_BIN_LINK.
+#
+# Both sha256 values in ZIG_ARCH_MAP are the "shasum" fields of
+# https://ziglang.org/download/index.json for release 0.15.2.
+# To BUMP: edit ZIG_VERSION plus BOTH sha256 values from index.json, then re-run
+#   setup-dispatch-host.sh (Step 4.9) or ./deploy.sh on every host.
+ZIG_VERSION="0.15.2"
+
+# Placeholders {version} and {arch} are substituted by the caller.
+ZIG_URL_TEMPLATE="https://ziglang.org/download/{version}/zig-{arch}-linux-{version}.tar.xz"
+
+# "<uname -m>|<url arch token>|<sha256>"
+ZIG_ARCH_MAP=(
+  "x86_64|x86_64|02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239"
+  "aarch64|aarch64|958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f"
+)
+
+ZIG_INSTALL_DIR_TEMPLATE="/opt/zig-{version}"
+ZIG_BIN_LINK="/usr/local/bin/zig"
+
+# Version-pinned cargo crates, "<crate>|<binary>|<version>". Installed with
+# `cargo binstall -y --force <crate>@=<version>`; bump the version here to converge.
+DEV_TOOLCHAIN_CARGO_PINNED_PKGS=(
+  "cargo-zigbuild|cargo-zigbuild|0.23.4"
+)
+
+# rustup targets added to every installed toolchain (idempotent).
+DEV_TOOLCHAIN_RUST_TARGETS=("aarch64-apple-darwin")
 
 # ---------------------------------------------------------------------------
 # FORMAT — PLAYWRIGHT_VERSIONS / PLAYWRIGHT_BROWSERS
