@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from datetime import datetime
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -546,6 +547,7 @@ class TestReviewerReceivesFallbackBranch:
             mock_gtd.get_rollout_merge_notes = AsyncMock(return_value=[])
             mock_dispatch.ITEM_COMMIT_TYPES = dispatch.ITEM_COMMIT_TYPES
             mock_dispatch.build_review_prompt = MagicMock(return_value="prompt")
+            mock_dispatch.find_newer_fallback_branch = MagicMock(return_value=None)
             mock_dispatch.compose_squash_subject = MagicMock(return_value=None)
             mock_dispatch.run_agent = AsyncMock(return_value=MagicMock(returncode=0))
             mock_dispatch.read_review_verdict = MagicMock(return_value=(None, "absent"))
@@ -748,3 +750,273 @@ class TestFallbackReuse:
         with caplog.at_level("WARNING"):
             dispatch.push_unpushed_repo(repo, "feat/x-r2", 60.0)
         assert any("nested suffix possible" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# review-branch-source logging and the newer -rN probe
+# ---------------------------------------------------------------------------
+
+_OLD = "2026-01-01T00:00:00+00:00"
+_NEW = "2026-06-01T00:00:00+00:00"
+_STARTED = "2026-03-01T00:00:00+00:00"
+
+
+def _commit_at(repo: Path, name: str, when: str) -> str:
+    (repo / name).write_text(name)
+    _git(repo, "add", "-A")
+    env = {**os.environ, "GIT_COMMITTER_DATE": when, "GIT_AUTHOR_DATE": when}
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", name],
+        cwd=repo,
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _push_branch_at(origin: _Origin, branch: str, when: str, base: str = "main") -> str:
+    name = f"mk-{branch.replace('/', '-')}"
+    repo = origin.clone(name, branch)
+    if base != "main":
+        _git(repo, "reset", "--hard", f"origin/{base}")
+    sha = _commit_at(repo, f"{name}.txt", when)
+    _git(repo, "push", "origin", f"HEAD:refs/heads/{branch}")
+    return sha
+
+
+def _started() -> datetime:
+    return datetime.fromisoformat(_STARTED)
+
+
+def _probe(origin: _Origin, chosen: str = "feat/x") -> str | None:
+    review = origin.clone("review", "scratch")
+    return dispatch.find_newer_fallback_branch(review, chosen, _started(), "main", 60)
+
+
+class TestReviewBranchSourceLog:
+    @pytest.mark.asyncio
+    async def test_sources_and_disagreement(self, caplog) -> None:
+        from agent_gtd_dispatch import db, main
+
+        await db.init_db()
+        build = Run(
+            item_id="i", project_name="P", branch_name="feat/h", mode=DispatchMode.BUILD
+        )
+        await db.insert_run(build)
+        with caplog.at_level("INFO"):
+            await main._review_branch_name(
+                "i",
+                {"title": "t"},
+                {"remote_run_id": "elsewhere", "feature_branch": "feat/b"},
+            )
+            await main._review_branch_name("i", {"title": "t"}, {})
+            got = await main._review_branch_name(
+                "i",
+                {"title": "t"},
+                {"remote_run_id": build.id, "feature_branch": "feat/b"},
+            )
+            await main._review_branch_name(
+                "i",
+                {"title": "t"},
+                {"remote_run_id": build.id, "feature_branch": "feat/h"},
+            )
+        assert got == "feat/h"
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(
+            "review-branch-source" in m and "source=board-row" in m for m in msgs
+        )
+        assert any(
+            "review-branch-source" in m and "source=deterministic" in m for m in msgs
+        )
+        assert sum("source=host-record" in m for m in msgs) == 2
+        disagree = [m for m in msgs if "review-branch-disagree" in m]
+        assert len(disagree) == 1
+        assert "host=feat/h board=feat/b" in disagree[0]
+
+
+class TestFindNewerFallbackBranch:
+    def test_fast_forward_has_no_candidates(self, tmp_path, caplog) -> None:
+        origin = _Origin(tmp_path)
+        _push_branch_at(origin, "feat/x", _NEW)
+        with caplog.at_level("INFO"):
+            assert _probe(origin) is None
+        assert "review-branch-probe" not in caplog.text
+
+    def test_fresh_r3_beats_stale_chosen(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        _push_branch_at(origin, "feat/x", _OLD)
+        _push_branch_at(origin, "feat/x-r3", _NEW)
+        assert _probe(origin) == "feat/x-r3"
+
+    def test_default_advancing_after_cut_still_found(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        _push_branch_at(origin, "feat/x", _OLD)
+        _push_branch_at(origin, "feat/x-r3", _NEW)
+        adv = origin.clone("adv", "adv")
+        _commit_at(adv, "later.txt", _NEW)
+        _git(adv, "push", "origin", "HEAD:refs/heads/main")
+        assert _probe(origin) == "feat/x-r3"
+
+    def test_rejections(self, tmp_path, caplog) -> None:
+        cases = []
+        o1 = _Origin(tmp_path / "a") if (tmp_path / "a").mkdir() is None else None
+        assert o1 is not None
+        _push_branch_at(o1, "feat/x", _NEW)
+        _push_branch_at(o1, "feat/x-r3", _NEW)
+        cases.append((o1, "chosen-newer"))
+        (tmp_path / "b").mkdir()
+        o2 = _Origin(tmp_path / "b")
+        _push_branch_at(o2, "feat/x", _OLD)
+        _push_branch_at(o2, "feat/x-r3", _OLD)
+        cases.append((o2, "candidate-older"))
+        (tmp_path / "c").mkdir()
+        o3 = _Origin(tmp_path / "c")
+        _push_branch_at(o3, "feat/x-r2", _NEW)
+        # chosen descends from the candidate but is old: rebase the old commit
+        # chain so the candidate is an ancestor of chosen.
+        repo = o3.clone("chosenwork", "feat/x")
+        _git(repo, "reset", "--hard", "origin/feat/x-r2")
+        _commit_at(repo, "tip.txt", _OLD)
+        _git(repo, "push", "origin", "HEAD:refs/heads/feat/x")
+        cases.append((o3, "already-in-chosen"))
+        for origin, reason in cases:
+            caplog.clear()
+            with caplog.at_level("INFO"):
+                assert _probe(origin) is None
+            assert f"result=none reason={reason}" in caplog.text, reason
+
+    def test_older_r4_skipped_for_fresh_r3(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        _push_branch_at(origin, "feat/x", _OLD)
+        _push_branch_at(origin, "feat/x-r3", _NEW)
+        _push_branch_at(origin, "feat/x-r4", _OLD)
+        assert _probe(origin) == "feat/x-r3"
+
+    def test_rescue_refs_never_chosen(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        _push_branch_at(origin, "feat/x", _OLD)
+        _push_branch_at(origin, "feat/x-rescue-abc", _NEW)
+        assert _probe(origin) is None
+
+    def test_origin_removed_returns_none_and_logs(self, tmp_path, caplog) -> None:
+        import shutil
+
+        origin = _Origin(tmp_path)
+        _push_branch_at(origin, "feat/x", _OLD)
+        review = origin.clone("review", "scratch")
+        shutil.rmtree(origin.path)
+        with caplog.at_level("INFO"):
+            got = dispatch.find_newer_fallback_branch(
+                review, "feat/x", _started(), "main", 60
+            )
+        assert got is None
+        assert "review-branch-probe-failed" in caplog.text
+
+    def test_empty_chosen(self, tmp_path) -> None:
+        origin = _Origin(tmp_path)
+        assert _probe(origin, "") is None
+
+
+class TestLaunchReviewerProbe:
+    @staticmethod
+    async def _launch(workspace, started_at, finder, caplog):
+        from agent_gtd_dispatch import db, main
+        from agent_gtd_dispatch.engines import CLAUDE
+
+        await db.init_db()
+        board_row = {
+            "id": "board-run",
+            "rollout_id": "ro-1",
+            "remote_run_id": "not-here",
+            "feature_branch": "feat/x",
+            "status": "success",
+            "created_at": "2026-10-19T00:00:00Z",
+            "started_at": started_at,
+        }
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+            caplog.at_level("INFO"),
+        ):
+            mock_gtd.get_item = AsyncMock(
+                return_value={"id": "item-rv", "title": "X", "commit_type": "fix"}
+            )
+            mock_gtd.list_runs_for_item = AsyncMock(return_value=[board_row])
+            mock_gtd.get_rollout_merge_notes = AsyncMock(return_value=[])
+            mock_dispatch.ITEM_COMMIT_TYPES = dispatch.ITEM_COMMIT_TYPES
+            mock_dispatch.build_review_prompt = MagicMock(return_value="prompt")
+            mock_dispatch.compose_squash_subject = MagicMock(return_value=None)
+            mock_dispatch.run_agent = AsyncMock(return_value=MagicMock(returncode=0))
+            mock_dispatch.read_review_verdict = MagicMock(return_value=(None, "absent"))
+            mock_dispatch.refresh_feature_branch_refs = MagicMock(
+                return_value={"repo": "refreshed"}
+            )
+            mock_dispatch.find_newer_fallback_branch = finder
+            mock_dispatch.last_probe_commit_times = dispatch.last_probe_commit_times
+            verdict = await main._launch_reviewer(
+                "ro-1",
+                "item-rv",
+                project={"name": "P"},
+                workspace=workspace,
+                reviewer_engine=CLAUDE,
+                token=None,
+                attribution=None,
+            )
+        return verdict, mock_dispatch
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("started", [_STARTED, "2026-03-01T00:00:00"])
+    async def test_stale_board_branch_switches_to_r3(
+        self, tmp_path, caplog, started
+    ) -> None:
+        origin = _Origin(tmp_path)
+        _push_branch_at(origin, "feat/x", _OLD)
+        _push_branch_at(origin, "feat/x-r3", _NEW)
+        _push_branch_at(origin, "feat/x-rescue-k", _NEW)
+        review = origin.clone("review", "scratch")
+        ws = SimpleNamespace(
+            root=tmp_path,
+            repo_paths={"repo": review},
+            default_branches={"repo": "main"},
+            workspace_mode=False,
+        )
+        verdict, md = await self._launch(
+            ws, started, dispatch.find_newer_fallback_branch, caplog
+        )
+        assert verdict.branch_name == "feat/x-r3"
+        assert md.build_review_prompt.call_args.args[3] == "feat/x-r3"
+        assert md.refresh_feature_branch_refs.call_args.args[1] == "feat/x-r3"
+        assert "review-branch-mismatch rollout_id=ro-1 item=item-rv" in caplog.text
+        assert "chosen=feat/x newer=feat/x-r3" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_no_started_at_skips_probe(self, tmp_path, caplog) -> None:
+        finder = MagicMock(return_value="feat/x-r9")
+        ws = SimpleNamespace(
+            root=tmp_path,
+            repo_paths={"repo": tmp_path},
+            default_branches={"repo": "main"},
+            workspace_mode=False,
+        )
+        verdict, _ = await self._launch(ws, None, finder, caplog)
+        finder.assert_not_called()
+        assert verdict.branch_name == "feat/x"
+
+    @pytest.mark.asyncio
+    async def test_two_repos_first_wins_and_ambiguity_logged(
+        self, tmp_path, caplog
+    ) -> None:
+        finder = MagicMock(side_effect=["feat/x-r2", "feat/x-r3"])
+        ws = SimpleNamespace(
+            root=tmp_path,
+            repo_paths={"b": tmp_path, "a": tmp_path},
+            default_branches={"a": "main", "b": "main"},
+            workspace_mode=False,
+        )
+        verdict, _ = await self._launch(ws, _STARTED, finder, caplog)
+        assert verdict.branch_name == "feat/x-r2"
+        assert (
+            "review-branch-mismatch-ambiguous item=item-rv names=feat/x-r2,feat/x-r3"
+            in caplog.text
+        )

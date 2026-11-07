@@ -2355,8 +2355,16 @@ async def _review_branch_name(
     run's commits) records that name as its ``branch_name``, and the board's
     ``feature_branch`` only catches up at terminal sync.  Then the board's
     ``feature_branch``, then the deterministic item branch name.
+
+    There is deliberately NO host-to-host lookup of another host's run record
+    (hosts hold no credentials for other hosts' APIs); cross-host correctness
+    rests on the board recording the pushed branch at terminal sync.  A
+    ``review-branch-mismatch`` warning firing after that change signals the
+    board terminal sync regressed or the rescue path raced.
     """
     remote_run_id = str(run_row.get("remote_run_id") or "")
+    board_branch = str(run_row.get("feature_branch") or "")
+    host_branch = ""
     if remote_run_id:
         try:
             build_run = await db.get_run(remote_run_id)
@@ -2368,11 +2376,100 @@ async def _review_branch_name(
             )
             build_run = None
         if build_run is not None and build_run.branch_name:
-            return build_run.branch_name
-    branch_name = str(run_row.get("feature_branch") or "")
-    if branch_name:
+            host_branch = str(build_run.branch_name)
+    if host_branch:
+        source, branch_name = "host-record", host_branch
+        if board_branch and board_branch != host_branch:
+            logger.warning(
+                "rollout-loop: review-branch-disagree item=%s host=%s board=%s "
+                "remote_run=%s",
+                item_id,
+                host_branch,
+                board_branch,
+                remote_run_id or "-",
+            )
+    elif board_branch:
+        source, branch_name = "board-row", board_branch
+    else:
+        source = "deterministic"
+        branch_name = make_branch_name(item_id, str(item.get("title") or ""))
+    logger.info(
+        "rollout-loop: review-branch-source item=%s source=%s branch=%s "
+        "board_feature_branch=%s remote_run=%s",
+        item_id,
+        source,
+        branch_name,
+        board_branch or "-",
+        remote_run_id or "-",
+    )
+    return branch_name
+
+
+async def _probe_newer_review_branch(
+    rollout_id: str,
+    item_id: str,
+    run_row: dict[str, Any],
+    branch_name: str,
+    workspace: Any,
+) -> str:
+    """Return the newer ``<branch>-rN`` to review instead of *branch_name*, if any."""
+    raw_started = run_row.get("started_at")
+    if not raw_started:
         return branch_name
-    return make_branch_name(item_id, str(item.get("title") or ""))
+    try:
+        started = datetime.fromisoformat(str(raw_started).replace("Z", "+00:00"))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=UTC)
+    except ValueError:
+        return branch_name
+    loop = asyncio.get_running_loop()
+    first: tuple[str, str] | None = None
+    for repo in sorted(workspace.repo_paths):
+        newer = await loop.run_in_executor(
+            None,
+            functools.partial(
+                dispatch.find_newer_fallback_branch,
+                workspace.repo_paths[repo],
+                branch_name,
+                started,
+                workspace.default_branches[repo],
+                config.LAND_GIT_TIMEOUT_SECONDS,
+                item_id=item_id,
+            ),
+        )
+        if not isinstance(newer, str) or not newer:
+            continue
+        if first is None:
+            first = (repo, newer)
+        elif newer != first[1]:
+            logger.warning(
+                "rollout-loop: review-branch-mismatch-ambiguous item=%s names=%s,%s",
+                item_id,
+                first[1],
+                newer,
+            )
+    if first is None:
+        return branch_name
+    repo, newer = first
+    try:
+        chosen_ct, newer_ct = dispatch.last_probe_commit_times(
+            workspace.repo_paths[repo], branch_name, newer
+        )
+    except Exception:
+        chosen_ct = newer_ct = "-"
+    logger.warning(
+        "rollout-loop: review-branch-mismatch rollout_id=%s item=%s repo=%s "
+        "chosen=%s newer=%s started_at=%s chosen_ct=%s newer_ct=%s",
+        rollout_id,
+        item_id,
+        repo,
+        branch_name,
+        newer,
+        started.isoformat(),
+        chosen_ct,
+        newer_ct,
+    )
+    return newer
 
 
 async def _reap_rollout_dirs(
@@ -2550,6 +2647,10 @@ async def _launch_reviewer(
         )
     run_row = await _latest_run_for_item(item_id, rollout_id, token=token)
     branch_name = await _review_branch_name(item_id, item, run_row)
+    if gate_failure_output is None and land_conflict is None:
+        branch_name = await _probe_newer_review_branch(
+            rollout_id, item_id, run_row, branch_name, workspace
+        )
 
     # Force-refresh the feature branch's tracking ref in every landing repo
     # BEFORE the run row exists: a cancel or error during the refresh then

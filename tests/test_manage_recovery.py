@@ -877,6 +877,7 @@ class TestLaunchReviewer:
         ctx.dispatch.ITEM_COMMIT_TYPES = real_dispatch.ITEM_COMMIT_TYPES
         ctx.dispatch.compose_squash_subject = real_dispatch.compose_squash_subject
         ctx.dispatch.build_review_prompt = MagicMock(return_value="PROMPT")
+        ctx.dispatch.find_newer_fallback_branch = MagicMock(return_value=None)
         ctx.dispatch.clear_review_verdict = MagicMock()
         ctx.dispatch.read_review_verdict = MagicMock(
             return_value=(verdict_blob, reason)

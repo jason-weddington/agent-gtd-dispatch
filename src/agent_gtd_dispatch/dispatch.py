@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+    from datetime import datetime
 
 from agent_gtd_dispatch_protocol.branches import make_branch_name
 from agent_gtd_dispatch_protocol.models import BuildEngine, DispatchMode
@@ -4678,6 +4679,116 @@ def refresh_feature_branch_refs(
             )
         results[repo] = state["result"]
     return results
+
+
+def _commit_time(repo: Path, ref: str, timeout: int) -> int:
+    """Committer time (epoch seconds) of *ref*'s tip; raises on failure."""
+    return int(_land_git_ok(repo, ["log", "-1", "--format=%ct", ref], timeout))
+
+
+def last_probe_commit_times(repo: Path, chosen: str, newer: str) -> tuple[str, str]:
+    """Committer times of two already-fetched review-branch refs, for logging."""
+    timeout = config.LAND_GIT_TIMEOUT_SECONDS
+    return (
+        str(_commit_time(repo, f"refs/remotes/origin/{chosen}", timeout)),
+        str(_commit_time(repo, f"refs/remotes/origin/{newer}", timeout)),
+    )
+
+
+def _fallback_candidates(repo: Path, chosen: str, timeout: int) -> list[int]:
+    """Fallback suffixes N present on origin as ``<chosen>-r<N>``, descending."""
+    out = _land_git_ok(
+        repo, ["ls-remote", "origin", f"refs/heads/{chosen}-r*"], timeout
+    )
+    suffixes: set[int] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        n = _canonical_suffix(chosen, parts[1])
+        if n is not None:
+            suffixes.add(n)
+    return sorted(suffixes, reverse=True)
+
+
+def find_newer_fallback_branch(
+    repo_path: Path,
+    chosen: str,
+    build_started_at: datetime,
+    default_branch: str,
+    timeout: int,
+    *,
+    item_id: str = "-",
+) -> str | None:
+    """Return a newer ``<chosen>-r<N>`` branch the build actually pushed, or None.
+
+    Belt and braces for a review that picked a stale item branch: when
+    *chosen*'s tip is older than the build's start time and origin holds a
+    ``<chosen>-r<N>`` whose tip is at least as new as the build start and is
+    not already contained in *chosen*, that fallback branch is the build's
+    real result.  Highest N wins.  Uses full ref names and forced-refspec
+    fetches into ``refs/remotes/origin/*`` only (the review clone is
+    single-branch and shallow); never touches HEAD, the index or the
+    worktree.  *default_branch* is only logged: main legitimately advances
+    during a rollout, so descent from it is not required.  NEVER raises.
+    """
+    del default_branch  # accepted for signature stability; see docstring
+    if not chosen:
+        return None
+    try:
+        suffixes = _fallback_candidates(repo_path, chosen, timeout)
+        if not suffixes:
+            return None
+        if not land_fetch_feature_branch(repo_path, chosen, timeout):
+            return None
+        started = build_started_at.timestamp()
+        chosen_ct = _commit_time(repo_path, f"refs/remotes/origin/{chosen}", timeout)
+        reason: str | None = None
+        if chosen_ct >= started:
+            reason = "chosen-newer"
+        else:
+            for n in suffixes:
+                cand = f"{chosen}-r{n}"
+                if not land_fetch_feature_branch(repo_path, cand, timeout):
+                    continue
+                cand_ref = f"refs/remotes/origin/{cand}"
+                if _commit_time(repo_path, cand_ref, timeout) < started:
+                    reason = reason or "candidate-older"
+                    continue
+                ancestor = _land_git(
+                    repo_path,
+                    [
+                        "merge-base",
+                        "--is-ancestor",
+                        cand_ref,
+                        f"refs/remotes/origin/{chosen}",
+                    ],
+                    timeout,
+                )
+                if ancestor.returncode not in (0, 1):
+                    raise LandGitError("merge-base", git_output_excerpt(ancestor))
+                if ancestor.returncode == 0:
+                    reason = reason or "already-in-chosen"
+                    continue
+                return cand
+        if reason is not None:
+            logger.info(
+                "rollout-loop: review-branch-probe item=%s repo=%s chosen=%s "
+                "result=none reason=%s",
+                item_id,
+                repo_path.name,
+                chosen,
+                reason,
+            )
+        return None
+    except Exception as exc:
+        logger.warning(
+            "rollout-loop: review-branch-probe-failed repo=%s chosen=%s error=%s",
+            repo_path.name,
+            chosen,
+            str(exc)[:200],
+        )
+        return None
 
 
 @dataclass(frozen=True)
