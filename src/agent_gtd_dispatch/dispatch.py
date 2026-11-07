@@ -5668,7 +5668,11 @@ are not supposed to.
 
 
 def _review_fix_mode_block(
-    gate_failure_output: str, *, workspace_mode: bool, where: str
+    gate_failure_output: str,
+    *,
+    workspace_mode: bool,
+    where: str,
+    bash_timeout_ms: int,
 ) -> str:
     """The FIX MODE section that replaces Steps 2-5 on a land-gate relaunch."""
     repos = (
@@ -5699,6 +5703,7 @@ Do exactly this:
 2. `git add` the changed files, then `git commit --amend --no-edit` in the repo
    that needs the fix, so the squash commit keeps its subject and both its
    `Rollout:` and `Item:` trailers and stays the ONLY commit ahead of origin.
+   Run the `git commit --amend --no-edit` as ONE foreground Bash call with the Bash tool `timeout` parameter set to {bash_timeout_ms}; NEVER set `run_in_background` for it. This commit is exempt from the 5-minute rule in Step 4.
 3. Re-run the gate yourself to confirm it is green.
 
 FORBIDDEN in this mode: `git checkout`, `git reset`, `git rebase`, `git merge`
@@ -5820,6 +5825,7 @@ def build_review_prompt(
     gate_failure_output: str | None = None,
     engine_name: str | None = None,
     land_conflict: dict[str, list[str]] | None = None,
+    review_timeout_seconds: int | None = None,
 ) -> str:
     """System prompt for REVIEW mode — review ONE build, then approve or refuse.
 
@@ -5848,6 +5854,11 @@ def build_review_prompt(
     if land_conflict is not None and gate_failure_output is not None:
         raise ValueError("land_conflict and gate_failure_output are mutually exclusive")
     fix_mode = gate_failure_output is not None
+    bash_timeout_ms = (
+        review_timeout_seconds
+        if review_timeout_seconds is not None
+        else config.REVIEW_TIMEOUT_SECONDS
+    ) * 1000
     conflict_mode = land_conflict is not None
     project_name = project.get("name", "")
     dirs = list(repo_dirs or [])
@@ -5972,7 +5983,10 @@ record `none` for it and continue — do NOT halt for that alone."""
         )
     elif fix_mode:
         steps = _review_fix_mode_block(
-            str(gate_failure_output), workspace_mode=workspace_mode, where=where
+            str(gate_failure_output),
+            workspace_mode=workspace_mode,
+            where=where,
+            bash_timeout_ms=bash_timeout_ms,
         )
     else:
         steps = textwrap.indent(
@@ -6076,7 +6090,8 @@ record `none` for it and continue — do NOT halt for that alone."""
                 re-run the bar. "Small" is your judgment; if the fix is non-trivial, or
                 your first attempt does not make the bar green, stop and return
                 `re-dispatch` (the build agent has the item's full context and you do
-                not) or `halt`.
+                not) or `halt`. Commit any inline fix on the local {branch_name} before
+                Step 5; an uncommitted inline fix is not squashed.
 
                 ALL repos that received the branch must pass the bar before ANY squash
                 commit is created.
@@ -6087,19 +6102,25 @@ record `none` for it and continue — do NOT halt for that alone."""
                 THAT repo's recorded default branch:
                 ```bash
                 git fetch origin +refs/heads/{branch_name}:refs/remotes/origin/{branch_name}
-                commit_count=$(git rev-list origin/<default_branch>..{branch_name} --count)
+                src=origin/{branch_name}; if git rev-parse --verify -q refs/heads/{branch_name} >/dev/null; then git merge-base --is-ancestor origin/{branch_name} {branch_name} || {{ echo 'local branch diverged from origin'; exit 1; }}; if [ "$(git rev-list --count origin/{branch_name}..{branch_name})" -gt 0 ]; then src={branch_name}; fi; fi
+                commit_count=$(git rev-list origin/<default_branch>.."$src" --count)
                 ```
                 `commit_count == 0` with a child status of `already_satisfied` is a
-                `skip`. `commit_count == 0` with any other status is a `halt`.
+                `skip`. `commit_count == 0` with any other status is a `halt`. A
+                diverged local branch (the guard prints `local branch diverged from
+                origin`) is an error: return `halt`.
 
                 {{commit_type}}
 
+                Run the squash merge and commit below as ONE foreground Bash call with the Bash tool `timeout` parameter set to {bash_timeout_ms}. NEVER set `run_in_background` for it. The commit runs the repo's pre-commit hook, which can take 10-20 minutes; wait for it. Resetting, retrying or returning `halt` because the commit seems slow is wrong. Do not pipe the git commands through `tail`, `head` or any other command: a pipe masks their exit status. The squash commit is exempt from the 5-minute rule in Step 4: the hook is part of committing, not optional verification.
+
                 Squash, inside each repo's directory, onto THAT repo's LOCAL default
-                branch:
+                branch (shell variables do not persist between Bash calls, so repeat
+                the `src=...` selection line from above in the same call as the squash):
                 ```bash
                 set -euo pipefail
                 git checkout <default_branch>
-                git merge --squash {branch_name}
+                git merge --squash "$src"
                 git commit -F - <<'COMMITEOF'
                 {squash_subject}
 
@@ -6517,7 +6538,12 @@ async def run_agent(
         # Same placement rule as --allowedTools: before --print.
         print_idx = cmd.index("--print")
         cmd[print_idx:print_idx] = ["--disallowedTools", ",".join(disallowed_tools)]
-    env = build_env(engine, mode=mode, callback_token=callback_token)
+    env = build_env(
+        engine,
+        mode=mode,
+        callback_token=callback_token,
+        timeout_seconds=timeout_seconds,
+    )
     if attribution:
         env["AGENT_GTD_AGENT_NAME"] = attribution
     # Tag the subprocess env with the engine identifier so KB-side telemetry can
@@ -6530,7 +6556,8 @@ async def run_agent(
     # value — only its host. Engines whose argv has no --model (kiro) log
     # model=default.
     logger.info(
-        "agent spawn run_id=%s engine=%s model=%s base_url_host=%s capability_override=%s",
+        "agent spawn run_id=%s engine=%s model=%s base_url_host=%s capability_override=%s"
+        " timeout_s=%d bash_limit_ms=%s",
         run_id,
         engine.name,
         next(
@@ -6539,6 +6566,8 @@ async def run_agent(
         ),
         urlparse(env.get("ANTHROPIC_BASE_URL", "")).netloc or "api.anthropic.com",
         env.get("CLAUDE_CODE_MODEL_CAPABILITIES", "absent"),
+        timeout_seconds,
+        env.get("BASH_MAX_TIMEOUT_MS", "absent"),
     )
 
     cmd = _sudo_wrap(with_tmp_env(cmd, tmp_dir))

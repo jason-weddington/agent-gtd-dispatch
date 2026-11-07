@@ -34,6 +34,7 @@ from agent_gtd_dispatch.dispatch import (
 from agent_gtd_dispatch.engines import (
     _MANAGE_EXECUTOR_ENV_KEYS,
     CLAUDE,
+    CLAUDE_BASH_LIMIT_ENV_KEYS,
     CLAUDE_DEEPSEEK,
     CLAUDE_GLM,
     CLAUDE_HAIKU,
@@ -43,12 +44,14 @@ from agent_gtd_dispatch.engines import (
     ENGINES,
     FORBIDDEN_ENV_KEYS,
     KIRO,
+    TALOS_ENGINES,
     TALOS_SONNET,
     Engine,
     _build_claude_deepseek_command,
     _claude_deepseek_extra_env,
     _claude_glm_extra_env,
     build_env,
+    claude_bash_limit_ms,
     get_engine,
 )
 from agent_gtd_dispatch.models import (
@@ -237,6 +240,60 @@ class TestKiroCommand:
         cmd = KIRO.build_command("sys prompt", "Fix bug", 20, "my-agent")
         idx = cmd.index("--agent")
         assert cmd[idx + 1] == "my-agent"
+
+
+class TestClaudeBashLimit:
+    @pytest.mark.parametrize(
+        ("seconds", "expected"),
+        [(2700, 2700000), (1800, 1800000), (600, 600000), (300, 600000), (0, 600000)],
+    )
+    def test_claude_bash_limit_ms(self, seconds: int, expected: int) -> None:
+        assert claude_bash_limit_ms(seconds) == expected
+
+    @pytest.mark.parametrize(
+        "eng",
+        [
+            CLAUDE,
+            CLAUDE_SONNET,
+            CLAUDE_HAIKU,
+            CLAUDE_OLLAMA,
+            CLAUDE_GLM,
+            CLAUDE_DEEPSEEK,
+        ],
+    )
+    def test_claude_family_gets_both_vars(self, eng, monkeypatch) -> None:
+        monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", "/nonexistent-ws")
+        env = build_env(eng, mode=DispatchMode.REVIEW, timeout_seconds=5400)
+        for key in CLAUDE_BASH_LIMIT_ENV_KEYS:
+            assert env[key] == "5400000"
+        for secs in (600, 100):
+            env = build_env(eng, mode=DispatchMode.REVIEW, timeout_seconds=secs)
+            for key in CLAUDE_BASH_LIMIT_ENV_KEYS:
+                assert env[key] == "600000"
+        env = build_env(eng, mode=DispatchMode.REVIEW, timeout_seconds=None)
+        for key in CLAUDE_BASH_LIMIT_ENV_KEYS:
+            assert key not in env
+
+    def test_talos_and_kiro_never_get_vars(self, monkeypatch) -> None:
+        monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", "/nonexistent-ws")
+        engines_ = [ENGINES[n] for n in TALOS_ENGINES if n in ENGINES] + [KIRO]
+        assert len(engines_) > 1
+        for eng in engines_:
+            env = build_env(eng, mode=DispatchMode.REVIEW, timeout_seconds=5400)
+            for key in CLAUDE_BASH_LIMIT_ENV_KEYS:
+                assert key not in env
+
+    def test_ambient_vars_are_not_inherited(self, monkeypatch) -> None:
+        """Guards against someone adding the names to COMMON_ENV_KEYS."""
+        monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", "/nonexistent-ws")
+        monkeypatch.setenv("BASH_MAX_TIMEOUT_MS", "1")
+        env = build_env(CLAUDE, mode=DispatchMode.REVIEW, timeout_seconds=None)
+        assert "BASH_MAX_TIMEOUT_MS" not in env
+
+    def test_glm_capability_override_kept(self, monkeypatch) -> None:
+        monkeypatch.setenv("DISPATCH_WORKSPACE_ROOT", "/nonexistent-ws")
+        env = build_env(CLAUDE_GLM, mode=DispatchMode.REVIEW, timeout_seconds=5400)
+        assert env["CLAUDE_CODE_MODEL_CAPABILITIES"] == "glm*=-mid_conv_system"
 
 
 class TestBuildEnv:
@@ -588,6 +645,19 @@ class TestBuildEnv:
                 assert eng_injected <= env_keep_keys, sorted(
                     eng_injected - env_keep_keys
                 )
+
+    def test_bash_limit_vars_are_in_sudoers_env_keep(self) -> None:
+        assert set(CLAUDE_BASH_LIMIT_ENV_KEYS) <= self._sudoers_env_keep_keys()
+
+    def test_claude_family_injected_keys_in_sudoers_env_keep(self) -> None:
+        env_keep_keys = self._sudoers_env_keep_keys()
+        for eng in ENGINES.values():
+            if not eng.is_claude_code_family:
+                continue
+            env = build_env(eng, mode=DispatchMode.REVIEW, timeout_seconds=5400)
+            injected = set(env) - (COMMON_ENV_KEYS | eng.env_keys)
+            assert injected <= env_keep_keys, sorted(injected - env_keep_keys)
+            assert set(CLAUDE_BASH_LIMIT_ENV_KEYS) <= injected
 
     def test_git_identity_vars_are_in_sudoers_env_keep(self) -> None:
         """AC-1/AC-2: the four git identity vars build_env sets (AC3 of the
@@ -971,6 +1041,57 @@ class TestRunAgent:
             args, _kwargs = mock_popen.call_args
             assert args[0][0] == "claude"
             assert "--dangerously-skip-permissions" in args[0]
+
+    @pytest.mark.parametrize(
+        ("engine", "timeout", "expected"),
+        [
+            (CLAUDE_SONNET, 5400, "5400000"),
+            (CLAUDE_SONNET, 300, "600000"),
+            (KIRO, 5400, "absent"),
+        ],
+    )
+    async def test_bash_limit_env_and_log(
+        self, tmp_path, monkeypatch, caplog, engine, timeout, expected
+    ) -> None:
+        mock_proc = _make_mock_proc(0)
+        with (
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"),
+            patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen,
+        ):
+            mock_popen.return_value = mock_proc
+            await run_agent(
+                engine,
+                tmp_path,
+                "sys",
+                "T",
+                20,
+                timeout_seconds=timeout,
+                mode=DispatchMode.REVIEW,
+            )
+        env = mock_popen.call_args.kwargs["env"]
+        for key in CLAUDE_BASH_LIMIT_ENV_KEYS:
+            assert env.get(key, "absent") == expected
+        assert f"timeout_s={timeout} bash_limit_ms={expected}" in caplog.text
+
+    async def test_review_default_timeout_feeds_bash_limit(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "REVIEW_TIMEOUT_SECONDS", 2700)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(
+                CLAUDE_SONNET,
+                tmp_path,
+                "sys",
+                "T",
+                20,
+                timeout_seconds=None,
+                mode=DispatchMode.REVIEW,
+            )
+        env = mock_popen.call_args.kwargs["env"]
+        for key in CLAUDE_BASH_LIMIT_ENV_KEYS:
+            assert env[key] == "2700000"
 
     async def test_run_id_excludes_that_runs_attachments_dir(
         self, tmp_path, monkeypatch
@@ -6069,6 +6190,47 @@ class TestReviewPromptContract:
             assert "/srv/agent/workspace/rollout-abc/.dispatch/verdict.json" in prompt
             assert "MERGE NOTE" in prompt
 
+    def test_bash_timeout_instructions(self) -> None:
+        prompt = self._prompt_timeout(5400)
+        assert "`timeout` parameter set to 5400000" in prompt
+        assert "NEVER set `run_in_background`" in prompt
+        assert "src=origin/" in prompt
+        assert "git merge --squash origin/" not in prompt
+        assert "The squash commit is exempt from the 5-minute rule in Step 4" in prompt
+
+    def test_bash_timeout_defaults_to_config(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "REVIEW_TIMEOUT_SECONDS", 1800)
+        assert "1800000" in self._prompt_timeout(None)
+
+    def test_fix_mode_has_bash_timeout(self) -> None:
+        prompt = dispatch.build_review_prompt(
+            self.ITEM,
+            self.PROJECT,
+            "rollout-abc",
+            "feat/abcdef01-do-the-thing",
+            40,
+            Path("/srv/agent/workspace/rollout-abc"),
+            repo_dirs=["repo-a"],
+            default_branches={"repo-a": "main"},
+            gate_failure_output="boom",
+            review_timeout_seconds=5400,
+        )
+        assert "`timeout` parameter set to 5400000" in prompt
+        assert "NEVER set `run_in_background`" in prompt
+
+    def _prompt_timeout(self, seconds: int | None) -> str:
+        return dispatch.build_review_prompt(
+            self.ITEM,
+            self.PROJECT,
+            "rollout-abc",
+            "feat/abcdef01-do-the-thing",
+            40,
+            Path("/srv/agent/workspace/rollout-abc"),
+            repo_dirs=["repo-a"],
+            default_branches={"repo-a": "main"},
+            review_timeout_seconds=seconds,
+        )
+
     def test_reviewer_deny_list_blocks_git_push(self) -> None:
         assert "Bash(git push:*)" in dispatch.REVIEWER_DISALLOWED_TOOLS
 
@@ -7058,6 +7220,12 @@ class TestLandConflictModePrompt:
             default_branches={"repo": "main"},
             **kw,
         )
+
+    def test_land_conflict_has_no_bash_timeout(self) -> None:
+        prompt = self._prompt(
+            land_conflict={"repo": ["a.py"]}, review_timeout_seconds=5400
+        )
+        assert "5400000" not in prompt
 
     def test_land_conflict_mode_sections(self) -> None:
         prompt = self._prompt(land_conflict={"repo": ["a.py"]})

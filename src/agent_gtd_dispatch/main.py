@@ -35,6 +35,7 @@ from . import (
     config,
     db,
     dispatch,
+    engines,
     gates,
     gtd_client,
     platform_support,
@@ -388,6 +389,42 @@ def _reaper_self_probe() -> None:
     )
 
 
+def _bash_limit_self_probe() -> None:
+    """Check the Bash-limit env vars survive the sudo env_keep hop. Never raises."""
+    keys = engines.CLAUDE_BASH_LIMIT_ENV_KEYS
+    if not config.AGENT_SUBPROCESS_USER:
+        logger.info("bash-limit-selfprobe: env_keep=n/a single_user=1")
+        return
+    try:
+        proc = subprocess.run(
+            dispatch._sudo_wrap(["/bin/bash", "-c", "env"]),
+            env={**os.environ, **dict.fromkeys(keys, "600001")},
+            capture_output=True,
+            timeout=10,
+        )
+        lines = proc.stdout.decode(errors="replace").splitlines()
+        missing = [k for k in keys if f"{k}=600001" not in lines]
+    except Exception as exc:
+        logger.error(
+            "bash-limit-selfprobe: env_keep=stripped missing=%s - claude-code "
+            "reviewers will be capped at 600s Bash; run ./deploy.sh to refresh "
+            "sudoers (probe failed: %s: %s)",
+            ",".join(keys),
+            type(exc).__name__,
+            exc,
+        )
+        return
+    if missing:
+        logger.error(
+            "bash-limit-selfprobe: env_keep=stripped missing=%s - claude-code "
+            "reviewers will be capped at 600s Bash; run ./deploy.sh to refresh "
+            "sudoers",
+            ",".join(missing),
+        )
+        return
+    logger.info("bash-limit-selfprobe: env_keep=ok keys=%s", ",".join(keys))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Initialize config and DB on startup, cancel tasks on shutdown."""
@@ -406,6 +443,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         _reaper_self_probe()
     if config.AGENT_SUBPROCESS_USER:
         _check_service_repo()
+    _bash_limit_self_probe()
     dispatch.init_executor()
     await db.init_db()
     orphaned_run_ids = await db.reconcile_orphans()
@@ -2701,6 +2739,24 @@ async def _launch_reviewer(
 
     used = _rollout_redispatches.get(rollout_id, {}).get(item_id, 0)
     repo_dirs = list(workspace.repo_paths)
+    raw_review_timeout = project.get("review_timeout_seconds")
+    review_timeout_seconds, review_timeout_source = (
+        config.resolve_review_timeout_seconds(raw_review_timeout)
+    )
+    if review_timeout_source == "invalid_project_value":
+        logger.warning(
+            "rollout-loop: review-timeout-override-invalid rollout_id=%s "
+            "item_id=%s project=%s raw=%r reason=%s fallback_s=%d",
+            rollout_id,
+            item_id,
+            project.get("name"),
+            raw_review_timeout,
+            "range"
+            if isinstance(raw_review_timeout, int)
+            and not isinstance(raw_review_timeout, bool)
+            else "type",
+            review_timeout_seconds,
+        )
     prompt = dispatch.build_review_prompt(
         item,
         project,
@@ -2727,33 +2783,20 @@ async def _launch_reviewer(
         redispatch_cap=MAX_ITEM_REDISPATCHES,
         gate_failure_output=gate_failure_output,
         land_conflict=land_conflict,
+        review_timeout_seconds=review_timeout_seconds,
     )
     pinned_subject = dispatch.compose_squash_subject(item)
-    raw_review_timeout = project.get("review_timeout_seconds")
-    review_timeout_seconds, review_timeout_source = (
-        config.resolve_review_timeout_seconds(raw_review_timeout)
-    )
-    if review_timeout_source == "invalid_project_value":
-        logger.warning(
-            "rollout-loop: review-timeout-override-invalid rollout_id=%s "
-            "item_id=%s project=%s raw=%r reason=%s fallback_s=%d",
-            rollout_id,
-            item_id,
-            project.get("name"),
-            raw_review_timeout,
-            "range"
-            if isinstance(raw_review_timeout, int)
-            and not isinstance(raw_review_timeout, bool)
-            else "type",
-            review_timeout_seconds,
-        )
     logger.info(
         "rollout-loop: review-prompt rollout_id=%s item_id=%s "
-        "commit_type_mode=%s subject=%r",
+        "commit_type_mode=%s subject=%r review_timeout_s=%d "
+        "review_timeout_source=%s prompt_bash_timeout_ms=%d",
         rollout_id,
         item_id,
         "pinned" if pinned_subject is not None else "derived",
         pinned_subject,
+        review_timeout_seconds,
+        review_timeout_source,
+        review_timeout_seconds * 1000,
     )
 
     reviewer_run = Run(

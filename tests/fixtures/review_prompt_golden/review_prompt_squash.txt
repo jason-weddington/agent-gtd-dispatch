@@ -199,7 +199,8 @@ one-line change, a coverage ratchet bump, a stale test assertion — then
 re-run the bar. "Small" is your judgment; if the fix is non-trivial, or
 your first attempt does not make the bar green, stop and return
 `re-dispatch` (the build agent has the item's full context and you do
-not) or `halt`.
+not) or `halt`. Commit any inline fix on the local feat/11111111-golden before
+Step 5; an uncommitted inline fix is not squashed.
 
 ALL repos that received the branch must pass the bar before ANY squash
 commit is created.
@@ -210,19 +211,25 @@ Immediately before each repo's squash, run the commit-count guard using
 THAT repo's recorded default branch:
 ```bash
 git fetch origin +refs/heads/feat/11111111-golden:refs/remotes/origin/feat/11111111-golden
-commit_count=$(git rev-list origin/<default_branch>..feat/11111111-golden --count)
+src=origin/feat/11111111-golden; if git rev-parse --verify -q refs/heads/feat/11111111-golden >/dev/null; then git merge-base --is-ancestor origin/feat/11111111-golden feat/11111111-golden || { echo 'local branch diverged from origin'; exit 1; }; if [ "$(git rev-list --count origin/feat/11111111-golden..feat/11111111-golden)" -gt 0 ]; then src=feat/11111111-golden; fi; fi
+commit_count=$(git rev-list origin/<default_branch>.."$src" --count)
 ```
 `commit_count == 0` with a child status of `already_satisfied` is a
-`skip`. `commit_count == 0` with any other status is a `halt`.
+`skip`. `commit_count == 0` with any other status is a `halt`. A
+diverged local branch (the guard prints `local branch diverged from
+origin`) is an error: return `halt`.
 
 This item's commit type was groomed: `feat`. The squash commit subject is EXACTLY: `feat(11111111): Golden item`. Do NOT change the type, the scope or the subject text. Do not apply the derivation rules.
 
+Run the squash merge and commit below as ONE foreground Bash call with the Bash tool `timeout` parameter set to 2700000. NEVER set `run_in_background` for it. The commit runs the repo's pre-commit hook, which can take 10-20 minutes; wait for it. Resetting, retrying or returning `halt` because the commit seems slow is wrong. Do not pipe the git commands through `tail`, `head` or any other command: a pipe masks their exit status. The squash commit is exempt from the 5-minute rule in Step 4: the hook is part of committing, not optional verification.
+
 Squash, inside each repo's directory, onto THAT repo's LOCAL default
-branch:
+branch (shell variables do not persist between Bash calls, so repeat
+the `src=...` selection line from above in the same call as the squash):
 ```bash
 set -euo pipefail
 git checkout <default_branch>
-git merge --squash feat/11111111-golden
+git merge --squash "$src"
 git commit -F - <<'COMMITEOF'
 feat(11111111): Golden item
 

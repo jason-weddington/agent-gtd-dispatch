@@ -6,7 +6,9 @@ branch on origin, and the reviewer kept squashing the STALE
 a plain ``git fetch origin <branch>`` only writes FETCH_HEAD.  These tests
 drive :func:`agent_gtd_dispatch.dispatch.refresh_feature_branch_refs` against
 real git repos (bare origin + single-branch clone), assert the reviewer prompt
-itself uses the forced refspec and squashes the LOCAL branch, and pin the
+itself uses the forced refspec and squashes ``origin/<branch>`` by default (the
+local branch only when it carries inline-fix commits ahead of origin; a stale
+local branch was the cause of rollout aed487a7), and pin the
 worker call-site contract.  They never touch host state: git repos live in
 ``tmp_path`` and ``config.AGENT_SUBPROCESS_USER`` is cleared so every git call
 runs as the test user.
@@ -339,7 +341,7 @@ class TestRefreshFeatureBranchRefsEdgeCases:
 class TestReviewPromptForcedRefspec:
     """AC-11 (prompt half): the rendered normal-mode prompt uses the forced refspec."""
 
-    def test_normal_prompt_fetches_forced_refspec_and_squashes_local_branch(
+    def test_normal_prompt_fetches_forced_refspec_and_squashes_origin_or_descendant_local_branch(
         self,
     ) -> None:
         forced = f"git fetch origin +refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}"
@@ -365,9 +367,95 @@ class TestReviewPromptForcedRefspec:
         )
         assert prompt.count(forced) == 2
         assert f"git checkout -B {BRANCH} origin/{BRANCH}" in prompt
-        assert f"git merge --squash {BRANCH}" in prompt
+        assert 'git merge --squash "$src"' in prompt
+        assert f"git merge --squash {BRANCH}" not in prompt
+        assert 'origin/<default_branch>.."$src"' in prompt
+        assert f"src=origin/{BRANCH}" in prompt
         # No bare branch fetch that would only write FETCH_HEAD.
         assert f"git fetch origin {BRANCH}" not in prompt
+
+
+def _selection_script(*, squash: bool) -> str:
+    """The rendered Step 5 src-selection line, as an executable script."""
+    prompt = dispatch.build_review_prompt(
+        {"id": "bbbbbbbb-2222-3333-4444-555555555555", "title": "T"},
+        {"name": "P"},
+        "ro-1",
+        BRANCH,
+        40,
+        Path("/ws"),
+        repo_dirs=["r"],
+        default_branches={"r": "main"},
+        engine_name="claude-code",
+    )
+    (line,) = [
+        ln.strip() for ln in prompt.splitlines() if ln.strip().startswith("src=origin/")
+    ]
+    tail = (
+        'git checkout -q main\ngit merge --squash "$src" >/dev/null\n'
+        if squash
+        else 'echo "$src"\n'
+    )
+    return (
+        "set -euo pipefail\n"
+        f"git fetch -q origin +refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}\n"
+        f"{line}\n{tail}"
+    )
+
+
+def _run_sh(repo: Path, script: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", script], cwd=repo, capture_output=True, text=True, check=False
+    )
+
+
+class TestSquashSourceSelection:
+    def test_no_local_branch_uses_origin(self, tmp_path: Path) -> None:
+        origin, _seed = _bare_origin(tmp_path)
+        clone = _single_branch_clone(origin, tmp_path / "clone")
+        proc = _run_sh(clone, _selection_script(squash=False))
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == f"origin/{BRANCH}"
+
+    def test_local_inline_fix_is_squashed(self, tmp_path: Path) -> None:
+        origin, _seed = _bare_origin(tmp_path)
+        clone = _single_branch_clone(origin, tmp_path / "clone")
+        _git(
+            clone,
+            "fetch",
+            "-q",
+            "origin",
+            f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}",
+        )
+        _git(clone, "checkout", "-q", "-B", BRANCH, f"origin/{BRANCH}")
+        (clone / "fix.txt").write_text("inline fix\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-m", "fix: inline")
+        proc = _run_sh(clone, _selection_script(squash=False))
+        assert proc.stdout.strip() == BRANCH
+        proc = _run_sh(clone, _selection_script(squash=True))
+        assert proc.returncode == 0, proc.stderr
+        assert (clone / "fix.txt").read_text() == "inline fix\n"
+        assert (clone / "feature.txt").exists()
+
+    def test_diverged_local_branch_fails(self, tmp_path: Path) -> None:
+        origin, _seed = _bare_origin(tmp_path)
+        clone = _single_branch_clone(origin, tmp_path / "clone")
+        _git(
+            clone,
+            "fetch",
+            "-q",
+            "origin",
+            f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}",
+        )
+        _git(clone, "branch", BRANCH, "main")
+        (clone / "other.txt").write_text("x\n")
+        _git(clone, "checkout", "-q", BRANCH)
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-m", "diverge")
+        proc = _run_sh(clone, _selection_script(squash=False))
+        assert proc.returncode != 0
+        assert "diverged" in proc.stdout
 
 
 class TestLandFeatureTipFallbackTripwire:

@@ -149,10 +149,24 @@ def prepend_agent_bin_dirs(current_path: str) -> str:
     return ":".join(prefixes)
 
 
+CLAUDE_BASH_LIMIT_ENV_KEYS: tuple[str, str] = (
+    "BASH_MAX_TIMEOUT_MS",
+    "CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS",
+)
+CLAUDE_BASH_LIMIT_FLOOR_MS: int = 600000
+
+
+def claude_bash_limit_ms(timeout_seconds: int) -> int:
+    """Bash limit in ms for a run timeout, never below the 600 s floor."""
+    return max(CLAUDE_BASH_LIMIT_FLOOR_MS, timeout_seconds * 1000)
+
+
 def build_env(
     engine: Engine,
     mode: DispatchMode = DispatchMode.BUILD,
     callback_token: str | None = None,
+    *,
+    timeout_seconds: int | None = None,
 ) -> dict[str, str]:
     """Build a filtered env dict for the engine's subprocess.
 
@@ -198,6 +212,14 @@ def build_env(
         env["AGENT_GTD_API_KEY"] = callback_token
     if engine.extra_env_fn is not None:
         env.update(engine.extra_env_fn())
+
+    # Claude Code caps a foreground Bash call at 600 s and stops a backgrounded
+    # one 10 min later, regardless of the requested timeout. Raise both limits
+    # to the run timeout. Computed per run, never inherited from os.environ.
+    if engine.is_claude_code_family and timeout_seconds is not None:
+        limit = str(claude_bash_limit_ms(timeout_seconds))
+        for key in CLAUDE_BASH_LIMIT_ENV_KEYS:
+            env[key] = limit
 
     # Set git committer/author identity to reflect the engine being used.
     # This overrides the static .gitconfig on the dispatch host so that commits

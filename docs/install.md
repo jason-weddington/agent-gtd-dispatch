@@ -586,6 +586,8 @@ Every dispatched agent commit is meant to be attributed to the engine that made 
 headless build run apart from an interactive session. Both only work if those five
 variables survive the `dispatch-svc → dispatch` `sudo` hop.
 
+The same `env_keep` list carries `BASH_MAX_TIMEOUT_MS` and `CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS`, which the worker sets to the run timeout in ms (floor 600000) on claude-code-family subprocesses; the startup `bash-limit-selfprobe` log line reports whether they survive sudo.
+
 **`sudo` runs with `env_reset` by default and drops every variable not named in the
 sudoers `env_keep` list** (`/etc/sudoers.d/dispatch-svc`, rendered from
 `templates/sudoers-dispatch-svc.tmpl`). Before this item, none of the five attribution

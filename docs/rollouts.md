@@ -798,6 +798,8 @@ What replaces them:
   flight, so a running build is never stranded. A crashed loop fails its own
   run and does not halt the rollout.
 - **The reviewer is bounded** by `REVIEW_TIMEOUT_SECONDS`. A project may override it with `review_timeout_seconds` (600-14400 s, set via update-project), read from the project record when the rollout loop starts (an edit applies to the next loop start or resume), falling back to the env default when unset or invalid. A FIX MODE reviewer runs while the project's land lease is held, so a long override also lengthens how long other rollouts on that project wait to land.
+
+The dispatch worker sets `BASH_MAX_TIMEOUT_MS` and `CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS` to the run timeout in ms (floor 600000) on every claude-code-family subprocess (builds and reviewers; not talos or kiro), because Claude Code otherwise caps a foreground Bash call at 600 s and stops a backgrounded one 10 min later, which kills a reviewer's squash commit when the repo's pre-commit hook runs longer. Both names are in the sudoers `env_keep`. To confirm on a host, check the startup `bash-limit-selfprobe` log line (`env_keep=ok`) and the `bash_limit_ms` field of the `agent spawn` log line; `transcript.txt` under `--output-format json` cannot show Bash tool flags.
 - **Restarts** are covered by the startup re-adoption sweep, which resumes only
   rollouts this host holds a local MANAGE run row for, and which the board does
   not say were moved elsewhere (see loop fencing below). The watchdog it replaced

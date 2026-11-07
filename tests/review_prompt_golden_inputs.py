@@ -1,5 +1,8 @@
 """Fixed inputs for the review-prompt golden files (item 21106de8, AC-12).
 
+The squash and fix-mode goldens were re-captured for item aa262ade
+(Bash timeout paragraph, origin-based squash source).
+
 The goldens under ``tests/fixtures/review_prompt_golden/`` were captured from
 the code BEFORE the conflict-classification text was factored into a shared
 helper; the equality tests re-render with exactly these inputs.
@@ -52,6 +55,7 @@ def render_prompt(*, fix_mode: bool) -> str:
         merge_notes=[],
         gate_failure_output="boom" if fix_mode else None,
         engine_name="claude-code",
+        review_timeout_seconds=2700,
     )
 
 

@@ -50,6 +50,7 @@ async def _review(
     calls: list[str] | None = None,
     project: dict[str, Any] | None = None,
     run_agent_mock: list[AsyncMock] | None = None,
+    prompt_mock: list[MagicMock] | None = None,
 ) -> tuple[main.ReviewVerdict, AsyncMock, MagicMock, MagicMock, MagicMock]:
     await db.init_db()
     (tmp_path / "transcript.txt").write_text("I was still running the gate\n")
@@ -93,8 +94,11 @@ async def _review(
         agent_mock = AsyncMock(side_effect=run_agent_effect)
         if run_agent_mock is not None:
             run_agent_mock.append(agent_mock)
+        prompt_spy = MagicMock(return_value="prompt")
+        if prompt_mock is not None:
+            prompt_mock.append(prompt_spy)
         for name, value in {
-            "build_review_prompt": MagicMock(return_value="prompt"),
+            "build_review_prompt": prompt_spy,
             "compose_squash_subject": MagicMock(return_value=None),
             "clear_review_verdict": MagicMock(),
             "run_agent": agent_mock,
@@ -316,6 +320,44 @@ class TestReviewTimeoutOverride:
             config.REVIEW_TIMEOUT_SECONDS
         )
         assert verdict.rationale == "reviewer timed out after 45m"
+
+    async def test_prompt_and_run_agent_share_override(self, tmp_path, caplog) -> None:
+        agent: list[AsyncMock] = []
+        prompt: list[MagicMock] = []
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            await _review(
+                tmp_path,
+                run_agent_effect=_timeout_for(7200),
+                project={"name": "P", "review_timeout_seconds": 7200},
+                run_agent_mock=agent,
+                prompt_mock=prompt,
+            )
+        assert prompt[0].call_args.kwargs["review_timeout_seconds"] == 7200
+        assert agent[0].call_args.kwargs["timeout_seconds"] == 7200
+        assert "review_timeout_s=7200" in caplog.text
+        assert "prompt_bash_timeout_ms=7200000" in caplog.text
+
+    @pytest.mark.parametrize(
+        "project",
+        [
+            {"name": "P"},
+            {"name": "P", "review_timeout_seconds": None},
+            {"name": "P", "review_timeout_seconds": 5},
+        ],
+    )
+    async def test_prompt_and_run_agent_default(self, tmp_path, project) -> None:
+        agent: list[AsyncMock] = []
+        prompt: list[MagicMock] = []
+        await _review(
+            tmp_path,
+            run_agent_effect=TIMEOUT,
+            project=project,
+            run_agent_mock=agent,
+            prompt_mock=prompt,
+        )
+        want = config.REVIEW_TIMEOUT_SECONDS
+        assert prompt[0].call_args.kwargs["review_timeout_seconds"] == want
+        assert agent[0].call_args.kwargs["timeout_seconds"] == want
 
     async def test_env_patched_default_vs_override(self, tmp_path) -> None:
         with patch.dict(os.environ, {"DISPATCH_REVIEW_TIMEOUT_SECONDS": "3600"}):
