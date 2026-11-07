@@ -663,6 +663,99 @@ class TestFixRelaunch:
         assert len(reason) <= main.ERROR_TEXT_MAX_CHARS
         assert _tip(mono.origin) == before
 
+    async def test_gate_failure_surfaces_failure_line_and_log_path(
+        self, mono, gtd, caplog
+    ) -> None:
+        from agent_gtd_dispatch import retention
+
+        _squash(mono.clone)
+        fake, calls = _fake_fixer(mono.clone)
+        gate = (
+            "echo 'FAILED t::boom'; head -c 5000 /dev/zero | tr '\\0' x; echo; exit 1"
+        )
+        with (
+            patch.object(main, "_launch_reviewer", side_effect=fake),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            result = await _land(mono.ws, mono.pre, gate=gate)
+        assert result == main._TICK_HALTED
+        reason = _halt_reason(gtd)
+        assert "FAILED t::boom" in reason
+        assert "(full log: " in reason
+        assert len(reason) <= main.ERROR_TEXT_MAX_CHARS
+        logs = list(retention.evidence_dir("100000000001").glob(f"land-{ITEM}-*.log"))
+        assert len(logs) == 2
+        assert str(max(logs).resolve()) in reason
+        out = calls[0]["gate_failure_output"]
+        assert "FAILED t::boom" in out
+        assert "Full gate log:" not in out
+        lines = [r.getMessage() for r in caplog.records]
+        gate_lines = [x for x in lines if x.startswith("land gate:")]
+        assert gate_lines
+        for tok in ("log_path=", "log_bytes=", "failure_lines_matched="):
+            assert tok in gate_lines[0]
+
+    async def test_passing_gate_logs_land_gate_line(self, mono, gtd, caplog) -> None:
+        _squash(mono.clone)
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            result = await _land(mono.ws, mono.pre, gate="true")
+        assert isinstance(result, ReviewVerdict)
+        line = next(
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("land gate:")
+        )
+        assert "failure_lines_matched=0" in line
+        assert "log_path=" in line
+
+    def _lander(self, pushed: set[str]):
+        lander = object.__new__(main._Lander)
+        lander.landing = ["repo-a", "repo-b"]
+        lander.repos = ["repo-a", "repo-b"]
+        lander.pushed = pushed
+        lander.rollout_id = "r"
+        lander.item_id = ITEM
+        lander.token = None
+        lander.attribution = None
+        lander._log_land = lambda *_a, **_k: None  # type: ignore[method-assign]
+        return lander
+
+    @pytest.mark.parametrize("ctx_len", [0, 3000])
+    async def test_halt_budget_and_invariant(self, ctx_len, caplog) -> None:
+        from pathlib import Path
+
+        lander = self._lander({"repo-a"} if ctx_len == 0 else set())
+        result = dispatch.GateResult(
+            1,
+            False,
+            "",
+            1.0,
+            log_path=Path("/ev/land-x.log"),
+            failure_lines=("FAILED t::boom",),
+            failure_lines_total=1,
+            tail="z" * 8000,
+        )
+        halt = lander._gate_halt(result, ["p" * ctx_len] if ctx_len else None)
+        captured: dict[str, str] = {}
+
+        async def _fake_halt(rollout_id, reason, **_k):
+            captured["reason"] = reason
+            return "halted"
+
+        with (
+            patch.object(main, "_halt_rollout_from_loop", _fake_halt),
+            caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.main"),
+        ):
+            await lander._halt(halt)
+        reason = captured["reason"]
+        assert len(reason) <= main.ERROR_TEXT_MAX_CHARS
+        if ctx_len == 0:
+            assert "FAILED t::boom" in reason
+            assert "/ev/land-x.log" in reason
+            assert "repo-a: pushed" in reason
+        else:
+            assert "summary invariant violated" in caplog.text
+
     async def test_fix_verdict_not_merge_halts(self, mono, gtd, caplog) -> None:
         before = _tip(mono.origin)
         _squash(mono.clone)
@@ -715,7 +808,9 @@ class TestFixRelaunch:
         release = threading.Event()
         log_contexts: list[str] = []
 
-        def _gate(*_a, tmp_dir=None, log_context=""):
+        def _gate(
+            *_a, tmp_dir=None, log_context="", log_dir=None, log_name_prefix="gate"
+        ):
             log_contexts.append(log_context)
             entered.set()
             release.wait(10)
@@ -2750,7 +2845,9 @@ class TestLandLease:
         entered = threading.Event()
         release = threading.Event()
 
-        def _gate(*_a, tmp_dir=None, log_context=""):
+        def _gate(
+            *_a, tmp_dir=None, log_context="", log_dir=None, log_name_prefix="gate"
+        ):
             entered.set()
             release.wait(10)
             return dispatch.GateResult(0, False, "", 0.0)

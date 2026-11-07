@@ -16,13 +16,13 @@ import tempfile
 import textwrap
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Literal
+from typing import IO, TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
-    from datetime import datetime
 
 from agent_gtd_dispatch_protocol.branches import make_branch_name
 from agent_gtd_dispatch_protocol.models import BuildEngine, DispatchMode
@@ -55,8 +55,21 @@ _review_executor: concurrent.futures.ThreadPoolExecutor | None = None
 _DEFAULT_BRANCH_CANDIDATES: tuple[str, ...] = ("main", "master")
 
 # Post-run gate: how many chars of combined gate output to keep for the
-# failure comment (tail only — the most recent output is the most useful).
-GATE_OUTPUT_TAIL_CHARS: int = 3000
+# failure comment (the most recent output is the most useful); the full output
+# is kept on disk and failure-pattern lines are surfaced ahead of the tail.
+GATE_OUTPUT_TAIL_CHARS: int = 8000
+GATE_FAILURE_PATTERNS: tuple[str, ...] = (
+    "FAIL",
+    "FAILED",
+    "Error",
+    "error:",
+    "panicked",
+    "Traceback",
+    "AssertionError",
+    "\u2718",
+)
+GATE_FAILURE_LINES_MAX: int = 200
+GATE_FAILURE_LINE_MAX_CHARS: int = 300
 
 # rev-list excludes for the rescue sweep's mid-run snapshot refs
 # (``<branch>-rescue-<run key>[-<N>]``): work that sits on origin only under a
@@ -1181,11 +1194,90 @@ class GateResult:
     timed_out: bool
     output: str
     duration_seconds: float
+    log_path: Path | None = None
+    failure_lines: tuple[str, ...] = ()
+    failure_lines_total: int = 0
+    tail: str = ""
+    log_bytes: int | None = None
 
     @property
     def passed(self) -> bool:
         """True when the gate exited 0 and did not time out."""
         return self.returncode == 0 and not self.timed_out
+
+
+def _gate_summary(
+    log: IO[bytes], log_path: Path | None
+) -> tuple[str, tuple[str, ...], int, str]:
+    """Summarise a gate log: ``(output, failure_lines, total, tail)``.
+
+    Streams the file line by line (never reading it whole), keeping the first
+    ``GATE_FAILURE_LINES_MAX`` lines that contain a failure pattern and
+    counting all of them. The tail is the last ``GATE_OUTPUT_TAIL_CHARS``
+    chars of the file.
+    """
+    log.flush()
+    log.seek(0)
+    shown: list[str] = []
+    total = 0
+    for raw in log:
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if any(p in line for p in GATE_FAILURE_PATTERNS):
+            total += 1
+            if len(shown) < GATE_FAILURE_LINES_MAX:
+                shown.append(line[:GATE_FAILURE_LINE_MAX_CHARS])
+    size = log.seek(0, os.SEEK_END)
+    log.seek(max(0, size - 4 * GATE_OUTPUT_TAIL_CHARS))
+    tail = log.read().decode("utf-8", errors="replace")[-GATE_OUTPUT_TAIL_CHARS:]
+    failure_lines = tuple(shown)
+    return (
+        compose_gate_summary(log_path, failure_lines, total, tail),
+        failure_lines,
+        total,
+        tail,
+    )
+
+
+def compose_gate_summary(
+    log_path: Path | None,
+    failure_lines: tuple[str, ...],
+    total: int,
+    tail: str,
+    *,
+    include_log_line: bool = True,
+) -> str:
+    """Compose the gate summary: log path, failure lines, then the tail."""
+    parts: list[str] = []
+    if include_log_line and log_path:
+        parts.append(f"Full gate log: {log_path}")
+    if total:
+        parts.append(f"Failure lines (first {len(failure_lines)} of {total} matched):")
+        parts.extend(failure_lines)
+    if parts:
+        parts.append(f"--- tail (last {GATE_OUTPUT_TAIL_CHARS} chars) ---")
+        return "\n".join([*parts, tail])
+    return tail
+
+
+def _open_gate_log(
+    log_dir: Path | None, log_name_prefix: str, log_context: str
+) -> tuple[IO[bytes], Path | None]:
+    """Open the gate's output file: a named log in *log_dir*, else a tempfile."""
+    if log_dir is not None:
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+            path = (log_dir / f"{log_name_prefix}-{stamp}.log").resolve()
+            return path.open("w+b"), path
+        except OSError as exc:
+            logger.warning(
+                "gate log: fallback to tempfile %s log_dir=%s errno=%s err=%s",
+                log_context,
+                log_dir,
+                exc.errno,
+                exc,
+            )
+    return tempfile.TemporaryFile(), None
 
 
 def _classify_gate_timeout(
@@ -1260,6 +1352,8 @@ def run_gate_command(
     *,
     tmp_dir: Path | None = None,
     log_context: str = "",
+    log_dir: Path | None = None,
+    log_name_prefix: str = "gate",
 ) -> GateResult:
     """Run the project's post-run quality gate and capture its outcome.
 
@@ -1302,7 +1396,20 @@ def run_gate_command(
         )
     )
 
-    with tempfile.TemporaryFile() as stdout_file:
+    stdout_file, log_path = _open_gate_log(log_dir, log_name_prefix, log_context)
+
+    def _summary_fields() -> dict[str, Any]:
+        output, failure_lines, total, tail = _gate_summary(stdout_file, log_path)
+        return {
+            "output": output,
+            "failure_lines": failure_lines,
+            "failure_lines_total": total,
+            "tail": tail,
+            "log_path": log_path,
+            "log_bytes": stdout_file.seek(0, os.SEEK_END) if log_path else None,
+        }
+
+    with stdout_file:
         start = time.monotonic()
         try:
             proc = subprocess.Popen(
@@ -1319,6 +1426,9 @@ def run_gate_command(
                 start_new_session=True,
             )
         except OSError as exc:
+            if log_path is not None:
+                stdout_file.close()
+                log_path.unlink(missing_ok=True)
             return GateResult(
                 returncode=None,
                 timed_out=False,
@@ -1330,12 +1440,6 @@ def run_gate_command(
             if popen_callback is not None:
                 popen_callback(proc)
 
-            def _tail() -> str:
-                size = stdout_file.tell()
-                stdout_file.seek(max(0, size - 4 * GATE_OUTPUT_TAIL_CHARS))
-                data = stdout_file.read()
-                return data.decode("utf-8", errors="replace")[-GATE_OUTPUT_TAIL_CHARS:]
-
             if tool is None:
                 deadline_result = _wait_python_deadline(
                     proc, timeout_seconds, log_context
@@ -1344,8 +1448,8 @@ def run_gate_command(
                     return GateResult(
                         returncode=None,
                         timed_out=True,
-                        output=_tail(),
                         duration_seconds=time.monotonic() - start,
+                        **_summary_fields(),
                     )
             try:
                 proc.wait(timeout=timeout_seconds + 2 * config.CANCEL_GRACE_SECONDS)
@@ -1358,8 +1462,8 @@ def run_gate_command(
                 return GateResult(
                     returncode=None,
                     timed_out=True,
-                    output=_tail(),
                     duration_seconds=time.monotonic() - start,
+                    **_summary_fields(),
                 )
 
             duration = time.monotonic() - start
@@ -1374,8 +1478,8 @@ def run_gate_command(
             return GateResult(
                 returncode=rc,
                 timed_out=_classify_gate_timeout(rc, duration, timeout_seconds),
-                output=_tail(),
                 duration_seconds=duration,
+                **_summary_fields(),
             )
         finally:
             # Reap the session on EVERY exit path: a gate that exits 0 or

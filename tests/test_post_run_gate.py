@@ -212,13 +212,13 @@ class TestRunGateCommandMocked:
         env = mock_popen.call_args.kwargs["env"]
         assert env["PATH"] == build_env(CLAUDE, mode=DispatchMode.BUILD)["PATH"]
 
-    def test_output_tail_truncated_to_3000_chars(self, tmp_path) -> None:
+    def test_output_tail_truncated_to_8000_chars(self, tmp_path) -> None:
         with patch(
             "agent_gtd_dispatch.dispatch.subprocess.Popen",
-            side_effect=_popen_ok(b"x" * 5000 + b"END"),
+            side_effect=_popen_ok(b"x" * 9000 + b"END"),
         ):
             result = dispatch.run_gate_command(tmp_path, "echo hi", 30, CLAUDE)
-        assert len(result.output) == 3000
+        assert len(result.output) == 8000
         assert result.output.endswith("END")
 
     def test_outer_timeout_kills_and_returns_partial_output(self, tmp_path) -> None:
@@ -271,6 +271,133 @@ class TestRunGateCommandMocked:
                 tmp_path, "echo hi", 30, CLAUDE, popen_callback=callback
             )
         callback.assert_called_once()
+
+
+class TestGateLogAndSummary:
+    def _run(self, tmp_path, data: bytes, **kw):
+        with patch(
+            "agent_gtd_dispatch.dispatch.subprocess.Popen",
+            side_effect=_popen_ok(data, rc=1),
+        ):
+            return dispatch.run_gate_command(tmp_path, "x", 30, CLAUDE, **kw)
+
+    def test_failure_line_far_from_end_is_surfaced(self, tmp_path) -> None:
+        data = b"FAILED tests/test_x.py::test_boom\n" + b"x" * 50000 + b"\nEND"
+        log_dir = tmp_path / "logs"
+        result = self._run(tmp_path, data, log_dir=log_dir)
+        assert "FAILED tests/test_x.py::test_boom" in result.output
+        assert result.output.endswith("END")
+        assert "FAILED tests/test_x.py::test_boom" not in result.tail
+        (log_file,) = log_dir.glob("gate-*.log")
+        assert log_file.read_bytes() == data
+        assert result.log_path == log_file.resolve()
+        assert result.log_bytes == len(data)
+        assert result.output.splitlines()[0] == f"Full gate log: {result.log_path}"
+
+    def test_caps(self, tmp_path) -> None:
+        result = self._run(tmp_path, b"FAIL x\n" * 500)
+        assert len(result.failure_lines) == 200
+        assert result.failure_lines_total == 500
+        assert "first 200 of 500 matched" in result.output
+        long = self._run(tmp_path, b"FAIL " + b"y" * 1000 + b"\n")
+        assert len(long.failure_lines[0]) == 300
+
+    def test_patterns(self, tmp_path) -> None:
+        for pat in dispatch.GATE_FAILURE_PATTERNS:
+            assert self._run(tmp_path, f"a {pat} b\n".encode()).failure_lines_total == 1
+        for line, n in [
+            ("ERROR: x", 0),
+            ("errors found", 0),
+            ("Errors found", 1),
+            ("AssertionError", 1),
+        ]:
+            assert self._run(tmp_path, line.encode()).failure_lines_total == n, line
+
+    def test_no_match_no_log_dir_is_exactly_tail(self, tmp_path) -> None:
+        result = self._run(tmp_path, b"x" * 20000)
+        assert result.output == "x" * 8000
+        assert result.log_path is None
+
+    def test_two_calls_two_files(self, tmp_path) -> None:
+        log_dir = tmp_path / "logs"
+        self._run(tmp_path, b"a", log_dir=log_dir)
+        self._run(tmp_path, b"a", log_dir=log_dir)
+        assert len(list(log_dir.glob("gate-*.log"))) == 2
+
+    def test_prefix(self, tmp_path) -> None:
+        log_dir = tmp_path / "logs"
+        self._run(tmp_path, b"a", log_dir=log_dir, log_name_prefix="land-X")
+        assert len(list(log_dir.glob("land-X-*.log"))) == 1
+
+    def test_compose_shapes(self, tmp_path) -> None:
+        r = self._run(tmp_path, b"FAIL one\nrest\n")
+        assert "Full gate log" not in r.output
+        assert r.output.startswith("Failure lines (first 1 of 1 matched):\nFAIL one\n")
+        assert "--- tail (last 8000 chars) ---" in r.output
+        log_dir = tmp_path / "logs"
+        r2 = self._run(tmp_path, b"fine\n", log_dir=log_dir)
+        assert r2.output == (
+            f"Full gate log: {r2.log_path}\n--- tail (last 8000 chars) ---\nfine\n"
+        )
+
+    def test_outer_timeout_keeps_log(self, tmp_path) -> None:
+        def _effect(*args, **kwargs):
+            kwargs["stdout"].write(b"partial")
+            proc = MagicMock()
+            proc.wait = MagicMock(
+                side_effect=[subprocess.TimeoutExpired(cmd="x", timeout=1), 0]
+            )
+            return proc
+
+        with (
+            patch("agent_gtd_dispatch.dispatch.subprocess.Popen", side_effect=_effect),
+            patch("agent_gtd_dispatch.dispatch.subprocess.run"),
+        ):
+            result = dispatch.run_gate_command(
+                tmp_path, "sleep 9", 1, CLAUDE, log_dir=tmp_path / "l"
+            )
+        assert result.timed_out
+        assert "partial" in result.output
+        assert result.log_path is not None
+        assert result.log_path.read_bytes() == b"partial"
+
+    def test_python_deadline_timeout_keeps_log(self, tmp_path, monkeypatch) -> None:
+        from agent_gtd_dispatch import platform_support
+
+        monkeypatch.setattr(platform_support, "gate_timeout_tool", lambda: None)
+        monkeypatch.setattr(dispatch, "_wait_python_deadline", lambda *a: True)
+        result = self._run(tmp_path, b"partial FAILED x", log_dir=tmp_path / "l")
+        assert result.timed_out is True
+        assert result.log_path is not None
+        assert "FAILED x" in result.output
+
+    def test_unwritable_log_dir_falls_back(self, tmp_path, caplog) -> None:
+        blocker = tmp_path / "file"
+        blocker.write_text("x")
+        log_dir = blocker / "sub"
+        with caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.dispatch"):
+            result = self._run(tmp_path, b"hello", log_dir=log_dir)
+        assert result.log_path is None
+        assert result.output == "hello"
+        warns = [
+            r
+            for r in caplog.records
+            if "gate log: fallback to tempfile" in r.getMessage()
+        ]
+        assert len(warns) == 1
+        assert str(log_dir) in warns[0].getMessage()
+
+    def test_popen_oserror_leaves_no_file(self, tmp_path) -> None:
+        log_dir = tmp_path / "logs"
+        with patch(
+            "agent_gtd_dispatch.dispatch.subprocess.Popen",
+            side_effect=FileNotFoundError("sudo"),
+        ):
+            result = dispatch.run_gate_command(
+                tmp_path, "x", 30, CLAUDE, log_dir=log_dir
+            )
+        assert result.log_path is None
+        assert list(log_dir.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -648,7 +775,13 @@ class TestWorkerPostRunGate:
         await db.insert_run(run)
 
         gate_result = GateResult(
-            returncode=1, timed_out=False, output="...boom...", duration_seconds=5.0
+            returncode=1,
+            timed_out=False,
+            output="Full gate log: /x/gate-1.log\nFAILED t\n--- tail ...boom...",
+            duration_seconds=5.0,
+            log_path=Path("/x/gate-1.log"),
+            failure_lines=("FAILED t",),
+            failure_lines_total=1,
         )
         fake_workspace = tmp_path / "repos-testproj-b"
         fake_workspace.mkdir()
@@ -685,6 +818,14 @@ class TestWorkerPostRunGate:
         assert len(gate_comments) == 1
         assert "boom" in gate_comments[0]
         assert "````" in gate_comments[0]
+        assert "Gate output (failure lines and tail):" in gate_comments[0]
+        assert "Full gate log: /x/gate-1.log" in gate_comments[0]
+        from agent_gtd_dispatch import retention
+
+        assert mock_dispatch.run_gate_command.call_args.kwargs[
+            "log_dir"
+        ] == retention.evidence_dir(run.id)
+        assert any("failure_lines_matched=1" in r.getMessage() for r in caplog.records)
 
         mock_dispatch.cleanup_workspace.assert_called_once_with(fake_workspace)
         assert any(

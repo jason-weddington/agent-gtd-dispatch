@@ -3955,14 +3955,18 @@ class _LandHalt(Exception):  # noqa: N818 — a control-flow signal, not an erro
 
     ``head`` is the halt reason; ``tail`` (gate output) is appended last and is
     the part trimmed to fit ``ERROR_TEXT_MAX_CHARS``, keeping its END.
+    ``tail_lead`` (failure lines) goes between them and keeps its START.
     """
 
-    def __init__(self, outcome: str, head: str, tail: str = "") -> None:
+    def __init__(
+        self, outcome: str, head: str, tail: str = "", *, tail_lead: str = ""
+    ) -> None:
         """Record the land outcome code and the halt reason parts."""
         super().__init__(head)
         self.outcome = outcome
         self.head = head
         self.tail = tail
+        self.tail_lead = tail_lead
 
 
 class _ConflictCheck(NamedTuple):
@@ -4705,11 +4709,24 @@ class _Lander:
                         log_context=(
                             f"rollout_id={self.rollout_id} item_id={self.item_id}"
                         ),
+                        log_dir=retention.evidence_dir(self.loop_run_id),
+                        log_name_prefix=f"land-{self.item_id}",
                     ),
                 )
             )
         finally:
             _active_subprocesses.pop(self.loop_run_id, None)
+        logger.info(
+            "land gate: rollout=%s item=%s returncode=%s timed_out=%s "
+            "log_path=%s log_bytes=%s failure_lines_matched=%d",
+            self.rollout_id,
+            self.item_id,
+            result.returncode,
+            result.timed_out,
+            result.log_path,
+            result.log_bytes,
+            result.failure_lines_total,
+        )
         self.gate_rc = str(result.returncode)
         self.gate_secs = result.duration_seconds
         if result.timed_out:
@@ -4739,7 +4756,17 @@ class _Lander:
             reviewer_engine=self.reviewer_engine,
             token=self.token,
             attribution=self.attribution,
-            gate_failure_output=result.output,
+            gate_failure_output=(
+                dispatch.compose_gate_summary(
+                    result.log_path,
+                    result.failure_lines,
+                    result.failure_lines_total,
+                    result.tail,
+                    include_log_line=False,
+                )
+                if result.failure_lines_total > 0 or result.log_path is not None
+                else result.output
+            ),
             item=self.item,
         )
         if fix.verdict != "merge":
@@ -4794,21 +4821,35 @@ class _Lander:
             if conflict_paths
             else ""
         )
+        log_note = f" (full log: {result.log_path})" if result.log_path else ""
         if result.timed_out:
             return _LandHalt(
                 "gate_timed_out",
                 f"land gate timed out for item {self.item_id}{ctx} after "
-                f"{result.duration_seconds:.0f}s",
+                f"{result.duration_seconds:.0f}s{log_note}",
             )
         if result.returncode is None:
             return _LandHalt(
                 "gate_launch_error",
                 f"land gate launch error for item {self.item_id}{ctx}: {result.output}",
             )
+        tail_lead = ""
+        if result.failure_lines_total > 0:
+            composed = dispatch.compose_gate_summary(
+                None,
+                result.failure_lines,
+                result.failure_lines_total,
+                "",
+                include_log_line=False,
+            )
+            sep = f"--- tail (last {dispatch.GATE_OUTPUT_TAIL_CHARS} chars) ---\n"
+            tail_lead = composed.removesuffix(sep)
         return _LandHalt(
             "gate_failed",
-            f"land gate failed for item {self.item_id}{ctx}: ",
-            tail=result.output,
+            f"land gate failed for item {self.item_id}{ctx}: "
+            + (f"(full log: {result.log_path}) " if result.log_path else ""),
+            tail=result.tail,
+            tail_lead=tail_lead,
         )
 
     async def _push_round(self, remaining: list[str], *, gate_on: bool) -> bool:
@@ -5666,6 +5707,26 @@ class _Lander:
             time.monotonic() - self.lease_acquired_at,
         )
 
+    def _check_gate_summary(self, halt: _LandHalt, reason: str) -> None:
+        """Warn when a composed gate_failed reason lost its key evidence."""
+        final = reason[:ERROR_TEXT_MAX_CHARS]
+        missing = None
+        first = halt.tail_lead.split("\n", 2)[1] if halt.tail_lead else ""
+        if first and first not in final:
+            missing = "first_failure_line"
+        elif "(full log: " in halt.head:
+            path = halt.head.split("(full log: ", 1)[1].split(") ", 1)[0]
+            if path not in final:
+                missing = "log_path"
+        if missing:
+            logger.warning(
+                "land gate halt: summary invariant violated item=%s missing=%s "
+                "reason_len=%d",
+                self.item_id,
+                missing,
+                len(reason),
+            )
+
     async def _halt(self, halt: _LandHalt) -> str:
         for repo in self.landing or self.repos:
             if repo not in self.pushed:
@@ -5680,10 +5741,14 @@ class _Lander:
                 )
                 + ")"
             )
-        if halt.tail:
+        if halt.tail or halt.tail_lead:
             head = f"{halt.head}{status + ' ' if status else ''}"
             budget = max(ERROR_TEXT_MAX_CHARS - len(head), 0)
-            reason = head + (halt.tail[-budget:] if budget else "")
+            lead = halt.tail_lead[:budget]
+            rest = budget - len(lead)
+            reason = head + lead + (halt.tail[-rest:] if rest else "")
+            if halt.outcome == "gate_failed":
+                self._check_gate_summary(halt, reason)
         else:
             reason = f"{halt.head} {status}".rstrip()
         return await _halt_rollout_from_loop(
@@ -8904,6 +8969,7 @@ async def _dispatch_worker(
                             _register_subprocess,
                             tmp_dir=run_tmp_dir,
                             log_context=f"run_id={run.id}",
+                            log_dir=retention.evidence_dir(run.id),
                         ),
                     )
                     assert _gate_result is not None  # noqa: S101
@@ -8923,7 +8989,9 @@ async def _dispatch_worker(
                 logger.info(
                     "post-run gate: run_id=%s decision=%s project=%s"
                     " pushed_repos=%d timeout_s=%s floor_applied=%s"
-                    " returncode=%s timed_out=%s duration_s=%s",
+                    " returncode=%s timed_out=%s duration_s=%s"
+                    " log_path=%s log_bytes=%s failure_lines_matched=%d"
+                    " failure_lines_shown=%d",
                     run.id,
                     decision,
                     project.get("name"),
@@ -8937,6 +9005,10 @@ async def _dispatch_worker(
                     _gate_rc or None,
                     _gate_timed_out or None,
                     (f"{_gate_duration:.1f}" if _gate_duration is not None else None),
+                    _gate_result.log_path if _gate_result is not None else None,
+                    _gate_result.log_bytes if _gate_result is not None else None,
+                    _gate_result.failure_lines_total if _gate_result else 0,
+                    len(_gate_result.failure_lines) if _gate_result else 0,
                 )
 
                 if _gate_result is not None and not _gate_result.passed:
@@ -8968,9 +9040,16 @@ async def _dispatch_worker(
                     )
                     _publish_run_event(run.id, "failed", completed)
                     logger.warning(
-                        "post-run gate: run_id=%s decision=%s output_tail=%r",
+                        "post-run gate: run_id=%s decision=%s log_path=%s"
+                        " failure_lines_matched=%d first_failure_line=%r"
+                        " output_tail=%r",
                         run.id,
                         decision,
+                        _gate_result.log_path,
+                        _gate_result.failure_lines_total,
+                        _gate_result.failure_lines[0]
+                        if _gate_result.failure_lines
+                        else None,
                         _gate_result.output[-1000:],
                     )
                     if run.item_id is not None:
@@ -9011,7 +9090,7 @@ async def _dispatch_worker(
                             )
                         _gate_comment = (
                             _gate_first_line
-                            + "\n\nGate output (tail):\n\n````\n"
+                            + "\n\nGate output (failure lines and tail):\n\n````\n"
                             + (_gate_result.output or "(no output)").rstrip("\n")
                             + "\n````"
                         )

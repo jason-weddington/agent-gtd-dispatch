@@ -524,7 +524,7 @@ class _Worker:
         )
         mock_gtd.set_item_status = AsyncMock()
 
-        def _gate(*args, tmp_dir=None, log_context=""):
+        def _gate(*args, tmp_dir=None, log_context="", **_kw):
             self.seen["gate_tmp_dir"] = tmp_dir
             self.seen["gate_args"] = args
             return GateResult(
@@ -846,7 +846,7 @@ class TestLand:
         seen: dict[str, Any] = {}
         real_gate = dispatch.run_gate_command
 
-        def _gate(*args, tmp_dir=None, log_context=""):
+        def _gate(*args, tmp_dir=None, log_context="", **_kw):
             seen["gate"] = tmp_dir
             seen["gate_was_dir"] = tmp_dir is not None and tmp_dir.is_dir()
             return real_gate(*args, tmp_dir=tmp_dir)
@@ -890,7 +890,7 @@ class TestLand:
         entered = threading.Event()
         release = threading.Event()
 
-        def _gate(*_a, tmp_dir=None, log_context=""):
+        def _gate(*_a, tmp_dir=None, log_context="", **_kw):
             entered.set()
             release.wait(10)
             return GateResult(

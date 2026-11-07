@@ -72,6 +72,18 @@ def _isolate_run_tmp_root(tmp_path_factory: pytest.TempPathFactory) -> Iterator[
 
 
 @pytest.fixture(autouse=True)
+def _isolate_evidence_root(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    # Gate logs land under config.EVIDENCE_ROOT; keep them off the real home.
+    # Restored by hand, like _isolate_run_tmp_root.
+    from agent_gtd_dispatch import config
+
+    saved = config.EVIDENCE_ROOT
+    config.EVIDENCE_ROOT = tmp_path_factory.mktemp("run-evidence")
+    yield
+    config.EVIDENCE_ROOT = saved
+
+
+@pytest.fixture(autouse=True)
 def _no_real_session_reap(request: pytest.FixtureRequest) -> Iterator[None]:
     # Every agent/gate/talos exit path now reaps its session, which runs real
     # pkill (and sudo in two-user mode).  Mocked tests must not do that, so the
