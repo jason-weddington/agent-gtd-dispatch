@@ -2,6 +2,17 @@
 
 <!-- version list -->
 
+## v2.23.0 (2026-11-07)
+
+### Features
+
+- **4760857b**: Per-project rollout reviewer timeout override (projects.review_timeout_seconds)
+  ([`0ad7c39`](https://github.com/repos/agent-gtd-dispatch/commit/0ad7c3923880a987a9a38488be1b5b59e91c38f1))
+
+- **f066df59**: Rollout reviewer: base drift re-dispatches onto current main instead of halting
+  ([`0e5d0ec`](https://github.com/repos/agent-gtd-dispatch/commit/0e5d0ec6cdf61c91da404ff6d5a48230e69c8d53))
+
+
 ## v2.22.3 (2026-11-07)
 
 ### Bug Fixes
