@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import IO, TYPE_CHECKING, Any, Literal
+from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
@@ -5700,6 +5700,108 @@ passes on the exact pushed tree.
 # post-run gate passed.  The reviewer prompt's Step 4 keys off it verbatim.
 GATE_PASSED_WORDING = "the post-run gate PASSED"
 
+# --- Post-run gate failure summary carried across hosts via the board ---
+GATE_SUMMARY_UNAVAILABLE = "post-run gate failed; no summary available"
+REVIEW_GATE_SUMMARY_MAX_LINES: int = 60
+REVIEW_GATE_SUMMARY_HEAD_LINES: int = 20
+REVIEW_GATE_SUMMARY_TAIL_LINES: int = 40
+_GATE_MARKER_RE = re.compile(r"<!-- gate-summary run=(\S*?) -->")
+_BACKTICK_RUN_RE = re.compile(r"`+")
+_FULL_GATE_LOG_PREFIX = "Full gate log: "
+
+
+def gate_summary_marker(run_id: str) -> str:
+    """The HTML-comment marker that tags a build's gate-failure comment."""
+    return f"<!-- gate-summary run={run_id} -->"
+
+
+def backtick_fence(text: str, minimum: int) -> str:
+    """A backtick run longer than any backtick run inside *text*."""
+    longest = max((len(m) for m in _BACKTICK_RUN_RE.findall(text)), default=0)
+    return "`" * max(minimum, longest + 1)
+
+
+class GateSummaryLookup(NamedTuple):
+    """Result of :func:`extract_gate_summary`."""
+
+    text: str | None
+    reason: str
+    omitted_lines: int
+    comments_scanned: int
+    marker_run_ids: tuple[str, ...]
+
+
+def _fence_len(line: str) -> int:
+    """Length of *line* if it is nothing but backticks, else 0."""
+    stripped = line.strip()
+    if stripped and set(stripped) == {"`"}:
+        return len(stripped)
+    return 0
+
+
+def extract_gate_summary(
+    comments: list[dict[str, Any]],
+    remote_run_id: str,
+    *,
+    max_lines: int = REVIEW_GATE_SUMMARY_MAX_LINES,
+) -> GateSummaryLookup:
+    """Pull the build host's gate failure summary out of board comments."""
+    scanned = len(comments)
+    seen: list[str] = []
+    for c in comments:
+        for m in _GATE_MARKER_RE.finditer(str(c.get("content_markdown") or "")):
+            if m.group(1) not in seen and len(seen) < 5:
+                seen.append(m.group(1))
+    ids = tuple(seen)
+
+    def miss(reason: str, omitted: int = 0) -> GateSummaryLookup:
+        return GateSummaryLookup(None, reason, omitted, scanned, ids)
+
+    if not remote_run_id:
+        return miss("no_remote_run_id")
+    if not seen:
+        return miss("no_marker")
+    marker = gate_summary_marker(remote_run_id)
+    body = ""
+    for c in reversed(comments):
+        content = str(c.get("content_markdown") or "")
+        if marker in content:
+            body = content
+            break
+    else:
+        return miss("marker_other_run")
+    lines = body.split(marker, 1)[1].split("\n")
+    start = next((i for i, ln in enumerate(lines) if _fence_len(ln) >= 4), None)
+    if start is None:
+        return miss("fence_unterminated")
+    open_len = _fence_len(lines[start])
+    end = next(
+        (i for i in range(start + 1, len(lines)) if _fence_len(lines[i]) >= open_len),
+        None,
+    )
+    if end is None:
+        return miss("fence_unterminated")
+    block = lines[start + 1 : end]
+    if not "\n".join(block).strip() or "\n".join(block).strip() == "(no output)":
+        return miss("empty_block")
+    omitted = 0
+    if len(block) > max_lines:
+        omitted = len(block) - max_lines
+        block = [
+            *block[:REVIEW_GATE_SUMMARY_HEAD_LINES],
+            f"... ({omitted} more lines omitted; full output is in the build's"
+            " item comment)",
+            *block[-REVIEW_GATE_SUMMARY_TAIL_LINES:],
+        ]
+    block = [
+        "Full gate log (on the build host; not readable from the reviewer's host): "
+        + ln[len(_FULL_GATE_LOG_PREFIX) :]
+        if ln.startswith(_FULL_GATE_LOG_PREFIX)
+        else ln
+        for ln in block
+    ]
+    return GateSummaryLookup("\n".join(block), "found", omitted, scanned, ids)
+
 
 def _review_envelope_block(
     item: dict[str, Any],
@@ -5707,6 +5809,7 @@ def _review_envelope_block(
     run_status: str,
     gate_result: str,
     merge_notes: list[dict[str, Any]] | None,
+    post_run_gate_summary: str | None = None,
 ) -> str:
     """The evidence envelope handed to a reviewer: AC, branch, gate, notes."""
     criteria = item.get("acceptance_criteria") or []
@@ -5740,13 +5843,27 @@ def _review_envelope_block(
             "you are the first)"
         )
 
+    gate_extra = ""
+    if post_run_gate_summary == GATE_SUMMARY_UNAVAILABLE:
+        gate_extra = "\n\n" + GATE_SUMMARY_UNAVAILABLE
+    elif post_run_gate_summary is not None:
+        fence = backtick_fence(post_run_gate_summary, 3)
+        gate_extra = (
+            "\n\nPost-run gate failure summary (from the build host)\n\n"
+            + fence
+            + "text\n"
+            + post_run_gate_summary
+            + "\n"
+            + fence
+        )
+
     body = f"""\
 ## The Build You Are Reviewing
 
 **Item:** {item.get("title", "(untitled)")} (`{item.get("id", "")}`)
 **Branch:** `{branch_name}`
 **Child build run terminal status:** `{run_status}`
-**Post-run gate result (from the dispatch worker):** {gate_result}
+**Post-run gate result (from the dispatch worker):** {gate_result}{gate_extra}
 
 ### Item description
 
@@ -5931,6 +6048,7 @@ def build_review_prompt(
     land_conflict: dict[str, list[str]] | None = None,
     review_timeout_seconds: int | None = None,
     gate_installed: bool = False,
+    post_run_gate_summary: str | None = None,
 ) -> str:
     """System prompt for REVIEW mode — review ONE build, then approve or refuse.
 
@@ -6054,7 +6172,12 @@ not a rollout with no quality bar. If a repo has no discoverable test or lint co
 record `none` for it and continue — do NOT halt for that alone."""
 
     envelope = _review_envelope_block(
-        item, branch_name, run_status, gate_result, merge_notes
+        item,
+        branch_name,
+        run_status,
+        gate_result,
+        merge_notes,
+        post_run_gate_summary=post_run_gate_summary,
     )
     conflict_contract = _review_conflict_contract_block(
         workspace_mode=workspace_mode, has_gate=bool(gate_command)

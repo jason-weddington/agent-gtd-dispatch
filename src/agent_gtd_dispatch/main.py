@@ -46,8 +46,11 @@ from . import (
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
 from .completion import agent_output_summary
 from .dispatch import (
+    GATE_SUMMARY_UNAVAILABLE,
     LandGitError,
     LandGitTimeout,
+    backtick_fence,
+    gate_summary_marker,
     kill_run_session,
     reap_run_session,
     run_session_has_members,
@@ -2728,6 +2731,99 @@ async def _run_gate_install(
     return _GateInstallResult("installed", duration_ms=_ms())
 
 
+async def _gate_summary_for_review(
+    item_id: str,
+    run_row: dict[str, Any],
+    *,
+    token: str | None,
+    normal_launch: bool,
+    rollout_id: str = "",
+) -> tuple[str | None, str]:
+    """Fetch the build host's gate failure summary from the board's comments.
+
+    Returns ``(summary, source)``; source is ``comment``, ``unavailable`` or
+    ``not-applicable``.  Board comments ONLY: the build may have run on
+    another host, so no local run record or gate log is consulted.
+    """
+    remote_run_id = str(run_row.get("remote_run_id") or "")
+    error_msg = str(run_row.get("error_msg") or "").strip().lower()
+    summary: str | None = None
+    source = "not-applicable"
+    scanned = 0
+    omitted = 0
+    if not normal_launch:
+        reason = "not_applicable_fix_mode_or_land_conflict"
+    elif not error_msg.startswith("post-run gate"):
+        reason = "not_applicable_passed"
+    else:
+        comments: list[dict[str, Any]] = []
+        reason = ""
+        if not remote_run_id:
+            logger.warning(
+                "rollout-loop: review-gate-summary-no-remote-run-id "
+                "rollout_id=%s item_id=%s board_run_id=%s",
+                rollout_id,
+                item_id,
+                run_row.get("id"),
+            )
+        try:
+            comments = await gtd_client.list_comments(item_id, token=token)
+        except Exception:
+            logger.warning(
+                "rollout-loop: failed to list comments for gate summary item_id=%s",
+                item_id,
+            )
+            reason = "list_error"
+        lookup = dispatch.extract_gate_summary(comments, remote_run_id)
+        scanned = lookup.comments_scanned
+        omitted = lookup.omitted_lines
+        if not reason:
+            reason = lookup.reason
+        if reason == "marker_other_run":
+            logger.warning(
+                "rollout-loop: review-gate-summary-marker-mismatch rollout_id=%s "
+                "item_id=%s remote_run_id=%s marker_run_ids=%s",
+                rollout_id,
+                item_id,
+                remote_run_id,
+                ",".join(lookup.marker_run_ids),
+            )
+        if reason == "found" and lookup.text is not None:
+            summary, source = lookup.text, "comment"
+        else:
+            summary, source = GATE_SUMMARY_UNAVAILABLE, "unavailable"
+    lines = 0
+    failure_lines = 0
+    if isinstance(summary, str) and summary != GATE_SUMMARY_UNAVAILABLE:
+        lines = summary.count("\n") + 1
+        failure_lines = sum(
+            1 for ln in summary.split("\n") if "FAILED" in ln or "Error" in ln
+        )
+    logger.info(
+        "rollout-loop: review-gate-summary rollout_id=%s item_id=%s "
+        "remote_run_id=%s source=%s reason=%s comments=%d lines=%d omitted=%d "
+        "failure_lines=%d",
+        rollout_id,
+        item_id,
+        remote_run_id,
+        source,
+        reason,
+        scanned,
+        lines,
+        omitted,
+        failure_lines,
+    )
+    if source == "comment" and omitted > 0 and failure_lines == 0:
+        logger.warning(
+            "rollout-loop: review-gate-summary-no-failure-lines rollout_id=%s "
+            "item_id=%s omitted=%d",
+            rollout_id,
+            item_id,
+            omitted,
+        )
+    return summary, source
+
+
 async def _launch_reviewer(
     rollout_id: str,
     item_id: str,
@@ -2905,6 +3001,13 @@ async def _launch_reviewer(
             else "type",
             review_timeout_seconds,
         )
+    gate_summary, _gate_summary_source = await _gate_summary_for_review(
+        item_id,
+        run_row,
+        token=token,
+        normal_launch=(gate_failure_output is None and land_conflict is None),
+        rollout_id=rollout_id,
+    )
     prompt = dispatch.build_review_prompt(
         item,
         project,
@@ -2933,6 +3036,7 @@ async def _launch_reviewer(
         land_conflict=land_conflict,
         review_timeout_seconds=review_timeout_seconds,
         gate_installed=gate_installed,
+        post_run_gate_summary=gate_summary,
     )
     pinned_subject = dispatch.compose_squash_subject(item)
     logger.info(
@@ -9138,32 +9242,6 @@ async def _dispatch_worker(
                     else:  # launch_error
                         error_str = "post-run gate failed: launch error"
 
-                    _push_results_json = json.dumps(
-                        [r.model_dump(mode="json") for r in push_results_list]
-                    )
-                    await db.update_run(
-                        run.id,
-                        status=RunStatus.failed,
-                        completed_at=completed,
-                        exit_code=result.returncode,
-                        error=error_str,
-                        push_results=_push_results_json,
-                        completion=_build_completion("failed", decision),
-                    )
-                    _publish_run_event(run.id, "failed", completed)
-                    logger.warning(
-                        "post-run gate: run_id=%s decision=%s log_path=%s"
-                        " failure_lines_matched=%d first_failure_line=%r"
-                        " output_tail=%r",
-                        run.id,
-                        decision,
-                        _gate_result.log_path,
-                        _gate_result.failure_lines_total,
-                        _gate_result.failure_lines[0]
-                        if _gate_result.failure_lines
-                        else None,
-                        _gate_result.output[-1000:],
-                    )
                     if run.item_id is not None:
                         if decision == "timed_out":
                             _gate_first_line = (
@@ -9200,11 +9278,18 @@ async def _dispatch_worker(
                                 f" `{run.branch_name}` was pushed but was not"
                                 " gate-verified."
                             )
+                        _gate_out = (_gate_result.output or "(no output)").rstrip("\n")
+                        _gate_fence = backtick_fence(_gate_out, 4)
                         _gate_comment = (
                             _gate_first_line
-                            + "\n\nGate output (failure lines and tail):\n\n````\n"
-                            + (_gate_result.output or "(no output)").rstrip("\n")
-                            + "\n````"
+                            + "\n\n"
+                            + gate_summary_marker(run.id)
+                            + "\nGate output (failure lines and tail):\n\n"
+                            + _gate_fence
+                            + "\n"
+                            + _gate_out
+                            + "\n"
+                            + _gate_fence
                         )
                         try:
                             await gtd_client.post_comment(
@@ -9215,10 +9300,49 @@ async def _dispatch_worker(
                             )
                         except Exception:
                             logger.warning(
-                                "Failed to post post-run gate failure comment"
-                                " for run %s",
+                                "post-run gate: comment-post-failed run_id=%s"
+                                " item_id=%s decision=%s",
                                 run.id,
+                                run.item_id,
+                                decision,
+                                exc_info=True,
                             )
+                        else:
+                            logger.info(
+                                "post-run gate: comment-posted run_id=%s"
+                                " item_id=%s decision=%s marker=1"
+                                " output_lines=%d",
+                                run.id,
+                                run.item_id,
+                                decision,
+                                _gate_out.count("\n") + 1,
+                            )
+                    _push_results_json = json.dumps(
+                        [r.model_dump(mode="json") for r in push_results_list]
+                    )
+                    await db.update_run(
+                        run.id,
+                        status=RunStatus.failed,
+                        completed_at=completed,
+                        exit_code=result.returncode,
+                        error=error_str,
+                        push_results=_push_results_json,
+                        completion=_build_completion("failed", decision),
+                    )
+                    _publish_run_event(run.id, "failed", completed)
+                    logger.warning(
+                        "post-run gate: run_id=%s decision=%s log_path=%s"
+                        " failure_lines_matched=%d first_failure_line=%r"
+                        " output_tail=%r",
+                        run.id,
+                        decision,
+                        _gate_result.log_path,
+                        _gate_result.failure_lines_total,
+                        _gate_result.failure_lines[0]
+                        if _gate_result.failure_lines
+                        else None,
+                        _gate_result.output[-1000:],
+                    )
                     return  # exit early — do not mark succeeded
 
             if push_results_list is not None:

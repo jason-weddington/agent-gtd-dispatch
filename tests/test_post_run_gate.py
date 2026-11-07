@@ -54,6 +54,22 @@ def _clear_gate_tool_cache():
     platform_support.gate_timeout_tool.cache_clear()
 
 
+def _assert_summary_comment(posted: str, run_id: str, line: str) -> None:
+    from agent_gtd_dispatch.dispatch import extract_gate_summary, gate_summary_marker
+
+    assert (
+        "\n" + gate_summary_marker(run_id) + "\nGate output (failure lines and tail):"
+        in posted
+    )
+    body = posted.split("Gate output (failure lines and tail):", 1)[1]
+    assert "````\n" in body
+    assert line in body
+    found = extract_gate_summary([{"content_markdown": posted}], run_id)
+    assert found.reason == "found"
+    assert found.text is not None
+    assert line in found.text
+
+
 # ---------------------------------------------------------------------------
 # _classify_gate_timeout
 # ---------------------------------------------------------------------------
@@ -862,6 +878,8 @@ class TestWorkerPostRunGate:
         assert "````" in gate_comments[0]
         assert "Gate output (failure lines and tail):" in gate_comments[0]
         assert "Full gate log: /x/gate-1.log" in gate_comments[0]
+        _assert_summary_comment(gate_comments[0], run.id, "FAILED t")
+        assert f"post-run gate: comment-posted run_id={run.id}" in caplog.text
         from agent_gtd_dispatch import retention
 
         assert mock_dispatch.run_gate_command.call_args.kwargs[
@@ -973,6 +991,67 @@ class TestWorkerPostRunGate:
         assert updated.status.value == "failed"
         n = mock_dispatch.run_gate_command.call_args.args[2]
         assert updated.error == f"post-run gate timed out after {n}s"
+        posted = [str(c.args[1]) for c in mock_gtd.post_comment.call_args_list]
+        gate_comments = [t for t in posted if "Post-run gate timed out" in t]
+        assert len(gate_comments) == 1
+        _assert_summary_comment(gate_comments[0], run.id, "stuck")
+
+    @pytest.mark.asyncio
+    async def test_comment_fence_roundtrip_and_ordering(self, tmp_path) -> None:
+        from agent_gtd_dispatch.dispatch import extract_gate_summary
+        from agent_gtd_dispatch.main import _dispatch_worker
+
+        await db.init_db()
+        run = Run(
+            item_id="item-f",
+            project_name="TestProject",
+            branch_name="feat/f",
+            mode=DispatchMode.BUILD,
+        )
+        await db.insert_run(run)
+        output = "FAILED t\n````\nnested\n````\nend"
+        gate_result = GateResult(
+            returncode=1, timed_out=False, output=output, duration_seconds=2.0
+        )
+        fake_workspace = tmp_path / "repos-testproj-f"
+        fake_workspace.mkdir()
+        order: list[str] = []
+        real_update = db.update_run
+
+        async def _update(*args, **kwargs):
+            if kwargs.get("status") is not None and kwargs["status"].value == "failed":
+                order.append("update_failed")
+            return await real_update(*args, **kwargs)
+
+        async def _post(*_a, **_k):
+            order.append("post_comment")
+
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_gtd,
+            patch("agent_gtd_dispatch.main.dispatch") as mock_dispatch,
+            patch.object(db, "update_run", _update),
+        ):
+            _install_common_mocks(
+                mock_gtd,
+                mock_dispatch,
+                item_id="item-f",
+                project=_default_project(),
+                fake_workspace=fake_workspace,
+            )
+            mock_gtd.post_comment = AsyncMock(side_effect=_post)
+            mock_dispatch.run_agent = AsyncMock(return_value=_completed(0))
+            mock_dispatch.verify_pushes = MagicMock(
+                return_value=[_pushed(branch="feat/f")]
+            )
+            mock_dispatch.run_gate_command = MagicMock(return_value=gate_result)
+            await _dispatch_worker(run, 50, CLAUDE, 600)
+
+        assert order.index("post_comment") < order.index("update_failed")
+        posted = str(mock_gtd.post_comment.call_args.args[1])
+        assert "\n`````\n" in posted
+        found = extract_gate_summary([{"content_markdown": posted}], run.id)
+        assert found.reason == "found"
+        assert found.text == output
 
     @pytest.mark.asyncio
     async def test_killed_by_signal_error_string(self, tmp_path) -> None:
