@@ -1981,3 +1981,207 @@ class TestQueuedInFlightStepText:
         assert directive == _TICK_WAIT
         assert steps == ["Waiting on 2 in-flight build run(s)"]
         assert stalled == []
+
+
+# ---------------------------------------------------------------------------
+# Halt during a pre-lease land wait
+# ---------------------------------------------------------------------------
+
+
+def _probe_lander(**attrs: Any) -> main._LandProbe:
+    base: dict[str, Any] = {
+        "lease_ever_acquired": False,
+        "lease_id": None,
+        "pushed": {},
+        "in_acquire_call": False,
+    }
+    base.update(attrs)
+    return main._LandProbe(lander=SimpleNamespace(**base))  # type: ignore[arg-type]
+
+
+def _teardown_line(caplog) -> str:
+    lines = _records(caplog, "rollout-loop: halt-teardown ")
+    assert len(lines) == 1
+    return lines[0]
+
+
+_DIRECTIVES = [_TICK_HALTED, _TICK_DONE, main._TICK_SUPERSEDED]
+
+
+class TestPreLeaseHalt:
+    @pytest.mark.parametrize("directive", _DIRECTIVES)
+    async def test_exit_tick_cancels_pre_lease_land(
+        self, tmp_path, caplog, directive: str
+    ) -> None:
+        task = _pending_task()
+        ls = _RolloutLoopState(
+            slots={0: _ws(tmp_path, 0)},
+            active_land=_ActiveLand("x", 0, task, 0.0, probe=_probe_lander()),
+        )
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger=LOGGER),
+        ):
+            assert await main._exit_tick(ROLLOUT, ls, directive) == directive
+        assert task.cancelled()
+        assert ls.active_land is None
+        assert ls.pending_directive is None
+        line = _teardown_line(caplog)
+        assert "active_land=- active_land_action=cancelled" in line
+        assert "active_land_probe=present acquire_in_flight=False" in line
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        ctx.gtd.post_comment.assert_not_awaited()
+
+    @pytest.mark.parametrize("directive", _DIRECTIVES)
+    @pytest.mark.parametrize(
+        "probe",
+        [
+            _probe_lander(lease_id="L1"),
+            _probe_lander(lease_ever_acquired=True),
+            _probe_lander(pushed={"repo-a": "abc"}),
+            _probe_lander(in_acquire_call=True),
+            None,
+        ],
+        ids=["lease_id", "ever_acquired", "pushed", "in_call", "no_probe"],
+    )
+    async def test_exit_tick_keeps_lease_land(
+        self, tmp_path, caplog, directive: str, probe
+    ) -> None:
+        task = _pending_task()
+        ls = _RolloutLoopState(
+            slots={0: _ws(tmp_path, 0)},
+            active_land=_ActiveLand("x", 0, task, 0.0, probe=probe),
+        )
+        try:
+            with (
+                _loop_patch_stack(),
+                caplog.at_level(logging.INFO, logger=LOGGER),
+            ):
+                assert await main._exit_tick(ROLLOUT, ls, directive) == _TICK_WAIT
+            assert not task.done()
+            assert ls.pending_directive == directive
+            assert ls.active_land is not None
+            line = _teardown_line(caplog)
+            assert "active_land=x active_land_action=kept" in line
+            if probe is None:
+                assert "active_land_probe=absent" in line
+        finally:
+            await _cleanup(ls)
+
+    async def test_suffix_names_pre_lease_active_land(self, tmp_path) -> None:
+        ls = _RolloutLoopState(
+            active_land=_ActiveLand("x", 0, _pending_task(), 0.0, probe=_probe_lander())
+        )
+        ls.land_queue.append(_queued("q", 1))
+        try:
+            assert main._queued_land_suffix(ls) == (
+                "; discarded queued merge verdict(s) for q, x: "
+                "they will be re-reviewed on resume"
+            )
+            ls.land_queue.clear()
+            assert "for x:" in main._queued_land_suffix(ls)
+            assert ls.active_land is not None
+            ls.active_land.probe = _probe_lander(lease_id="L1")
+            assert main._queued_land_suffix(ls) == ""
+        finally:
+            await _cleanup(ls)
+
+    async def test_pending_directive_cancels_pre_lease_land(
+        self, tmp_path, caplog
+    ) -> None:
+        task = _pending_task()
+        ls = _RolloutLoopState(
+            slots={0: _ws(tmp_path, 0)},
+            active_land=_ActiveLand("x", 0, task, 0.0, probe=_probe_lander()),
+            pending_directive=_TICK_HALTED,
+        )
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger=LOGGER),
+        ):
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=["x"])
+            assert await _tick(ctx, ls) == _TICK_HALTED
+        assert task.cancelled()
+        assert ls.active_land is None
+        assert ls.pending_directive is None
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        assert _records(caplog, "pending-directive-cancel-land")
+
+    @pytest.mark.parametrize("directive", _DIRECTIVES)
+    async def test_harvest_of_aborted_land_ends_tick(
+        self, tmp_path, directive: str
+    ) -> None:
+        probe = main._LandProbe(aborted=directive, lander_returned=True)
+        land_task = _done_task(directive)
+        await _yield()
+        ls = _RolloutLoopState(
+            slots={i: _ws(tmp_path, i) for i in range(2)},
+            active_land=_ActiveLand("x", 0, land_task, 0.0, probe=probe),
+        )
+        ls.land_queue.append(_queued("q", 1))
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_land_reviewed_merge", new=AsyncMock()) as land,
+        ):
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=["x", "q"], next_ready=["z"])
+            assert await _tick(ctx, ls) == directive
+        land.assert_not_awaited()
+        ctx.gtd.dispatch_item.assert_not_awaited()
+        assert ctx.gtd.halt_rollout.await_count == 0
+        assert ctx.gtd.post_comment.await_count == 0
+        assert ctx.gtd.update_rollout_state.await_count == 0
+        assert ls.active_land is None
+        assert ls.land_queue == []
+        assert ls.pending_directive is None
+
+    async def test_start_land_passes_probe(self, tmp_path) -> None:
+        seen: dict[str, Any] = {}
+        entered = asyncio.Event()
+
+        async def _land(rollout_id, item_id, verdict, **kw):
+            seen["probe"] = kw.get("probe")
+            entered.set()
+            await asyncio.Event().wait()
+
+        ls = _RolloutLoopState(slots={0: _ws(tmp_path, 0)})
+        ls.land_queue.append(_queued("a", 0))
+        try:
+            with patch.object(main, "_land_reviewed_merge", new=_land):
+                main._start_land(
+                    ROLLOUT,
+                    ls,
+                    project={"name": "p"},
+                    reviewer_engine=MagicMock(),
+                    loop_run_id="loop-run-1",
+                    token=None,
+                    attribution=None,
+                )
+                await asyncio.wait_for(entered.wait(), 5)
+            assert ls.active_land is not None
+            assert ls.active_land.probe is not None
+            assert seen["probe"] is ls.active_land.probe
+        finally:
+            await _cleanup(ls)
+
+    async def test_cancelled_land_harvest_logs_breach(self, tmp_path, caplog) -> None:
+        task = _pending_task()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        ls = _RolloutLoopState(
+            slots={0: _ws(tmp_path, 0)},
+            active_land=_ActiveLand("x", 0, task, 0.0, probe=_probe_lander()),
+        )
+        with (
+            _loop_patch_stack() as ctx,
+            caplog.at_level(logging.INFO, logger=LOGGER),
+        ):
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=["x"])
+            await _tick(ctx, ls)
+        assert _records(
+            caplog,
+            "rollout-loop: invariant-breach kind=cancelled_land_harvested "
+            f"rollout_id={ROLLOUT} item_id=x",
+        )

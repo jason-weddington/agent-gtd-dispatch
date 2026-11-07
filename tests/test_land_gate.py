@@ -245,6 +245,7 @@ async def _land(
     outcome: ReviewVerdict | None = None,
     item_id: str = ITEM,
     loop_run_id: str = "100000000001",
+    probe: main._LandProbe | None = None,
 ):
     project = {"name": "P", "git_origin": "git@h:o/repo.git"}
     if gate is not None:
@@ -260,6 +261,7 @@ async def _land(
         loop_run_id=loop_run_id,
         token=None,
         attribution=None,
+        probe=probe,
     )
 
 
@@ -495,7 +497,7 @@ class TestGreenPath:
         assert "fix relaunch: none" in comment
 
         phases = [c.args[1] for c in gtd.update_rollout_state.await_args_list]
-        assert set(phases) == {"merging"}
+        assert set(phases) == {"waiting_for_lease", "merging"}
 
     async def test_every_pushed_sha_is_the_last_gated_sha(
         self, mono, tmp_path: Path
@@ -2653,7 +2655,7 @@ class TestLandLease:
         _squash(mono.clone)
         monkeypatch.setattr(main, "LAND_LEASE_WAIT_WARN_SECONDS", 1e-9)
         gtd.acquire_land_lease.side_effect = [_held(), _acquired()]
-        gtd.get_rollout = AsyncMock(return_value={"status": "halted"})
+        gtd.get_rollout = AsyncMock(return_value={"status": "running"})
         with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
             result = await _land(mono.ws, mono.pre)
         assert isinstance(result, ReviewVerdict)
@@ -2797,46 +2799,189 @@ class TestLandLease:
         assert reason.startswith(f"land lease acquire failed for item {ITEM}")
         assert "board unreachable for" in reason
 
-    async def _assert_aborted(self, mono, gtd, status: str) -> None:
+    async def _assert_aborted(
+        self, mono, gtd, caplog, directive: str, *, source: str, observed: str
+    ) -> None:
         before = _tip(mono.origin)
         fetch = MagicMock(side_effect=dispatch.land_fetch)
         push = MagicMock(side_effect=dispatch.land_push)
+        gate = MagicMock(side_effect=dispatch.run_gate_command)
+        probe = main._LandProbe()
         with (
             patch.object(dispatch, "land_fetch", fetch),
             patch.object(dispatch, "land_push", push),
+            patch.object(dispatch, "run_gate_command", gate),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
         ):
-            result = await _land(mono.ws, mono.pre)
-        assert result == main._TICK_HALTED
+            result = await _land(mono.ws, mono.pre, probe=probe)
+        assert result == directive
+        assert probe.aborted == directive
+        assert probe.lander_returned is True
         fetch.assert_not_called()
         push.assert_not_called()
+        gate.assert_not_called()
         gtd.release_land_lease.assert_not_awaited()
-        assert _halt_reason(gtd) == (
-            f"land aborted for item {ITEM}: rollout {status} while waiting for "
-            "the land lease"
-        )
+        gtd.halt_rollout.assert_not_awaited()
+        gtd.post_comment.assert_not_awaited()
+        phases = [c.args[1] for c in gtd.update_rollout_state.await_args_list]
+        assert "halted" not in phases
+        assert "land_lease_error" not in caplog.text
+        aborted = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("rollout-loop: land-lease wait-aborted ")
+        ]
+        assert len(aborted) == 1
+        assert (
+            f"rollout_id={ROLLOUT} item_id={ITEM} source={source} "
+            f"observed={observed} directive={directive} waited_secs="
+        ) in aborted[0]
         assert _tip(mono.origin) == before
 
-    async def test_cancelled_rollout_aborts_wait(self, mono, gtd) -> None:
+    @pytest.mark.parametrize(
+        ("status", "directive"),
+        [
+            ("halted", main._TICK_HALTED),
+            ("cancelled", main._TICK_DONE),
+            ("completed", main._TICK_DONE),
+        ],
+    )
+    async def test_board_status_aborts_pre_lease_wait(
+        self, mono, gtd, caplog, status: str, directive: str
+    ) -> None:
+        _squash(mono.clone)
+        gtd.acquire_land_lease.side_effect = [_held()]
+        gtd.get_rollout = AsyncMock(return_value={"status": status})
+        await self._assert_aborted(
+            mono, gtd, caplog, directive, source="poll", observed=status
+        )
+        assert "holders_seen=1" in caplog.text
+
+    async def test_cancelled_rollout_aborts_wait(self, mono, gtd, caplog) -> None:
         _squash(mono.clone)
         gtd.acquire_land_lease.side_effect = [_held()]
         gtd.get_rollout = AsyncMock(return_value={"status": "cancelled"})
-        await self._assert_aborted(mono, gtd, "cancelled")
+        await self._assert_aborted(
+            mono, gtd, caplog, main._TICK_DONE, source="poll", observed="cancelled"
+        )
 
-    async def test_refused_acquire_aborts(self, mono, gtd) -> None:
+    @pytest.mark.parametrize(
+        ("refused", "directive"),
+        [
+            ("rollout_halted", main._TICK_HALTED),
+            ("rollout_cancelled", main._TICK_DONE),
+            ("rollout_completed", main._TICK_DONE),
+        ],
+    )
+    async def test_refused_acquire_aborts(
+        self, mono, gtd, caplog, refused: str, directive: str
+    ) -> None:
         _squash(mono.clone)
-        gtd.acquire_land_lease.side_effect = [
-            {"acquired": False, "refused": "rollout_cancelled"}
-        ]
-        await self._assert_aborted(mono, gtd, "cancelled")
+        gtd.acquire_land_lease.side_effect = [{"acquired": False, "refused": refused}]
+        await self._assert_aborted(
+            mono, gtd, caplog, directive, source="refused", observed=refused
+        )
+        assert gtd.acquire_land_lease.await_args.kwargs["continuing_land"] is False
 
-    async def test_superseded_loop_aborts_wait(self, mono, gtd, monkeypatch) -> None:
+    async def test_superseded_loop_aborts_wait(
+        self, mono, gtd, monkeypatch, caplog
+    ) -> None:
         _squash(mono.clone)
         gtd.acquire_land_lease.side_effect = [_held()]
         gtd.get_rollout = AsyncMock(
             return_value={"status": "running", "loop_remote_run_id": "OTHER-LOOP"}
         )
         monkeypatch.setattr(main.db, "list_runs_by_rollout", AsyncMock(return_value=[]))
-        await self._assert_aborted(mono, gtd, "superseded")
+        await self._assert_aborted(
+            mono,
+            gtd,
+            caplog,
+            main._TICK_SUPERSEDED,
+            source="poll",
+            observed="superseded",
+        )
+
+    def _bare_lander(self, mono) -> main._Lander:
+        return main._Lander(
+            ROLLOUT,
+            ITEM,
+            _verdict(),
+            project={"name": "P"},
+            workspace=mono.ws,
+            pre_review_origin=mono.pre,
+            reviewer_engine=get_engine("claude-code-sonnet"),
+            loop_run_id="100000000001",
+            token=None,
+            attribution=None,
+        )
+
+    async def test_refused_after_push_still_halts(self, mono, gtd) -> None:
+        lander = self._bare_lander(mono)
+        lander.pushed = {"repo": "abc"}
+        gtd.acquire_land_lease.side_effect = [
+            {"acquired": False, "refused": "rollout_halted"}
+        ]
+        with pytest.raises(main._LandHalt) as info:
+            await lander._acquire_lease()
+        assert gtd.acquire_land_lease.await_args.kwargs["continuing_land"] is True
+        result = await lander._halt(info.value)
+        assert result == main._TICK_HALTED
+        assert _halt_reason(gtd).startswith(
+            f"land aborted for item {ITEM}: rollout halted while waiting for "
+            "the land lease"
+        )
+
+    async def test_continuing_land_reacquires_while_halted(
+        self, mono, gtd, fast_lease
+    ) -> None:
+        lander = self._bare_lander(mono)
+        lander.lease_ever_acquired = True
+        gtd.get_rollout = AsyncMock(return_value={"status": "halted"})
+        gtd.acquire_land_lease.side_effect = [_held(), _acquired("L2")]
+        try:
+            lease_id = await lander._acquire_lease()
+        finally:
+            await lander._stop_lease_renewal()
+        assert lease_id == "L2"
+        assert lander.lease_id == "L2"
+        for call in gtd.acquire_land_lease.await_args_list:
+            assert call.kwargs["continuing_land"] is True
+        gtd.halt_rollout.assert_not_awaited()
+
+    async def test_phases_wait_then_merging(self, mono, gtd, fast_lease) -> None:
+        _squash(mono.clone)
+        gtd.acquire_land_lease.side_effect = [_held(), _held("R3"), _acquired()]
+        gtd.get_rollout = AsyncMock(return_value={"status": "running"})
+        result = await _land(mono.ws, mono.pre)
+        assert isinstance(result, ReviewVerdict)
+        calls = gtd.update_rollout_state.await_args_list
+        phases = [c.args[1] for c in calls]
+        first_merging = phases.index("merging")
+        assert first_merging > 0
+        assert set(phases[:first_merging]) == {"waiting_for_lease"}
+        assert (
+            calls[first_merging].kwargs["current_step"]
+            == f"Land: lease acquired for {ITEM}"
+        )
+        assert "waiting_for_lease" not in phases[first_merging:]
+
+    async def test_probe_tracks_lander(self, mono, gtd) -> None:
+        _squash(mono.clone)
+        probe = main._LandProbe()
+        seen: list[tuple[object, bool]] = []
+
+        async def acquire(*_a, **_kw):
+            seen.append((probe.lander, probe.lander_returned))
+            return _acquired()
+
+        gtd.acquire_land_lease.side_effect = acquire
+        result = await _land(mono.ws, mono.pre, probe=probe)
+        assert isinstance(result, ReviewVerdict)
+        assert isinstance(seen[0][0], main._Lander)
+        assert seen[0][1] is False
+        assert probe.lander is seen[0][0]
+        assert probe.lander_returned is True
+        assert probe.aborted is None
 
     async def test_cancel_during_gate_releases_lease(self, mono, gtd) -> None:
         import threading
@@ -2959,3 +3104,42 @@ class TestLeaseRenewTask:
         await lander._stop_lease_renewal()
         assert lander.lease_renew_task is None
         gtd.renew_land_lease.assert_not_awaited()
+
+
+class TestLandIsPreLease:
+    def _active(self, probe: main._LandProbe | None) -> main._ActiveLand:
+        return main._ActiveLand("I", 0, MagicMock(), 0.0, probe=probe)
+
+    def _lander(self, **attrs: object) -> SimpleNamespace:
+        base: dict[str, object] = {
+            "lease_ever_acquired": False,
+            "lease_id": None,
+            "pushed": {},
+            "in_acquire_call": False,
+        }
+        base.update(attrs)
+        return SimpleNamespace(**base)
+
+    @pytest.mark.parametrize(
+        ("attrs", "expected"),
+        [
+            ({}, True),
+            ({"lease_ever_acquired": True}, False),
+            ({"lease_id": "L1", "lease_ever_acquired": True}, False),
+            ({"pushed": {"repo": "abc"}}, False),
+            ({"in_acquire_call": True}, False),
+        ],
+    )
+    def test_lander_rows(self, attrs: dict[str, object], expected: bool) -> None:
+        probe = main._LandProbe(lander=self._lander(**attrs))  # type: ignore[arg-type]
+        assert main._land_is_pre_lease(self._active(probe)) is expected
+
+    def test_no_probe(self) -> None:
+        assert main._land_is_pre_lease(self._active(None)) is False
+
+    def test_no_lander_yet(self) -> None:
+        assert main._land_is_pre_lease(self._active(main._LandProbe())) is True
+
+    def test_lander_returned(self) -> None:
+        probe = main._LandProbe(lander=self._lander(), lander_returned=True)  # type: ignore[arg-type]
+        assert main._land_is_pre_lease(self._active(probe)) is False

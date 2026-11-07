@@ -300,12 +300,18 @@ async def acquire_land_lease(
     item_id: str,
     loop_run_id: str,
     ttl_seconds: int,
+    continuing_land: bool = False,
     token: str | None = None,
 ) -> dict[str, Any]:
     """POST /api/rollouts/{rollout_id}/land-lease/acquire.
 
+    *continuing_land* is True when the land already held the lease or pushed
+    a repo; the board then lets a halted rollout re-acquire to finish it.
+
     Returns ``{acquired: True, lease}``, ``{acquired: False, holder}`` or
-    ``{acquired: False, refused}`` (cancelled/completed rollout).
+    ``{acquired: False, refused}`` where ``refused`` is
+    ``'rollout_cancelled'``, ``'rollout_completed'`` or ``'rollout_halted'``
+    (the last only for a non-continuing caller).
     """
     result: dict[str, Any] = await _request(
         "POST",
@@ -315,6 +321,7 @@ async def acquire_land_lease(
             "item_id": item_id,
             "loop_run_id": loop_run_id,
             "ttl_seconds": ttl_seconds,
+            "continuing_land": continuing_land,
         },
     )
     return result

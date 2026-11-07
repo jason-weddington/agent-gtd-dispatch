@@ -663,7 +663,28 @@ class TestLandLease:
                 "acquire_land_lease",
                 {"item_id": "I", "loop_run_id": "LR", "ttl_seconds": 2400},
                 "acquire",
-                {"item_id": "I", "loop_run_id": "LR", "ttl_seconds": 2400},
+                {
+                    "item_id": "I",
+                    "loop_run_id": "LR",
+                    "ttl_seconds": 2400,
+                    "continuing_land": False,
+                },
+            ),
+            (
+                "acquire_land_lease",
+                {
+                    "item_id": "I",
+                    "loop_run_id": "LR",
+                    "ttl_seconds": 2400,
+                    "continuing_land": True,
+                },
+                "acquire",
+                {
+                    "item_id": "I",
+                    "loop_run_id": "LR",
+                    "ttl_seconds": 2400,
+                    "continuing_land": True,
+                },
             ),
             (
                 "renew_land_lease",

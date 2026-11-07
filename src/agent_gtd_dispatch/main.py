@@ -2361,16 +2361,17 @@ async def _publish_rollout_phase(
     on them for control flow — they are pure observability — so a failure to
     publish must never stop the wave.
 
-    The stage -> ``ManagerPhase`` mapping is 1:1 with the existing enum, which
-    is why no UI change is needed: ``warm_up`` (adopting the rollout and
-    preparing the shared workspace), ``dispatching``, ``polling`` (waiting on
-    in-flight builds), ``reviewing`` (published by the reviewer itself, which
-    is the agent actually in that phase), ``merging`` (now published by the
-    worker's land step — :func:`_land_reviewed_merge` — which owns the fetch,
-    rebase, gate and push, and republishes it as a heartbeat while it waits on
-    locks or a gate), ``reconciling_ac`` (the reviewer's), ``parked``
-    (published by the loop on every tick while its host drains), and
-    ``halted``.
+    Each stage maps onto a board ``ManagerPhase`` member (the UI prints the
+    phase raw): ``warm_up`` (adopting the rollout and preparing the shared
+    workspace), ``dispatching``, ``polling`` (waiting on in-flight builds),
+    ``reviewing`` (published by the reviewer itself, which is the agent
+    actually in that phase), ``waiting_for_lease`` (the worker's land step
+    while the land does not yet hold the project land lease, including the
+    wait on the host land lock), ``merging`` (the land step once it holds the
+    lease — :func:`_land_reviewed_merge` owns the fetch, rebase, gate and
+    push, and republishes its phase as a heartbeat), ``reconciling_ac`` (the
+    reviewer's), ``parked`` (published by the loop on every tick while its
+    host drains), and ``halted``.
     """
     try:
         await gtd_client.update_rollout_state(
@@ -4185,6 +4186,29 @@ class _LandHalt(Exception):  # noqa: N818 — a control-flow signal, not an erro
         self.tail_lead = tail_lead
 
 
+class _LeaseWaitAborted(Exception):  # noqa: N818 — a control-flow signal
+    """Raised while a land waits for the land lease and the board ended it.
+
+    Not a :class:`_LandHalt`: the rollout already left ``running`` (or this
+    loop was superseded), so the land must not halt the rollout again.
+    ``directive`` is the tick directive :meth:`_Lander.run` returns directly.
+    """
+
+    def __init__(self, directive: str) -> None:
+        """Record the directive the land returns."""
+        super().__init__(directive)
+        self.directive = directive
+
+
+@dataclass
+class _LandProbe:
+    """A handle the loop holds on one land task to read its lease state."""
+
+    lander: _Lander | None = None
+    lander_returned: bool = False
+    aborted: str | None = None
+
+
 class _ConflictCheck(NamedTuple):
     """One repo's conflict-guard result (see ``_Lander._check_repo_conflicts``)."""
 
@@ -4289,6 +4313,12 @@ class _Lander:
         self.lease_holders_seen: set[str] = set()
         self.lease_reacquires: int = 0
         self.lease_held_rejections: int = 0
+        # True once this land has ever held the lease (never reset).
+        self.lease_ever_acquired: bool = False
+        # True while an acquire request is on the wire.
+        self.in_acquire_call: bool = False
+        self.lease_wait_start: float = 0.0
+        self.probe: _LandProbe | None = None
 
     # -- plumbing ---------------------------------------------------------
 
@@ -4315,12 +4345,16 @@ class _Lander:
     def _path(self, repo: str) -> Path:
         return self.workspace.repo_paths[repo]
 
+    def _phase(self) -> str:
+        """``waiting_for_lease`` until the land holds the lease, else ``merging``."""
+        return "waiting_for_lease" if self.lease_id is None else "merging"
+
     async def publish(self, step: str) -> None:
-        """Publish ``merging`` with *step*; the heartbeat republishes it."""
+        """Publish the land phase with *step*; the heartbeat republishes it."""
         self.step = step
         await _publish_rollout_phase(
             self.rollout_id,
-            "merging",
+            self._phase(),
             item_id=self.item_id,
             step=step[:200],
             token=self.token,
@@ -4336,7 +4370,7 @@ class _Lander:
             except TimeoutError:
                 await _publish_rollout_phase(
                     self.rollout_id,
-                    "merging",
+                    self._phase(),
                     item_id=self.item_id,
                     step=self.step[:200],
                     token=self.token,
@@ -5650,51 +5684,83 @@ class _Lander:
             "waiting for the land lease",
         )
 
-    async def _lease_wait_abort_check(self) -> None:
-        """Abort a lease wait when the rollout was cancelled/completed/superseded.
+    def _wait_aborted(
+        self, source: str, observed: str, directive: str
+    ) -> _LeaseWaitAborted:
+        logger.info(
+            "rollout-loop: land-lease wait-aborted rollout_id=%s item_id=%s "
+            "source=%s observed=%s directive=%s waited_secs=%.1f holders_seen=%d",
+            self.rollout_id,
+            self.item_id,
+            source,
+            observed,
+            directive,
+            time.monotonic() - self.lease_wait_start,
+            len(self.lease_holders_seen),
+        )
+        return _LeaseWaitAborted(directive)
 
-        A halted rollout keeps waiting, so a land already underway behind a
-        halt still finishes.
+    async def _lease_wait_abort_check(self) -> None:
+        """End a pre-lease wait when the board ended the rollout or this loop.
+
+        Only a land that never held the lease and pushed nothing is aborted:
+        a halted rollout ends it with ``_TICK_HALTED``, a cancelled/completed
+        one with ``_TICK_DONE`` and a superseded loop with
+        ``_TICK_SUPERSEDED``, all via :class:`_LeaseWaitAborted` (no second
+        halt).  A continuing land (held the lease before, or pushed) returns
+        early and keeps waiting: the board admits its re-acquire.
         """
-        if self.pushed:
+        if self.lease_ever_acquired or self.pushed:
             return
         rollout = await gtd_client.get_rollout(self.rollout_id, token=self.token)
         status = rollout.get("status")
+        if status == "halted":
+            raise self._wait_aborted("poll", "halted", _TICK_HALTED)
         if status in ("cancelled", "completed"):
-            raise self._lease_aborted(str(status))
+            raise self._wait_aborted("poll", str(status), _TICK_DONE)
         if rollout.get("loop_remote_run_id") and (
             _loop_superseded(rollout, await db.list_runs_by_rollout(self.rollout_id))
             is not None
         ):
-            raise self._lease_aborted("superseded")
+            raise self._wait_aborted("poll", "superseded", _TICK_SUPERSEDED)
 
     async def _acquire_lease(self) -> str:
         """Acquire the project's board land lease, waiting behind any holder.
 
         Waiting is not a failure: it consumes no push attempt and no relaunch
-        budget.  A refused acquire (cancelled/completed rollout) or a
-        cancelled/superseded rollout aborts the land; a board outage longer
+        budget.  Before the land ever held the lease (and with nothing
+        pushed), a refused acquire or a halted/cancelled/completed/superseded
+        rollout ends the wait with :class:`_LeaseWaitAborted`; for a
+        continuing land a refused acquire aborts it as before.  A board outage longer
         than ``config.ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS`` or any other error
         halts it (fail-closed, including a board without the endpoint).
         """
         start = time.monotonic()
+        self.lease_wait_start = start
         last_holder: str | None = None
         warned = 0
         while True:
             try:
-                resp = await gtd_client.acquire_land_lease(
-                    self.rollout_id,
-                    item_id=self.item_id,
-                    loop_run_id=self.loop_run_id,
-                    ttl_seconds=_land_lease_ttl(),
-                    token=self.token,
-                )
+                continuing = self.lease_ever_acquired or bool(self.pushed)
+                self.in_acquire_call = True
+                try:
+                    resp = await gtd_client.acquire_land_lease(
+                        self.rollout_id,
+                        item_id=self.item_id,
+                        loop_run_id=self.loop_run_id,
+                        ttl_seconds=_land_lease_ttl(),
+                        continuing_land=continuing,
+                        token=self.token,
+                    )
+                finally:
+                    self.in_acquire_call = False
                 if resp.get("acquired"):
                     lease_id = str(resp["lease"]["lease_id"])
                     await self._stop_lease_renewal()
                     if lease_id != self.lease_id:
                         self.lease_acquired_at = time.monotonic()
                     self.lease_id = lease_id
+                    self.lease_ever_acquired = True
                     self.lease_lost = False
                     self.lease_last_ok = time.monotonic()
                     self.lease_renew_failures = 0
@@ -5710,9 +5776,13 @@ class _Lander:
                         lease_id,
                         waited,
                     )
+                    await self.publish(f"Land: lease acquired for {self.item_id}")
                     return lease_id
                 refused = resp.get("refused")
                 if refused:
+                    directive = _REFUSED_DIRECTIVES.get(str(refused))
+                    if directive is not None and not continuing:
+                        raise self._wait_aborted("refused", str(refused), directive)
                     raise self._lease_aborted(str(refused).removeprefix("rollout_"))
                 self.lease_outage.reset()
                 holder = resp.get("holder") or {}
@@ -5757,6 +5827,8 @@ class _Lander:
                     )
                 await self._lease_wait_abort_check()
             except _LandHalt:
+                raise
+            except _LeaseWaitAborted:
                 raise
             except Exception as exc:
                 if _is_transient_board_error(exc):
@@ -6007,6 +6079,10 @@ class _Lander:
                 return await self._land()
             except _LandHalt as halt:
                 return await self._halt(halt)
+            except _LeaseWaitAborted as aborted:
+                if self.probe is not None:
+                    self.probe.aborted = aborted.directive
+                return aborted.directive
         finally:
             # Release the board lease BEFORE the host-local locks.
             await self._stop_lease_renewal()
@@ -6068,6 +6144,7 @@ async def _land_reviewed_merge(
     token: str | None,
     attribution: str | None,
     item: dict[str, Any] | None = None,
+    probe: _LandProbe | None = None,
 ) -> ReviewVerdict | str:
     """Land a reviewer-approved squash commit: fetch, rebase, gate, push.
 
@@ -6119,10 +6196,15 @@ async def _land_reviewed_merge(
       is deleted (best effort) and one comment is posted on the item.
 
     Returns:
-        The original verdict (with any fix rationale appended) on success, or
-        the ``_TICK_HALTED`` directive after halting the rollout.
+        The original verdict (with any fix rationale appended) on success,
+        the ``_TICK_HALTED`` directive after halting the rollout, or the
+        directive of a pre-lease wait the board ended (*probe* ``aborted``).
+
+    *probe*, when given, receives the ``_Lander`` before it runs and
+    ``lander_returned`` once it returns, so the loop can tell a land still
+    waiting for the lease from one that holds it.
     """
-    return await _Lander(
+    lander = _Lander(
         rollout_id,
         item_id,
         outcome,
@@ -6134,8 +6216,23 @@ async def _land_reviewed_merge(
         token=token,
         attribution=attribution,
         item=item,
-    ).run()
+    )
+    lander.probe = probe
+    if probe is not None:
+        probe.lander = lander
+    try:
+        return await lander.run()
+    finally:
+        if probe is not None:
+            probe.lander_returned = True
 
+
+#: Board acquire refusals that end a pre-lease wait, and the tick directive.
+_REFUSED_DIRECTIVES: dict[str, str] = {
+    "rollout_halted": _TICK_HALTED,
+    "rollout_cancelled": _TICK_DONE,
+    "rollout_completed": _TICK_DONE,
+}
 
 _TRANSIENT_BOARD_STATUSES = frozenset({502, 503, 504})
 
@@ -6418,6 +6515,46 @@ class _ActiveLand:
     slot: int
     task: asyncio.Task[ReviewVerdict | str]
     started_at: float
+    probe: _LandProbe | None = None
+
+
+def _land_is_pre_lease(active: _ActiveLand) -> bool:
+    """Whether *active* has done no land work yet (still before the lease).
+
+    True only with a probe whose land has not returned and whose lander is
+    not built yet, or has never held the lease, pushed nothing and has no
+    acquire request on the wire.  No probe means unknown: False.
+    """
+    probe = active.probe
+    if probe is None or probe.lander_returned:
+        return False
+    lander = probe.lander
+    if lander is None:
+        return True
+    return (
+        not lander.lease_ever_acquired
+        and lander.lease_id is None
+        and not lander.pushed
+        and not lander.in_acquire_call
+    )
+
+
+def _cancellable_land(loop_state: _RolloutLoopState) -> _ActiveLand | None:
+    """The active land when it is still running and pre-lease, else None."""
+    active = loop_state.active_land
+    if active is not None and not active.task.done() and _land_is_pre_lease(active):
+        return active
+    return None
+
+
+async def _cancel_pre_lease_land(
+    loop_state: _RolloutLoopState, active: _ActiveLand
+) -> None:
+    """Cancel a pre-lease active land and clear the parked directive."""
+    active.task.cancel()
+    await asyncio.gather(active.task, return_exceptions=True)
+    loop_state.active_land = None
+    loop_state.pending_directive = None
 
 
 @dataclass
@@ -6575,10 +6712,19 @@ async def _teardown_reviews(
 
 
 def _queued_land_suffix(loop_state: _RolloutLoopState) -> str:
-    """The halt-reason suffix naming queued merge verdicts a halt discards."""
-    if not loop_state.land_queue:
+    """The halt-reason suffix naming merge verdicts a halt discards.
+
+    Names the queued lands and a still pre-lease active land (which the halt
+    teardown cancels).  Advisory for the active land: the ``halt-teardown``
+    log line records what was actually cancelled.
+    """
+    ids_list = [q.item_id for q in loop_state.land_queue]
+    active = _cancellable_land(loop_state)
+    if active is not None:
+        ids_list.append(active.item_id)
+    if not ids_list:
         return ""
-    ids = ", ".join(q.item_id for q in loop_state.land_queue)
+    ids = ", ".join(ids_list)
     return (
         f"; discarded queued merge verdict(s) for {ids}: "
         "they will be re-reviewed on resume"
@@ -6595,27 +6741,47 @@ async def _halt_teardown(
 ) -> str:
     """The halt path: no further reviews, lands or dispatches.
 
-    Tears down every review, drops the land queue WITHOUT landing, and never
-    cancels the active land: while one runs, *directive* is parked in
-    ``pending_directive`` and the tick waits for that land to finish.  A
-    parked DONE/HALTED is dropped instead of returned when a refused relaunch
-    marked this loop before the next running tick (resume-mark-consumed).
+    Tears down every review and drops the land queue WITHOUT landing.  A
+    pre-lease active land (see :func:`_land_is_pre_lease`) is cancelled and
+    *directive* returned at once; its item is re-reviewed on resume.  A land
+    holding or having held the lease, or with any repo pushed, still
+    finishes: *directive* is parked in ``pending_directive`` and the tick
+    waits for it.  A parked DONE/HALTED is dropped instead of returned when a
+    refused relaunch marked this loop before the next running tick
+    (resume-mark-consumed).
     """
     cancelled = await _teardown_reviews(loop_state, rollout_id=rollout_id)
     dropped = [q.item_id for q in loop_state.land_queue]
     loop_state.land_queue.clear()
     active = loop_state.active_land
+    running = active is not None and not active.task.done()
+    lander = (
+        active.probe.lander if active is not None and active.probe is not None else None
+    )
+    cancel_land = active is not None and running and _land_is_pre_lease(active)
+    if active is not None and cancel_land:
+        await _cancel_pre_lease_land(loop_state, active)
+    action = "cancelled" if cancel_land else ("kept" if running else "none")
     logger.info(
         "rollout-loop: halt-teardown rollout_id=%s cause=%s cause_item=%s "
-        "reviews_cancelled=%s land_queue_dropped=%s active_land=%s",
+        "reviews_cancelled=%s land_queue_dropped=%s active_land=%s "
+        "active_land_action=%s active_land_lease_id=%s active_land_pushed=%d "
+        "active_land_probe=%s acquire_in_flight=%s",
         rollout_id,
         cause,
         cause_item or "-",
         ",".join(cancelled) or "-",
         ",".join(dropped) or "-",
-        active.item_id if active is not None else "-",
+        loop_state.active_land.item_id if loop_state.active_land is not None else "-",
+        action,
+        (lander.lease_id if lander is not None else None) or "-",
+        len(lander.pushed) if lander is not None else 0,
+        "present" if active is not None and active.probe is not None else "absent",
+        lander.in_acquire_call if lander is not None else False,
     )
-    if active is not None and not active.task.done():
+    if cancel_land:
+        return directive
+    if running:
         loop_state.pending_directive = directive
         return _TICK_WAIT
     return directive
@@ -6729,6 +6895,7 @@ async def _run_land_task(
     loop_run_id: str,
     token: str | None,
     attribution: str | None,
+    probe: _LandProbe | None = None,
 ) -> ReviewVerdict | str:
     """Land one queued merge in its slot, then act on the returned verdict."""
     landed = await _land_reviewed_merge(
@@ -6743,6 +6910,7 @@ async def _run_land_task(
         token=token,
         attribution=attribution,
         item=queued.item,
+        probe=probe,
     )
     if isinstance(landed, str):
         return landed
@@ -6769,6 +6937,7 @@ def _start_land(
     """Pop the head of the land queue and start its (single) land task."""
     queued = loop_state.land_queue.pop(0)
     workspace = loop_state.slots[queued.slot]
+    probe = _LandProbe()
     task: asyncio.Task[ReviewVerdict | str] = asyncio.create_task(
         _run_land_task(
             rollout_id,
@@ -6779,10 +6948,13 @@ def _start_land(
             loop_run_id=loop_run_id,
             token=token,
             attribution=attribution,
+            probe=probe,
         )
     )
     now = _monotonic()
-    loop_state.active_land = _ActiveLand(queued.item_id, queued.slot, task, now)
+    loop_state.active_land = _ActiveLand(
+        queued.item_id, queued.slot, task, now, probe=probe
+    )
     queued_secs = now - queued.queued_at
     loop_state.max_land_queued_secs = max(loop_state.max_land_queued_secs, queued_secs)
     logger.info(
@@ -6934,9 +7106,11 @@ async def _rollout_wave_tick(
     Land is strictly serialized per rollout: at most one land task exists
     (``active_land``), lands start in harvest order, and ``_Lander`` rebases
     each onto the LIVE origin tip and gates that exact tree — so a review done
-    against an older base is still gated on the post-merge tip.  No halt ever
-    cancels a land: the DONE/HALTED exits wait for it (``pending_directive``),
-    unless a refused relaunch marked this loop (resume-mark-consumed): then the
+    against an older base is still gated on the post-merge tip.  A halt
+    cancels a pre-lease active land at once (its item is re-reviewed on
+    resume); a land holding or having held the lease, or with any repo
+    pushed, still finishes: the DONE/HALTED exits wait for it
+    (``pending_directive``), unless a refused relaunch marked this loop (resume-mark-consumed): then the
     parked DONE/HALTED is dropped and the loop keeps driving the resumed rollout.
 
     Drain parking.  When the board reports the loop's host draining
@@ -7043,8 +7217,10 @@ async def _rollout_wave_tick(
 
     # Loop fencing: a lead resume may have moved this rollout's loop to another
     # host.  Once the board names a loop run this host does not hold, stand
-    # down: no halt, no phase publish, no board writes.  An active land still
-    # finishes first (_exit_tick defers behind it).
+    # down: no halt, no phase publish, no board writes.  A pre-lease active
+    # land is cancelled (re-reviewed on resume); a land holding or having held
+    # the lease, or with any repo pushed, still finishes first (_exit_tick
+    # defers behind it).
     board_loop = _loop_superseded(rollout, await db.list_runs_by_rollout(rollout_id))
     if board_loop is not None:
         land = loop_state.active_land
@@ -7236,6 +7412,31 @@ async def _rollout_wave_tick(
             if land.task.cancelled()
             else land.task.exception()
         )
+        if isinstance(land_exc, asyncio.CancelledError):
+            logger.warning(
+                "rollout-loop: invariant-breach kind=cancelled_land_harvested "
+                "rollout_id=%s item_id=%s",
+                rollout_id,
+                land.item_id,
+            )
+        if land_exc is None and land.probe is not None and land.probe.aborted:
+            result = land.task.result()
+            logger.info(
+                "rollout-loop: land-done rollout_id=%s item_id=%s slot=%d "
+                "directive=%s land_secs=%.1f lease_wait_aborted=True",
+                rollout_id,
+                land.item_id,
+                land.slot,
+                result,
+                land_secs,
+            )
+            return await _halt_teardown(
+                rollout_id,
+                loop_state,
+                cause="land",
+                cause_item=land.item_id,
+                directive=str(result),
+            )
         if land_exc is None:
             result = land.task.result()
             loop_state.lands += 1
@@ -7277,6 +7478,18 @@ async def _rollout_wave_tick(
                 attribution=attribution,
             )
     if loop_state.pending_directive is not None:
+        pre_lease = _cancellable_land(loop_state)
+        if pre_lease is not None:
+            directive = loop_state.pending_directive
+            await _cancel_pre_lease_land(loop_state, pre_lease)
+            logger.info(
+                "rollout-loop: pending-directive-cancel-land rollout_id=%s "
+                "item_id=%s directive=%s",
+                rollout_id,
+                pre_lease.item_id,
+                directive,
+            )
+            return directive
         if loop_state.active_land is not None:
             return _TICK_WAIT
         directive = loop_state.pending_directive
