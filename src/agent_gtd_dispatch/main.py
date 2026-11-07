@@ -9953,6 +9953,52 @@ async def get_run_transcript(
     }
 
 
+@app.post("/runs/{run_id}/release-queued", response_model=RunResponse)
+async def release_queued_run(
+    run_id: str,
+    _: str = Depends(_verify_api_key),
+) -> RunResponse:
+    """Release a host-queued run back to the board for re-placement.
+
+    Only a run still waiting in ``_pending_queue`` can be released; anything
+    else returns 409 ``not_queued`` with no side effects.  Posts no comment and
+    publishes no SSE event: the board re-places the run itself.
+    """
+    run = await db.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    # Synchronous block (no await): the dequeue must not race promotion.
+    idx = next((i for i, p in enumerate(_pending_queue) if p.run.id == run_id), None)
+    if idx is None:
+        logger.info("release-queued refused run=%s state=%s", run_id, run.status.value)
+        raise HTTPException(status_code=409, detail={"reason": "not_queued"})
+    depth_before = len(_pending_queue)
+    pending = _pending_queue.pop(idx)
+    depth_after = len(_pending_queue)
+
+    _release_engine_slot(run_id)
+    _run_event_queues.pop(run_id, None)
+    completed = datetime.now(UTC).isoformat()
+    await db.update_run(
+        run_id,
+        status=RunStatus.cancelled,
+        completed_at=completed,
+        error="host draining: queued run released for re-placement",
+    )
+    logger.info(
+        "release-queued run=%s queue_depth_before=%d queue_depth_after=%d engine=%s",
+        run_id,
+        depth_before,
+        depth_after,
+        pending.engine.name,
+    )
+    run = await db.get_run(run_id)
+    if run is None:  # pragma: no cover
+        raise HTTPException(status_code=404, detail="Run not found")
+    return RunResponse(**run.model_dump())
+
+
 @app.post("/runs/{run_id}/cancel", response_model=RunResponse)
 async def cancel_run(
     run_id: str,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -1121,6 +1121,130 @@ class TestGetRun:
         assert pr["local_sha"] == "deadbeef"
         assert pr["commits_ahead"] == 1
         assert pr["dirty"] is False
+
+
+class TestReleaseQueued:
+    @staticmethod
+    def _queue(client, run_id="rq-1", n=1, engine_name="claude-code"):
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.engines import get_engine
+        from agent_gtd_dispatch.models import Run
+
+        entries = []
+        for i in range(n):
+            run = Run(id=f"{run_id}-{i}" if n > 1 else run_id, project_name="P")
+            client.portal.call(db.insert_run, run)
+            main._engine_slot_holders.setdefault(engine_name, set()).add(run.id)
+            entries.append(
+                main._PendingDispatch(
+                    run=run,
+                    engine=get_engine(engine_name),
+                    max_turns=5,
+                    timeout_seconds=60,
+                    attribution=None,
+                )
+            )
+        return entries
+
+    def test_released_and_never_promoted(
+        self, client, auth_headers, monkeypatch, caplog
+    ) -> None:
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(main, "_engine_slot_holders", {})
+        entries = self._queue(client)
+        queue = list(entries)
+        monkeypatch.setattr(main, "_pending_queue", queue)
+        monkeypatch.setattr(main, "_active_processes", {})
+        with (
+            patch("agent_gtd_dispatch.main.gtd_client") as mock_client,
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            mock_client.post_comment = AsyncMock()
+            resp = client.post("/runs/rq-1/release-queued", headers=auth_headers)
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "cancelled"
+            assert (
+                resp.json()["error"]
+                == "host draining: queued run released for re-placement"
+            )
+            assert queue == []
+            assert "rq-1" not in main._engine_slot_holders["claude-code"]
+            mock_client.post_comment.assert_not_called()
+            caplog.clear()
+            main._audit_engine_slots()
+            assert "engine-slot leak" not in caplog.text
+            monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 5)
+            with patch("agent_gtd_dispatch.main._dispatch_worker") as worker:
+                main._try_start_pending()
+                worker.assert_not_called()
+            assert main._active_processes == {}
+
+    def test_success_log_line(self, client, auth_headers, monkeypatch, caplog) -> None:
+        monkeypatch.setattr(main, "_engine_slot_holders", {})
+        monkeypatch.setattr(main, "_pending_queue", self._queue(client))
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            client.post("/runs/rq-1/release-queued", headers=auth_headers)
+        assert (
+            "release-queued run=rq-1 queue_depth_before=1 queue_depth_after=0"
+            " engine=claude-code"
+        ) in caplog.text
+
+    def test_running_run_gets_409(
+        self, client, auth_headers, monkeypatch, caplog
+    ) -> None:
+        from agent_gtd_dispatch import db
+        from agent_gtd_dispatch.models import Run
+
+        monkeypatch.setattr(main, "_pending_queue", [])
+        run = Run(id="rq-run", project_name="P", status="running")
+        client.portal.call(db.insert_run, run)
+        task = MagicMock()
+        monkeypatch.setattr(main, "_active_processes", {"rq-run": task})
+        holders = {"claude-code": {"rq-run"}}
+        monkeypatch.setattr(main, "_engine_slot_holders", holders)
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            resp = client.post("/runs/rq-run/release-queued", headers=auth_headers)
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == {"reason": "not_queued"}
+        task.cancel.assert_not_called()
+        assert holders == {"claude-code": {"rq-run"}}
+        row = client.get("/runs/rq-run", headers=auth_headers).json()
+        assert row["status"] == "running"
+        assert "release-queued refused run=rq-run state=running" in caplog.text
+
+    def test_unknown_run_404(self, client, auth_headers) -> None:
+        resp = client.post("/runs/nope/release-queued", headers=auth_headers)
+        assert resp.status_code == 404
+
+    def test_requires_api_key(self, client) -> None:
+        a = client.post("/runs/x/release-queued")
+        b = client.post("/runs/x/cancel")
+        assert a.status_code == b.status_code
+        assert a.status_code in (401, 403)
+
+    def test_fifo_promotion_unchanged(self, client, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+
+        monkeypatch.setattr(main, "_engine_slot_holders", {})
+        entries = self._queue(client, run_id="ff", n=2)
+        monkeypatch.setattr(main, "_pending_queue", list(entries))
+        monkeypatch.setattr(main, "_active_processes", {})
+        monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 5)
+        started: list[str] = []
+
+        async def fake_worker(run, *a, **k):
+            started.append(run.id)
+
+        async def go() -> None:
+            import asyncio
+
+            with patch("agent_gtd_dispatch.main._dispatch_worker", fake_worker):
+                main._try_start_pending()
+                await asyncio.sleep(0.05)
+
+        client.portal.call(go)
+        assert started == ["ff-0", "ff-1"]
 
 
 class TestCancelRun:
