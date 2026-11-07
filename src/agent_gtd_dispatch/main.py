@@ -152,9 +152,14 @@ class _PendingDispatch(NamedTuple):
     max_turns: int
     timeout_seconds: int
     attribution: str | None
+    enqueued_at: float = 0.0
 
 
 _pending_queue: list[_PendingDispatch] = []
+
+# Run ids of rollout loops (token-free asyncio loops).  They live in
+# ``_active_processes`` but never hold a run slot: see ``_slot_holding_count``.
+_loop_run_ids: set[str] = set()
 
 # Per-engine slots (config.ENGINE_SLOTS): engine name -> ids of BUILD runs holding
 # a slot (running or host-queued).  _engine_slot_admitting holds ids between the
@@ -614,9 +619,27 @@ def _try_start_pending() -> None:
     completes, freeing a slot. No await between slot-count check and task
     creation — stays atomic within the event-loop tick.
     """
-    while _pending_queue and len(_active_processes) < config.MAX_CONCURRENT_RUNS:
+    while _pending_queue and _slot_holding_count() < config.MAX_CONCURRENT_RUNS:
         pending = _pending_queue.pop(0)
+        logger.info(
+            "pending promote run=%s mode=%s waited_s=%.1f slot_holders=%d cap=%d"
+            " queue_depth=%d",
+            pending.run.id,
+            pending.run.mode,
+            max(0.0, time.monotonic() - pending.enqueued_at)
+            if pending.enqueued_at
+            else 0.0,
+            _slot_holding_count(),
+            config.MAX_CONCURRENT_RUNS,
+            len(_pending_queue),
+        )
         if pending.run.mode == DispatchMode.MANAGE and pending.run.rollout_id:
+            logger.error(
+                "rollout-loop found in pending queue run=%s rollout=%s"
+                " (loop bypass regressed)",
+                pending.run.id,
+                pending.run.rollout_id,
+            )
             if not _start_rollout_loop(pending.run, attribution=pending.attribution):
                 _cancel_refused_loop_run(pending.run)
             continue
@@ -2142,6 +2165,27 @@ def _counted_active_runs() -> int:
     return len(_active_processes) - len(
         _parked_rollout_loops & _active_processes.keys()
     )
+
+
+def _slot_holding_count() -> int:
+    """Runs charged against MAX_CONCURRENT_RUNS: no rollout loops, parked or not."""
+    return len(set(_active_processes) - _loop_run_ids - _parked_rollout_loops)
+
+
+def _audit_run_slots() -> None:
+    """Log (never repair) run-slot accounting violations."""
+    holders = _slot_holding_count()
+    if holders > config.MAX_CONCURRENT_RUNS:
+        logger.error(
+            "run-slot over-admit holders=%d cap=%d",
+            holders,
+            config.MAX_CONCURRENT_RUNS,
+        )
+    for rid in sorted(_loop_run_ids - _active_processes.keys()):
+        logger.error("rollout-loop id leak run=%s", rid)
+    for loop_run in list(_rollout_loops.values()):
+        if loop_run.id in _active_processes and loop_run.id not in _loop_run_ids:
+            logger.error("rollout-loop untracked run=%s", loop_run.id)
 
 
 def _parked_step(drain: str) -> str:
@@ -7357,7 +7401,7 @@ async def _rollout_wave_tick(
                 )
                 if queued:
                     step = (
-                        f"Waiting for a free engine slot ({queued} queued); "
+                        f"Waiting for a free slot ({queued} queued); "
                         f"{len(in_flight) - queued} other in-flight build run(s)"
                     )[:200]
                 else:
@@ -7759,6 +7803,7 @@ async def _rollout_loop_worker(run: Run, *, attribution: str | None = None) -> N
         _publish_run_event(run.id, "failed", failed)
     finally:
         _parked_rollout_loops.discard(run.id)
+        _loop_run_ids.discard(run.id)
         _refused_relaunch_runs.discard(run.id)
         _active_processes.pop(run.id, None)
         _try_start_pending()
@@ -7824,6 +7869,7 @@ def _start_rollout_loop(run: Run, *, attribution: str | None = None) -> bool:
         return False
     _rollout_loops[run.rollout_id] = run
     task = asyncio.create_task(_rollout_loop_worker(run, attribution=attribution))
+    _loop_run_ids.add(run.id)
     _active_processes[run.id] = task
     return True
 
@@ -9326,11 +9372,15 @@ async def info() -> InfoResponse:
     agent_dicts = await run_list_agents_script()
     load_avg_1m, cpu_count = _host_load()
     _audit_engine_slots()
+    _audit_run_slots()
     return InfoResponse(
         engine=ENGINE_NAME,
         version=SERVICE_VERSION,
         max_concurrent_runs=config.MAX_CONCURRENT_RUNS,
         active_runs=_counted_active_runs(),
+        slot_runs=_slot_holding_count(),
+        active_loops=len(_loop_run_ids & _active_processes.keys()),
+        queued_runs=len(_pending_queue),
         engines=get_available_engine_names(),
         agents=[a["name"] for a in agent_dicts],
         parked_rollout_loops=len(_parked_rollout_loops & _active_processes.keys()),
@@ -9756,12 +9806,17 @@ async def dispatch_item(
     finally:
         _engine_slot_admitting.discard(run.id)
     logger.info(
-        "engine-slot admit run=%s engine=%s held=%d cap=%d queued=%s",
+        "engine-slot admit run=%s engine=%s held=%d cap=%d queued=%s"
+        " slot_holders=%d live_loops=%d max_concurrent=%d loop_bypass=%s",
         run.id,
         effective_engine_name,
         len(_engine_slot_holders.get(effective_engine_name, set())),
         config.ENGINE_SLOTS.get(effective_engine_name, 0),
-        len(_active_processes) >= config.MAX_CONCURRENT_RUNS,
+        (not is_loop_run) and _slot_holding_count() >= config.MAX_CONCURRENT_RUNS,
+        _slot_holding_count(),
+        len(_loop_run_ids & _active_processes.keys()),
+        config.MAX_CONCURRENT_RUNS,
+        is_loop_run,
     )
 
     if engine_swapped:
@@ -9779,7 +9834,7 @@ async def dispatch_item(
 
     # ATOMIC capacity check: no await between this check and task creation /
     # queue append, so concurrent coroutines cannot both pass for the same slot.
-    if len(_active_processes) >= config.MAX_CONCURRENT_RUNS:
+    if not is_loop_run and _slot_holding_count() >= config.MAX_CONCURRENT_RUNS:
         # Service is at capacity — queue the run and return 200 immediately.
         # _try_start_pending() will promote it when a slot frees.
         _pending_queue.append(
@@ -9789,6 +9844,7 @@ async def dispatch_item(
                 max_turns=max_turns,
                 timeout_seconds=timeout_seconds,
                 attribution=body.attribution,
+                enqueued_at=time.monotonic(),
             )
         )
         return RunResponse(

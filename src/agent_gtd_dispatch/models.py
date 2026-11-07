@@ -36,9 +36,16 @@ class InfoResponse(BaseModel):
 
     ``active_runs`` excludes rollout loops parked behind a host drain, so a
     drained host reads idle once its loops park; those loops are reported in
-    ``parked_rollout_loops``.  A parked loop still holds its slot on the host,
-    so routers add ``parked_rollout_loops`` back to compute slot occupancy
-    (``max_concurrent_runs - active_runs - parked_rollout_loops`` free).
+    ``parked_rollout_loops``.  ``active_runs`` remains the restart-safety idle
+    signal (an unparked loop reads as non-idle).
+
+    Rollout loops never count against ``max_concurrent_runs`` and are never
+    queued.  ``slot_runs`` is the only count charged against it, so routers
+    compute free slots as ``max_concurrent_runs - slot_runs``.  A host that
+    omits ``slot_runs`` (old shape) is routed with the legacy formula
+    ``max_concurrent_runs - active_runs - parked_rollout_loops``.
+    ``active_loops`` (live loops) and ``queued_runs`` (host-queued dispatches)
+    are informational.
 
     ``load_avg_1m`` and ``cpu_count`` report host health.  Routers treat a
     host as overloaded when ``load_avg_1m > 1.5 x cpu_count``; a missing or
@@ -58,6 +65,9 @@ class InfoResponse(BaseModel):
     engines: list[str]
     agents: list[str]
     parked_rollout_loops: int = 0
+    slot_runs: int = 0
+    active_loops: int = 0
+    queued_runs: int = 0
     load_avg_1m: float | None = None
     cpu_count: int | None = None
     engine_slots: dict[str, EngineSlotInfo] = {}

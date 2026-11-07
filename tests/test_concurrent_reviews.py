@@ -1968,7 +1968,7 @@ class TestQueuedInFlightStepText:
         directive, steps, stalled = await self._polling_step(tmp_path, in_flight)
         assert directive == _TICK_WAIT
         assert steps == [
-            "Waiting for a free engine slot (3 queued); 1 other in-flight build run(s)"
+            "Waiting for a free slot (3 queued); 1 other in-flight build run(s)"
         ]
         assert stalled == []
 

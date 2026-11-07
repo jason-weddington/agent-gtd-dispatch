@@ -789,18 +789,25 @@ class TestMaxConcurrentRunsEnforcement:
             data = resp.json()
             assert "capacity" not in str(data).lower()
 
+    @patch("agent_gtd_dispatch.main._rollout_loop_worker", new_callable=AsyncMock)
     @patch("agent_gtd_dispatch.main.gtd_client")
     @patch("agent_gtd_dispatch.main.dispatch")
-    def test_manage_mode_queues_at_concurrent_limit(
-        self, mock_dispatch, mock_client, client, auth_headers, monkeypatch
+    def test_manage_mode_starts_at_concurrent_limit(
+        self,
+        mock_dispatch,
+        mock_client,
+        _mock_worker,
+        client,
+        auth_headers,
+        monkeypatch,
     ) -> None:
-        """POST /dispatch for manage mode also queues (200 pending) at max_concurrent_runs."""
-        from unittest.mock import AsyncMock
-
+        """A rollout loop starts immediately even on a full host."""
         from agent_gtd_dispatch import config
 
         monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 1)
         monkeypatch.setattr("agent_gtd_dispatch.main._active_processes", {"run1": None})
+        monkeypatch.setattr("agent_gtd_dispatch.main._loop_run_ids", set())
+        monkeypatch.setattr("agent_gtd_dispatch.main._rollout_loops", {})
 
         fresh_queue: list = []
         monkeypatch.setattr("agent_gtd_dispatch.main._pending_queue", fresh_queue)
@@ -826,9 +833,102 @@ class TestMaxConcurrentRunsEnforcement:
             headers=auth_headers,
         )
         assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "pending"
-        assert len(fresh_queue) == 1
+        assert fresh_queue == []
+        from agent_gtd_dispatch import main
+
+        assert "rollout123" in main._rollout_loops
+        assert resp.json()["id"] in main._loop_run_ids
+
+
+class TestSlotAccounting:
+    def test_slot_count_excludes_loops_and_parked(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import main
+
+        monkeypatch.setattr(
+            main, "_active_processes", {"b": None, "l1": None, "l2": None}
+        )
+        monkeypatch.setattr(main, "_loop_run_ids", {"l1", "l2"})
+        monkeypatch.setattr(main, "_parked_rollout_loops", {"l2"})
+        assert main._slot_holding_count() == 1
+
+    def test_try_start_pending_ignores_loops(self, monkeypatch) -> None:
+        from unittest.mock import MagicMock
+
+        from agent_gtd_dispatch import config, main
+
+        monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 4)
+        procs = {f"b{i}": MagicMock() for i in range(4)}
+        procs.update({"l1": MagicMock(), "l2": MagicMock()})
+        monkeypatch.setattr(main, "_active_processes", procs)
+        monkeypatch.setattr(main, "_loop_run_ids", {"l1", "l2"})
+        monkeypatch.setattr(main, "_parked_rollout_loops", set())
+        pending = main._PendingDispatch(
+            run=MagicMock(id="q1", mode="build", rollout_id=None),
+            engine=MagicMock(),
+            max_turns=1,
+            timeout_seconds=1,
+            attribution=None,
+        )
+        queue = [pending]
+        monkeypatch.setattr(main, "_pending_queue", queue)
+        del procs["l1"]
+        main._try_start_pending()
+        assert queue == [pending]  # builds still full
+        del procs["b0"]
+
+        async def _go() -> None:
+            with patch.object(main, "_dispatch_worker", new=AsyncMock()):
+                main._try_start_pending()
+            for t in list(procs.values()):
+                if hasattr(t, "cancel") and not isinstance(t, MagicMock):
+                    await t
+
+        import asyncio
+
+        asyncio.run(_go())
+        assert queue == []
+        assert "q1" in procs
+
+    def test_info_reports_slot_fields(self, client, monkeypatch) -> None:
+        from unittest.mock import MagicMock
+
+        from agent_gtd_dispatch import main
+
+        monkeypatch.setattr(
+            main,
+            "_active_processes",
+            {"b": MagicMock(), "l1": MagicMock(), "l2": MagicMock()},
+        )
+        monkeypatch.setattr(main, "_loop_run_ids", {"l1", "l2"})
+        monkeypatch.setattr(main, "_parked_rollout_loops", set())
+        info = client.get("/info").json()
+        assert info["active_runs"] == 3
+        assert info["slot_runs"] == 1
+        assert info["active_loops"] == 2
+        assert info["queued_runs"] == len(main._pending_queue)
+        assert client.get("/health").json()["active_runs"] == 3
+        monkeypatch.setattr(main, "_parked_rollout_loops", {"l1"})
+        info = client.get("/info").json()
+        assert info["active_runs"] == 2
+        assert info["parked_rollout_loops"] == 1
+
+    def test_audit_run_slots_logs(self, monkeypatch, caplog) -> None:
+        from unittest.mock import MagicMock
+
+        from agent_gtd_dispatch import config, main
+
+        monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 1)
+        monkeypatch.setattr(
+            main, "_active_processes", {"b1": MagicMock(), "b2": MagicMock(), "l": 1}
+        )
+        monkeypatch.setattr(main, "_loop_run_ids", {"ghost"})
+        monkeypatch.setattr(main, "_rollout_loops", {"r": MagicMock(id="l")})
+        with caplog.at_level("ERROR"):
+            main._audit_run_slots()
+        text = caplog.text
+        assert "run-slot over-admit" in text
+        assert "rollout-loop id leak run=ghost" in text
+        assert "rollout-loop untracked run=l" in text
 
 
 class TestBurstDispatch:

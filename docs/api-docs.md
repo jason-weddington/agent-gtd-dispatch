@@ -49,6 +49,9 @@ separate round-trip to `/agents`.
   "engines": ["claude-code", "claude-code-sonnet", "claude-code-haiku"],
   "agents": ["claude-lead-abc", "claude-build-def"],
   "parked_rollout_loops": 1,
+  "slot_runs": 1,
+  "active_loops": 2,
+  "queued_runs": 0,
   "load_avg_1m": 0.42,
   "cpu_count": 32,
   "engine_slots": {"talos-qwen": {"max_concurrent_runs": 1, "active_runs": 0}}
@@ -67,7 +70,10 @@ separate round-trip to `/agents`.
 | `cpu_count` | `int \| null` | Logical CPU count from `os.cpu_count`; null when unknown |
 | `engine_slots` | `object` | Per-engine caps declared by this host (`DISPATCH_ENGINE_SLOTS`), one entry per capped engine, including cap-0 entries. Absent or empty means no per-engine caps. `engine_slots.<engine>.active_runs` counts runs holding a slot, both running and host-queued, so it differs from the top-level `active_runs`; only BUILD-mode runs admitted through `/dispatch` are counted |
 | `engines_only` | `list[str] \| null` | Sorted `DISPATCH_ENGINES_ONLY` allowlist, or null when unset. `engine_slots` is not filtered by it |
-| `parked_rollout_loops` | `int` | Rollout loops parked behind a host drain. They still hold a slot on the host, so routers compute free slots as `max_concurrent_runs - active_runs - parked_rollout_loops` |
+| `parked_rollout_loops` | `int` | Rollout loops parked behind a host drain (informational). `active_runs` is unchanged and remains the restart-safety idle signal |
+| `slot_runs` | `int` | Runs charged against `max_concurrent_runs` (builds, plans, reviews; never rollout loops). The router's capacity input: free slots = `max_concurrent_runs - slot_runs`. Absent on old hosts (routers fall back to `max_concurrent_runs - active_runs - parked_rollout_loops`) |
+| `active_loops` | `int` | Live rollout loops (informational). Loops never count against `max_concurrent_runs` and are never queued |
+| `queued_runs` | `int` | Dispatches waiting in the host queue (informational) |
 
 ---
 

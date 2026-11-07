@@ -75,6 +75,7 @@ def _loop_patch_stack():
         patch("agent_gtd_dispatch.main._rollout_redispatches", {}) as redispatches,
         patch("agent_gtd_dispatch.main._rollout_unrecorded_merges", {}) as unrecorded,
         patch("agent_gtd_dispatch.main._parked_rollout_loops", set()) as parked,
+        patch("agent_gtd_dispatch.main._loop_run_ids", set()),
         patch("agent_gtd_dispatch.main._refused_relaunch_runs", set()) as refused,
     ):
         mock_gtd.update_rollout_state = AsyncMock()
