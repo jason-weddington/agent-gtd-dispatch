@@ -2628,6 +2628,24 @@ async def _launch_reviewer(
         land_conflict=land_conflict,
     )
     pinned_subject = dispatch.compose_squash_subject(item)
+    raw_review_timeout = project.get("review_timeout_seconds")
+    review_timeout_seconds, review_timeout_source = (
+        config.resolve_review_timeout_seconds(raw_review_timeout)
+    )
+    if review_timeout_source == "invalid_project_value":
+        logger.warning(
+            "rollout-loop: review-timeout-override-invalid rollout_id=%s "
+            "item_id=%s project=%s raw=%r reason=%s fallback_s=%d",
+            rollout_id,
+            item_id,
+            project.get("name"),
+            raw_review_timeout,
+            "range"
+            if isinstance(raw_review_timeout, int)
+            and not isinstance(raw_review_timeout, bool)
+            else "type",
+            review_timeout_seconds,
+        )
     logger.info(
         "rollout-loop: review-prompt rollout_id=%s item_id=%s "
         "commit_type_mode=%s subject=%r",
@@ -2653,7 +2671,8 @@ async def _launch_reviewer(
     await db.insert_run(reviewer_run)
     logger.info(
         "rollout-loop: reviewer spawn rollout_id=%s item_id=%s run_id=%s engine=%s "
-        "branch=%s max_turns=%d slot=%d",
+        "branch=%s max_turns=%d slot=%d review_timeout_s=%d "
+        "review_timeout_source=%s",
         rollout_id,
         item_id,
         reviewer_run.id,
@@ -2661,6 +2680,8 @@ async def _launch_reviewer(
         branch_name,
         config.REVIEW_MAX_TURNS,
         slot,
+        review_timeout_seconds,
+        review_timeout_source,
     )
 
     # Clear any prior verdict so a reviewer that dies before writing one can
@@ -2671,7 +2692,7 @@ async def _launch_reviewer(
     timed_out = False
     failure: str = ""
     reap_note = ""
-    timeout_mins = config.REVIEW_TIMEOUT_SECONDS // 60
+    timeout_mins = review_timeout_seconds // 60
     # Set when this review is cancelled.  run_agent's Popen happens on an
     # executor thread, so a cancel can land after the thread picked up the
     # job but before it registered the process: the cancel handler then finds
@@ -2704,7 +2725,7 @@ async def _launch_reviewer(
             prompt,
             f"Review and merge `{branch_name}` for item {item_id}",
             config.REVIEW_MAX_TURNS,
-            timeout_seconds=config.REVIEW_TIMEOUT_SECONDS,
+            timeout_seconds=review_timeout_seconds,
             mode=DispatchMode.REVIEW,
             attribution=attribution,
             callback_token=token,
@@ -2747,7 +2768,7 @@ async def _launch_reviewer(
         timed_out = True
         failure = (
             f"reviewer timed out after {timeout_mins}m "
-            f"(timeout={config.REVIEW_TIMEOUT_SECONDS}s)"
+            f"(timeout={review_timeout_seconds}s)"
         )
         logger.warning(
             "rollout-loop: reviewer run %s timed out after %dm for item %s",

@@ -797,7 +797,7 @@ What replaces them:
   `_TICK_WAIT`; the only liveness halt ("rollout stalled") requires nothing in
   flight, so a running build is never stranded. A crashed loop fails its own
   run and does not halt the rollout.
-- **The reviewer is bounded** by `REVIEW_TIMEOUT_SECONDS`.
+- **The reviewer is bounded** by `REVIEW_TIMEOUT_SECONDS`. A project may override it with `review_timeout_seconds` (600-14400 s, set via update-project), read from the project record when the rollout loop starts (an edit applies to the next loop start or resume), falling back to the env default when unset or invalid. A FIX MODE reviewer runs while the project's land lease is held, so a long override also lengthens how long other rollouts on that project wait to land.
 - **Restarts** are covered by the startup re-adoption sweep, which resumes only
   rollouts this host holds a local MANAGE run row for, and which the board does
   not say were moved elsewhere (see loop fencing below). The watchdog it replaced

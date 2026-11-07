@@ -517,7 +517,7 @@ resident manager agent, so there is nothing to relaunch:
   loop sleeps `ROLLOUT_LOOP_POLL_SECONDS`. Its only liveness halt ("rollout stalled")
   requires nothing to be in flight, so it never strands a running build. A crashed loop fails
   its own run and does not halt the rollout.
-- **The reviewer is bounded** by `REVIEW_TIMEOUT_SECONDS` (45 min).
+- **The reviewer is bounded** by `REVIEW_TIMEOUT_SECONDS` (45 min). A project may override it with `review_timeout_seconds` (600-14400 s, set via update-project), read from the project record when the rollout loop starts (an edit applies to the next loop start or resume), falling back to the env default when unset or invalid. A FIX MODE reviewer runs while the project's land lease is held, so a long override also lengthens how long other rollouts on that project wait to land.
 - **A restart is covered by the re-adoption sweep** (`_readopt_running_rollouts`), which runs
   once at startup and resumes ONLY rollouts this host holds a local MANAGE run row for.
 - **A lead's resume relaunches the loop.** When a loop reads a halted rollout it exits. After
