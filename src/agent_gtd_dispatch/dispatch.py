@@ -4680,6 +4680,124 @@ def refresh_feature_branch_refs(
     return results
 
 
+@dataclass(frozen=True)
+class BaseDrift:
+    """A feature branch whose merge-base is *behind* commits behind origin/default."""
+
+    repo: str
+    merge_base: str  # 7-char short sha
+    behind: int
+
+
+def measure_base_drift(
+    workspace: RolloutWorkspace, branch_name: str, repos: list[str], timeout: int
+) -> dict[str, BaseDrift | None]:
+    """Measure how far *branch_name*'s merge-base lags origin/<default> per repo.
+
+    Returns exactly the keys in *repos*; a value is None when the branch is not
+    behind (k == 0) or on any failure.  NEVER raises.  Synchronous.
+    """
+    protected = not branch_name or branch_name in set(
+        workspace.default_branches.values()
+    )
+    if protected:
+        logger.warning(
+            "base-drift: measure_failed repo=%s branch=%s step=%s err=%s: %s",
+            "*",
+            branch_name,
+            "guard",
+            "ProtectedBranch",
+            "empty or default branch",
+        )
+        return dict.fromkeys(repos)
+    out: dict[str, BaseDrift | None] = {}
+    for repo in repos:
+        try:
+            out[repo] = _measure_one_drift(workspace, repo, branch_name, timeout)
+        except Exception as exc:  # contract: never raises
+            logger.warning(
+                "base-drift: measure_failed repo=%s branch=%s step=%s err=%s: %s",
+                repo,
+                branch_name,
+                getattr(exc, "drift_step", "fetch_default"),
+                type(exc).__name__,
+                exc,
+            )
+            out[repo] = None
+    return out
+
+
+class _DriftStepError(Exception):
+    """A drift measurement step failed; carries the step name for the log."""
+
+    def __init__(self, step: str, message: str) -> None:
+        """Record the failing step name and message."""
+        super().__init__(message)
+        self.drift_step = step
+
+
+def _measure_one_drift(
+    workspace: RolloutWorkspace, repo: str, branch_name: str, timeout: int
+) -> BaseDrift | None:
+    """Measure one repo; raise on failure (the caller logs and maps to None)."""
+    started = time.monotonic()
+    path = workspace.repo_paths[repo]
+    default = workspace.default_branches.get(repo) or _DEFAULT_BRANCH_CANDIDATES[0]
+    default_ref = f"refs/remotes/origin/{default}"
+    branch_ref = f"refs/remotes/origin/{branch_name}"
+    default_spec = f"+refs/heads/{default}:{default_ref}"
+    branch_spec = f"+refs/heads/{branch_name}:{branch_ref}"
+
+    def step(name: str, args: list[str]) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return _land_git(path, args, timeout)
+        except Exception as exc:
+            raise _DriftStepError(name, f"{type(exc).__name__}: {exc}") from exc
+
+    proc = step("fetch_default", ["fetch", "origin", default_spec])
+    if proc.returncode != 0:
+        raise _DriftStepError("fetch_default", git_output_excerpt(proc))
+    try:
+        fetched = land_fetch_feature_branch(path, branch_name, timeout)
+    except Exception as exc:
+        raise _DriftStepError("fetch_branch", f"{type(exc).__name__}: {exc}") from exc
+    if not fetched:
+        raise _DriftStepError("fetch_branch", "branch not found on origin")
+    deepened = False
+    proc = step("merge_base", ["merge-base", branch_ref, default_ref])
+    if proc.returncode != 0:
+        deepened = True
+        proc = step(
+            "deepen",
+            ["fetch", "--deepen=500", "origin", default_spec, branch_spec],
+        )
+        if proc.returncode != 0:
+            raise _DriftStepError("deepen", git_output_excerpt(proc))
+        proc = step("merge_base", ["merge-base", branch_ref, default_ref])
+        if proc.returncode != 0:
+            raise _DriftStepError("merge_base", git_output_excerpt(proc))
+    merge_base = proc.stdout.decode("utf-8", errors="replace").strip()
+    proc = step("rev_list", ["rev-list", "--count", f"{merge_base}..{default_ref}"])
+    if proc.returncode != 0:
+        raise _DriftStepError("rev_list", git_output_excerpt(proc))
+    try:
+        behind = int(proc.stdout.decode("utf-8", errors="replace").strip())
+    except ValueError as exc:
+        raise _DriftStepError("rev_list", f"ValueError: {exc}") from exc
+    logger.info(
+        "base-drift: measured repo=%s branch=%s default=%s merge_base=%s "
+        "behind=%d deepened=%s elapsed_ms=%d",
+        repo,
+        branch_name,
+        default,
+        merge_base[:7],
+        behind,
+        deepened,
+        int((time.monotonic() - started) * 1000),
+    )
+    return BaseDrift(repo, merge_base[:7], behind) if behind > 0 else None
+
+
 def _quiet_ref_sha(
     path: Path, ref: str, timeout: int, *, repo: str, branch: str
 ) -> str:

@@ -131,6 +131,37 @@ REVIEW_MAX_TURNS: int = 40
 # has not finished one build in this long is wedged, not slow.
 REVIEW_TIMEOUT_SECONDS: int = 45 * 60
 
+# Bounds for a project's ``review_timeout_seconds`` override.  Must equal the
+# board's MIN/MAX_REVIEW_TIMEOUT_SECONDS in agent_gtd/dispatch_constants.py.
+MIN_REVIEW_TIMEOUT_OVERRIDE_SECONDS: int = 600
+MAX_REVIEW_TIMEOUT_OVERRIDE_SECONDS: int = 14400
+
+
+def resolve_review_timeout_seconds(project_value: object) -> tuple[int, str]:
+    """Resolve the effective reviewer timeout for a project.
+
+    Args:
+        project_value: The project record's ``review_timeout_seconds`` (any
+            JSON value; None when unset or when the board predates the field).
+
+    Returns:
+        ``(seconds, source)``.  ``source`` is ``project`` for a valid override,
+        ``env_default`` when unset, or ``invalid_project_value`` when the value
+        is not an int in range (fail closed to the env default).
+    """
+    if project_value is None:
+        return REVIEW_TIMEOUT_SECONDS, "env_default"
+    if (
+        isinstance(project_value, int)
+        and not isinstance(project_value, bool)
+        and MIN_REVIEW_TIMEOUT_OVERRIDE_SECONDS
+        <= project_value
+        <= MAX_REVIEW_TIMEOUT_OVERRIDE_SECONDS
+    ):
+        return project_value, "project"
+    return REVIEW_TIMEOUT_SECONDS, "invalid_project_value"
+
+
 # The worker's land step (fetch, rebase onto current origin, gate the exact
 # tree, push).  The gate timeout also bounds the push, because a push may run
 # the repo's own pre-push hook when the project has no gate_command.

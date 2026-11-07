@@ -48,6 +48,8 @@ async def _review(
     land_conflict: dict[str, list[str]] | None = None,
     refresh_result: dict[str, str] | None = None,
     calls: list[str] | None = None,
+    project: dict[str, Any] | None = None,
+    run_agent_mock: list[AsyncMock] | None = None,
 ) -> tuple[main.ReviewVerdict, AsyncMock, MagicMock, MagicMock, MagicMock]:
     await db.init_db()
     (tmp_path / "transcript.txt").write_text("I was still running the gate\n")
@@ -88,11 +90,14 @@ async def _review(
         )
         mock_gtd.list_runs_for_item = AsyncMock(return_value=[])
         mock_gtd.get_rollout_merge_notes = AsyncMock(return_value=[])
+        agent_mock = AsyncMock(side_effect=run_agent_effect)
+        if run_agent_mock is not None:
+            run_agent_mock.append(agent_mock)
         for name, value in {
             "build_review_prompt": MagicMock(return_value="prompt"),
             "compose_squash_subject": MagicMock(return_value=None),
             "clear_review_verdict": MagicMock(),
-            "run_agent": AsyncMock(side_effect=run_agent_effect),
+            "run_agent": agent_mock,
             "read_review_verdict": MagicMock(return_value=verdict),
             "reap_marker_processes": marker_reap,
             "reap_workspace_processes": ws_reap,
@@ -110,7 +115,7 @@ async def _review(
         result = await main._launch_reviewer(
             "ro-1",
             "item-t",
-            project={"name": "P"},
+            project=project if project is not None else {"name": "P"},
             workspace=workspace,  # type: ignore[arg-type]
             reviewer_engine=CLAUDE,
             token=None,
@@ -269,3 +274,131 @@ class TestReviewBranchRefreshCallSite:
             "review-branch-refresh none-refreshed" in r.getMessage()
             for r in caplog.records
         )
+
+
+def _timeout_for(seconds: int) -> subprocess.TimeoutExpired:
+    return subprocess.TimeoutExpired(cmd=["claude"], timeout=seconds)
+
+
+class TestReviewTimeoutOverride:
+    async def test_override_used_when_set(self, tmp_path) -> None:
+        agent: list[AsyncMock] = []
+        verdict, update_run, _mr, _wr, _rf = await _review(
+            tmp_path,
+            run_agent_effect=_timeout_for(7200),
+            project={"name": "P", "review_timeout_seconds": 7200},
+            run_agent_mock=agent,
+        )
+        assert agent[0].call_args.kwargs["timeout_seconds"] == 7200
+        assert verdict.verdict == "halt"
+        assert verdict.rationale == "reviewer timed out after 120m"
+        assert verdict.detail.startswith(
+            "reviewer timed out after 120m (timeout=7200s)"
+        )
+        error = _terminal_call(update_run).kwargs["error"]
+        assert error.startswith(
+            "review_timeout: reviewer timed out after 120m (timeout=7200s)"
+        )
+
+    @pytest.mark.parametrize(
+        "project",
+        [{"name": "P"}, {"name": "P", "review_timeout_seconds": None}],
+    )
+    async def test_env_default_when_unset(self, tmp_path, project) -> None:
+        agent: list[AsyncMock] = []
+        verdict, _ur, _mr, _wr, _rf = await _review(
+            tmp_path,
+            run_agent_effect=TIMEOUT,
+            project=project,
+            run_agent_mock=agent,
+        )
+        assert agent[0].call_args.kwargs["timeout_seconds"] == (
+            config.REVIEW_TIMEOUT_SECONDS
+        )
+        assert verdict.rationale == "reviewer timed out after 45m"
+
+    async def test_env_patched_default_vs_override(self, tmp_path) -> None:
+        with patch.dict(os.environ, {"DISPATCH_REVIEW_TIMEOUT_SECONDS": "3600"}):
+            config.load()
+            agent: list[AsyncMock] = []
+            await _review(
+                tmp_path,
+                run_agent_effect=TIMEOUT,
+                run_agent_mock=agent,
+            )
+            assert agent[0].call_args.kwargs["timeout_seconds"] == 3600
+            agent2: list[AsyncMock] = []
+            await _review(
+                tmp_path,
+                run_agent_effect=TIMEOUT,
+                project={"name": "P", "review_timeout_seconds": 900},
+                run_agent_mock=agent2,
+            )
+            assert agent2[0].call_args.kwargs["timeout_seconds"] == 900
+
+    async def test_late_verdict_warning_uses_override(self, tmp_path, caplog) -> None:
+        blob = {"verdict": "halt", "rationale": "found a bug", "commit_type": "fix"}
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            await _review(
+                tmp_path,
+                run_agent_effect=_timeout_for(7200),
+                verdict=(blob, "ok"),
+                project={"name": "P", "review_timeout_seconds": 7200},
+            )
+        assert any(
+            "timed out after 120m but wrote verdict" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.parametrize(
+        ("value", "source", "reason"),
+        [
+            (7200, "project", None),
+            (599, "invalid_project_value", "range"),
+            (14401, "invalid_project_value", "range"),
+            (True, "invalid_project_value", "type"),
+            (None, "env_default", None),
+        ],
+    )
+    async def test_observability(self, tmp_path, caplog, value, source, reason) -> None:
+        project: dict[str, Any] = {"name": "P"}
+        if value is not None:
+            project["review_timeout_seconds"] = value
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            await _review(tmp_path, run_agent_effect=TIMEOUT, project=project)
+        msgs = [r.getMessage() for r in caplog.records]
+        spawn = next(m for m in msgs if "reviewer spawn" in m)
+        assert f"review_timeout_source={source}" in spawn
+        expected_s = value if source == "project" else config.REVIEW_TIMEOUT_SECONDS
+        assert f"review_timeout_s={expected_s} " in spawn + " "
+        warns = [m for m in msgs if "review-timeout-override-invalid" in m]
+        if reason is None:
+            assert warns == []
+        else:
+            assert len(warns) == 1
+            assert f"reason={reason}" in warns[0]
+            assert f"fallback_s={config.REVIEW_TIMEOUT_SECONDS}" in warns[0]
+
+
+class TestResolveReviewTimeout:
+    @pytest.mark.parametrize("value", [600, 14400])
+    def test_valid(self, value) -> None:
+        assert config.resolve_review_timeout_seconds(value) == (value, "project")
+
+    @pytest.mark.parametrize("value", [599, 14401, 0, -1, True, 7200.0, "7200", []])
+    def test_invalid_falls_back(self, value) -> None:
+        assert config.resolve_review_timeout_seconds(value) == (
+            config.REVIEW_TIMEOUT_SECONDS,
+            "invalid_project_value",
+        )
+
+    def test_none(self) -> None:
+        assert config.resolve_review_timeout_seconds(None) == (
+            config.REVIEW_TIMEOUT_SECONDS,
+            "env_default",
+        )
+
+    def test_bounds_match_board_twin(self) -> None:
+        # Twin of MIN/MAX_REVIEW_TIMEOUT_SECONDS in agent_gtd/dispatch_constants.py.
+        assert config.MIN_REVIEW_TIMEOUT_OVERRIDE_SECONDS == 600
+        assert config.MAX_REVIEW_TIMEOUT_OVERRIDE_SECONDS == 14400
