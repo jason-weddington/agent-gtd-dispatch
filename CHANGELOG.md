@@ -2,6 +2,18 @@
 
 <!-- version list -->
 
+## v2.22.3 (2026-11-07)
+
+### Bug Fixes
+
+- Provision the armv7 C cross compiler on every dispatch host
+  ([`79aec1a`](https://github.com/repos/agent-gtd-dispatch/commit/79aec1a0c3df02966de7176b3d9eee6ffbf7414b))
+
+- **b7a5e06e**: Host provisioning: zig 0.15.2, cargo-zigbuild 0.23.4 and the aarch64-apple-darwin
+  rustup target on every Linux dispatch host
+  ([`77a59db`](https://github.com/repos/agent-gtd-dispatch/commit/77a59dba378b5f76f86b58137e75baca7c3983ad))
+
+
 ## v2.22.2 (2026-11-06)
 
 ### Bug Fixes
