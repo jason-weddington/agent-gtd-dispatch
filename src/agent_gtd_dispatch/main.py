@@ -2410,7 +2410,8 @@ async def _publish_rollout_phase(
 
     Each stage maps onto a board ``ManagerPhase`` member (the UI prints the
     phase raw): ``warm_up`` (adopting the rollout and preparing the shared
-    workspace), ``dispatching``, ``polling`` (waiting on in-flight builds),
+    workspace), ``dispatching``, ``polling`` (waiting on in-flight builds, or
+    for a free host review slot when a completed build is ready),
     ``reviewing`` (published by the reviewer itself, which is the agent
     actually in that phase), ``waiting_for_lease`` (the worker's land step
     while the land does not yet hold the project land lease, including the
@@ -7434,6 +7435,8 @@ async def _rollout_wave_tick(
     started = False
     dispatched = False
     done_seen = False
+    deferred_for_slot = 0
+    deferred_ids: list[str] = []
 
     # (a) HARVEST finished reviews.
     for item_id, entry in list(loop_state.reviews.items()):
@@ -7791,6 +7794,8 @@ async def _rollout_wave_tick(
             slot is None
             or _host_reviews_in_flight >= config.ROLLOUT_MAX_CONCURRENT_REVIEWS
         ):
+            deferred_for_slot += 1
+            deferred_ids.append(item_id)
             continue
         workspace = await _slot_workspace(
             rollout_id,
@@ -7890,6 +7895,17 @@ async def _rollout_wave_tick(
             loop_state.active_land.item_id
             if loop_state.active_land is not None
             else "-",
+        )
+
+    if deferred_for_slot:
+        logger.info(
+            "rollout-loop: review-deferred rollout_id=%s item_ids=%s "
+            "deferred=%d host_reviews_in_flight=%d/%d",
+            rollout_id,
+            ",".join(deferred_ids),
+            deferred_for_slot,
+            _host_reviews_in_flight,
+            config.ROLLOUT_MAX_CONCURRENT_REVIEWS,
         )
 
     # (f) DISPATCH next_ready, on every tick regardless of reviews or lands.
@@ -8002,7 +8018,19 @@ async def _rollout_wave_tick(
                 token=token,
             )
         elif not (harvested or started or dispatched):
-            if in_flight:
+            if deferred_for_slot:
+                await _publish_rollout_phase(
+                    rollout_id,
+                    "polling",
+                    step=(
+                        "Waiting for a free host review slot "
+                        f"({_host_reviews_in_flight}/"
+                        f"{config.ROLLOUT_MAX_CONCURRENT_REVIEWS} in flight); "
+                        f"{deferred_for_slot} build(s) ready for review"
+                    )[:200],
+                    token=token,
+                )
+            elif in_flight:
                 # Runs the board holds in 'queued' are waiting for a free
                 # engine slot; name them so the wait reads as expected.
                 queued = sum(
@@ -8045,6 +8073,9 @@ async def _rollout_wave_tick(
             rollout_id,
             ",".join(f"{k}:{v.passes}" for k, v in pending.items()),
         )
+        return _TICK_WAIT
+
+    if deferred_for_slot:
         return _TICK_WAIT
 
     return await _halt_rollout_from_loop(

@@ -1985,6 +1985,190 @@ class TestQueuedInFlightStepText:
         assert stalled == []
 
 
+class TestDeferredForReviewSlot:
+    """A completed build waiting only for a host review slot waits, not halts.
+
+    Every host review slot may be held by ANOTHER rollout's review, so a loop
+    whose only build has finished can have nothing to do and nothing in
+    flight while a review is still owed: that is a wait, not a stall.
+    """
+
+    async def test_host_cap_full_waits_and_names_the_waiting_build(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "ROLLOUT_MAX_CONCURRENT_REVIEWS", 3)
+        monkeypatch.setattr(main, "_host_reviews_in_flight", 3)
+
+        reviewer = FakeReviewer()
+        ls = _RolloutLoopState(slots={0: _ws(tmp_path, 0)})
+        publish, halt = AsyncMock(), AsyncMock()
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_publish_rollout_phase", new=publish),
+            patch.object(main, "_launch_reviewer", new=reviewer),
+            patch.object(main, "_halt_rollout_from_loop", new=halt),
+        ):
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=["a"])
+            directive = await _tick(ctx, ls)
+
+        assert directive == main._TICK_WAIT
+        ctx.gtd.halt_rollout.assert_not_awaited()
+        assert halt.await_count == 0
+        assert reviewer.items() == []
+        assert ls.reviews == {}
+        assert main._host_reviews_in_flight == 3
+        steps = [
+            c.kwargs.get("step")
+            for c in publish.await_args_list
+            if c.args[1:2] == ("polling",)
+        ]
+        assert steps == [
+            "Waiting for a free host review slot (3/3 in flight); "
+            "1 build(s) ready for review"
+        ]
+
+    async def test_deferral_counts_items_not_ticks(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        monkeypatch.setattr(config, "ROLLOUT_MAX_CONCURRENT_REVIEWS", 3)
+        monkeypatch.setattr(main, "_host_reviews_in_flight", 3)
+
+        reviewer = FakeReviewer()
+        ls = _RolloutLoopState(slots={0: _ws(tmp_path, 0)})
+        publish, halt = AsyncMock(), AsyncMock()
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_publish_rollout_phase", new=publish),
+            patch.object(main, "_launch_reviewer", new=reviewer),
+            patch.object(main, "_halt_rollout_from_loop", new=halt),
+            caplog.at_level(logging.INFO, logger=LOGGER),
+        ):
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=["a", "b"])
+            directive = await _tick(ctx, ls)
+
+        assert directive == main._TICK_WAIT
+        assert ls.reviews == {}
+        steps = [
+            c.kwargs.get("step")
+            for c in publish.await_args_list
+            if c.args[1:2] == ("polling",)
+        ]
+        assert steps == [
+            "Waiting for a free host review slot (3/3 in flight); "
+            "2 build(s) ready for review"
+        ]
+        deferred = [
+            r
+            for r in caplog.records
+            if "rollout-loop: review-deferred" in r.getMessage()
+        ]
+        assert len(deferred) == 1
+        message = deferred[0].getMessage()
+        assert "item_ids=a,b" in message
+        assert "deferred=2" in message
+
+    async def test_a_free_host_slot_still_starts_the_review(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "ROLLOUT_MAX_CONCURRENT_REVIEWS", 3)
+        # The autouse fixture pins this; do not rely on ambient state.
+        assert main._host_reviews_in_flight == 0
+
+        reviewer = FakeReviewer()
+        ls = _RolloutLoopState(slots={0: _ws(tmp_path, 0)})
+        publish = AsyncMock()
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_publish_rollout_phase", new=publish),
+            patch.object(main, "_launch_reviewer", new=reviewer),
+        ):
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=["a"])
+            directive = await _tick(ctx, ls)
+            assert directive == main._TICK_CONTINUE
+            # The review is registered synchronously; its task body has not run.
+            assert list(ls.reviews) == ["a"]
+            await _yield()
+            assert reviewer.items() == ["a"]
+            assert main._host_reviews_in_flight == 1
+            ctx.gtd.halt_rollout.assert_not_awaited()
+            steps = [
+                c.kwargs.get("step")
+                for c in publish.await_args_list
+                if c.args[1:2] == ("polling",)
+            ]
+            assert steps == []
+
+            await _cleanup(ls)
+            await _yield()
+        assert main._host_reviews_in_flight == 0
+
+    async def test_slot_wait_step_replaces_the_in_flight_step(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "ROLLOUT_MAX_CONCURRENT_REVIEWS", 3)
+        monkeypatch.setattr(main, "_host_reviews_in_flight", 3)
+
+        reviewer = FakeReviewer()
+        ls = _RolloutLoopState(slots={0: _ws(tmp_path, 0)})
+        publish, halt = AsyncMock(), AsyncMock()
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_publish_rollout_phase", new=publish),
+            patch.object(main, "_launch_reviewer", new=reviewer),
+            patch.object(main, "_halt_rollout_from_loop", new=halt),
+        ):
+            _wire(ctx, tmp_path)
+            # 'b' is still building, so only the finished 'a' needs a review.
+            _board(ctx, in_progress=["a", "b"], in_flight=["b"])
+            directive = await _tick(ctx, ls)
+
+        assert directive == main._TICK_WAIT
+        steps = [
+            c.kwargs.get("step")
+            for c in publish.await_args_list
+            if c.args[1:2] == ("polling",)
+        ]
+        assert len(steps) == 1
+        assert steps == [
+            "Waiting for a free host review slot (3/3 in flight); "
+            "1 build(s) ready for review"
+        ]
+        assert not any(str(s).startswith("Waiting on ") for s in steps)
+        assert not any("in-flight build run(s)" in str(s) for s in steps)
+        assert reviewer.items() == []
+        assert ls.reviews == {}
+        assert halt.await_count == 0
+
+    async def test_a_genuine_stall_still_halts_and_the_counter_does_not_leak(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "ROLLOUT_MAX_CONCURRENT_REVIEWS", 3)
+        monkeypatch.setattr(main, "_host_reviews_in_flight", 3)
+
+        ls = _RolloutLoopState(slots={0: _ws(tmp_path, 0)})
+        # `_halt_rollout_from_loop` and `_publish_rollout_phase` stay REAL here:
+        # the real helper is what reaches `gtd_client.halt_rollout`.
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_launch_reviewer", new=FakeReviewer()),
+        ):
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=["a"])
+            assert await _tick(ctx, ls) == main._TICK_WAIT
+            ctx.gtd.halt_rollout.assert_not_awaited()
+
+            # Same loop state, next tick: nothing reviewable at all, so the
+            # deferral count from the previous tick must be gone.
+            _board(ctx, in_progress=[], blocked=["z"])
+            assert await _tick(ctx, ls) == main._TICK_HALTED
+
+        ctx.gtd.halt_rollout.assert_awaited_once()
+        assert "rollout stalled" in ctx.gtd.halt_rollout.await_args.kwargs["reason"]
+
+
 # ---------------------------------------------------------------------------
 # Halt during a pre-lease land wait
 # ---------------------------------------------------------------------------
