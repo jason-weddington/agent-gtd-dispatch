@@ -2,6 +2,56 @@
 
 <!-- version list -->
 
+## v2.24.0 (2026-11-07)
+
+### Bug Fixes
+
+- **1f92702f**: Reviewer may run the full gate: exempt it from the 5-minute command ceiling and
+  install the gate in the review clone
+  ([`9a6d321`](https://github.com/repos/agent-gtd-dispatch/commit/9a6d321f97f3f2ebc015b1f08b8aeed641edb600))
+
+- **2549ff79**: Review prompt carries the post-run gate failure summary across hosts, not just the
+  exit code
+  ([`a873b97`](https://github.com/repos/agent-gtd-dispatch/commit/a873b97a5bf1e3573303cbbe12bdaa25195deed7))
+
+- **3941ded7**: A draining host must not acquire new land leases, so a restart can never land
+  mid-push
+  ([`d2a2272`](https://github.com/repos/agent-gtd-dispatch/commit/d2a22727e05f463c88e6baf1634ae1021cb31834))
+
+- **4aa329c0**: A draining host must not start runs from its pending queue; the board releases them
+  for re-placement
+  ([`5dce1a5`](https://github.com/repos/agent-gtd-dispatch/commit/5dce1a5e81c1747241abf26db0d025fc55c27396))
+
+- **a21f26c9**: Halting a rollout whose land is still waiting for the land lease must abort that
+  wait, and a halted rollout must not acquire the lease
+  ([`a8b0512`](https://github.com/repos/agent-gtd-dispatch/commit/a8b0512bc67bbf6802e6b4fd5e587003c1c1f89d))
+
+- **aa262ade**: Reviewer squash commit killed by Claude Code Bash limits: give Claude Code processes
+  the run timeout as BASH_MAX_TIMEOUT_MS and squash from origin/<branch>
+  ([`e88bc24`](https://github.com/repos/agent-gtd-dispatch/commit/e88bc249ad730c00b43bb17702965ec05d66ce6d))
+
+- **bcc14771**: Gate output: keep the full log on disk and surface failure lines in the summary, not
+  just a 3000-char tail
+  ([`44fdf1f`](https://github.com/repos/agent-gtd-dispatch/commit/44fdf1ff340d20856422b183c0b2011c8fe16cdd))
+
+- **cee1fc54**: Cross-host rollout review reviews a stale item branch after a -rN push fallback:
+  board records the pushed branch and the reviewer uses it
+  ([`9dffa87`](https://github.com/repos/agent-gtd-dispatch/commit/9dffa87232b67075ef981097423cc825fcb99f55))
+
+- **f741f069**: Post-run gate gets a dedicated budget, not the build time left over
+  ([`4f6ece5`](https://github.com/repos/agent-gtd-dispatch/commit/4f6ece5fc7a73da94a384b35ecedd0458184f4f0))
+
+- **fe90e674**: Rollout loops must not consume host run slots, and a host-queued run shows as
+  queued, not running
+  ([`29a3013`](https://github.com/repos/agent-gtd-dispatch/commit/29a3013b4b2c45ee8ac47ef7d6dae28140fa616e))
+
+### Features
+
+- **cb9c0bf4**: Hosts report restart_blocking_runs (builds, reviews, lease-holding lands) so
+  drain-and-deploy stops waiting out land-lease queues
+  ([`363364e`](https://github.com/repos/agent-gtd-dispatch/commit/363364e8cee3bf69775ae4fb9e649c6cb879efa3))
+
+
 ## v2.23.0 (2026-11-07)
 
 ### Features
