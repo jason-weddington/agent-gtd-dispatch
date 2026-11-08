@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.24.1 (2026-11-08)
+
+### Bug Fixes
+
+- **50190aaf**: A rollout whose completed builds wait only for a host review slot waits instead of
+  halting as stalled
+  ([`1fc6083`](https://github.com/repos/agent-gtd-dispatch/commit/1fc608356857e0903e5e5b545c9bf71fb32ac470))
+
+
 ## v2.24.0 (2026-11-07)
 
 ### Bug Fixes
