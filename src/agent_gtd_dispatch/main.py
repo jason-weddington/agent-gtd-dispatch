@@ -5747,7 +5747,7 @@ class _Lander:
         )
         return _LeaseWaitAborted(directive)
 
-    async def _lease_wait_abort_check(self) -> None:
+    async def _lease_wait_abort_check(self) -> dict[str, Any] | None:
         """End a pre-lease wait when the board ended the rollout or this loop.
 
         Only a land that never held the lease and pushed nothing is aborted:
@@ -5755,10 +5755,12 @@ class _Lander:
         one with ``_TICK_DONE`` and a superseded loop with
         ``_TICK_SUPERSEDED``, all via :class:`_LeaseWaitAborted` (no second
         halt).  A continuing land (held the lease before, or pushed) returns
-        early and keeps waiting: the board admits its re-acquire.
+        early (None, no board read) and keeps waiting: the board admits its
+        re-acquire.  Otherwise the fetched rollout is returned so the caller
+        can apply the host-drain hold.
         """
         if self.lease_ever_acquired or self.pushed:
-            return
+            return None
         rollout = await gtd_client.get_rollout(self.rollout_id, token=self.token)
         status = rollout.get("status")
         if status == "halted":
@@ -5770,6 +5772,14 @@ class _Lander:
             is not None
         ):
             raise self._wait_aborted("poll", "superseded", _TICK_SUPERSEDED)
+        return rollout
+
+    @staticmethod
+    def _drain_reason(rollout: dict[str, Any] | None) -> str:
+        """The host drain reason on a fetched rollout, "" when not draining."""
+        if rollout is None:
+            return ""
+        return str(rollout.get("loop_host_drain_reason") or "").strip()
 
     async def _acquire_lease(self) -> str:
         """Acquire the project's board land lease, waiting behind any holder.
@@ -5786,8 +5796,66 @@ class _Lander:
         self.lease_wait_start = start
         last_holder: str | None = None
         warned = 0
+        drain_held = False
+        drain_start = 0.0
+        drain_polls = 0
+        drain_warned = 0
         while True:
             try:
+                rollout = await self._lease_wait_abort_check()
+                drain = self._drain_reason(rollout)
+                if drain:
+                    # A draining host must not take a new lease: a restart
+                    # could land mid-push.  Wait without an acquire attempt.
+                    self.lease_outage.reset()
+                    now = time.monotonic()
+                    drain_polls += 1
+                    if not drain_held:
+                        drain_held = True
+                        drain_start = now
+                        drain_warned = 0
+                        await self.publish(
+                            f"Land: host draining ({drain}); not acquiring "
+                            f"the land lease for {self.item_id}"
+                        )
+                        logger.info(
+                            "rollout-loop: land-lease drain-hold rollout_id=%s "
+                            "item_id=%s drain_reason=%r",
+                            self.rollout_id,
+                            self.item_id,
+                            drain,
+                        )
+                    drained = now - drain_start
+                    multiple = int(drained // LAND_LEASE_WAIT_WARN_SECONDS)
+                    if multiple > drain_warned:
+                        drain_warned = multiple
+                        logger.warning(
+                            "rollout-loop: land-lease drain-hold-long "
+                            "rollout_id=%s item_id=%s drain_reason=%r "
+                            "drained_secs=%.0f",
+                            self.rollout_id,
+                            self.item_id,
+                            drain,
+                            drained,
+                        )
+                        await self.publish(
+                            f"Land: held {int(drained // 60)}m by host drain "
+                            f"({drain}); not acquiring the land lease for "
+                            f"{self.item_id}"
+                        )
+                    await asyncio.sleep(LAND_LEASE_POLL_SECONDS)
+                    continue
+                if drain_held:
+                    drain_held = False
+                    last_holder = None
+                    logger.info(
+                        "rollout-loop: land-lease drain-released rollout_id=%s "
+                        "item_id=%s drained_secs=%.1f drain_polls=%d",
+                        self.rollout_id,
+                        self.item_id,
+                        time.monotonic() - drain_start,
+                        drain_polls,
+                    )
                 continuing = self.lease_ever_acquired or bool(self.pushed)
                 self.in_acquire_call = True
                 try:
@@ -5817,11 +5885,12 @@ class _Lander:
                     self.lease_waited_secs += waited
                     logger.info(
                         "rollout-loop: land-lease acquired rollout_id=%s item_id=%s "
-                        "lease_id=%s waited_secs=%.1f",
+                        "lease_id=%s waited_secs=%.1f continuing=%s",
                         self.rollout_id,
                         self.item_id,
                         lease_id,
                         waited,
+                        continuing,
                     )
                     await self.publish(f"Land: lease acquired for {self.item_id}")
                     return lease_id
@@ -5872,7 +5941,6 @@ class _Lander:
                         f"Land: waiting {int(waited // 60)}m for land lease held "
                         f"by rollout {holder_rollout} (item {holder_item})"
                     )
-                await self._lease_wait_abort_check()
             except _LandHalt:
                 raise
             except _LeaseWaitAborted:
@@ -6684,6 +6752,11 @@ def _busy(loop_state: _RolloutLoopState) -> bool:
         or loop_state.land_queue
         or loop_state.active_land is not None
     )
+
+
+def _drain_busy(loop_state: _RolloutLoopState) -> bool:
+    """Whether a review or the active land still has to finish before parking."""
+    return bool(loop_state.reviews or loop_state.active_land is not None)
 
 
 def _audit_loop_state(
@@ -7562,16 +7635,18 @@ async def _rollout_wave_tick(
     if not drain:
         loop_state.drain_finishing_logged = False
     else:
-        if loop_state.active_land is None and loop_state.land_queue:
-            _start_land(
+        # No new land starts while draining; a pre-lease land (including a
+        # drain-held one) is cancelled and re-reviewed after a restart/undrain.
+        pre_lease = _cancellable_land(loop_state)
+        if pre_lease is not None:
+            await _cancel_pre_lease_land(loop_state, pre_lease)
+            logger.info(
+                "rollout-loop: drain-cancel-land rollout_id=%s item_id=%s",
                 rollout_id,
-                loop_state,
-                project=project,
-                reviewer_engine=reviewer_engine,
-                loop_run_id=loop_run_id,
-                token=token,
-                attribution=attribution,
+                pre_lease.item_id,
             )
+        if loop_state.active_land is None:
+            loop_state.land_queue.clear()
         if pending:
             await _publish_rollout_phase(
                 rollout_id,
@@ -7583,7 +7658,7 @@ async def _rollout_wave_tick(
                 token=token,
             )
             return _TICK_WAIT
-        if _busy(loop_state):
+        if _drain_busy(loop_state):
             n_reviews = len(loop_state.reviews)
             n_lands = len(loop_state.land_queue) + (
                 1 if loop_state.active_land is not None else 0

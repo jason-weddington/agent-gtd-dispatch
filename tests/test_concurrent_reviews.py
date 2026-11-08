@@ -981,10 +981,12 @@ class TestDrainFinishesThenParks:
             assert reviewer.items() == ["a"]
             reviewer.release("a", ReviewVerdict("merge", "r", "n", ""))
             await _yield()
-            assert await _tick(ctx, ls) == _TICK_WAIT  # harvest; land starts
-            await _yield()
-            land.assert_awaited_once()
+            # Harvest: the merge verdict queues a land, but a draining host
+            # starts no new land; it is dropped and re-reviewed after restart.
             assert await _tick(ctx, ls) == _TICK_PARKED
+            await _yield()
+            land.assert_not_awaited()
+            assert ls.land_queue == []
         ctx.gtd.dispatch_item.assert_not_awaited()
         assert reviewer.items() == ["a"]
         msgs = [r for r in caplog.records if "drain-finishing" in r.getMessage()]
@@ -2185,3 +2187,77 @@ class TestPreLeaseHalt:
             "rollout-loop: invariant-breach kind=cancelled_land_harvested "
             f"rollout_id={ROLLOUT} item_id=x",
         )
+
+
+# ---------------------------------------------------------------------------
+# Draining host: no new land lease, pre-lease lands are dropped
+# ---------------------------------------------------------------------------
+
+
+class TestDrainLandHold:
+    async def test_pre_lease_land_cancelled_and_queue_cleared(self, tmp_path) -> None:
+        task = _pending_task()
+        ls = _RolloutLoopState(
+            slots={0: _ws(tmp_path, 0)},
+            land_queue=[_queued("b", 1)],
+            active_land=_ActiveLand("a", 0, task, 0.0, probe=_probe_lander()),
+        )
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_start_land") as start,
+        ):
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=["a", "b"], drain="deploy")
+            assert await _tick(ctx, ls) == _TICK_PARKED
+        assert task.cancelled()
+        assert ls.active_land is None
+        assert ls.land_queue == []
+        start.assert_not_called()
+
+    async def test_lease_holding_land_is_waited_on(self, tmp_path) -> None:
+        task = _pending_task()
+        ls = _RolloutLoopState(
+            slots={0: _ws(tmp_path, 0)},
+            active_land=_ActiveLand(
+                "a", 0, task, 0.0, probe=_probe_lander(lease_id="L1")
+            ),
+        )
+        with _loop_patch_stack() as ctx:
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=["a"], drain="deploy")
+            assert await _tick(ctx, ls) == _TICK_WAIT
+        assert not task.cancelled()
+        assert ls.active_land is not None
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def test_queued_land_not_started_while_draining(self, tmp_path) -> None:
+        ls = _RolloutLoopState(land_queue=[_queued("b", 1)])
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_start_land") as start,
+        ):
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=["b"], drain="deploy")
+            assert await _tick(ctx, ls) == _TICK_PARKED
+        start.assert_not_called()
+
+    async def test_dropped_item_re_reviewed_after_undrain(self, tmp_path) -> None:
+        reviewer = FakeReviewer()
+        task = _pending_task()
+        ls = _RolloutLoopState(
+            slots={0: _ws(tmp_path, 0)},
+            active_land=_ActiveLand("a", 0, task, 0.0, probe=_probe_lander()),
+        )
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_launch_reviewer", new=reviewer),
+        ):
+            _wire(ctx, tmp_path)
+            _board(ctx, in_progress=["a"], drain="deploy")
+            assert await _tick(ctx, ls) == _TICK_PARKED
+            _board(ctx, in_progress=["a"])
+            await _tick(ctx, ls)
+            await _yield()
+            assert reviewer.items() == ["a"]
+            await _cleanup(ls)

@@ -4115,11 +4115,10 @@ class TestAsynchronousDrainRefusal:
 
 
 class TestNeverParkMidLand:
-    async def test_drain_arriving_mid_review_finishes_the_land(self) -> None:
+    async def test_drain_arriving_mid_review_drops_the_unstarted_land(self) -> None:
         from agent_gtd_dispatch import main
         from agent_gtd_dispatch.main import (
             _TICK_PARKED,
-            _TICK_WAIT,
             ReviewVerdict,
             _RolloutLoopState,
         )
@@ -4161,11 +4160,14 @@ class TestNeverParkMidLand:
             first = await _tick(ctx, loop_state=ls, loop_run_id=run.id)
             assert first != _TICK_PARKED
             await _settle_children(ls)
-            # The drain arrived mid-review: the merge still lands before parking.
-            assert await _tick(ctx, loop_state=ls, loop_run_id=run.id) == _TICK_WAIT
+            # The drain arrived mid-review: a draining host starts no new land
+            # (it could restart mid-push); the queued merge is dropped and the
+            # item is re-reviewed after the restart.
+            assert await _tick(ctx, loop_state=ls, loop_run_id=run.id) == _TICK_PARKED
             await _settle_children(ls)
-            land.assert_awaited_once()
-            ctx.gtd.complete_in_rollout.assert_awaited_once()
+            land.assert_not_awaited()
+            ctx.gtd.complete_in_rollout.assert_not_awaited()
+            assert ls.land_queue == []
 
             ctx.gtd.dispatch_item.reset_mock()
             second = await _tick(ctx, loop_state=ls, loop_run_id=run.id)

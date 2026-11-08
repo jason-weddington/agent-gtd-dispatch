@@ -228,6 +228,7 @@ def _env(monkeypatch):
         return_value={"renewed": True, "lease": {"lease_id": "L1"}}
     )
     gtd.release_land_lease = AsyncMock(return_value={"released": True})
+    gtd.get_rollout = AsyncMock(return_value={"status": "running"})
     monkeypatch.setattr(main, "gtd_client", gtd)
     return gtd
 
@@ -2649,7 +2650,7 @@ class TestLandLease:
         assert "holder_rollout_id=R2 holder_item_id=I2" in waiting[0]
         assert "rollout-loop: land-lease acquired rollout_id=" in caplog.text
         assert "rollout-loop: land-lease released rollout_id=" in caplog.text
-        assert gtd.get_rollout.await_count == 2
+        assert gtd.get_rollout.await_count == 3
 
     async def test_wait_long_warning(self, mono, gtd, fast_lease, monkeypatch, caplog):
         _squash(mono.clone)
@@ -2855,7 +2856,8 @@ class TestLandLease:
         await self._assert_aborted(
             mono, gtd, caplog, directive, source="poll", observed=status
         )
-        assert "holders_seen=1" in caplog.text
+        assert "holders_seen=0" in caplog.text
+        assert gtd.acquire_land_lease.await_count == 0
 
     async def test_cancelled_rollout_aborts_wait(self, mono, gtd, caplog) -> None:
         _squash(mono.clone)
@@ -2864,6 +2866,7 @@ class TestLandLease:
         await self._assert_aborted(
             mono, gtd, caplog, main._TICK_DONE, source="poll", observed="cancelled"
         )
+        assert gtd.acquire_land_lease.await_count == 0
 
     @pytest.mark.parametrize(
         ("refused", "directive"),
@@ -3143,3 +3146,181 @@ class TestLandIsPreLease:
     def test_lander_returned(self) -> None:
         probe = main._LandProbe(lander=self._lander(), lander_returned=True)  # type: ignore[arg-type]
         assert main._land_is_pre_lease(self._active(probe)) is False
+
+
+_DRAIN = "host 'h' is draining: deploy"
+
+
+def _draining() -> dict:
+    return {"status": "running", "loop_host_drain_reason": _DRAIN}
+
+
+def _running() -> dict:
+    return {"status": "running"}
+
+
+class TestDrainHold:
+    def _lander(self, mono) -> main._Lander:
+        return main._Lander(
+            ROLLOUT,
+            ITEM,
+            _verdict(),
+            project={"name": "P"},
+            workspace=mono.ws,
+            pre_review_origin=mono.pre,
+            reviewer_engine=get_engine("claude-code-sonnet"),
+            loop_run_id="100000000001",
+            token=None,
+            attribution=None,
+        )
+
+    async def _acquire(self, lander: main._Lander) -> str:
+        try:
+            return await lander._acquire_lease()
+        finally:
+            await lander._stop_lease_renewal()
+
+    async def test_hold_then_undrain_acquires(
+        self, mono, gtd, fast_lease, caplog
+    ) -> None:
+        lander = self._lander(mono)
+        seen: list[int] = []
+
+        async def get_rollout(*_a, **_kw):
+            seen.append(gtd.acquire_land_lease.await_count)
+            return [_draining(), _draining(), _draining(), _running()][len(seen) - 1]
+
+        gtd.get_rollout = AsyncMock(side_effect=get_rollout)
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            assert await self._acquire(lander) == "L1"
+        assert seen == [0, 0, 0, 0]
+        gtd.acquire_land_lease.assert_awaited_once()
+        assert gtd.acquire_land_lease.await_args.kwargs["continuing_land"] is False
+        expected = (
+            f"Land: host draining ({_DRAIN}); not acquiring the land lease for {ITEM}"
+        )
+        assert _steps(gtd).count(expected) == 1
+        assert caplog.text.count("land-lease drain-hold rollout_id=") == 1
+        assert caplog.text.count("land-lease drain-released") == 1
+        assert "drain_polls=3" in caplog.text
+        assert "continuing=False" in caplog.text
+
+    async def test_two_episodes_with_holder_between(self, mono, gtd, fast_lease):
+        lander = self._lander(mono)
+        gtd.get_rollout = AsyncMock(
+            side_effect=[
+                _draining(),
+                _draining(),
+                _running(),
+                _draining(),
+                _running(),
+                _running(),
+            ]
+        )
+        gtd.acquire_land_lease.side_effect = [_held(), _held(), _acquired()]
+        await self._acquire(lander)
+        steps = _steps(gtd)
+        drain_step = (
+            f"Land: host draining ({_DRAIN}); not acquiring the land lease for {ITEM}"
+        )
+        waiting = "waiting for land lease held by rollout R2 (item I2)"
+        assert steps.count(drain_step) == 2
+        assert sum(waiting in s for s in steps) == 2
+
+    async def test_lease_holder_never_reads_board(self, mono, gtd) -> None:
+        lander = self._lander(mono)
+        lander.lease_id = "L1"
+        lander.lease_ever_acquired = True
+        gtd.get_rollout = AsyncMock(return_value=_draining())
+        assert await lander._lease_wait_abort_check() is None
+        gtd.get_rollout.assert_not_awaited()
+
+    async def test_continuing_reacquire_not_held(self, mono, gtd, fast_lease) -> None:
+        lander = self._lander(mono)
+        lander.pushed = {"repo": "abc"}
+        gtd.get_rollout = AsyncMock(return_value=_draining())
+        await self._acquire(lander)
+        gtd.get_rollout.assert_not_awaited()
+        assert gtd.acquire_land_lease.await_args.kwargs["continuing_land"] is True
+
+    async def test_halted_wins_over_drain(self, mono, gtd) -> None:
+        lander = self._lander(mono)
+        gtd.get_rollout = AsyncMock(
+            return_value={"status": "halted", "loop_host_drain_reason": _DRAIN}
+        )
+        with pytest.raises(main._LeaseWaitAborted) as info:
+            await lander._acquire_lease()
+        assert info.value.directive == main._TICK_HALTED
+        assert gtd.acquire_land_lease.await_count == 0
+
+    async def test_transient_error_absorbed(self, mono, gtd, fast_lease) -> None:
+        lander = self._lander(mono)
+        gtd.get_rollout = AsyncMock(side_effect=[_connect_error(), _running()])
+        assert await self._acquire(lander) == "L1"
+
+    async def test_drain_poll_resets_outage(
+        self, mono, gtd, fast_lease, monkeypatch
+    ) -> None:
+        lander = self._lander(mono)
+        clock = iter([0.0, 0.0, 1000.0, 1000.0, 1000.0, 1000.0, 2000.0, 2000.0])
+        last = [0.0]
+
+        def mono_clock() -> float:
+            last[0] = next(clock, last[0])
+            return last[0]
+
+        monkeypatch.setattr(main, "_monotonic", mono_clock)
+        monkeypatch.setattr(config, "ROLLOUT_LOOP_BOARD_OUTAGE_SECONDS", 100)
+        gtd.get_rollout = AsyncMock(
+            side_effect=[
+                _connect_error(),
+                _draining(),
+                _draining(),
+                _connect_error(),
+                _running(),
+            ]
+        )
+        assert await self._acquire(lander) == "L1"
+        gtd.halt_rollout.assert_not_awaited()
+
+    async def test_drain_held_land_counts_as_pre_lease(
+        self, mono, gtd, fast_lease
+    ) -> None:
+        lander = self._lander(mono)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def get_rollout(*_a, **_kw):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                entered.set()
+                await release.wait()
+                return _running()
+            return _draining()
+
+        gtd.get_rollout = AsyncMock(side_effect=get_rollout)
+        task = asyncio.create_task(self._acquire(lander))
+        await asyncio.wait_for(entered.wait(), 5)
+        active = main._ActiveLand(
+            ITEM, 0, task, 0.0, probe=main._LandProbe(lander=lander)
+        )
+        assert main._land_is_pre_lease(active) is True
+        assert lander.in_acquire_call is False
+        assert gtd.acquire_land_lease.await_count == 0
+        release.set()
+        assert await asyncio.wait_for(task, 5) == "L1"
+
+    async def test_drain_hold_long_warning(
+        self, mono, gtd, fast_lease, monkeypatch, caplog
+    ) -> None:
+        lander = self._lander(mono)
+        monkeypatch.setattr(main, "LAND_LEASE_WAIT_WARN_SECONDS", 1e-9)
+        gtd.get_rollout = AsyncMock(
+            side_effect=[_draining(), _draining(), _draining(), _running()]
+        )
+        with caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"):
+            await self._acquire(lander)
+        assert caplog.text.count("land-lease drain-hold-long rollout_id=") >= 1
+        assert any(s.startswith("Land: held ") for s in _steps(gtd))
