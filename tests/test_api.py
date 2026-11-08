@@ -49,6 +49,9 @@ class TestHealth:
         resp = client.get("/health")
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
+        body = resp.json()
+        assert set(body) == {"status", "active_runs", "restart_blocking_runs"}
+        assert isinstance(body["restart_blocking_runs"], int)
 
 
 class TestParkedRolloutLoopsExcludedFromActiveRuns:
@@ -79,6 +82,176 @@ class TestParkedRolloutLoopsExcludedFromActiveRuns:
         info = client.get("/info").json()
         assert info["active_runs"] == 1
         assert info["parked_rollout_loops"] == 0
+
+
+class TestRestartBlockingRuns:
+    @staticmethod
+    def _setup(monkeypatch, *, loop=None, state=None, procs=None, queue=()):
+        import types  # noqa: F401
+        from unittest.mock import MagicMock
+
+        from agent_gtd_dispatch import main
+
+        active = {k: MagicMock() for k in (procs or [])}
+        loop_ids = set()
+        states = {}
+        if loop is not None:
+            active[loop] = MagicMock()
+            loop_ids.add(loop)
+        if state is not None:
+            states[loop or "orphan"] = state
+        monkeypatch.setattr(main, "_active_processes", active)
+        monkeypatch.setattr(main, "_loop_run_ids", loop_ids)
+        monkeypatch.setattr(main, "_rollout_loop_states", states)
+        monkeypatch.setattr(main, "_pending_queue", list(queue))
+        monkeypatch.setattr(main, "_parked_rollout_loops", set())
+
+    @staticmethod
+    def _task(done: bool):
+        from unittest.mock import MagicMock
+
+        return MagicMock(done=MagicMock(return_value=done))
+
+    def _land(self, *, done=False, probe="set", **lander_kw):
+        import types
+
+        from agent_gtd_dispatch import main
+
+        if probe is None:
+            return main._ActiveLand("i1", 0, self._task(done), 0.0, probe=None)
+        base = {
+            "lease_ever_acquired": False,
+            "lease_id": None,
+            "pushed": {},
+            "in_acquire_call": False,
+        }
+        returned = lander_kw.pop("lander_returned", False)
+        lander = (
+            None
+            if lander_kw.pop("no_lander", False)
+            else types.SimpleNamespace(**{**base, **lander_kw})
+        )
+        return main._ActiveLand(
+            "i1",
+            0,
+            self._task(done),
+            0.0,
+            probe=main._LandProbe(lander=lander, lander_returned=returned),
+        )
+
+    def _state(self, *, land=None, reviews=(), queued=False):
+        from unittest.mock import MagicMock
+
+        from agent_gtd_dispatch import main
+
+        st = main._RolloutLoopState()
+        st.active_land = land
+        for i, done in enumerate(reviews):
+            st.reviews[f"i{i}"] = main._ReviewEntry(
+                item_id=f"i{i}",
+                slot=0,
+                task=self._task(done),
+                item={},
+                pre_review_origin={},
+                started_at=0.0,
+            )
+        if queued:
+            st.land_queue.append(main._QueuedLand("i2", 1, MagicMock(), {}, {}, 0.0))
+        return st
+
+    def _check(self, client, total, **comp):
+        info = client.get("/info").json()
+        assert info["restart_blocking_runs"] == total
+        assert info["restart_blocking_runs"] == sum(info["restart_blocking"].values())
+        assert list(info["restart_blocking"]) == [
+            "slot_runs",
+            "queued_runs",
+            "reviews_in_flight",
+            "lease_holding_lands",
+        ]
+        for k, v in comp.items():
+            assert info["restart_blocking"][k] == v
+        assert client.get("/health").json()["restart_blocking_runs"] == total
+        return info
+
+    def test_pre_lease_loops_not_counted(self, client, monkeypatch) -> None:
+        st = self._state(land=self._land(no_lander=True))
+        self._setup(monkeypatch, loop="loop-1", state=st)
+        info = self._check(client, 0)
+        assert info["active_runs"] == 1
+        st = self._state(land=self._land())
+        self._setup(monkeypatch, loop="loop-1", state=st)
+        self._check(client, 0)
+
+    def test_reviews(self, client, monkeypatch) -> None:
+        self._setup(monkeypatch, loop="loop-1", state=self._state(reviews=[False]))
+        self._check(client, 1, reviews_in_flight=1)
+        self._setup(monkeypatch, loop="loop-1", state=self._state(reviews=[True]))
+        self._check(client, 0)
+
+    def test_lands(self, client, monkeypatch) -> None:
+        cases = [
+            (self._land(lease_id="L1"), 1),
+            (self._land(pushed={"repo": "sha"}), 1),
+            (self._land(probe=None), 1),
+            (self._land(lease_ever_acquired=True), 1),
+            (self._land(lander_returned=True), 1),
+            (self._land(done=True, lease_id="L1"), 0),
+            (self._land(done=True, probe=None), 0),
+            (self._land(in_acquire_call=True), 1),
+        ]
+        for land, expected in cases:
+            self._setup(monkeypatch, loop="loop-1", state=self._state(land=land))
+            self._check(client, expected, lease_holding_lands=expected)
+
+    def test_build_queue_parked_landqueue(self, client, monkeypatch) -> None:
+        from unittest.mock import MagicMock
+
+        from agent_gtd_dispatch import main
+
+        self._setup(monkeypatch, procs=["b1"])
+        self._check(client, 1, slot_runs=1)
+        self._setup(monkeypatch, queue=[MagicMock()])
+        self._check(client, 1, queued_runs=1)
+        self._setup(monkeypatch, loop="loop-1", state=self._state())
+        monkeypatch.setattr(main, "_parked_rollout_loops", {"loop-1"})
+        info = self._check(client, 0)
+        assert info["active_runs"] == 0
+        self._setup(monkeypatch, loop="loop-1", state=self._state(queued=True))
+        self._check(client, 0)
+
+    def test_orphan_state_not_counted_and_audited(
+        self, client, monkeypatch, caplog
+    ) -> None:
+        self._setup(monkeypatch, state=self._state(reviews=[False]))
+        with caplog.at_level("ERROR"):
+            self._check(client, 0)
+        assert "rollout-loop state leak" in caplog.text
+
+    def test_missing_state_audited(self, client, monkeypatch, caplog) -> None:
+        self._setup(monkeypatch, loop="loop-1")
+        with caplog.at_level("ERROR"):
+            self._check(client, 0)
+        assert "rollout-loop state missing" in caplog.text
+
+    def test_shutdown_log(self, monkeypatch, caplog) -> None:
+        import logging
+
+        from agent_gtd_dispatch import main
+
+        self._setup(monkeypatch, loop="loop-1", state=self._state(reviews=[False]))
+        with caplog.at_level(logging.INFO):
+            main._log_shutdown_restart_blocking()
+        recs = [r for r in caplog.records if "shutdown: restart_blocking" in r.message]
+        assert recs[0].levelno == logging.WARNING
+        assert "reviews_in_flight=1" in recs[0].message
+        caplog.clear()
+        self._setup(monkeypatch, loop="loop-1", state=self._state())
+        with caplog.at_level(logging.INFO):
+            main._log_shutdown_restart_blocking()
+        recs = [r for r in caplog.records if "shutdown: restart_blocking" in r.message]
+        assert recs[0].levelno == logging.INFO
+        assert "restart_blocking_runs=0" in recs[0].message
 
 
 class TestAuth:

@@ -19,13 +19,14 @@ Invalid or missing credentials return **401 Unauthorized**.
 
 **Auth**: None required.
 
-Returns the service health status and the count of currently active (running) dispatches. `active_runs` excludes rollout loops parked behind a host drain, so a draining host reads 0 once its loops park and its other runs finish.
+Returns the service health status and the count of currently active (running) dispatches. `active_runs` excludes rollout loops parked behind a host drain, so a draining host reads 0 once its loops park and its other runs finish. `restart_blocking_runs` is the work a restart would lose (slot-holding runs, host-queued runs, rollout reviews in flight, lease-holding lands); it is always present as a JSON integer, and `active_runs` is unchanged.
 
 **Response 200:**
 ```json
 {
   "status": "ok",
-  "active_runs": 3
+  "active_runs": 3,
+  "restart_blocking_runs": 1
 }
 ```
 
@@ -70,8 +71,10 @@ separate round-trip to `/agents`.
 | `cpu_count` | `int \| null` | Logical CPU count from `os.cpu_count`; null when unknown |
 | `engine_slots` | `object` | Per-engine caps declared by this host (`DISPATCH_ENGINE_SLOTS`), one entry per capped engine, including cap-0 entries. Absent or empty means no per-engine caps. `engine_slots.<engine>.active_runs` counts runs holding a slot, both running and host-queued, so it differs from the top-level `active_runs`; only BUILD-mode runs admitted through `/dispatch` are counted |
 | `engines_only` | `list[str] \| null` | Sorted `DISPATCH_ENGINES_ONLY` allowlist, or null when unset. `engine_slots` is not filtered by it |
-| `parked_rollout_loops` | `int` | Rollout loops parked behind a host drain (informational). `active_runs` is unchanged and remains the restart-safety idle signal |
-| `slot_runs` | `int` | Runs charged against `max_concurrent_runs` (builds, plans, reviews; never rollout loops). The router's capacity input: free slots = `max_concurrent_runs - slot_runs`. Absent on old hosts (routers fall back to `max_concurrent_runs - active_runs - parked_rollout_loops`) |
+| `parked_rollout_loops` | `int` | Rollout loops parked behind a host drain (informational). `active_runs` is unchanged; `restart_blocking_runs` is the restart-safety idle signal |
+| `slot_runs` | `int` | Runs charged against `max_concurrent_runs` (build and plan runs; never rollout loops or the reviews they run, which are reported in restart_blocking.reviews_in_flight). The router's capacity input: free slots = `max_concurrent_runs - slot_runs`. Absent on old hosts (routers fall back to `max_concurrent_runs - active_runs - parked_rollout_loops`) |
+| `restart_blocking_runs` | `int` | Work a restart would lose; equals the sum of `restart_blocking` values. Drain-and-deploy tooling should wait on this being 0 |
+| `restart_blocking` | `object` | Components: `slot_runs` (build and plan runs holding a slot), `queued_runs` (host-queued dispatches), `reviews_in_flight` (live rollout reviewer tasks), `lease_holding_lands` (lands that hold, held or are requesting the land lease, or whose state is unknown) |
 | `active_loops` | `int` | Live rollout loops (informational). Loops never count against `max_concurrent_runs` and are never queued |
 | `queued_runs` | `int` | Dispatches waiting in the host queue (informational) |
 

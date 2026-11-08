@@ -36,8 +36,10 @@ class InfoResponse(BaseModel):
 
     ``active_runs`` excludes rollout loops parked behind a host drain, so a
     drained host reads idle once its loops park; those loops are reported in
-    ``parked_rollout_loops``.  ``active_runs`` remains the restart-safety idle
-    signal (an unparked loop reads as non-idle).
+    ``parked_rollout_loops``.  ``restart_blocking_runs`` is the restart-safety
+    idle signal (the work a restart would lose: slot-holding runs, host-queued
+    runs, rollout reviews in flight and lease-holding lands); ``active_runs`` is
+    unchanged in value and kept for older consumers.
 
     Rollout loops never count against ``max_concurrent_runs`` and are never
     queued.  ``slot_runs`` is the only count charged against it, so routers
@@ -68,6 +70,8 @@ class InfoResponse(BaseModel):
     slot_runs: int = 0
     active_loops: int = 0
     queued_runs: int = 0
+    restart_blocking_runs: int = 0
+    restart_blocking: dict[str, int] = {}
     load_avg_1m: float | None = None
     cpu_count: int | None = None
     engine_slots: dict[str, EngineSlotInfo] = {}

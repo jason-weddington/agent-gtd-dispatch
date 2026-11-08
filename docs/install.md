@@ -1145,6 +1145,8 @@ Pass `--restart-if-stale` to let Step 6.5 restart `dispatch-api` automatically w
 
 A rollout loop parked behind a host drain is not counted in `active_runs`, so it does not block the restart; the startup re-adoption sweep picks it up again on the new process.
 
+The Step 6.5 gate still reads `active_runs`. `/health` also reports `restart_blocking_runs` (build and plan runs holding a slot, host-queued runs, rollout reviews in flight and lease-holding lands); external drain-and-deploy tooling should wait on `restart_blocking_runs == 0`, falling back to `active_runs == 0` when the field is absent (older hosts). A restart at `restart_blocking_runs == 0` may still cancel a pre-lease land-lease wait or drop queued merge verdicts; those items are re-reviewed (not rebuilt) after re-adoption.
+
 This exists because **a restart looks like run completion to the status poller** (kb-01486) — an earlier revision of the Postgres provisioning that blindly restarted the service on every re-run was reworked specifically to avoid that. Without `--restart-if-stale`, or when any of the above checks fail, Step 6.5 prints a `[WARN]` explaining exactly why it refused (`refused-no-flag`, `refused-in-flight`, `refused-probe-failed`) and leaves the service alone. After an automatic restart, Step 6.5 re-resolves the new `MainPID` and re-runs the same comparison against the **new** process — verifying the actual running state, not just that a restart command was issued — before reporting `restarted-verified` or `restarted-still-stale`.
 
 ### Two-consumer model: process env vs. `.claude.json`

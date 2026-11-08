@@ -503,6 +503,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     # Bounded, because systemd will SIGKILL us at its stop timeout regardless and
     # a rescue that cannot finish in time must not take the shutdown down with it.
     # `return_exceptions=True` so one run's failed teardown cannot strand the rest.
+    _log_shutdown_restart_blocking()
     _in_flight = []
     for task in list(_active_processes.values()):
         task.cancel()
@@ -2184,6 +2185,46 @@ def _slot_holding_count() -> int:
     return len(set(_active_processes) - _loop_run_ids - _parked_rollout_loops)
 
 
+def _restart_blocking_counts() -> dict[str, int]:
+    """Work a restart would lose, by component (see ``_restart_blocking_runs``)."""
+    reviews = 0
+    lands = 0
+    for rid, ls in _rollout_loop_states.items():
+        if rid not in _active_processes:
+            continue
+        reviews += sum(1 for e in ls.reviews.values() if not e.task.done())
+        land = ls.active_land
+        if land is not None and not land.task.done() and not _land_is_pre_lease(land):
+            lands += 1
+    return {
+        "slot_runs": _slot_holding_count(),
+        "queued_runs": len(_pending_queue),
+        "reviews_in_flight": reviews,
+        "lease_holding_lands": lands,
+    }
+
+
+def _log_shutdown_restart_blocking() -> None:
+    """Log what a shutdown is about to cancel (WARNING when work would be lost)."""
+    rb = _restart_blocking_counts()
+    total = sum(rb.values())
+    (logger.warning if total > 0 else logger.info)(
+        "shutdown: restart_blocking_runs=%d slot_runs=%d queued_runs=%d"
+        " reviews_in_flight=%d lease_holding_lands=%d active_runs=%d",
+        total,
+        rb["slot_runs"],
+        rb["queued_runs"],
+        rb["reviews_in_flight"],
+        rb["lease_holding_lands"],
+        _counted_active_runs(),
+    )
+
+
+def _restart_blocking_runs() -> int:
+    """Total of ``_restart_blocking_counts``: 0 means a restart loses no work."""
+    return sum(_restart_blocking_counts().values())
+
+
 def _audit_run_slots() -> None:
     """Log (never repair) run-slot accounting violations."""
     holders = _slot_holding_count()
@@ -2198,6 +2239,12 @@ def _audit_run_slots() -> None:
     for loop_run in list(_rollout_loops.values()):
         if loop_run.id in _active_processes and loop_run.id not in _loop_run_ids:
             logger.error("rollout-loop untracked run=%s", loop_run.id)
+    for rid in sorted(_rollout_loop_states.keys() - _active_processes.keys()):
+        logger.error("rollout-loop state leak run=%s", rid)
+    for rid in sorted(
+        (_loop_run_ids & _active_processes.keys()) - _rollout_loop_states.keys()
+    ):
+        logger.error("rollout-loop state missing run=%s", rid)
 
 
 def _parked_step(drain: str) -> str:
@@ -6588,6 +6635,10 @@ class _RolloutLoopState:
     applied_reviewer_engine_reason: str | None = None
 
 
+# Live loop state per rollout-loop Run id; popped in `_rollout_loop_worker`.
+_rollout_loop_states: dict[str, _RolloutLoopState] = {}
+
+
 def _held_slots(loop_state: _RolloutLoopState) -> list[int]:
     """Every slot index held by a review, a queued land or the active land."""
     held = [e.slot for e in loop_state.reviews.values()]
@@ -8078,6 +8129,7 @@ async def _drive_rollout(
     )
 
     loop_state = _RolloutLoopState()
+    _rollout_loop_states[run.id] = loop_state
     dispatch_attempts: dict[str, int] = {}
     directive = _TICK_CONTINUE
     parked_since: float | None = None
@@ -8206,6 +8258,21 @@ async def _drive_rollout(
             # shutdown cancels it; the pre-review already-landed check then
             # recovers a push that had already reached origin.
             if shutdown:
+                probe = land.probe
+                lander = probe.lander if probe is not None else None
+                logger.info(
+                    "rollout-loop: shutdown-cancel-land rollout_id=%s item_id=%s"
+                    " pre_lease=%s lease_id_set=%s pushed_repos=%d"
+                    " lease_ever_acquired=%s in_acquire_call=%s probe=%s",
+                    rollout_id,
+                    land.item_id,
+                    _land_is_pre_lease(land),
+                    lander.lease_id is not None if lander is not None else "none",
+                    len(lander.pushed) if lander is not None else 0,
+                    lander.lease_ever_acquired if lander is not None else "none",
+                    lander.in_acquire_call if lander is not None else "none",
+                    "none" if probe is None else "set",
+                )
                 land.task.cancel()
             await asyncio.gather(land.task, return_exceptions=True)
         _rollout_redispatches.pop(rollout_id, None)
@@ -8289,6 +8356,7 @@ async def _rollout_loop_worker(run: Run, *, attribution: str | None = None) -> N
     finally:
         _parked_rollout_loops.discard(run.id)
         _loop_run_ids.discard(run.id)
+        _rollout_loop_states.pop(run.id, None)
         _refused_relaunch_runs.discard(run.id)
         _active_processes.pop(run.id, None)
         _try_start_pending()
@@ -9873,7 +9941,11 @@ async def _dispatch_worker(
 async def health() -> dict[str, object]:
     """Return service health and active run count (parked rollout loops excluded)."""
     active = _counted_active_runs()
-    return {"status": "ok", "active_runs": active}
+    return {
+        "status": "ok",
+        "active_runs": active,
+        "restart_blocking_runs": _restart_blocking_runs(),
+    }
 
 
 def _host_load() -> tuple[float | None, int | None]:
@@ -9901,6 +9973,7 @@ async def info() -> InfoResponse:
     load_avg_1m, cpu_count = _host_load()
     _audit_engine_slots()
     _audit_run_slots()
+    rb_counts = _restart_blocking_counts()
     return InfoResponse(
         engine=ENGINE_NAME,
         version=SERVICE_VERSION,
@@ -9909,6 +9982,8 @@ async def info() -> InfoResponse:
         slot_runs=_slot_holding_count(),
         active_loops=len(_loop_run_ids & _active_processes.keys()),
         queued_runs=len(_pending_queue),
+        restart_blocking_runs=sum(rb_counts.values()),
+        restart_blocking=rb_counts,
         engines=get_available_engine_names(),
         agents=[a["name"] for a in agent_dicts],
         parked_rollout_loops=len(_parked_rollout_loops & _active_processes.keys()),

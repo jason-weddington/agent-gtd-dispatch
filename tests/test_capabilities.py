@@ -86,6 +86,8 @@ class TestInfoEndpoint:
             "slot_runs",
             "active_loops",
             "queued_runs",
+            "restart_blocking_runs",
+            "restart_blocking",
             "load_avg_1m",
             "cpu_count",
             "engine_slots",

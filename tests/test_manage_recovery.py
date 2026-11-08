@@ -4175,6 +4175,123 @@ class TestNeverParkMidLand:
         ctx.gtd.dispatch_item.assert_not_awaited()
 
 
+class TestRolloutLoopStateRegistry:
+    @staticmethod
+    def _board(ctx) -> None:
+        ctx.gtd.get_rollout = AsyncMock(return_value={"project_id": "proj-1"})
+        ctx.gtd.get_project = AsyncMock(
+            return_value={"name": "P", "workspace_repos": []}
+        )
+
+    async def test_registered_during_tick_and_popped_by_worker(self) -> None:
+        from agent_gtd_dispatch import main
+        from agent_gtd_dispatch.main import _TICK_DONE, _rollout_loop_worker
+
+        run = _loop_run()
+        seen: list[bool] = []
+
+        async def _tick_fn(*a, **kw):
+            seen.append(
+                main._rollout_loop_states[kw["loop_run_id"]] is kw["loop_state"]
+            )
+            return _TICK_DONE
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_rollout_loop_states", {}),
+            patch.object(
+                main, "_rollout_wave_tick", new=AsyncMock(side_effect=_tick_fn)
+            ),
+            patch("agent_gtd_dispatch.main.get_engine", return_value=MagicMock()),
+        ):
+            self._board(ctx)
+            ctx.active[run.id] = MagicMock()
+            await _rollout_loop_worker(run)
+            assert run.id not in main._rollout_loop_states
+        assert seen == [True]
+
+    async def test_popped_on_cancellation(self) -> None:
+        from agent_gtd_dispatch import main
+        from agent_gtd_dispatch.main import _rollout_loop_worker
+
+        run = _loop_run()
+
+        async def _tick_fn(*a, **kw):
+            assert main._rollout_loop_states[kw["loop_run_id"]] is kw["loop_state"]
+            raise asyncio.CancelledError
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_rollout_loop_states", {}),
+            patch.object(
+                main, "_rollout_wave_tick", new=AsyncMock(side_effect=_tick_fn)
+            ),
+            patch("agent_gtd_dispatch.main.get_engine", return_value=MagicMock()),
+        ):
+            self._board(ctx)
+            ctx.active[run.id] = MagicMock()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _rollout_loop_worker(run)
+            assert run.id not in main._rollout_loop_states
+
+    async def test_drive_rollout_leaves_entry_registered(self) -> None:
+        from agent_gtd_dispatch import main
+        from agent_gtd_dispatch.main import _TICK_DONE
+
+        run = _loop_run()
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_rollout_loop_states", {}),
+            patch.object(
+                main, "_rollout_wave_tick", new=AsyncMock(return_value=_TICK_DONE)
+            ),
+            patch("agent_gtd_dispatch.main.get_engine", return_value=MagicMock()),
+        ):
+            self._board(ctx)
+            assert await main._drive_rollout(run) == _TICK_DONE
+            assert run.id in main._rollout_loop_states
+
+    async def test_shutdown_cancel_land_is_logged(self, caplog) -> None:
+        from agent_gtd_dispatch import main
+
+        run = _loop_run()
+
+        async def _tick_fn(*a, **kw):
+            lander = SimpleNamespace(
+                lease_ever_acquired=True,
+                lease_id="L1",
+                pushed={},
+                in_acquire_call=False,
+            )
+            task = asyncio.ensure_future(asyncio.sleep(100))
+            kw["loop_state"].active_land = main._ActiveLand(
+                "item-a",
+                0,
+                task,
+                0.0,
+                probe=main._LandProbe(lander=lander),
+            )
+            raise asyncio.CancelledError
+
+        with (
+            _loop_patch_stack() as ctx,
+            patch.object(main, "_rollout_loop_states", {}),
+            patch.object(
+                main, "_rollout_wave_tick", new=AsyncMock(side_effect=_tick_fn)
+            ),
+            patch("agent_gtd_dispatch.main.get_engine", return_value=MagicMock()),
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.main"),
+        ):
+            self._board(ctx)
+            with contextlib.suppress(asyncio.CancelledError):
+                await main._drive_rollout(run)
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(
+            "shutdown-cancel-land" in m and "pre_lease=False lease_id_set=True" in m
+            for m in msgs
+        )
+
+
 class TestDriveRolloutParking:
     @staticmethod
     def _board(ctx, ticks: list[tuple[dict, dict]]) -> None:
