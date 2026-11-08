@@ -756,6 +756,7 @@ class TestOllamaCloudEngineGating:
         assert engines.is_engine_available(engines.TALOS_GLM) is False
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is False
         assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is False
+        assert engines.is_engine_available(engines.TALOS_BEAM) is False
         assert engines.is_engine_available(engines.CLAUDE_DEEPSEEK) is False
         assert cloud_auth._probe_result is None
 
@@ -769,6 +770,7 @@ class TestOllamaCloudEngineGating:
         assert engines.is_engine_available(engines.TALOS_GLM) is True
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is True
         assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is True
+        assert engines.is_engine_available(engines.TALOS_BEAM) is True
         assert engines.is_engine_available(engines.CLAUDE_DEEPSEEK) is True
 
     def test_one_probe_serves_all_three_cloud_engines(self, monkeypatch) -> None:
@@ -799,6 +801,7 @@ class TestOllamaCloudEngineGating:
         assert engines.is_engine_available(engines.TALOS_GLM) is True
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is True
         assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is True
+        assert engines.is_engine_available(engines.TALOS_BEAM) is True
         assert engines.is_engine_available(engines.CLAUDE_DEEPSEEK) is True
         assert len(urlopens) == 1, (
             "the probe must run exactly once for all four cloud engines"
@@ -814,6 +817,7 @@ class TestOllamaCloudEngineGating:
         assert engines.is_engine_available(engines.TALOS_GLM) is False
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is False
         assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is False
+        assert engines.is_engine_available(engines.TALOS_BEAM) is False
         assert engines.is_engine_available(engines.CLAUDE_DEEPSEEK) is False
 
     def test_unknown_probe_keeps_engine_available(self, monkeypatch) -> None:
@@ -826,6 +830,7 @@ class TestOllamaCloudEngineGating:
         assert engines.is_engine_available(engines.TALOS_GLM) is True
         assert engines.is_engine_available(engines.TALOS_GLM_FLASH) is True
         assert engines.is_engine_available(engines.TALOS_DEEPSEEK) is True
+        assert engines.is_engine_available(engines.TALOS_BEAM) is True
         assert engines.is_engine_available(engines.CLAUDE_DEEPSEEK) is True
 
     def test_invalid_probe_logs_error_once_with_key_length(
@@ -852,6 +857,7 @@ class TestOllamaCloudEngineGating:
         assert "talos-glm" in errors[0].message
         assert "talos-glm-flash" in errors[0].message
         assert "talos-deepseek" in errors[0].message
+        assert "talos-beam" in errors[0].message
         assert "claude-code-deepseek" in errors[0].message
 
     def test_unknown_probe_logs_warning_once(self, monkeypatch, caplog) -> None:

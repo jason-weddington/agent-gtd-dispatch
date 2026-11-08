@@ -641,6 +641,15 @@ TALOS_DEEPSEEK = Engine(
     build_command=_talos_build_command_stub,
 )
 
+TALOS_BEAM = Engine(
+    name="talos-beam",
+    binary="talos",
+    # ollama-cloud-routed: auth flows via env overlay (OLLAMA_API_KEY=cloud key)
+    auth_env_key="",
+    env_keys=frozenset(),
+    build_command=_talos_build_command_stub,
+)
+
 ENGINES: dict[str, Engine] = {
     "claude-code": CLAUDE,
     "kiro": KIRO,
@@ -656,6 +665,7 @@ ENGINES: dict[str, Engine] = {
     "talos-glm": TALOS_GLM,
     "talos-glm-flash": TALOS_GLM_FLASH,
     "talos-deepseek": TALOS_DEEPSEEK,
+    "talos-beam": TALOS_BEAM,
 }
 
 # Talos-family engine names. is_talos_engine is the canonical branch discriminator
@@ -688,6 +698,7 @@ _OLLAMA_CLOUD_ENGINE_NAMES: frozenset[str] = frozenset(
         "talos-glm",
         "talos-glm-flash",
         "talos-deepseek",
+        "talos-beam",
     }
 )
 

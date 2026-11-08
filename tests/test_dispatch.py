@@ -2648,7 +2648,11 @@ class TestClaudeDeepseekEngine:
         root = Path(__file__).parent.parent
 
         dispatch_env = (root / "templates" / "dispatch-env.tmpl").read_text()
-        assert "a single key powers FIVE cloud engines" in dispatch_env
+        assert "a single key powers SIX cloud engines" in dispatch_env
+        assert (
+            "#   talos-beam       (talos loop → beam:cloud, Ollama native /api/chat)"
+            in dispatch_env
+        )
         assert (
             "#   claude-code-deepseek  (Claude Code loop → "
             "deepseek-v4.1-flash:cloud, /v1/messages)" in dispatch_env
@@ -2656,6 +2660,11 @@ class TestClaudeDeepseekEngine:
 
         sudoers = (root / "templates" / "sudoers-dispatch-svc.tmpl").read_text()
         assert "CLAUDE_CODE_MODEL_CAPABILITIES" in sudoers
+        assert (
+            "# OLLAMA_MODEL             — talos-glm/qwen model pin (glm-5.3:cloud,"
+            " glm-5.3-flash:cloud, deepseek-v4.1-flash:cloud, beam:cloud,"
+            " qwen3.8:27b)." in sudoers
+        )
 
         setup_md = (root / "docs" / "setup.md").read_text()
         assert (
@@ -2678,9 +2687,16 @@ class TestClaudeDeepseekEngine:
 
         setup_sh = (root / "setup-dispatch-host.sh").read_text()
         assert (
-            "The GLM/DeepSeek cloud engines (talos-glm, claude-code-glm,"
-            " talos-glm-flash, talos-deepseek, claude-code-deepseek) will be"
-            in setup_sh
+            "The GLM/DeepSeek/Beam cloud engines (talos-glm, claude-code-glm,"
+            " talos-glm-flash, talos-deepseek, talos-beam, claude-code-deepseek)"
+            " will be" in setup_sh
+        )
+
+        install_md = (root / "docs" / "install.md").read_text()
+        assert (
+            "(`talos-haiku`, `talos-sonnet`, `talos-opus`, `talos-qwen`,"
+            " `talos-glm`, `talos-glm-flash`, `talos-deepseek`, `talos-beam`)"
+            in install_md
         )
 
         config_py = (root / "src" / "agent_gtd_dispatch" / "config.py").read_text()

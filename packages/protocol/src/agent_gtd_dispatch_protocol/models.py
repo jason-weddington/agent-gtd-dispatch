@@ -60,6 +60,7 @@ class BuildEngine(StrEnum):
     TALOS_GLM = "talos-glm"
     TALOS_GLM_FLASH = "talos-glm-flash"
     TALOS_DEEPSEEK = "talos-deepseek"
+    TALOS_BEAM = "talos-beam"
 
 
 class DispatchRequest(BaseModel):

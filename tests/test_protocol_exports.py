@@ -56,7 +56,11 @@ class TestProtocolExports:
             "talos-glm",
             "talos-glm-flash",
             "talos-deepseek",
+            "talos-beam",
         ]
         assert BuildEngine("claude-code-deepseek") is BuildEngine.CLAUDE_CODE_DEEPSEEK
         assert BuildEngine("talos-glm-flash") is BuildEngine.TALOS_GLM_FLASH
         assert BuildEngine("talos-deepseek") is BuildEngine.TALOS_DEEPSEEK
+        assert BuildEngine("talos-beam") is BuildEngine.TALOS_BEAM
+        assert [m.value for m in BuildEngine][-1] == "talos-beam"
+        assert [m.value for m in BuildEngine][-2] == "talos-deepseek"

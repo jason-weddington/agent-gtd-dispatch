@@ -85,6 +85,7 @@ class TestTalosEngineRoster:
             "talos-glm",
             "talos-glm-flash",
             "talos-deepseek",
+            "talos-beam",
         }
         assert frozenset(expected) == TALOS_ENGINES
         for name in expected:
@@ -101,7 +102,13 @@ class TestTalosEngineRoster:
     def test_talos_ollama_engines_have_empty_auth_env(self) -> None:
         from agent_gtd_dispatch.engines import get_engine
 
-        for name in ("talos-qwen", "talos-glm", "talos-glm-flash", "talos-deepseek"):
+        for name in (
+            "talos-qwen",
+            "talos-glm",
+            "talos-glm-flash",
+            "talos-deepseek",
+            "talos-beam",
+        ):
             assert get_engine(name).auth_env_key == ""
 
     def test_talos_build_command_raises_not_implemented(self) -> None:
@@ -124,6 +131,7 @@ class TestTalosEngineRoster:
         assert is_talos_engine("talos-glm")
         assert is_talos_engine("talos-glm-flash")
         assert is_talos_engine("talos-deepseek")
+        assert is_talos_engine("talos-beam")
         assert not is_talos_engine("claude-code")
         assert not is_talos_engine("claude-code-ollama")
         assert not is_talos_engine("")
@@ -286,6 +294,103 @@ class TestTalosEnvOverlay:
             == "deepseek-v4.1-flash:cloud"
         )
 
+    def test_beam_overlay_literal_exact_dict(self) -> None:
+        """talos-beam overlay is an exact-dict with beam:cloud + think=high."""
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        # KB config empty in the test env: the overlay must be EXACTLY the
+        # six cloud keys, no PERSONAL_KB_* keys.
+        overlay = talos_env_overlay("talos-beam")
+        assert overlay == {
+            "TALOS_BACKEND": "ollama",
+            "OLLAMA_MODEL": "beam:cloud",
+            "OLLAMA_BASE_URL": "https://ollama.com",
+            "OLLAMA_NUM_CTX": "1048576",
+            "OLLAMA_THINK": "high",
+            "OLLAMA_API_KEY": config.OLLAMA_CLOUD_API_KEY,
+        }
+        assert set(overlay) == {
+            "TALOS_BACKEND",
+            "OLLAMA_MODEL",
+            "OLLAMA_BASE_URL",
+            "OLLAMA_NUM_CTX",
+            "OLLAMA_THINK",
+            "OLLAMA_API_KEY",
+        }
+        assert overlay["OLLAMA_MODEL"] == "beam:cloud"
+        # No fallback to OLLAMA_API_KEY
+        assert overlay["OLLAMA_API_KEY"] != config.OLLAMA_API_KEY
+
+    def test_beam_model_ignores_cloud_model_override(self, monkeypatch) -> None:
+        # The model is a fixed literal; OLLAMA_CLOUD_MODEL steers
+        # claude-code-glm only and must not retarget talos-beam.
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_MODEL", "other-model:cloud")
+        assert talos_env_overlay("talos-beam")["OLLAMA_MODEL"] == "beam:cloud"
+
+    def test_beam_overlay_logs_one_info_record_without_key(
+        self, monkeypatch, caplog
+    ) -> None:
+        """Exactly one INFO record attests the beam pin per run; key value never logged."""
+        import logging
+
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.talos import talos_env_overlay
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud-secret")
+        with caplog.at_level(logging.INFO):
+            talos_env_overlay("talos-beam")
+        records = [
+            r
+            for r in caplog.records
+            if r.name == "agent_gtd_dispatch.talos" and r.levelno == logging.INFO
+        ]
+        assert len(records) == 1
+        message = records[0].message
+        assert "backend=ollama" in message
+        assert "model=beam:cloud" in message
+        assert "base_url=https://ollama.com" in message
+        assert "num_ctx=1048576" in message
+        assert "think=high" in message
+        assert "key_len=12" in message
+        assert "cloud-secret" not in caplog.text
+
+    def test_docstring_pins_name_beam_literals(self) -> None:
+        """The four fixed-literal bullets in talos_env_overlay.__doc__ name talos-beam."""
+        import inspect
+
+        from agent_gtd_dispatch import talos
+
+        doc = " ".join(inspect.getdoc(talos.talos_env_overlay).split())
+        assert (
+            "the talos-glm, talos-glm-flash, talos-deepseek and talos-beam"
+            " literals below stay fixed" in doc
+        )
+        assert (
+            "``1048576`` (1M) for talos-glm / talos-glm-flash / talos-deepseek"
+            " / talos-beam (glm-5.3:cloud / glm-5.3-flash:cloud /"
+            " deepseek-v4.1-flash:cloud are 1M-context models; beam:cloud is"
+            " pinned to the same window)" in doc
+        )
+        assert (
+            "``OLLAMA_BASE_URL='https://ollama.com'`` for talos-glm,"
+            " talos-glm-flash, talos-deepseek and talos-beam — glm-5.3:cloud,"
+            " glm-5.3-flash:cloud, deepseek-v4.1-flash:cloud and beam:cloud"
+            " live only on Ollama Cloud; no operator override" in doc
+        )
+        assert (
+            "``OLLAMA_THINK='high'`` for talos-glm (model=glm-5.3:cloud),"
+            " talos-glm-flash (model=glm-5.3-flash:cloud), talos-deepseek"
+            " (model=deepseek-v4.1-flash:cloud) and talos-beam"
+            " (model=beam:cloud) — PINNED at 'high' for all of them" in doc
+        )
+        # beam:cloud is documented as a PIN, not as a measured 1M-context model.
+        assert "beam:cloud are 1M-context" not in doc
+        assert "beam:cloud is a 1M-context" not in doc
+
     def test_glm_think_pinned_high(self) -> None:
         """OLLAMA_THINK='high' is pinned for BOTH glm engines — never unset."""
         from agent_gtd_dispatch.talos import talos_env_overlay
@@ -328,6 +433,7 @@ class TestTalosEnvOverlay:
             "talos-glm",
             "talos-glm-flash",
             "talos-deepseek",
+            "talos-beam",
         ):
             overlay = talos_env_overlay(name)
             for key in overlay:
@@ -343,6 +449,7 @@ class TestTalosEnvOverlay:
         monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "cloud-secret")
         assert talos_env_overlay("talos-glm")["OLLAMA_API_KEY"] == "cloud-secret"
         assert talos_env_overlay("talos-deepseek")["OLLAMA_API_KEY"] == "cloud-secret"
+        assert talos_env_overlay("talos-beam")["OLLAMA_API_KEY"] == "cloud-secret"
         assert talos_env_overlay("talos-qwen")["OLLAMA_API_KEY"] == "local-secret"
 
     def test_qwen_keep_alive_absent_when_empty(self, monkeypatch) -> None:
@@ -379,7 +486,7 @@ class TestTalosEnvOverlay:
         from agent_gtd_dispatch.talos import talos_env_overlay
 
         monkeypatch.setattr(config, "TALOS_QWEN_KEEP_ALIVE", "10m")
-        for name in ("talos-glm", "talos-glm-flash", "talos-sonnet"):
+        for name in ("talos-glm", "talos-glm-flash", "talos-sonnet", "talos-beam"):
             overlay = talos_env_overlay(name)
             assert "TALOS_OLLAMA_KEEP_ALIVE" not in overlay
             assert "OLLAMA_KEEP_ALIVE" not in overlay
@@ -637,6 +744,7 @@ class TestTalosAvailabilityGating:
             "talos-glm",
             "talos-glm-flash",
             "talos-deepseek",
+            "talos-beam",
         ):
             assert talos in names
 
@@ -662,6 +770,13 @@ class TestTalosAvailabilityGating:
 
         monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "")
         assert "talos-glm-flash" not in get_available_engine_names()
+
+    def test_talos_beam_absent_without_cloud_key(self, monkeypatch) -> None:
+        from agent_gtd_dispatch import config
+        from agent_gtd_dispatch.engines import get_available_engine_names
+
+        monkeypatch.setattr(config, "OLLAMA_CLOUD_API_KEY", "")
+        assert "talos-beam" not in get_available_engine_names()
 
     def test_talos_qwen_absent_without_base_url(self, monkeypatch) -> None:
         from agent_gtd_dispatch import config
