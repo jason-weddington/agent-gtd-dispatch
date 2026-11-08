@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.25.0 (2026-11-08)
+
+### Features
+
+- **986b93e9**: Dispatch: talos-beam engine (beam:cloud on Ollama cloud)
+  ([`222b6b7`](https://github.com/repos/agent-gtd-dispatch/commit/222b6b7288acc3199ab0752e24e944d64ca1d8a3))
+
+
 ## v2.24.1 (2026-11-08)
 
 ### Bug Fixes
