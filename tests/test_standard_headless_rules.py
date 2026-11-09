@@ -55,8 +55,21 @@ class TestSharedSection:
             "cannot install software or system packages",
             "commits on the remote branch",
             "Never push to or commit on the default branch",
+            "Never stop a process by pattern",
         ):
             assert phrase in s
+
+    @pytest.mark.parametrize("mode", ["build", "plan", "manage", "manage_ws", "review"])
+    def test_kill_guard_rule_in_every_mode(self, mode: str) -> None:
+        assert _prompts()[mode].count("- Never stop a process by pattern") == 1
+
+    def test_kill_guard_rule_is_the_last_base_bullet(self) -> None:
+        """Talos still ends on the git-commit bullet; everyone else on this one."""
+        lines = dispatch._standard_headless_rules("claude-code").splitlines()
+        assert lines[-1].startswith("- Never stop a process by pattern")
+        talos_lines = dispatch._standard_headless_rules("talos-sonnet").splitlines()
+        assert talos_lines[-1].startswith("- Never run `git commit`")
+        assert talos_lines[-2].startswith("- Never stop a process by pattern")
 
     def test_engine_agnostic_copy(self) -> None:
         for engine in (None, "talos-sonnet"):

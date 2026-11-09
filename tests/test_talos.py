@@ -116,7 +116,7 @@ class TestTalosEngineRoster:
 
         eng = get_engine("talos-haiku")
         with pytest.raises(NotImplementedError, match="talos"):
-            eng.build_command("prompt", "title", 10, None)
+            eng.build_command(None, "title", 10, None)
 
     def test_get_engine_unknown_talos_still_raises_value_error(self) -> None:
         from agent_gtd_dispatch.engines import get_engine
@@ -1892,6 +1892,74 @@ def _make_talos_run() -> tuple:
         "gate_command": "uv run pytest",
     }
     return run, engine, item, project
+
+
+class TestTalosPromptNeverInArgv:
+    """AC-7/AC-10(d): the TaskSpec goes on STDIN; the argv carries flags+PATH."""
+
+    async def _run(self, tmp_path, monkeypatch, *, rc: int = 10):
+        from agent_gtd_dispatch import config, db, gtd_client, main
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        monkeypatch.setattr(config, "TALOS_BIN", "talos")
+        run, engine, item, project = _make_talos_run()
+        item = {**item, "title": "TITLE-SENTINEL", "description": "DESC-SENTINEL"}
+        monkeypatch.setattr(db, "update_run", AsyncMock())
+        monkeypatch.setattr(gtd_client, "post_comment", AsyncMock())
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (b"", b"")
+        mock_proc.returncode = rc
+        mock_proc.poll.return_value = rc
+        with patch(
+            "agent_gtd_dispatch.main.subprocess.Popen", return_value=mock_proc
+        ) as mock_popen:
+            await main._run_talos(
+                run,
+                engine,
+                tmp_path,
+                item,
+                project,
+                timeout_seconds=600,
+                attribution=None,
+                register_cb=lambda _p: None,
+            )
+        return mock_popen, mock_proc
+
+    async def test_task_spec_on_stdin_and_never_in_the_argv(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import json as _json
+
+        mock_popen, mock_proc = await self._run(tmp_path, monkeypatch)
+        assert mock_popen.call_args.kwargs["stdin"] is subprocess.PIPE
+        argv = mock_popen.call_args.args[0]
+        assert not any("TITLE-SENTINEL" in a or "DESC-SENTINEL" in a for a in argv), (
+            argv
+        )
+        assert all(len(a) <= 512 for a in argv), [a for a in argv if len(a) > 512]
+        payload = mock_proc.communicate.call_args.kwargs["input"]
+        assert _json.loads(payload)["title"] == "TITLE-SENTINEL"
+        assert _json.loads(payload)["description"] == "DESC-SENTINEL"
+
+    async def test_argv_carries_the_guard_padded_path_once(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from agent_gtd_dispatch import engines
+
+        mock_popen, _proc = await self._run(tmp_path, monkeypatch)
+        argv = mock_popen.call_args.args[0]
+        guard = engines.agent_guard_bin_dir()
+        path_elements = [a for a in argv if a.startswith("PATH=")]
+        assert len(path_elements) == 1, path_elements
+        assert path_elements[0].startswith(f"PATH={guard}:"), path_elements[0]
+
+    def test_build_talos_argv_elements_are_all_short(self, tmp_path) -> None:
+        from agent_gtd_dispatch import talos as talos_mod
+
+        assert all(
+            len(a) <= 512
+            for a in talos_mod.build_talos_argv(tmp_path, "item-abc", 1, 600)
+        )
 
 
 class TestRunTalosWorkerBranch:

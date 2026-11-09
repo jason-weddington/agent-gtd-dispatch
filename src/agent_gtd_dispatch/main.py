@@ -44,7 +44,12 @@ from . import (
     talos,
 )
 from .agent_discovery import ENGINE_NAME, SERVICE_VERSION, run_list_agents_script
-from .completion import agent_output_summary
+from .completion import (
+    SIGNAL_NAMES,
+    agent_output_summary,
+    killed_by_signal,
+    signal_halt_text,
+)
 from .dispatch import (
     GATE_SUMMARY_UNAVAILABLE,
     LandGitError,
@@ -864,6 +869,10 @@ async def _run_talos(
     if attribution:
         env["AGENT_GTD_AGENT_NAME"] = attribution
     env["HEADLESS_BUILD_ENGINE"] = engine.name
+    # Prepend the kill-guard shim dir (and the agent bin dirs). The env dict
+    # carries it in single-user mode; the SAME value also rides in the argv
+    # below, because sudoers secure_path replaces the child's PATH.
+    env["PATH"] = engines.prepend_agent_bin_dirs(env.get("PATH", ""))
 
     argv = talos.build_talos_argv(
         workspace,
@@ -871,6 +880,7 @@ async def _run_talos(
         attempt=1,
         timeout_seconds=timeout_seconds,
         tmp_dir=tmp_dir,
+        path=env["PATH"],
     )
 
     stdout_text = ""
@@ -917,6 +927,7 @@ async def _run_talos(
                 context=f"run_id={run.id}",
                 marker=run_tmp.run_marker(tmp_dir),
             )
+            dispatch.log_guard_refusals(run.id, engine.name, tmp_dir)
 
     loop = asyncio.get_event_loop()
     try:
@@ -3438,14 +3449,27 @@ async def _launch_reviewer(
     verdict_blob, reason = dispatch.read_review_verdict(workspace.root)
 
     if verdict_blob is None:
-        detail = failure or f"verdict artifact {reason} (reviewer exit={exit_code})"
+        # A KILLED reviewer says nothing: when the harness dies on a signal it
+        # leaves at most a benign startup line in transcript.txt, so quoting
+        # that line as "agent said: ..." reports the wrong cause (a
+        # `--output-format json --print` run killed mid-flight looks exactly
+        # like `[claude-code:unrecognized_model]`).  Report the signal instead.
+        sig = killed_by_signal(exit_code)
+        detail = failure or (
+            f"verdict artifact {reason} (reviewer {signal_halt_text(sig)})"
+            if sig is not None
+            else f"verdict artifact {reason} (reviewer exit={exit_code})"
+        )
+        detail_source = "signal" if not failure and sig is not None else "plain"
         # Only when run_agent launched: it truncates transcript.txt on launch,
         # so before that the file still holds the PREVIOUS reviewer's output.
         # TimeoutExpired is raised only after the launch, so the file is ours.
-        if exit_code is not None or timed_out:
+        # Never on a signal path: a killed reviewer has no words of its own.
+        if sig is None and (exit_code is not None or timed_out):
             agent_said = agent_output_summary(Path(workspace.root) / "transcript.txt")
             if agent_said:
                 detail = f"{detail}; agent said: {agent_said}"
+                detail_source = "agent-said"
         suffix = f" | {reap_note}" if reap_note else ""
         if timed_out:
             await db.update_run(
@@ -3474,9 +3498,13 @@ async def _launch_reviewer(
         )
         logger.warning(
             "rollout-loop: reviewer run %s produced no usable verdict (%s) — "
-            "treating as halt",
+            "treating as halt exit_code=%s signal=%s signal_name=%s detail_source=%s",
             reviewer_run.id,
             reason,
+            exit_code,
+            "none" if sig is None else sig,
+            "none" if sig is None else SIGNAL_NAMES.get(sig, f"signal-{sig}"),
+            detail_source,
         )
         return ReviewVerdict(
             "halt",

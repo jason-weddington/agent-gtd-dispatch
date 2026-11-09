@@ -200,7 +200,12 @@ def agent_shell_env() -> dict[str, str]:
     helper `engines.build_env` uses (`engines.prepend_agent_bin_dirs`), so
     gate installs see the same `~/.local/bin` (uvx/MCP binaries) and
     `~/.cargo/bin` (rustup toolchain binaries) prefix the agent subprocess
-    itself gets.
+    itself gets, plus the kill-guard shim dir ahead of them.
+
+    The PATH computed here is ALSO carried in the argv by the caller
+    (:func:`run_as_agent` -> ``run_tmp.with_tmp_env``): sudo's ``secure_path``
+    replaces the child's env PATH, so the env dict alone does not reach the
+    child in the two-user split.
     """
     env = {k: v for k, v in os.environ.items() if k in GATE_ENV_KEYS}
     env["PATH"] = prepend_agent_bin_dirs(env.get("PATH", ""))
@@ -222,14 +227,17 @@ def run_as_agent(
     successful agent exit under the same sudo/env constraints.
 
     ``tmp_dir`` (the run's private TMPDIR) is prefixed via ``with_tmp_env``
-    inside the sudo wrap; None leaves the argv unchanged.
+    inside the sudo wrap; None leaves the argv unchanged.  The PATH from
+    :func:`agent_shell_env` rides in that same argv prefix, because sudo's
+    ``secure_path`` replaces the child's env PATH.
     """
     start = time.monotonic()
+    env = agent_shell_env()
     try:
         result = subprocess.run(
-            _sudo_wrap(with_tmp_env(argv, tmp_dir)),
+            _sudo_wrap(with_tmp_env(argv, tmp_dir, path=env["PATH"])),
             cwd=cwd,
-            env=agent_shell_env(),
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=timeout_seconds,

@@ -2337,6 +2337,53 @@ else
 fi
 
 # ===========================================================================
+# Step 4.12: Kill guard (agent user) — pkill/killall shims on the agent PATH
+#
+# Every build, gate and review run on one host runs as the SAME agent account,
+# so a pattern kill issued by any run (`pkill -f gate.sh`, `pkill -9 -f
+# selftest`, any killall) matches another run's processes: their argv carries
+# prompts, branch names and script names. On 2026-11-09 that killed two rollout
+# reviewers (exit 143 and -9) and five concurrent build gates.
+#
+# So the agent PATH gets a `pkill` and a `killall` that refuse EVERY invocation
+# with one line and exit 2. Numeric `kill <pid>` is untouched — an agent stops
+# what it started by recording `$!` or a pidfile.
+#
+# The directory is a SIBLING of ~/.local/bin, never inside it: sudo's
+# `secure_path` contains ~/.local/bin and is used for the WORKER's own
+# `sudo -n -u <agent> pkill -KILL -s <sid>`; a shim there would not be in the
+# sudoers NOPASSWD list, sudo would refuse, and every timeout/cancel would
+# signal only the sudo wrapper (kb-03965). The path is also carried in the
+# argv by run_tmp.with_tmp_env, because secure_path REPLACES the child PATH.
+#
+# Agent-owned and agent-writable on purpose: this is a habit guardrail, not an
+# integrity control (an agent that rewrites it is out of scope, exactly like
+# the absolute-path /usr/bin/pkill escape).
+# ===========================================================================
+echo ""
+echo "--- Step 4.12: Kill guard (agent user) ---"
+
+# Keep this literal in step with engines.AGENT_GUARD_BIN_RELPATH.
+AGENT_GUARD_RELPATH='.local/share/agent-gtd-dispatch/kill-guard'
+_kg_dir="${AGENT_HOME}/${AGENT_GUARD_RELPATH}"
+if [[ ! -f "${TMPL_DIR}/agent-gtd-kill-guard/pkill" || ! -f "${TMPL_DIR}/agent-gtd-kill-guard/killall" ]]; then
+    die "agent-gtd-kill-guard templates missing — this ships in the repo; its absence means a broken checkout"
+fi
+if $DRY_RUN; then
+    would "install -m 0755 -o ${AGENT_USER} -g ${AGENT_GROUP} ${TMPL_DIR}/agent-gtd-kill-guard/{pkill,killall} -> ${_kg_dir}"
+else
+    install -d -m 0755 -o "${AGENT_USER}" -g "${AGENT_GROUP}" "${_kg_dir}"
+    for _kg_name in pkill killall; do
+        if [[ -f "${_kg_dir}/${_kg_name}" ]] && cmp -s "${TMPL_DIR}/agent-gtd-kill-guard/${_kg_name}" "${_kg_dir}/${_kg_name}"; then
+            skip "${_kg_dir}/${_kg_name} already up to date"
+        else
+            install -m 0755 -o "${AGENT_USER}" -g "${AGENT_GROUP}" "${TMPL_DIR}/agent-gtd-kill-guard/${_kg_name}" "${_kg_dir}/${_kg_name}"
+            info "installed ${_kg_dir}/${_kg_name}"
+        fi
+    done
+fi
+
+# ===========================================================================
 # Step 5a: Claude symlink (must precede sudoers so the path exists when
 #           visudo validates the fragment)
 # ===========================================================================
@@ -2690,6 +2737,7 @@ echo "  Wheel index:  ${DISPATCH_WHEEL_INDEX}"
 echo "  Env file:     ${SERVICE_ENV}"
 echo "  Service:      ${SERVICE_NAME}  (port ${API_PORT})"
 echo "  Env freshness: ${ENV_FRESHNESS_STATE}"
+echo "  Kill guard:   ${AGENT_HOME}/${AGENT_GUARD_RELPATH} (pkill/killall shims)"
 if [[ ${#_tc_failed[@]} -gt 0 ]]; then
     echo "  Dev toolchain: INCOMPLETE — missing: ${_tc_failed[*]}"
 else

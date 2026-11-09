@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import json
 import logging
 import os
@@ -38,6 +39,8 @@ from .engines import (
 from .models import PushStatus, RepoPushStatus
 from .run_tmp import (
     RUN_MARKER_ENV,
+    count_guard_refusals,
+    guard_log_path,
     is_run_tmp_dir,
     live_paths,
     run_marker,
@@ -1379,8 +1382,9 @@ def run_gate_command(
         "timeout": _GATE_SHIM,
         "gtimeout": _GATE_SHIM_GTIMEOUT,
     }.get(tool or "", _GATE_SHIM_PYTHON_DEADLINE)
-    # ``tmp_dir`` (the run's private TMPDIR) rides in the argv via
-    # /usr/bin/env, inside the sudo wrap: sudo strips TMPDIR from the env.
+    # ``tmp_dir`` (the run's private TMPDIR) and the agent PATH (which carries
+    # the kill-guard shim dir) ride in the argv via /usr/bin/env, inside the
+    # sudo wrap: sudo strips TMPDIR from the env and secure_path replaces PATH.
     argv = _sudo_wrap(
         with_tmp_env(
             [
@@ -1393,6 +1397,7 @@ def run_gate_command(
                 gate_command,
             ],
             tmp_dir,
+            path=env.get("PATH", ""),
         )
     )
 
@@ -1493,6 +1498,7 @@ def run_gate_command(
                 context=log_context,
                 marker=run_marker(tmp_dir),
             )
+            log_guard_refusals(log_context, engine.name, tmp_dir)
 
 
 def _detect_default_branch(repo_path: Path) -> str:
@@ -3211,6 +3217,10 @@ def _standard_headless_rules(engine_name: str | None = None) -> str:
         "your own work changes it.",
         "- Never push to or commit on the default branch, except through a merge "
         "procedure this prompt explicitly gives you.",
+        "- Never stop a process by pattern (pkill, killall, pgrep -f): every run "
+        "on this host shares one account, so a pattern can match another run's "
+        "processes. To stop a background command you started, record its PID "
+        "($!) and kill that PID.",
     ]
     if engine_name and is_talos_engine(engine_name):
         lines.append(
@@ -4344,6 +4354,125 @@ def _write_default_branches(root: Path, branches: dict[str, str]) -> None:
         (root / DEFAULT_BRANCHES_RELPATH).write_text(payload)
     except OSError:
         logger.warning("could not write default-branch record under %s", root)
+
+
+# A single argv element longer than this is a prompt/argument blob in disguise:
+# on a shared dispatch account any run can read another run's
+# /proc/<pid>/cmdline, and a pattern pkill/pgrep then matches it.
+ARGV_ELEMENT_MAX_BYTES: int = 4096
+# How much of an offending argv element to quote in the error log.
+_OFFENDING_ARGV_EXCERPT: int = 80
+
+
+def write_agent_text_file(path: Path, text: str) -> None:
+    """Write *text* to *path* as the agent user, mode 0600, byte-exact.
+
+    In the two-user split the write goes through ``_sudo_wrap`` so the file is
+    OWNED by the agent user, who must be able to read it (and, for a run tmp
+    dir, rewrite or delete it).  ``/bin/bash`` with ``umask 077`` and
+    ``cat > "$1"`` creates the file with exactly the given bytes and mode 0600
+    in one hop; ``/bin/bash`` is already in the sudoers NOPASSWD list, so no
+    new privilege entry is needed.  In single-user mode the file is owned by
+    the INVOKING account — also mode 0600, and readable by the process the
+    engine runs as because that process is that account.
+
+    No trailing newline is added: the bytes written are exactly
+    ``text.encode('utf-8')``.
+    """
+    if config.AGENT_SUBPROCESS_USER:
+        subprocess.run(
+            _sudo_wrap(
+                [
+                    "/bin/bash",
+                    "-c",
+                    'umask 077; cat > "$1"',
+                    "agent-gtd-write-prompt",
+                    str(path),
+                ]
+            ),
+            input=text.encode("utf-8"),
+            check=True,
+            capture_output=True,
+        )
+        return
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o600)
+
+
+def _assert_no_prompt_in_argv(
+    cmd: list[str],
+    system_prompt: str,
+    prompt_path: Path,
+    *,
+    run_id: str = "",
+    engine: str = "",
+    verify_prompt_file: bool = False,
+) -> None:
+    """Raise before spawning when the argv still carries prompt text.
+
+    Three independent failures, one mechanism: every run on a dispatch host
+    shares one account, so anything in ``/proc/<pid>/cmdline`` — a 15-30 KB
+    system prompt most of all — is visible to, and matchable by, every other
+    run's pattern ``pkill``/``pgrep``.  The prompt therefore travels in a file
+    and this guard makes the invariant structural rather than a convention.
+    """
+    offending: str | None = None
+    if "--system-prompt" in cmd:
+        offending = "--system-prompt"
+    else:
+        prompt_bytes = system_prompt.encode("utf-8")
+        for arg in cmd:
+            if (
+                arg == system_prompt
+                or len(arg.encode("utf-8")) > ARGV_ELEMENT_MAX_BYTES
+            ):
+                offending = arg[:_OFFENDING_ARGV_EXCERPT]
+                break
+        if offending is None and verify_prompt_file:
+            try:
+                size = prompt_path.stat().st_size
+            except OSError:
+                size = -1
+            if size != len(prompt_bytes):
+                offending = f"prompt file {prompt_path} size={size}"
+    if offending is not None:
+        logger.error(
+            "agent argv invariant violated run_id=%s engine=%s offending=%r",
+            run_id,
+            engine,
+            offending,
+        )
+        msg = (
+            "agent argv would carry the system prompt: "
+            f"offending={offending!r} (it must travel in a file, not in argv)"
+        )
+        raise ValueError(msg)
+
+
+def log_guard_refusals(label: str, engine_name: str, tmp_dir: Path | None) -> None:
+    """Log how many pattern kills a run's kill-guard shims refused.
+
+    One line, after the process is reaped: a refusal is evidence an agent tried
+    a pattern kill, which is exactly the mistake this guard exists to record.
+    """
+    n = count_guard_refusals(tmp_dir)
+    path = guard_log_path(tmp_dir) if tmp_dir is not None else None
+    if n > 0:
+        logger.warning(
+            "kill-guard: run_id=%s engine=%s refused_count=%d log=%s",
+            label,
+            engine_name,
+            n,
+            path,
+        )
+    else:
+        logger.debug(
+            "kill-guard: run_id=%s engine=%s refused_count=%d log=%s",
+            label,
+            engine_name,
+            n,
+            path,
+        )
 
 
 def prepare_rollout_workspace(
@@ -6757,7 +6886,13 @@ async def run_agent(
 
     ``tmp_dir`` is the run's private TMPDIR (see ``run_tmp``); it is passed
     as ``/usr/bin/env TMPDIR=.. TMP=.. TEMP=..`` in the argv, inside the sudo
-    wrap.  None leaves the argv exactly as before.
+    wrap, together with the agent PATH (which carries the kill-guard shims).
+    None leaves the argv without those tmp assignments.
+
+    The system prompt never travels in argv: it is written to
+    ``<tmp_dir>/system_prompt.txt`` (or ``<workspace>/.dispatch/system_prompt.txt``
+    when no tmp dir was allocated) and the harness is handed that PATH.  See
+    :func:`write_agent_text_file` and :func:`_assert_no_prompt_in_argv`.
 
     ``executor`` picks the thread pool the blocking subprocess wait runs on;
     None means the shared ``_executor``.  Rollout-loop reviewers pass
@@ -6782,7 +6917,26 @@ async def run_agent(
         (workspace / "system_prompt.md").write_text(
             f"{system_prompt}\n\n---\n\n## Task\n\n{title}"
         )
-    cmd = engine.build_command(system_prompt, title, max_turns, agent_name)
+    # The prompt travels in a file, NEVER in argv: every run on a host shares
+    # one account, so prompt text in /proc/<pid>/cmdline is readable by — and
+    # matchable by a pattern pkill/pgrep from — every other run.
+    prompt_path = (
+        tmp_dir if tmp_dir is not None else workspace / ".dispatch"
+    ) / "system_prompt.txt"
+    if engine.is_claude_code_family:
+        if tmp_dir is None:
+            # ``.dispatch/`` must be owned by the agent user, exactly as in
+            # _write_default_branches: the agent writes its verdict there.
+            if config.AGENT_SUBPROCESS_USER:
+                subprocess.run(
+                    _sudo_wrap(["mkdir", "-p", str(prompt_path.parent)]),
+                    check=False,
+                    capture_output=True,
+                )
+            else:
+                prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        write_agent_text_file(prompt_path, system_prompt)
+    cmd = engine.build_command(prompt_path, title, max_turns, agent_name)
     if allowed_tools is not None and engine.name == "claude-code":
         # Insert --allowedTools BEFORE --print.  claude's argparser breaks
         # when --allowedTools sits between --print and the positional prompt
@@ -6811,9 +6965,10 @@ async def run_agent(
     # (model literal, base URL host, capability override). Never log the key
     # value — only its host. Engines whose argv has no --model (kiro) log
     # model=default.
+    prompt_bytes = system_prompt.encode("utf-8")
     logger.info(
         "agent spawn run_id=%s engine=%s model=%s base_url_host=%s capability_override=%s"
-        " timeout_s=%d bash_limit_ms=%s",
+        " timeout_s=%d bash_limit_ms=%s prompt_path=%s prompt_bytes=%d prompt_sha256=%s",
         run_id,
         engine.name,
         next(
@@ -6824,9 +6979,14 @@ async def run_agent(
         env.get("CLAUDE_CODE_MODEL_CAPABILITIES", "absent"),
         timeout_seconds,
         env.get("BASH_MAX_TIMEOUT_MS", "absent"),
+        prompt_path,
+        len(prompt_bytes),
+        hashlib.sha256(prompt_bytes).hexdigest(),
     )
 
-    cmd = _sudo_wrap(with_tmp_env(cmd, tmp_dir))
+    # The agent PATH rides INSIDE the sudo wrap: sudoers secure_path replaces
+    # the child's PATH, so the env dict alone cannot deliver the kill-guard dir.
+    cmd = _sudo_wrap(with_tmp_env(cmd, tmp_dir, path=env["PATH"]))
     transcript_path = workspace / "transcript.txt"
     # Exclude transcript.txt, .dispatch/ and this run's staged attachments
     # BEFORE the subprocess starts — the agent is never asked not to commit
@@ -6834,6 +6994,15 @@ async def run_agent(
     _setup_git_exclude(workspace, [attachments_exclude_line(run_id)] if run_id else [])
 
     def _stream() -> subprocess.CompletedProcess[str]:
+        # Immediately before the spawn, assert the argv carries no prompt text.
+        _assert_no_prompt_in_argv(
+            cmd,
+            system_prompt,
+            prompt_path,
+            run_id=run_id,
+            engine=engine.name,
+            verify_prompt_file=engine.is_claude_code_family,
+        )
         with transcript_path.open("wb") as f:
             proc = subprocess.Popen(
                 cmd,
@@ -6869,6 +7038,7 @@ async def run_agent(
                     context=log_context or (f"run_id={run_id}" if run_id else ""),
                     marker=run_marker(tmp_dir),
                 )
+                log_guard_refusals(log_context or run_id, engine.name, tmp_dir)
         return subprocess.CompletedProcess(cmd, proc.returncode, stdout="", stderr="")
 
     loop = asyncio.get_event_loop()

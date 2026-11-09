@@ -230,6 +230,7 @@ class TestAgentShellEnv:
         with patch("agent_gtd_dispatch.gates.pwd.getpwnam", return_value=mock_pw):
             env = agent_shell_env()
         assert env["PATH"].startswith(
+            "/home/dispatch/.local/share/agent-gtd-dispatch/kill-guard:"
             "/home/dispatch/.local/bin:/home/dispatch/.cargo/bin:"
         )
 
@@ -237,7 +238,9 @@ class TestAgentShellEnv:
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
         monkeypatch.delenv("PATH", raising=False)
         env = agent_shell_env()
-        expected_prefix = str(Path.home() / ".local" / "bin")
+        expected_prefix = str(
+            Path.home() / ".local" / "share" / "agent-gtd-dispatch" / "kill-guard"
+        )
         assert env["PATH"].startswith(expected_prefix)
 
 
@@ -309,6 +312,9 @@ class TestRunAsAgent:
         ) as mock_run:
             run_as_agent(argv, tmp_path, 30)
         called_argv = mock_run.call_args.args[0]
+        env = mock_run.call_args.kwargs["env"]
+        # The agent PATH (kill-guard shim dir first) rides in the argv INSIDE
+        # the sudo wrap, because sudoers secure_path replaces the child's PATH.
         assert called_argv == [
             "sudo",
             "-u",
@@ -318,8 +324,14 @@ class TestRunAsAgent:
             "-c",
             'umask 0002; exec "$@"',
             "agent-gtd-umask",
+            "/usr/bin/env",
+            f"PATH={env['PATH']}",
             *argv,
         ]
+        assert called_argv[9].startswith(
+            "PATH=/home/dispatch/.local/share/agent-gtd-dispatch/kill-guard:"
+        )
+        assert sum(1 for a in called_argv if a.startswith("PATH=")) == 1
         assert mock_run.call_args.kwargs["cwd"] == tmp_path
 
     def test_no_sudo_wrap_when_subprocess_user_unset(
@@ -332,7 +344,15 @@ class TestRunAsAgent:
         ) as mock_run:
             run_as_agent(["git", "config", "core.hooksPath", ".husky"], tmp_path, 30)
         called_argv = mock_run.call_args.args[0]
-        assert called_argv == ["git", "config", "core.hooksPath", ".husky"]
+        env = mock_run.call_args.kwargs["env"]
+        assert called_argv == [
+            "/usr/bin/env",
+            f"PATH={env['PATH']}",
+            "git",
+            "config",
+            "core.hooksPath",
+            ".husky",
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -676,7 +696,9 @@ class TestRunGateStepsEnv:
                 "DISPATCH_API_KEY",
             ):
                 assert secret not in env
-            assert env["PATH"].startswith("/home/dispatch/.local/bin:")
+            assert env["PATH"].startswith(
+                "/home/dispatch/.local/share/agent-gtd-dispatch/kill-guard:"
+            )
 
 
 # ---------------------------------------------------------------------------

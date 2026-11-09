@@ -132,7 +132,7 @@ deploy_one() {
     local _stage
     _stage=$(ssh "${host}" mktemp -d) || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
     [[ "$_stage" == /tmp/* ]] || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
-    scp -q "${SCRIPT_DIR}/scripts/sudoers-refresh.sh" "${SCRIPT_DIR}/scripts/kb-mcp-refresh.sh" "${SCRIPT_DIR}/templates/mcp-probe.py" "${SCRIPT_DIR}/templates/sudoers-dispatch-svc.tmpl" "${SCRIPT_DIR}/templates/personal-kb-hook-settings.py" "${host}:${_stage}/" || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
+    scp -q "${SCRIPT_DIR}/scripts/sudoers-refresh.sh" "${SCRIPT_DIR}/scripts/kb-mcp-refresh.sh" "${SCRIPT_DIR}/templates/mcp-probe.py" "${SCRIPT_DIR}/templates/sudoers-dispatch-svc.tmpl" "${SCRIPT_DIR}/templates/personal-kb-hook-settings.py" "${SCRIPT_DIR}/templates/agent-gtd-kill-guard/pkill" "${SCRIPT_DIR}/templates/agent-gtd-kill-guard/killall" "${host}:${_stage}/" || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
 
     ssh "${host}" bash -s <<EOF
 set -euo pipefail
@@ -492,6 +492,27 @@ elif sudo python3 "${_stage}/personal-kb-hook-settings.py" "\$_kb_settings" /hom
     echo "[OK]   personal-kb-hook wiring: 7 events"
 else
     echo "[WARN] personal-kb-hook wiring skipped: merge into \$_kb_settings failed — settings.json left unchanged" >&2
+fi
+
+# Kill guard (setup-dispatch-host.sh Step 4.12): refresh the pkill/killall shims
+# so a host on the routine channel is not left unguarded between provisionings.
+# deploy.sh has no AGENT_GROUP, so the agent user's primary group is derived on
+# the host. Non-fatal throughout: a failed refresh prints a WARN naming the
+# setup step to re-run and the deploy continues.
+_kg_dir="/home/${AGENT_USER}/.local/share/agent-gtd-dispatch/kill-guard"
+_kg_grp="\$(id -gn ${AGENT_USER} 2>/dev/null || echo ${AGENT_USER})"
+if sudo install -d -m 0755 -o ${AGENT_USER} -g "\$_kg_grp" "\$_kg_dir"; then
+    for _kg in pkill killall; do
+        if sudo cmp -s "${_stage}/\$_kg" "\$_kg_dir/\$_kg" 2>/dev/null; then
+            echo "[SKIP] kill guard: \$_kg_dir/\$_kg already up to date"
+        elif sudo install -m 0755 -o ${AGENT_USER} -g "\$_kg_grp" "${_stage}/\$_kg" "\$_kg_dir/\$_kg"; then
+            echo "[OK]   kill guard: installed \$_kg_dir/\$_kg"
+        else
+            echo "[WARN] kill guard: could not install \$_kg_dir/\$_kg — run 'sudo ./setup-dispatch-host.sh' (Step 4.12)" >&2
+        fi
+    done
+else
+    echo "[WARN] kill guard: could not create \$_kg_dir — run 'sudo ./setup-dispatch-host.sh' (Step 4.12)" >&2
 fi
 rm -rf "${_stage}"
 

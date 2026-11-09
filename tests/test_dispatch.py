@@ -50,9 +50,14 @@ from agent_gtd_dispatch.engines import (
     _build_claude_deepseek_command,
     _claude_deepseek_extra_env,
     _claude_glm_extra_env,
+    agent_guard_bin_dir,
+    agent_home,
+    agent_local_bin_dirs,
+    agent_path_prefix_dirs,
     build_env,
     claude_bash_limit_ms,
     get_engine,
+    prepend_agent_bin_dirs,
 )
 from agent_gtd_dispatch.models import (
     DispatchMode,
@@ -68,6 +73,10 @@ from tests.completion_fixtures import (
     write_envelope,
 )
 from tests.worker_mocks import stub_rescue
+
+# A prompt-file PATH used by the builders under test. It is never created: the
+# builders only embed it in argv, so a literal path is exactly what is needed.
+PROMPT_PATH = Path("/tmp/rt-x/system_prompt.txt")  # noqa: S108 — never created
 
 
 def _dispatch_sudo_available() -> bool:
@@ -199,10 +208,17 @@ class TestGetEngine:
 
 class TestClaudeCommand:
     def test_basic(self) -> None:
-        cmd = CLAUDE.build_command("sys prompt", "Fix bug", 20, None)
+        prompt_path = PROMPT_PATH
+        cmd = CLAUDE.build_command(prompt_path, "Fix bug", 20, None)
         assert cmd[0] == "claude"
         assert "--dangerously-skip-permissions" in cmd
-        assert "--system-prompt" in cmd
+        # Whole-element equality only: "--system-prompt-file" CONTAINS
+        # "--system-prompt" as a substring, so an `in` test would be wrong.
+        assert "--system-prompt" not in cmd
+        assert cmd.count("--system-prompt-file") == 1
+        idx = cmd.index("--system-prompt-file")
+        assert cmd[idx + 1] == str(prompt_path)
+        assert all(len(a) <= 4096 for a in cmd)
         assert "--max-turns" in cmd
         assert "20" in cmd
         assert "--print" in cmd
@@ -212,19 +228,63 @@ class TestClaudeCommand:
         assert "--agent" not in cmd
 
     def test_with_agent(self) -> None:
-        cmd = CLAUDE.build_command("sys prompt", "Fix bug", 20, "my-agent")
+        cmd = CLAUDE.build_command(PROMPT_PATH, "Fix bug", 20, "my-agent")
         idx = cmd.index("--agent")
         assert cmd[idx + 1] == "my-agent"
 
     def test_model_is_opus(self) -> None:
-        cmd = CLAUDE.build_command("sys prompt", "Fix bug", 20, None)
+        cmd = CLAUDE.build_command(PROMPT_PATH, "Fix bug", 20, None)
         assert cmd[1] == "--model"
         assert cmd[2] == "opus"
+
+    def test_none_prompt_path_raises(self) -> None:
+        with pytest.raises(ValueError, match="prompt_path is required"):
+            CLAUDE.build_command(None, "T", 5, None)
+
+
+class TestPromptPathIsTheFirstArgument:
+    """AC-1/AC-2: every claude-family builder takes a PATH, never the prompt."""
+
+    def test_every_claude_family_engine_emits_system_prompt_file(self) -> None:
+        claude_engines = {
+            name for name, eng in ENGINES.items() if eng.binary == "claude"
+        }
+        assert claude_engines == {
+            "claude-code",
+            "claude-code-ollama",
+            "claude-code-glm",
+            "claude-code-deepseek",
+            "claude-code-sonnet",
+            "claude-code-haiku",
+        }
+        for name in sorted(claude_engines):
+            cmd = get_engine(name).build_command(PROMPT_PATH, "Title", 20, None)
+            assert cmd.count("--system-prompt-file") == 1, name
+            assert cmd[cmd.index("--system-prompt-file") + 1] == str(PROMPT_PATH), name
+            assert "--system-prompt" not in cmd, name
+            assert all(len(a) <= 4096 for a in cmd), name
+
+    def test_every_claude_family_engine_requires_a_path(self) -> None:
+        claude_engines = [
+            name for name, eng in ENGINES.items() if eng.binary == "claude"
+        ]
+        assert len(claude_engines) == 6
+        for name in sorted(claude_engines):
+            with pytest.raises(ValueError, match="prompt_path is required"):
+                get_engine(name).build_command(None, "T", 5, None)
+
+    def test_kiro_accepts_and_ignores_the_path(self) -> None:
+        cmd = KIRO.build_command(PROMPT_PATH, "T", 5, None)
+        assert isinstance(cmd, list)
+        assert cmd[-1] == (
+            "Use the read tool to open system_prompt.md in this directory, "
+            "then follow every instruction inside it."
+        )
 
 
 class TestKiroCommand:
     def test_basic(self) -> None:
-        cmd = KIRO.build_command("sys prompt", "Fix bug", 20, None)
+        cmd = KIRO.build_command(PROMPT_PATH, "Fix bug", 20, None)
         assert cmd[0] == "kiro-cli"
         assert "chat" in cmd
         assert "--no-interactive" in cmd
@@ -237,7 +297,7 @@ class TestKiroCommand:
         )
 
     def test_with_agent(self) -> None:
-        cmd = KIRO.build_command("sys prompt", "Fix bug", 20, "my-agent")
+        cmd = KIRO.build_command(PROMPT_PATH, "Fix bug", 20, "my-agent")
         idx = cmd.index("--agent")
         assert cmd[idx + 1] == "my-agent"
 
@@ -353,13 +413,19 @@ class TestBuildEnv:
         mock_pw.pw_dir = "/home/dispatch"
         with patch("pwd.getpwnam", return_value=mock_pw):
             env = build_env(CLAUDE)
-        assert env["PATH"].startswith("/home/dispatch/.local/bin:")
+        # The kill-guard shim dir comes FIRST, then ~/.local/bin, then .cargo/bin.
+        assert env["PATH"].startswith(
+            "/home/dispatch/.local/share/agent-gtd-dispatch/kill-guard:/home/dispatch/.local/bin:"
+        )
 
     def test_path_fallback_when_user_unset(self, monkeypatch) -> None:
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
         env = build_env(CLAUDE)
-        expected_prefix = str(Path.home() / ".local" / "bin") + ":"
+        expected_prefix = (
+            str(Path.home() / ".local" / "share" / "agent-gtd-dispatch" / "kill-guard")
+            + ":"
+        )
         assert env["PATH"].startswith(expected_prefix)
 
     def test_path_fallback_when_user_not_found_keyerror(self, monkeypatch) -> None:
@@ -367,7 +433,10 @@ class TestBuildEnv:
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
         with patch("pwd.getpwnam", side_effect=KeyError):
             env = build_env(CLAUDE)
-        expected_prefix = str(Path.home() / ".local" / "bin") + ":"
+        expected_prefix = (
+            str(Path.home() / ".local" / "share" / "agent-gtd-dispatch" / "kill-guard")
+            + ":"
+        )
         assert env["PATH"].startswith(expected_prefix)
 
     def test_path_no_duplication_when_already_present(self, monkeypatch) -> None:
@@ -386,6 +455,7 @@ class TestBuildEnv:
         with patch("pwd.getpwnam", return_value=mock_pw):
             env = build_env(CLAUDE)
         assert env["PATH"].startswith(
+            "/home/dispatch/.local/share/agent-gtd-dispatch/kill-guard:"
             "/home/dispatch/.local/bin:/home/dispatch/.cargo/bin:"
         )
 
@@ -403,6 +473,42 @@ class TestBuildEnv:
         parts = env["PATH"].split(":")
         assert parts.count(cargo_bin) == 1
         assert parts.count(local_bin) == 1
+
+    @pytest.mark.sudo_integration
+    def test_sudo_wrap_path_carries_guard_dir_real_sudo(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Real sudo to the agent user: the guard dir must reach the child.
+
+        THE ONLY test that fails if the argv carrier regresses.  Unlike
+        ``~/.local/bin``, the kill-guard dir is in neither the sudoers
+        ``secure_path`` nor ``env_keep``, so it can appear in the child's PATH
+        ONLY if it was carried in the argv inside the sudo wrap.
+        """
+        if not _dispatch_sudo_available():
+            pytest.skip(
+                f"sudo -n -u dispatch true not permitted for {getpass.getuser()}; "
+                "run as the dispatch service user"
+            )
+        from agent_gtd_dispatch import run_tmp as run_tmp_mod
+        from agent_gtd_dispatch.dispatch import _sudo_wrap
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        guard = agent_guard_bin_dir()
+        result = subprocess.run(
+            _sudo_wrap(
+                run_tmp_mod.with_tmp_env(
+                    ["/bin/bash", "-c", 'printf %s "$PATH"'],
+                    None,
+                    path=f"{guard}:/usr/bin:/bin",
+                )
+            ),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert result.stdout.startswith(str(guard) + ":"), result.stdout
 
     def test_git_identity_reflects_engine_name_claude(self, monkeypatch) -> None:
         """Git identity env vars should reflect the engine being used (AC3)."""
@@ -595,7 +701,7 @@ class TestBuildEnv:
 
     @staticmethod
     def _stub_build_command(
-        system_prompt: str, title: str, max_turns: int, agent_name: str | None
+        prompt_path: Path | None, title: str, max_turns: int, agent_name: str | None
     ) -> list[str]:
         return []
 
@@ -1039,7 +1145,9 @@ class TestRunAgent:
             mock_popen.return_value = mock_proc
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
             args, _kwargs = mock_popen.call_args
-            assert args[0][0] == "claude"
+            # The env prefix (PATH first) rides in the argv even with no sudo hop.
+            assert args[0][0] == "/usr/bin/env"
+            assert args[0][2] == "claude"
             assert "--dangerously-skip-permissions" in args[0]
 
     @pytest.mark.parametrize(
@@ -1471,13 +1579,24 @@ class TestSudoWrapping:
     ) -> None:
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        # The prompt write is sudo-wrapped in two-user mode; patch it so this
+        # test exercises ONLY the argv shape (AC-4 covers the write itself).
+        monkeypatch.setattr(
+            dispatch,
+            "write_agent_text_file",
+            lambda path, text: Path(path).write_text(text),
+        )
         mock_proc = _make_mock_proc(0)
         with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
             mock_popen.return_value = mock_proc
-            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
+            await run_agent(CLAUDE, tmp_path, "sys", "Title", 20, tmp_dir=tmp_path)
             args, _kwargs = mock_popen.call_args
             cmd = args[0]
             assert cmd[:4] == ["sudo", "-u", "dispatch", "-H"]
+            # PATH rides INSIDE the sudo wrap, ahead of the tmp assignments.
+            assert cmd[8] == "/usr/bin/env"
+            assert cmd[9].startswith("PATH=" + str(agent_guard_bin_dir()) + ":")
+            assert sum(1 for a in cmd if a.startswith("PATH=")) == 1
 
     async def test_run_agent_no_sudo_prefix_when_user_empty(
         self, tmp_path, monkeypatch
@@ -1490,7 +1609,8 @@ class TestSudoWrapping:
             await run_agent(CLAUDE, tmp_path, "sys", "Title", 20)
             args, _kwargs = mock_popen.call_args
             cmd = args[0]
-            assert cmd[0] == "claude"
+            assert cmd[0] == "/usr/bin/env"
+            assert cmd[2] == "claude"
 
     def test_prepare_workspace_sudo_prefix_when_user_set(
         self, tmp_path, monkeypatch
@@ -1535,7 +1655,11 @@ class TestSudoWrapping:
             mock_pw.pw_dir = "/home/dispatch"
             with patch("pwd.getpwnam", return_value=mock_pw):
                 path = build_env(CLAUDE)["PATH"]
-            assert path.split(":")[0] == "/home/dispatch/.local/bin"
+            assert (
+                path.split(":")[0]
+                == "/home/dispatch/.local/share/agent-gtd-dispatch/kill-guard"
+            )
+            assert path.split(":")[1] == "/home/dispatch/.local/bin"
             tmpl = (
                 Path(__file__).parent.parent / "templates" / "sudoers-dispatch-svc.tmpl"
             )
@@ -2480,7 +2604,7 @@ class TestClaudeOllamaEngine:
 
     def test_command_builder_same_structure_as_claude(self, monkeypatch) -> None:
         monkeypatch.setattr(config, "OLLAMA_DEFAULT_MODEL", "qwen3.5:35b")
-        cmd = CLAUDE_OLLAMA.build_command("sys", "Fix bug", 20, None)
+        cmd = CLAUDE_OLLAMA.build_command(PROMPT_PATH, "Fix bug", 20, None)
         assert cmd[0] == "claude"
         assert "--model" in cmd
         assert cmd[cmd.index("--model") + 1] == "qwen3.5:35b"
@@ -2491,7 +2615,7 @@ class TestClaudeOllamaEngine:
         assert cmd[-1] == "Fix bug"
 
     def test_vanilla_claude_command_uses_opus_model(self) -> None:
-        cmd = CLAUDE.build_command("sys", "Fix bug", 20, None)
+        cmd = CLAUDE.build_command(PROMPT_PATH, "Fix bug", 20, None)
         assert "--model" in cmd
         assert cmd[cmd.index("--model") + 1] == "opus"
 
@@ -2517,7 +2641,8 @@ class TestClaudeDeepseekEngine:
         assert "claude-code-deepseek" in engines_mod._OLLAMA_CLOUD_ENGINE_NAMES
 
     def test_argv_without_agent(self) -> None:
-        cmd = _build_claude_deepseek_command("sys", "Title", 20, None)
+        prompt_path = PROMPT_PATH
+        cmd = _build_claude_deepseek_command(prompt_path, "Title", 20, None)
         assert cmd == [
             "claude",
             "--model",
@@ -2525,8 +2650,8 @@ class TestClaudeDeepseekEngine:
             "--dangerously-skip-permissions",
             "--max-turns",
             "20",
-            "--system-prompt",
-            "sys",
+            "--system-prompt-file",
+            str(prompt_path),
             "--output-format",
             "json",
             "--print",
@@ -2534,7 +2659,8 @@ class TestClaudeDeepseekEngine:
         ]
 
     def test_argv_with_agent(self) -> None:
-        cmd = _build_claude_deepseek_command("sys", "Title", 20, "rev")
+        prompt_path = PROMPT_PATH
+        cmd = _build_claude_deepseek_command(prompt_path, "Title", 20, "rev")
         assert cmd == [
             "claude",
             "--model",
@@ -2542,8 +2668,8 @@ class TestClaudeDeepseekEngine:
             "--dangerously-skip-permissions",
             "--max-turns",
             "20",
-            "--system-prompt",
-            "sys",
+            "--system-prompt-file",
+            str(prompt_path),
             "--output-format",
             "json",
             "--print",
@@ -2556,10 +2682,10 @@ class TestClaudeDeepseekEngine:
         """The model is the PINNED literal — never config.OLLAMA_CLOUD_MODEL
         (that variable is the GLM model)."""
         monkeypatch.setattr(config, "OLLAMA_CLOUD_MODEL", "glm-5.3:cloud")
-        cmd = CLAUDE_DEEPSEEK.build_command("sys", "Title", 20, None)
+        cmd = CLAUDE_DEEPSEEK.build_command(PROMPT_PATH, "Title", 20, None)
         assert cmd[cmd.index("--model") + 1] == "deepseek-v4.1-flash:cloud"
         monkeypatch.setattr(config, "OLLAMA_CLOUD_MODEL", "other-model:cloud")
-        cmd = CLAUDE_DEEPSEEK.build_command("sys", "Title", 20, None)
+        cmd = CLAUDE_DEEPSEEK.build_command(PROMPT_PATH, "Title", 20, None)
         assert cmd[cmd.index("--model") + 1] == "deepseek-v4.1-flash:cloud"
 
     def test_extra_env_exact_dict_cloud_key_not_local(self, monkeypatch) -> None:
@@ -2630,7 +2756,7 @@ class TestClaudeDeepseekEngine:
     def test_glm_model_follows_cloud_model_config(self, monkeypatch) -> None:
         """Unlike deepseek, glm's --model follows config.OLLAMA_CLOUD_MODEL."""
         monkeypatch.setattr(config, "OLLAMA_CLOUD_MODEL", "glm-5.3:cloud")
-        cmd = CLAUDE_GLM.build_command("sys", "Title", 20, None)
+        cmd = CLAUDE_GLM.build_command(PROMPT_PATH, "Title", 20, None)
         assert cmd[2] == "glm-5.3:cloud"
 
     def test_deepseek_keys_in_sudoers_env_keep(self) -> None:
@@ -2714,7 +2840,7 @@ class TestClaudeSonnetEngine:
         assert CLAUDE_SONNET.binary == "claude"
 
     def test_command_builder_has_model_flag(self) -> None:
-        cmd = CLAUDE_SONNET.build_command("sys", "Fix bug", 20, None)
+        cmd = CLAUDE_SONNET.build_command(PROMPT_PATH, "Fix bug", 20, None)
         assert cmd[0] == "claude"
         assert cmd[1] == "--model"
         assert cmd[2] == "sonnet"
@@ -2752,7 +2878,7 @@ class TestClaudeHaikuEngine:
         assert CLAUDE_HAIKU.binary == "claude"
 
     def test_command_builder_has_model_flag(self) -> None:
-        cmd = CLAUDE_HAIKU.build_command("sys", "Fix bug", 20, None)
+        cmd = CLAUDE_HAIKU.build_command(PROMPT_PATH, "Fix bug", 20, None)
         assert cmd[0] == "claude"
         assert cmd[1] == "--model"
         assert cmd[2] == "haiku"
@@ -4563,6 +4689,203 @@ class TestZeroCommitsGuard:
 
 
 # ---------------------------------------------------------------------------
+# The agent PATH prefix (kill-guard dir first)
+# ---------------------------------------------------------------------------
+
+
+class TestAgentPathPrefixDirs:
+    """AC-11: one home resolver, one ordered prefix list, no duplicates."""
+
+    def _patch_agent_user(self, monkeypatch):
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        mock_pw = MagicMock()
+        mock_pw.pw_dir = "/home/dispatch"
+        return patch("pwd.getpwnam", return_value=mock_pw)
+
+    def test_prefix_dirs_guard_first_then_local_bin_then_cargo_bin(
+        self, monkeypatch
+    ) -> None:
+        with self._patch_agent_user(monkeypatch):
+            assert [str(p) for p in agent_path_prefix_dirs()] == [
+                "/home/dispatch/.local/share/agent-gtd-dispatch/kill-guard",
+                "/home/dispatch/.local/bin",
+                "/home/dispatch/.cargo/bin",
+            ]
+            assert agent_home() == Path("/home/dispatch")
+
+    def test_prepend_puts_guard_first_and_is_idempotent(self, monkeypatch) -> None:
+        with self._patch_agent_user(monkeypatch):
+            once = prepend_agent_bin_dirs("/usr/bin:/bin")
+        assert once == (
+            "/home/dispatch/.local/share/agent-gtd-dispatch/kill-guard:"
+            "/home/dispatch/.local/bin:/home/dispatch/.cargo/bin:/usr/bin:/bin"
+        )
+        with self._patch_agent_user(monkeypatch):
+            assert prepend_agent_bin_dirs(once) == once
+
+    def test_guard_dir_is_never_inside_local_bin(self, monkeypatch) -> None:
+        with self._patch_agent_user(monkeypatch):
+            guard = agent_guard_bin_dir()
+            assert ".local/bin" not in str(guard)
+            assert guard not in agent_local_bin_dirs()
+
+    def test_build_env_path_starts_with_the_guard_dir(self, monkeypatch) -> None:
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        with self._patch_agent_user(monkeypatch):
+            env = build_env(CLAUDE)
+            expected = str(agent_guard_bin_dir()) + ":"
+        assert env["PATH"].startswith(expected)
+
+
+# ---------------------------------------------------------------------------
+# The system prompt travels in a FILE, never in argv
+# ---------------------------------------------------------------------------
+
+
+class TestRunAgentPromptFile:
+    """AC-3/AC-5: run_agent writes the prompt to the run's private tmp dir."""
+
+    _SENTINEL: ClassVar[str] = "PROMPT-SENTINEL-" + "x" * 20000
+
+    async def test_prompt_goes_to_the_run_tmp_file_and_never_to_argv(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        run_tmp_dir = tmp_path / "rt-aaaaaaaaaaab"
+        run_tmp_dir.mkdir()
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(
+                CLAUDE, tmp_path, self._SENTINEL, "Title", 20, tmp_dir=run_tmp_dir
+            )
+            cmd = mock_popen.call_args[0][0]
+        prompt_file = run_tmp_dir / "system_prompt.txt"
+        assert prompt_file.read_text() == self._SENTINEL
+        assert all(len(a.encode("utf-8")) <= 4096 for a in cmd)
+        assert not any("PROMPT-SENTINEL-" in a for a in cmd)
+        assert cmd[cmd.index("--system-prompt-file") + 1] == str(prompt_file)
+
+    async def test_no_tmp_dir_writes_into_the_workspace_dispatch_dir(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, self._SENTINEL, "Title", 20)
+            cmd = mock_popen.call_args[0][0]
+        prompt_file = tmp_path / ".dispatch" / "system_prompt.txt"
+        assert prompt_file.read_text() == self._SENTINEL
+        assert cmd[cmd.index("--system-prompt-file") + 1] == str(prompt_file)
+
+    async def test_kiro_still_reads_system_prompt_md_and_writes_no_prompt_file(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        run_tmp_dir = tmp_path / "rt-aaaaaaaaaaab"
+        run_tmp_dir.mkdir()
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(
+                KIRO,
+                tmp_path,
+                "PROMPT-SENTINEL-TINY",
+                "Title",
+                20,
+                tmp_dir=run_tmp_dir,
+            )
+        assert (
+            (tmp_path / "system_prompt.md")
+            .read_text()
+            .startswith("PROMPT-SENTINEL-TINY")
+        )
+        assert (run_tmp_dir / "system_prompt.txt").exists() is False
+
+    async def test_spawn_log_records_the_prompt_it_delivered(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        import hashlib
+
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        mock_proc = _make_mock_proc(0)
+        prompt = "sys-prompt-for-hash"
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        with (
+            caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"),
+            patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen,
+        ):
+            mock_popen.return_value = mock_proc
+            await run_agent(CLAUDE, tmp_path, prompt, "Title", 20)
+        assert f"prompt_bytes={len(prompt.encode('utf-8'))}" in caplog.text
+        assert f"prompt_sha256={digest}" in caplog.text
+
+    async def test_argv_guard_raises_before_popen_when_the_file_is_short(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+
+        def _write_empty(path, _text):
+            Path(path).write_text("")
+
+        monkeypatch.setattr(dispatch, "write_agent_text_file", _write_empty)
+        with (
+            patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen,
+            pytest.raises(ValueError, match="agent argv would carry"),
+        ):
+            await run_agent(CLAUDE, tmp_path, self._SENTINEL, "Title", 20)
+        mock_popen.assert_not_called()
+
+    def test_assert_no_prompt_in_argv_rejects_the_prompt_element(self) -> None:
+        path = PROMPT_PATH
+        with pytest.raises(ValueError):
+            dispatch._assert_no_prompt_in_argv(["claude", "secret"], "secret", path)
+        with pytest.raises(ValueError):
+            dispatch._assert_no_prompt_in_argv(
+                ["claude", "--system-prompt", "x"], "secret", path
+            )
+        with pytest.raises(ValueError):
+            dispatch._assert_no_prompt_in_argv(["claude", "y" * 5000], "secret", path)
+        # A short, prompt-free argv passes (no file check requested).
+        dispatch._assert_no_prompt_in_argv(
+            ["claude", "--system-prompt-file", str(path)], "secret", path
+        )
+
+
+class TestWriteAgentTextFile:
+    """AC-4: the prompt file is written as the agent user, mode 0600."""
+
+    def test_single_user_writes_0600_and_exact_bytes(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        path = tmp_path / "system_prompt.txt"
+        text = "line one\nline two"
+        dispatch.write_agent_text_file(path, text)
+        assert path.exists()
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.read_text() == text
+
+    def test_two_user_writes_through_the_sudo_wrap(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        path = tmp_path / "system_prompt.txt"
+        text = "PROMPT-SENTINEL"
+        with patch("agent_gtd_dispatch.dispatch.subprocess.run") as mock_run:
+            dispatch.write_agent_text_file(path, text)
+        argv = mock_run.call_args.args[0]
+        assert argv[0] == "sudo"
+        assert "/bin/bash" in argv
+        assert mock_run.call_args.kwargs["input"] == text.encode("utf-8")
+        assert mock_run.call_args.kwargs["check"] is True
+
+
+# ---------------------------------------------------------------------------
 # Leg 1 — `--output-format json` on every claude-code argv builder
 # ---------------------------------------------------------------------------
 
@@ -4581,13 +4904,13 @@ class TestOutputFormatJsonArgv:
 
     @pytest.mark.parametrize("engine_name", CLAUDE_ENGINE_NAMES)
     def test_output_format_precedes_print(self, engine_name) -> None:
-        cmd = get_engine(engine_name).build_command("sys", "Title", 20, None)
+        cmd = get_engine(engine_name).build_command(PROMPT_PATH, "Title", 20, None)
         assert cmd.index("--output-format") == cmd.index("--print") - 2
         assert cmd[cmd.index("--output-format") + 1] == "json"
         assert cmd[-1] == "Title"
 
     def test_kiro_untouched(self) -> None:
-        cmd = KIRO.build_command("sys", "Title", 20, None)
+        cmd = KIRO.build_command(PROMPT_PATH, "Title", 20, None)
         assert "--output-format" not in cmd
         assert "--print" not in cmd
 
@@ -4595,30 +4918,77 @@ class TestOutputFormatJsonArgv:
         # Talos never reaches run_agent; its build_command is a refusing stub, so
         # there is no argv to carry the flag pair.
         with pytest.raises(NotImplementedError):
-            get_engine("talos-sonnet").build_command("sys", "Title", 20, None)
+            get_engine("talos-sonnet").build_command(None, "Title", 20, None)
 
 
 class TestAllowedToolsOrderingWithOutputFormat:
     """`--allowedTools` insertion keeps working, and only for claude-code."""
 
+    _SENTINEL: ClassVar[str] = "PROMPT-SENTINEL-" + "x" * 20000
+
+    def _assert_prompt_only_in_the_file(
+        self, cmd: list[str], prompt_file: Path
+    ) -> None:
+        """The prompt rides in the file; argv carries nothing of it."""
+        assert cmd.count("--system-prompt-file") == 1
+        assert cmd[cmd.index("--system-prompt-file") + 1] == str(prompt_file)
+        assert all(len(a.encode("utf-8")) <= 4096 for a in cmd)
+        assert not any("PROMPT-SENTINEL-" in a for a in cmd)
+
     async def test_claude_final_argv_order(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
         monkeypatch.setattr(config, "TIMEOUT_SECONDS", 60)
+        prompt_file = tmp_path / ".dispatch" / "system_prompt.txt"
         mock_proc = _make_mock_proc(0)
         with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
             mock_popen.return_value = mock_proc
             await run_agent(
-                CLAUDE, tmp_path, "sys", "Title", 20, allowed_tools=["Bash"]
+                CLAUDE,
+                tmp_path,
+                self._SENTINEL,
+                "Title",
+                20,
+                allowed_tools=["Bash"],
+                disallowed_tools=["mcp__a__x"],
             )
             cmd = mock_popen.call_args[0][0]
         of = cmd.index("--output-format")
-        assert cmd[of : of + 6] == [
+        assert cmd[of : of + 8] == [
             "--output-format",
             "json",
             "--allowedTools",
             "Bash",
+            "--disallowedTools",
+            "mcp__a__x",
             "--print",
             "Title",
         ]
+        self._assert_prompt_only_in_the_file(cmd, prompt_file)
+
+    async def test_review_mode_final_argv_also_keeps_the_prompt_in_the_file(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The reviewer call site (main._launch_reviewer) passes the deny-list."""
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
+        monkeypatch.setattr(config, "REVIEW_TIMEOUT_SECONDS", 600)
+        prompt_file = tmp_path / ".dispatch" / "system_prompt.txt"
+        mock_proc = _make_mock_proc(0)
+        with patch("agent_gtd_dispatch.dispatch.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            await run_agent(
+                CLAUDE,
+                tmp_path,
+                self._SENTINEL,
+                "Title",
+                20,
+                mode=DispatchMode.REVIEW,
+                disallowed_tools=list(dispatch.REVIEWER_DISALLOWED_TOOLS),
+            )
+            cmd = mock_popen.call_args[0][0]
+        idx = cmd.index("--disallowedTools")
+        assert idx < cmd.index("--print")
+        assert cmd[-1] == "Title"
+        self._assert_prompt_only_in_the_file(cmd, prompt_file)
 
     async def test_sonnet_gets_output_format_but_no_allowed_tools(
         self, tmp_path, monkeypatch

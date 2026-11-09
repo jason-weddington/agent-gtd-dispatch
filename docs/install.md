@@ -26,7 +26,9 @@ This guide covers bootstrapping a fresh Ubuntu host and migrating an existing si
 > [personal-kb-hook (Step 4.10)](#personal-kb-hook-step-410)), and
 > **Playwright browsers** (Step 4.11: the Chromium builds dispatched repos' e2e
 > suites need, installed into the agent user's default browser cache — see
-> [Playwright browsers (Step 4.11)](#playwright-browsers-step-411)).
+> [Playwright browsers (Step 4.11)](#playwright-browsers-step-411)), and the
+> **agent kill guard** (Step 4.12: `pkill`/`killall` shims on the agent PATH — see
+> [Agent kill guard (Step 4.12)](#agent-kill-guard-step-412)).
 > The `rustup` bootstrap also guarantees a usable default toolchain for the agent
 > user, even when `rustup` was already present with no default configured.
 > All other tooling (`python3`, `visudo`, `systemctl`) ships with standard Ubuntu.
@@ -1117,6 +1119,86 @@ A Raspberry Pi 5 is `aarch64`, and Playwright publishes **linux-arm64** Chromium
 
 ---
 
+## Agent kill guard (Step 4.12)
+
+Step 4.12 installs two shims — `pkill` and `killall` — into the agent user's
+`~/.local/share/agent-gtd-dispatch/kill-guard/` directory and puts that directory on
+every agent, gate and talos PATH.
+
+### Why this matters
+
+Every build, gate and reviewer process on a host runs as the SAME agent account, so
+every process's `/proc/<pid>/cmdline` is readable by — and matchable by — every other
+run. A run that cleans up its own background job with a pattern kill
+(`pkill -f gate.sh`, `pkill -9 -f selftest`, `killall selftest`) therefore kills
+unrelated runs whose argv happens to contain that string. That is not theoretical: on
+2026-11-09 one such pattern kill took out two rollout reviewers (exit 143 and exit -9)
+and five concurrent build gates, and the halt was misreported as a model error because
+a killed `--print` run leaves only a benign startup line behind.
+
+Two mechanisms bound the blast radius, and this step provisions the second:
+
+1. **No prompt text in argv.** The claude-family engines hand the harness
+   `--system-prompt-file <run tmp>/system_prompt.txt` instead of
+   `--system-prompt <15–30 KB of text>`; the worker writes that file (mode 0600, as the
+   agent user) before the spawn and refuses to launch an argv that carries the prompt.
+   Talos never carried prompt text either: its TaskSpec is piped on stdin.
+2. **Pattern kills refused.** The shims shadow `pkill` and `killall` on the agent PATH
+   and refuse EVERY invocation: one line on stderr naming the reason, exit code 2, and
+   the real tool is never executed. Numeric `kill <pid>` is untouched — an agent stops
+   what it started by recording `$!` or a pidfile. Each refusal is also appended to the
+   run's own `kill-guard.log` (one `ts=… shim=… pid=… ppid=… cwd=… args=…` line), so the
+   worker logs `kill-guard: … refused_count=N` after the run.
+
+### What the step does
+
+1. Resolves `${AGENT_HOME}/.local/share/agent-gtd-dispatch/kill-guard` — the same literal
+   as `engines.AGENT_GUARD_BIN_RELPATH`, so the installer and the code cannot drift.
+   `$AGENT_HOME` is the target home in single-user mode, so one step covers both modes.
+2. `die`s when `templates/agent-gtd-kill-guard/{pkill,killall}` are missing: they ship in
+   the repo, and their absence means a broken checkout rather than a host condition.
+3. `[DRY]` under `--dry-run`, printing the exact install command.
+4. Otherwise `install -d` the directory (mode 0755, owned by the agent user and its
+   group) and, per shim, `cmp -s` against the template — printing `[SKIP]` when the
+   installed file is already identical, and installing (mode 0755) with `[OK]`
+   otherwise. Re-running the installer therefore converges with no writes.
+
+The directory is a SIBLING of `~/.local/bin`, never inside it, and it is not on the
+sudoers `secure_path`. That is deliberate: the worker kills a timed-out or cancelled
+run with `sudo -n -u <agent> pkill -KILL -s <sid>`, which sudo resolves through
+`secure_path`; a shim reachable that way would not be in the NOPASSWD list, sudo would
+refuse with "a password is required", and every timeout or cancel would signal only the
+sudo wrapper (the kb-03965 regression). Because `secure_path` REPLACES the child's PATH,
+the guard directory is delivered in the argv (`/usr/bin/env PATH=…` inside the sudo
+wrap) as well as in the subprocess env, which covers single-user mode.
+
+The shims are deliberately agent-owned and agent-writable: this is a habit guardrail,
+not an integrity control. An agent that rewrites them, or calls `/usr/bin/pkill` by
+absolute path, is out of scope.
+
+### `deploy.sh` refreshes them
+
+`deploy.sh` stages both shim files with the sudoers refresh and re-installs them right
+before it removes its stage directory, printing `[SKIP]` per unchanged file and `[OK]`
+per installed one. The refresh is non-fatal: a failure prints
+`[WARN] … run 'sudo ./setup-dispatch-host.sh' (Step 4.12)` and the deploy continues.
+
+### A host provisioned before this step
+
+Run the installer once more — this step is unconditional (it is NOT gated on
+`--with-talos`), so a plain re-run suffices:
+
+```bash
+sudo ./setup-dispatch-host.sh
+```
+
+Verify with `ls -l ~/.local/share/agent-gtd-dispatch/kill-guard/` as the agent user: it
+must contain exactly `killall` and `pkill`, both mode `0755`.
+
+---
+
+---
+
 ## Service environment freshness (Step 6.5)
 
 Step 6.5 of the installer compares `$SERVICE_ENV` against the **running** `dispatch-api` process's actual environment (`/proc/<MainPID>/environ`), and reports — loudly — when they disagree.
@@ -1387,6 +1469,24 @@ sudo journalctl -u dispatch-api -n 100 --no-pager
 
 **Fix**: Verify that `--agent-user` and `--service-user` contain only `[a-z0-9_-]` characters.
 The temp file is `/etc/sudoers.d/dispatch-svc.tmp.*` and is removed by a trap. To inspect the render, run `scripts/sudoers-refresh.sh --render-only --template templates/sudoers-dispatch-svc.tmpl --service-user <u> --agent-user <u>`.
+
+---
+
+### Every claude-family run fails with `error: unknown option '--system-prompt-file'`
+
+**Symptom**: build, review, plan and manage runs fail immediately with
+`error: unknown option '--system-prompt-file'` in the run's `transcript.txt`.
+
+**Cause**: the installed `claude` binary is older than the release that added the flag
+(supported from Claude Code 2.1.319). The engines pass the system prompt as a FILE, so
+an older binary rejects the argv before doing any work.
+
+**Fix**:
+```bash
+sudo -u dispatch claude update
+```
+Then re-run the installer (`sudo ./setup-dispatch-host.sh`) so the `/usr/local/bin/claude`
+symlink points at the updated binary, and re-dispatch the failed run.
 
 ---
 

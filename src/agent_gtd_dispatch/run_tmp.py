@@ -12,6 +12,10 @@ placed INSIDE the sudo wrap: sudo-rs strips TMPDIR even with
 ``--preserve-env=TMPDIR``, so neither the subprocess env dict nor sudoers
 ``env_keep`` can carry it.
 
+``PATH`` rides in the same argv prefix for the same reason: sudoers
+``secure_path`` REPLACES the child's PATH, so the agent's kill-guard shim
+directory (and the rest of the agent bin dirs) can only be delivered there.
+
 This module must NOT import ``.dispatch`` or ``.retention`` at module level:
 dispatch imports this module, and retention imports dispatch, so a
 module-level import would be circular.  The helpers needed are imported
@@ -41,6 +45,11 @@ TMP_ENV_KEYS: tuple[str, ...] = ("TMPDIR", "TMP", "TEMP")
 # and survives setsid/cd: the reaper finds escaped processes by scanning
 # /proc/<pid>/environ for the exact ``AGENT_GTD_RUN_KEY=<value>`` entry.
 RUN_MARKER_ENV: str = "AGENT_GTD_RUN_KEY"
+# Per-run log the kill-guard shims append a line to for every refusal.  The
+# path rides in the argv like TMPDIR, so the shims (which run as the agent
+# user, under sudo's env filter) can always find it.
+GUARD_LOG_ENV: str = "AGENT_GTD_KILL_GUARD_LOG"
+GUARD_LOG_NAME: str = "kill-guard.log"
 RUN_TMP_KEY_RE = re.compile(r"^(?:[0-9a-f]{12}|land-[0-9a-f]{12}-[0-9A-Za-z-]{1,64})$")
 RUN_TMP_NAME_RE = re.compile(
     r"^rt-(?:[0-9a-f]{12}|land-[0-9a-f]{12}-[0-9A-Za-z-]{1,64})$"
@@ -62,20 +71,58 @@ def run_marker(tmp_dir: Path | None) -> str | None:
     return tmp_dir.name
 
 
-def with_tmp_env(cmd: list[str], tmp_dir: Path | None) -> list[str]:
-    """Prefix *cmd* with ``/usr/bin/env TMPDIR=.. TMP=.. TEMP=.. <marker>``.
+def guard_log_path(tmp_dir: Path) -> Path:
+    """Return the kill-guard refusal log path for *tmp_dir*."""
+    return tmp_dir / GUARD_LOG_NAME
 
-    The last assignment is ``AGENT_GTD_RUN_KEY=<tmp_dir.name>``, the
-    run-unique marker the reapers match on.  ``tmp_dir=None`` returns a copy
-    of *cmd* unchanged.  Callers wrap the result in ``_sudo_wrap`` so the env
-    prefix runs AFTER sudo's env filter.
+
+def count_guard_refusals(tmp_dir: Path | None) -> int:
+    """Return how many kill-guard refusals *tmp_dir*'s log recorded.
+
+    ``0`` when the directory is None, the log is missing, or it cannot be
+    read — a missing log is the normal case (most runs never attempt a pattern
+    kill) and must never be an error for the caller.
     """
     if tmp_dir is None:
+        return 0
+    try:
+        return len(guard_log_path(tmp_dir).read_text().splitlines())
+    except OSError:
+        return 0
+
+
+def with_tmp_env(
+    cmd: list[str], tmp_dir: Path | None, *, path: str | None = None
+) -> list[str]:
+    """Prefix *cmd* with ``/usr/bin/env [PATH=..] TMPDIR=.. TMP=.. TEMP=.. ...``.
+
+    The ``TMPDIR``/``TMP``/``TEMP`` assignments are followed by
+    ``AGENT_GTD_RUN_KEY=<tmp_dir.name>`` (the run-unique marker the reapers
+    match on) and ``AGENT_GTD_KILL_GUARD_LOG=<tmp_dir>/kill-guard.log``.
+
+    ``path`` is the agent PATH the caller computed with
+    ``engines.prepend_agent_bin_dirs``; sudoers ``secure_path`` replaces the
+    child's PATH, so the argv is the ONLY carrier that reaches the process.
+    It is emitted FIRST, before every tmp assignment.
+
+    ``tmp_dir=None`` and ``path=None`` return a copy of *cmd* unchanged.
+    Callers wrap the result in ``_sudo_wrap`` so the env prefix runs AFTER
+    sudo's env filter.
+    """
+    if tmp_dir is None and path is None:
         return list(cmd)
     return [
         "/usr/bin/env",
-        *(f"{key}={tmp_dir}" for key in TMP_ENV_KEYS),
-        f"{RUN_MARKER_ENV}={tmp_dir.name}",
+        *([f"PATH={path}"] if path is not None else []),
+        *(
+            [
+                *(f"{key}={tmp_dir}" for key in TMP_ENV_KEYS),
+                f"{RUN_MARKER_ENV}={tmp_dir.name}",
+                f"{GUARD_LOG_ENV}={guard_log_path(tmp_dir)}",
+            ]
+            if tmp_dir is not None
+            else []
+        ),
         *cmd,
     ]
 

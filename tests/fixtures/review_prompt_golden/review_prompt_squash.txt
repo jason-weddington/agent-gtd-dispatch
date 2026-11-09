@@ -383,6 +383,7 @@ RolloutManager; new config key dispatch.manager_default_timeout_minutes
 - You cannot install software or system packages, and must not design a fix that installs anything at run time; host tooling is provisioned by the host setup. If a tool is missing, say so in your final report.
 - What decides the run's outcome is the commits on the remote branch, the gate result and the worker's result record; nothing you say about your own work changes it.
 - Never push to or commit on the default branch, except through a merge procedure this prompt explicitly gives you.
+- Never stop a process by pattern (pkill, killall, pgrep -f): every run on this host shares one account, so a pattern can match another run's processes. To stop a background command you started, record its PID ($!) and kill that PID.
 
 ## Turn Discipline — Never End Your Turn With Something Still Running
 

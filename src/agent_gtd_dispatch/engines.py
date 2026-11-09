@@ -49,13 +49,17 @@ if _leaked:  # pragma: no cover - import-time guard
 
 @dataclass(frozen=True, slots=True)
 class Engine:
-    """Configuration for a headless agent CLI backend."""
+    """Configuration for a headless agent CLI backend.
+
+    ``build_command``'s first argument is the PATH of the file holding the
+    system prompt, never the prompt text itself.
+    """
 
     name: str
     binary: str
     auth_env_key: str
     env_keys: frozenset[str]
-    build_command: Callable[[str, str, int, str | None], list[str]]
+    build_command: Callable[[Path | None, str, int, str | None], list[str]]
     extra_env_fn: Callable[[], dict[str, str]] | None = None
 
     @property
@@ -105,18 +109,23 @@ _REVIEW_FORBIDDEN_ENV_KEYS: frozenset[str] = frozenset(
 )
 
 
-def agent_local_bin_dirs() -> list[Path]:
-    """Return the agent user's ``.local/bin`` and ``.cargo/bin`` directories.
+# Kill-guard shims (see templates/agent-gtd-kill-guard/): a directory of
+# `pkill` / `killall` shims that refuse pattern kills.  Deliberately a SIBLING
+# of ~/.local/bin, never inside it — sudo's `secure_path` contains
+# ~/.local/bin, and a shim there would not be in the sudoers NOPASSWD list, so
+# the worker's own `sudo -n -u <agent> pkill -KILL -s <sid>` would fail with
+# "a password is required" (the kb-03965 regression).  The path here is the
+# single source of truth: setup-dispatch-host.sh and this constant must agree.
+AGENT_GUARD_BIN_RELPATH: str = ".local/share/agent-gtd-dispatch/kill-guard"
 
-    Shared by :func:`build_env` and ``gates.agent_shell_env`` so both PATH
-    computations stay in lockstep. Resolves the agent user's home directory
-    the same way in both cases: via ``pwd.getpwnam(config.AGENT_SUBPROCESS_USER)``
-    when that config var is set (falling back to ``Path.home()`` on ``KeyError``),
-    else ``Path.home()``.
 
-    ``.local/bin`` comes first (uvx/MCP binaries), then ``.cargo/bin`` (rustup
-    toolchain binaries — cargo, cog, typos, cargo-sort, etc.), so both are
-    discoverable after sudo's ``env_reset`` strips PATH.
+def agent_home() -> Path:
+    """Return the agent user's home directory — the single home resolver.
+
+    ``pwd.getpwnam(config.AGENT_SUBPROCESS_USER).pw_dir`` when that config var
+    is set (falling back to ``Path.home()`` on ``KeyError``), else
+    ``Path.home()``.  Shared by every PATH computation below so they cannot
+    drift apart.
     """
     import pwd
 
@@ -125,23 +134,53 @@ def agent_local_bin_dirs() -> list[Path]:
     if config.AGENT_SUBPROCESS_USER:
         try:
             pw = pwd.getpwnam(config.AGENT_SUBPROCESS_USER)
-            home = Path(pw.pw_dir)
+            return Path(pw.pw_dir)
         except KeyError:
-            home = Path.home()
-    else:
-        home = Path.home()
+            return Path.home()
+    return Path.home()
 
+
+def agent_local_bin_dirs() -> list[Path]:
+    """Return the agent user's ``.local/bin`` and ``.cargo/bin`` directories.
+
+    Shared by :func:`build_env` and ``gates.agent_shell_env`` so both PATH
+    computations stay in lockstep. Resolves the agent user's home directory via
+    :func:`agent_home`.
+
+    ``.local/bin`` comes first (uvx/MCP binaries), then ``.cargo/bin`` (rustup
+    toolchain binaries — cargo, cog, typos, cargo-sort, etc.), so both are
+    discoverable after sudo's ``env_reset`` strips PATH.
+    """
+    home = agent_home()
     return [home / ".local" / "bin", home / ".cargo" / "bin"]
 
 
+def agent_guard_bin_dir() -> Path:
+    """Return the agent user's kill-guard shim directory.
+
+    Sibling of ``~/.local/bin`` on purpose — see :data:`AGENT_GUARD_BIN_RELPATH`.
+    """
+    return agent_home() / AGENT_GUARD_BIN_RELPATH
+
+
+def agent_path_prefix_dirs() -> list[Path]:
+    """Return every directory prepended to an agent PATH, guard dir first."""
+    return [agent_guard_bin_dir(), *agent_local_bin_dirs()]
+
+
 def prepend_agent_bin_dirs(current_path: str) -> str:
-    """Prepend the agent's `.local/bin` and `.cargo/bin` dirs onto *current_path*.
+    """Prepend the kill-guard dir and the agent's bin dirs onto *current_path*.
 
     Each directory is added at most once (never duplicated) and only if not
-    already present as a `:`-split entry of *current_path*.
+    already present as a `:`-split entry of *current_path*.  The kill-guard
+    directory comes FIRST so a shim shadows a real ``pkill``/``killall``.
+
+    NOTE: this env-dict PATH only takes effect in single-user mode; in the
+    two-user split sudo's ``secure_path`` replaces it, so the same value is
+    ALSO carried in the argv by :func:`run_tmp.with_tmp_env`.
     """
     existing = current_path.split(":") if current_path else []
-    prefixes = [str(d) for d in agent_local_bin_dirs() if str(d) not in existing]
+    prefixes = [str(d) for d in agent_path_prefix_dirs() if str(d) not in existing]
     if not prefixes:
         return current_path
     if current_path:
@@ -229,10 +268,11 @@ def build_env(
     env["GIT_AUTHOR_EMAIL"] = f"{engine.name}@agent-gtd-dispatch"
     env["GIT_COMMITTER_EMAIL"] = f"{engine.name}@agent-gtd-dispatch"
 
-    # Prepend ~/.local/bin and ~/.cargo/bin for the agent user so uvx/MCP
-    # binaries and rustup toolchain binaries (cargo,
-    # cog, typos, cargo-sort, ...) are discoverable after sudo's env_reset
-    # strips PATH.
+    # Prepend the kill-guard dir and the agent's ~/.local/bin and ~/.cargo/bin
+    # so the pkill/killall shims, uvx/MCP binaries and rustup toolchain
+    # binaries are discoverable after sudo's env_reset strips PATH. This dict
+    # only carries PATH in single-user mode; the two-user path also rides in
+    # the argv (run_tmp.with_tmp_env) because secure_path replaces it.
     env["PATH"] = prepend_agent_bin_dirs(env.get("PATH", ""))
 
     return env
@@ -241,12 +281,29 @@ def build_env(
 # --- Command builders ---
 
 
+PROMPT_PATH_REQUIRED: str = (
+    "prompt_path is required: the system prompt now travels in a file, not in argv"
+)
+
+
+def _require_prompt_path(prompt_path: Path | None) -> Path:
+    """Return *prompt_path*, raising when a builder was handed no path at all.
+
+    The system prompt never travels in argv: it is written to the run's private
+    tmp dir and handed to the harness by PATH (``--system-prompt-file``).
+    """
+    if prompt_path is None:
+        raise ValueError(PROMPT_PATH_REQUIRED)
+    return prompt_path
+
+
 def _build_claude_command(
-    system_prompt: str,
+    prompt_path: Path | None,
     title: str,
     max_turns: int,
     agent_name: str | None,
 ) -> list[str]:
+    prompt_path = _require_prompt_path(prompt_path)
     cmd = [
         "claude",
         "--model",
@@ -254,8 +311,8 @@ def _build_claude_command(
         "--dangerously-skip-permissions",
         "--max-turns",
         str(max_turns),
-        "--system-prompt",
-        system_prompt,
+        "--system-prompt-file",
+        str(prompt_path),
         "--output-format",
         "json",
         "--print",
@@ -267,7 +324,7 @@ def _build_claude_command(
 
 
 def _build_kiro_command(
-    system_prompt: str,
+    prompt_path: Path | None,  # ignored: kiro reads system_prompt.md from the cwd
     title: str,
     max_turns: int,  # Kiro has no --max-turns flag
     agent_name: str | None,
@@ -284,7 +341,7 @@ def _build_kiro_command(
 
 
 def _build_claude_ollama_command(
-    system_prompt: str,
+    prompt_path: Path | None,
     title: str,
     max_turns: int,
     agent_name: str | None,
@@ -292,6 +349,7 @@ def _build_claude_ollama_command(
     """Build command for claude-code-ollama: same as CLAUDE but injects --model."""
     from . import config  # local import so module is readable before config.load()
 
+    prompt_path = _require_prompt_path(prompt_path)
     cmd = [
         "claude",
         "--model",
@@ -299,8 +357,8 @@ def _build_claude_ollama_command(
         "--dangerously-skip-permissions",
         "--max-turns",
         str(max_turns),
-        "--system-prompt",
-        system_prompt,
+        "--system-prompt-file",
+        str(prompt_path),
         "--output-format",
         "json",
         "--print",
@@ -322,7 +380,7 @@ def _claude_ollama_extra_env() -> dict[str, str]:
 
 
 def _build_claude_glm_command(
-    system_prompt: str,
+    prompt_path: Path | None,
     title: str,
     max_turns: int,
     agent_name: str | None,
@@ -336,6 +394,7 @@ def _build_claude_glm_command(
     """
     from . import config  # local import so module is readable before config.load()
 
+    prompt_path = _require_prompt_path(prompt_path)
     cmd = [
         "claude",
         "--model",
@@ -343,8 +402,8 @@ def _build_claude_glm_command(
         "--dangerously-skip-permissions",
         "--max-turns",
         str(max_turns),
-        "--system-prompt",
-        system_prompt,
+        "--system-prompt-file",
+        str(prompt_path),
         "--output-format",
         "json",
         "--print",
@@ -381,7 +440,7 @@ def _claude_glm_extra_env() -> dict[str, str]:
 
 
 def _build_claude_deepseek_command(
-    system_prompt: str,
+    prompt_path: Path | None,
     title: str,
     max_turns: int,
     agent_name: str | None,
@@ -395,6 +454,7 @@ def _build_claude_deepseek_command(
     ``deepseek-v4.1-flash:cloud`` — it deliberately never reads
     ``config.OLLAMA_CLOUD_MODEL`` (that variable steers the GLM engines).
     """
+    prompt_path = _require_prompt_path(prompt_path)
     cmd = [
         "claude",
         "--model",
@@ -402,8 +462,8 @@ def _build_claude_deepseek_command(
         "--dangerously-skip-permissions",
         "--max-turns",
         str(max_turns),
-        "--system-prompt",
-        system_prompt,
+        "--system-prompt-file",
+        str(prompt_path),
         "--output-format",
         "json",
         "--print",
@@ -440,12 +500,13 @@ def _claude_deepseek_extra_env() -> dict[str, str]:
 
 
 def _build_claude_sonnet_command(
-    system_prompt: str,
+    prompt_path: Path | None,
     title: str,
     max_turns: int,
     agent_name: str | None,
 ) -> list[str]:
     """Build command for claude-code-sonnet: same as CLAUDE but uses moving alias."""
+    prompt_path = _require_prompt_path(prompt_path)
     cmd = [
         "claude",
         "--model",
@@ -453,8 +514,8 @@ def _build_claude_sonnet_command(
         "--dangerously-skip-permissions",
         "--max-turns",
         str(max_turns),
-        "--system-prompt",
-        system_prompt,
+        "--system-prompt-file",
+        str(prompt_path),
         "--output-format",
         "json",
         "--print",
@@ -466,12 +527,13 @@ def _build_claude_sonnet_command(
 
 
 def _build_claude_haiku_command(
-    system_prompt: str,
+    prompt_path: Path | None,
     title: str,
     max_turns: int,
     agent_name: str | None,
 ) -> list[str]:
     """Build command for claude-code-haiku: same as CLAUDE but uses moving alias."""
+    prompt_path = _require_prompt_path(prompt_path)
     cmd = [
         "claude",
         "--model",
@@ -479,8 +541,8 @@ def _build_claude_haiku_command(
         "--dangerously-skip-permissions",
         "--max-turns",
         str(max_turns),
-        "--system-prompt",
-        system_prompt,
+        "--system-prompt-file",
+        str(prompt_path),
         "--output-format",
         "json",
         "--print",
@@ -561,7 +623,7 @@ CLAUDE_HAIKU = Engine(
 
 
 def _talos_build_command_stub(
-    _system_prompt: str,
+    _prompt_path: Path | None,
     _title: str,
     _max_turns: int,
     _agent_name: str | None,

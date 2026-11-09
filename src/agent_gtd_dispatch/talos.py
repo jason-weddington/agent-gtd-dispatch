@@ -344,11 +344,20 @@ def build_talos_argv(
     timeout_seconds: int | None = None,
     *,
     tmp_dir: Path | None = None,
+    path: str | None = None,
 ) -> list[str]:
     """Return the sudo-wrapped ``talos run …`` argv for the subprocess launch.
 
     ``tmp_dir`` is the run's private TMPDIR, prefixed via ``with_tmp_env``
-    inside the sudo wrap; None leaves the argv unchanged.
+    inside the sudo wrap; None leaves the argv without those assignments.
+
+    ``path`` is the agent PATH the caller computed (kill-guard shim dir first).
+    It rides in the SAME argv prefix for the same reason as TMPDIR: sudoers
+    ``secure_path`` replaces the child's env PATH, so the argv is the only
+    carrier that reaches the process.
+
+    The TaskSpec itself is NEVER in the argv: it is piped on stdin by the
+    caller, so no prompt/spec text is visible in ``/proc/<pid>/cmdline``.
 
     - Uses ``config.TALOS_BIN`` (default ``'talos'``, PATH-resolved).
     - Passes ``--workspace``, ``--task-id``, ``--attempt``. The TaskSpec JSON is
@@ -400,7 +409,7 @@ def build_talos_argv(
     if config.TALOS_MEMORY != "off":
         argv += ["--memory", config.TALOS_MEMORY]
     argv.append("--transcript")
-    return _sudo_wrap(with_tmp_env(argv, tmp_dir))
+    return _sudo_wrap(with_tmp_env(argv, tmp_dir, path=path))
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,17 @@
+#!/bin/sh
+# Kill guard: refuse every killall invocation.
+#
+# Every build, gate and review run on a dispatch host runs as ONE shared
+# account, so a `killall <name>` issued by any run matches another run's
+# processes (their argv contains prompts, branch names and script names).
+# This shim is installed ahead of the real killall on the agent PATH by
+# setup-dispatch-host.sh Step 4.12 / deploy.sh.  It never execs the real tool.
+#
+# Stop a background process you started by recording its PID ($!) and killing
+# that number; numeric `kill <pid>` is untouched by this guard.
+printf '%s\n' 'killall: refused - a pattern kill can hit another run on this shared account; kill only a PID you started, e.g. kill $! or the number in your pidfile' >&2
+if [ -n "${AGENT_GTD_KILL_GUARD_LOG:-}" ]; then
+    { printf 'ts=%s shim=killall pid=%s ppid=%s cwd=%s args=%s\n' \
+        "$(date +%s)" "$$" "$PPID" "$(pwd)" "$*" >>"$AGENT_GTD_KILL_GUARD_LOG"; } 2>/dev/null || :
+fi
+exit 2

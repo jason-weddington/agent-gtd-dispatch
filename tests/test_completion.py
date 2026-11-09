@@ -198,3 +198,50 @@ class TestEnvelopeVerdict:
             {"type": "result", "subtype": "success", "brand_new_field": 3}
         )
         assert env.model_dump()["brand_new_field"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Signal-only exits (AC-17)
+# ---------------------------------------------------------------------------
+
+
+class TestKilledBySignal:
+    @pytest.mark.parametrize(
+        ("returncode", "expected"),
+        [
+            (-9, 9),
+            (-15, 15),
+            (143, 15),
+            (137, 9),
+            (0, None),
+            (None, None),
+            (128, None),
+            (129, 1),
+            (2, None),
+            (192, 64),
+            (193, None),
+            (200, None),
+        ],
+    )
+    def test_killed_by_signal(self, returncode, expected) -> None:
+        assert completion.killed_by_signal(returncode) == expected
+
+    def test_signal_halt_text_names_pinned_signals(self) -> None:
+        assert completion.signal_halt_text(9) == "killed by signal 9 (SIGKILL)"
+        assert completion.signal_halt_text(15) == "killed by signal 15 (SIGTERM)"
+        assert completion.signal_halt_text(1) == "killed by signal 1 (SIGHUP)"
+
+    def test_signal_halt_text_unmapped_signal_uses_the_number_only(self) -> None:
+        # Never signal.Signals(34).name — that renders SIGRTMIN on glibc.
+        assert completion.signal_halt_text(34) == "killed by signal 34"
+
+    def test_signal_names_table_is_pinned(self) -> None:
+        assert completion.SIGNAL_EXIT_BASE == 128
+        assert completion.SIGNAL_NAMES == {
+            1: "SIGHUP",
+            2: "SIGINT",
+            6: "SIGABRT",
+            9: "SIGKILL",
+            13: "SIGPIPE",
+            15: "SIGTERM",
+        }

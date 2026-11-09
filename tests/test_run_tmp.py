@@ -63,9 +63,34 @@ class TestWithTmpEnv:
             f"TMP={p}",
             f"TEMP={p}",
             "AGENT_GTD_RUN_KEY=rt-x",
+            f"AGENT_GTD_KILL_GUARD_LOG={p}/kill-guard.log",
             "a",
             "b",
         ]
+
+    def test_path_is_the_first_assignment(self, tmp_path) -> None:
+        p = tmp_path / "rt-x"
+        assert with_tmp_env(["a", "b"], p, path="/g:/usr/bin") == [
+            "/usr/bin/env",
+            "PATH=/g:/usr/bin",
+            f"TMPDIR={p}",
+            f"TMP={p}",
+            f"TEMP={p}",
+            "AGENT_GTD_RUN_KEY=rt-x",
+            f"AGENT_GTD_KILL_GUARD_LOG={p}/kill-guard.log",
+            "a",
+            "b",
+        ]
+
+    def test_path_without_tmp_dir(self) -> None:
+        assert with_tmp_env(["a"], None, path="/g:/usr/bin") == [
+            "/usr/bin/env",
+            "PATH=/g:/usr/bin",
+            "a",
+        ]
+
+    def test_both_none_is_identity(self) -> None:
+        assert with_tmp_env(["a"], None, path=None) == ["a"]
 
     def test_run_marker(self) -> None:
         assert run_marker(Path("/x/rt-abc")) == "rt-abc"
@@ -97,6 +122,7 @@ class TestWithTmpEnv:
             f"TMP={p}",
             f"TEMP={p}",
             "AGENT_GTD_RUN_KEY=rt-x",
+            f"AGENT_GTD_KILL_GUARD_LOG={p}/kill-guard.log",
             "x",
         ]
 
@@ -364,12 +390,23 @@ class TestSweep:
 # ---------------------------------------------------------------------------
 
 
+def _make_run_tmp(tmp_path: Path) -> Path:
+    """A run tmp dir on disk with the real naming shape (rt-<12 hex chars>).
+
+    Created under ``tmp_path`` — never ``config.RUN_TMP_ROOT`` — so no test
+    touches the host's real run-tmp root.
+    """
+    path = tmp_path / "rt-aaaaaaaaaaab"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 class TestLaunchArgv:
     async def test_run_agent_argv_and_env(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
         monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-ant-secret")
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
-        tmp = config.RUN_TMP_ROOT / "rt-aaaaaaaaaaab"
+        tmp = _make_run_tmp(tmp_path)
         proc = MagicMock()
         proc.returncode = 0
         proc.wait.return_value = 0
@@ -379,14 +416,16 @@ class TestLaunchArgv:
             await dispatch.run_agent(CLAUDE, tmp_path, "sys", "T", 5, tmp_dir=tmp)
         argv = popen.call_args.args[0]
         env = popen.call_args.kwargs["env"]
-        assert argv[:5] == [
+        assert argv[:6] == [
             "/usr/bin/env",
+            "PATH=" + env["PATH"],
             f"TMPDIR={tmp}",
             f"TMP={tmp}",
             f"TEMP={tmp}",
             f"AGENT_GTD_RUN_KEY={tmp.name}",
         ]
-        assert argv[5] == "claude"
+        assert argv[6] == f"AGENT_GTD_KILL_GUARD_LOG={tmp}/kill-guard.log"
+        assert argv[7] == "claude"
         assert not any("ANTHROPIC_API_KEY" in part for part in argv)
         assert "ANTHROPIC_API_KEY" not in env
 
@@ -401,11 +440,19 @@ class TestLaunchArgv:
             "agent_gtd_dispatch.dispatch.subprocess.Popen", return_value=proc
         ) as popen:
             await dispatch.run_agent(CLAUDE, tmp_path, "sys", "T", 5)
-        assert popen.call_args.args[0][0] == "claude"
+        argv = popen.call_args.args[0]
+        # The agent PATH still rides in the argv (single-user mode has no sudo
+        # hop but the carrier is shared); there are no TMPDIR assignments.
+        assert argv[0] == "/usr/bin/env"
+        assert argv[1] == "PATH=" + popen.call_args.kwargs["env"]["PATH"]
+        assert argv[2] == "claude"
+        assert not any(a.startswith("TMPDIR=") for a in argv)
+        # The prompt still goes to a file under the workspace .dispatch dir.
+        assert (tmp_path / ".dispatch" / "system_prompt.txt").read_text() == "sys"
 
     def test_run_gate_command_argv(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
-        tmp = config.RUN_TMP_ROOT / "rt-aaaaaaaaaaab"
+        tmp = _make_run_tmp(tmp_path)
         proc = MagicMock()
         proc.returncode = 0
         proc.wait.return_value = 0
@@ -414,21 +461,24 @@ class TestLaunchArgv:
         ) as popen:
             dispatch.run_gate_command(tmp_path, "make gate", 30, CLAUDE, tmp_dir=tmp)
         argv = popen.call_args.args[0]
+        env = popen.call_args.kwargs["env"]
         assert argv[:8] == dispatch._sudo_wrap([])
-        assert argv[8:14] == [
+        assert argv[8:15] == [
             "/usr/bin/env",
+            "PATH=" + env["PATH"],
             f"TMPDIR={tmp}",
             f"TMP={tmp}",
             f"TEMP={tmp}",
             f"AGENT_GTD_RUN_KEY={tmp.name}",
-            "/bin/bash",
+            f"AGENT_GTD_KILL_GUARD_LOG={tmp}/kill-guard.log",
         ]
+        assert argv[15] == "/bin/bash"
         assert argv[-1] == "make gate"
         assert "ANTHROPIC_API_KEY" not in popen.call_args.kwargs["env"]
 
     def test_run_as_agent_and_run_gate_steps(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "")
-        tmp = config.RUN_TMP_ROOT / "rt-aaaaaaaaaaab"
+        tmp = _make_run_tmp(tmp_path)
         step = gates.GateStep(
             repo_label="r",
             repo_path=tmp_path,
@@ -442,18 +492,28 @@ class TestLaunchArgv:
             return_value=subprocess.CompletedProcess([], 0, stdout=b""),
         ) as run:
             assert gates.run_gate_steps([step], 5, run_id="r", tmp_dir=tmp) is None
-        assert run.call_args.args[0] == with_tmp_env(["./setup"], tmp)
+        env = run.call_args.kwargs["env"]
+        assert run.call_args.args[0] == with_tmp_env(["./setup"], tmp, path=env["PATH"])
 
     def test_build_talos_argv(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
-        tmp = config.RUN_TMP_ROOT / "rt-aaaaaaaaaaab"
+        tmp = _make_run_tmp(tmp_path)
         plain = talos.build_talos_argv(tmp_path, "t", 1)
         wrapped = talos.build_talos_argv(tmp_path, "t", 1, tmp_dir=tmp)
         inner = plain[8:]
         assert wrapped == dispatch._sudo_wrap(with_tmp_env(inner, tmp))
 
+    def test_build_talos_argv_carries_path_in_the_argv(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "AGENT_SUBPROCESS_USER", "dispatch")
+        tmp = _make_run_tmp(tmp_path)
+        argv = talos.build_talos_argv(tmp_path, "t", 1, tmp_dir=tmp, path="/g:/usr/bin")
+        assert argv[8] == "/usr/bin/env"
+        assert argv[9] == "PATH=/g:/usr/bin"
+
     def test_commit_with_retry_wraps_only_commits(self, tmp_path) -> None:
-        tmp = config.RUN_TMP_ROOT / "rt-aaaaaaaaaaab"
+        tmp = _make_run_tmp(tmp_path)
         calls: list[list[str]] = []
         results = iter(
             [
@@ -475,7 +535,7 @@ class TestLaunchArgv:
         others = [c for c in calls if "commit" not in c]
         assert len(commits) == 2
         for c in commits:
-            assert c[:5] == with_tmp_env([], tmp)
+            assert c[:6] == with_tmp_env([], tmp)
         for c in others:
             assert c[0] == "git"
 

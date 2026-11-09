@@ -211,6 +211,74 @@ class TestReviewerTimeout:
         assert last.kwargs["error"].startswith("reaped 1 leaked process(es) by marker")
 
 
+class TestSignalKilledReviewer:
+    """AC-17: a signal-killed reviewer is reported as killed, not as "agent said"."""
+
+    @staticmethod
+    async def _review_signal(tmp_path, returncode: int, caplog=None):
+        async def _run_agent(*_args: Any, **_kwargs: Any) -> Any:
+            # A killed `--print` run leaves only this benign startup line.
+            (tmp_path / "transcript.txt").write_text(
+                "[claude-code:unrecognized_model]\n"
+            )
+            return MagicMock(returncode=returncode)
+
+        ctx = (
+            caplog.at_level(logging.WARNING, logger="agent_gtd_dispatch.main")
+            if caplog is not None
+            else ExitStack()
+        )
+        with ctx:
+            verdict, update_run, _mr, _wr, _rf = await _review(
+                tmp_path,
+                run_agent_effect=_run_agent,
+            )
+        return verdict, _terminal_call(update_run)
+
+    async def test_negative_returncode_reports_the_signal(
+        self, tmp_path, caplog
+    ) -> None:
+        verdict, call = await self._review_signal(tmp_path, -9, caplog)
+        assert call.kwargs["status"] == RunStatus.failed
+        error = call.kwargs["error"]
+        assert error.startswith("review_no_verdict:")
+        assert (
+            "verdict artifact absent (reviewer killed by signal 9 (SIGKILL))" in error
+        )
+        assert "agent said" not in error
+        assert "unrecognized_model" not in error
+        assert verdict.rationale == "reviewer returned no usable verdict"
+        assert verdict.verdict == "halt"
+        assert any(
+            "signal=9" in r.getMessage()
+            and "signal_name=SIGKILL" in r.getMessage()
+            and "detail_source=signal" in r.getMessage()
+            for r in caplog.records
+        )
+
+    async def test_shell_style_143_reports_sigterm(self, tmp_path) -> None:
+        _verdict, call = await self._review_signal(tmp_path, 143)
+        error = call.kwargs["error"]
+        assert (
+            "verdict artifact absent (reviewer killed by signal 15 (SIGTERM))" in error
+        )
+        assert "agent said" not in error
+
+    async def test_negative_15_reports_the_same_signal(self, tmp_path) -> None:
+        _verdict, call = await self._review_signal(tmp_path, -15)
+        assert (
+            "verdict artifact absent (reviewer killed by signal 15 (SIGTERM))"
+            in call.kwargs["error"]
+        )
+
+    async def test_plain_exit_still_quotes_the_agent(self, tmp_path) -> None:
+        _verdict, call = await self._review_signal(tmp_path, 1)
+        error = call.kwargs["error"]
+        assert "verdict artifact absent (reviewer exit=1)" in error
+        assert "; agent said:" in error
+        assert "unrecognized_model" in error
+
+
 class TestReviewBranchRefreshCallSite:
     """AC-11: the worker refreshes feature refs before a NORMAL review launch."""
 

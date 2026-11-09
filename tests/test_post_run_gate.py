@@ -156,7 +156,11 @@ class TestRunGateCommandMocked:
         ) as mock_popen:
             dispatch.run_gate_command(tmp_path, "echo hi", 30, CLAUDE)
         argv = mock_popen.call_args.args[0]
-        assert argv[0] == "/bin/bash"
+        # No sudo hop in single-user mode, but the env prefix (PATH first, then
+        # the run tmp assignments) still rides in the argv.
+        assert argv[0] == "/usr/bin/env"
+        assert argv[1] == "PATH=" + mock_popen.call_args.kwargs["env"]["PATH"]
+        assert argv[2] == "/bin/bash"
 
     def test_argv_sudo_wrap_when_subprocess_user_set(
         self, tmp_path, monkeypatch
@@ -2487,7 +2491,10 @@ class TestGateTimeoutSelection:
         ) as mock_popen:
             dispatch.run_gate_command(tmp_path, "echo hi", 30, CLAUDE)
         argv = mock_popen.call_args.args[0]
-        assert argv[2] == shim
+        assert argv[0] == "/usr/bin/env"
+        assert argv[1].startswith("PATH=")
+        assert argv[2] == "/bin/bash"
+        assert argv[4] == shim
         assert argv[-4:] == [
             "agent-gtd-gate",
             f"{config.CANCEL_GRACE_SECONDS}s",
@@ -2524,7 +2531,7 @@ class TestGateTimeoutSelection:
             caplog.at_level(logging.INFO, logger="agent_gtd_dispatch.dispatch"),
         ):
             dispatch.run_gate_command(tmp_path, "echo hi", 30, CLAUDE)
-        assert mock_popen.call_args.args[0][2] == dispatch._GATE_SHIM_PYTHON_DEADLINE
+        assert mock_popen.call_args.args[0][4] == dispatch._GATE_SHIM_PYTHON_DEADLINE
         gate_env = mock_popen.call_args.kwargs["env"]
         assert paths == [gate_env.get("PATH")]
         assert any(

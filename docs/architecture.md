@@ -619,3 +619,40 @@ For a single-machine / development install (no two-user split, no sudo wrapping 
 subprocesses), use **single-user mode**: run the setup script with `DISPATCH_SINGLE_USER=1`.
 See [docs/install.md — Single-user mode](install.md#single-user-mode). This is the
 recommended path for an engineer's workstation.
+
+### Shared-account blast radius: the kill guard
+
+Every run on a host — build, gate, reviewer, talos — runs as ONE account, so every
+process's `/proc/<pid>/cmdline` is readable by, and matchable by, every other run. A
+pattern kill (`pkill -f gate.sh`, `killall selftest`) issued by one run to clean up its
+own background job therefore kills unrelated runs: on 2026-11-09 it killed two rollout
+reviewers (exit 143 and exit -9) and five concurrent build gates.
+
+Two mechanisms bound that blast radius:
+
+- **The system prompt never travels in argv.** The claude-family engines pass
+  `--system-prompt-file <run tmp>/system_prompt.txt` and the worker writes the file
+  (mode 0600, as the agent user) before the spawn; `run_agent` refuses to launch an argv
+  that carries the prompt text, an element equal to it, or any element over 4 KB. Talos
+  never carried prompt text either: its TaskSpec is piped on stdin.
+- **A `pkill`/`killall` shim shadows both names on the agent PATH.** The shims live in
+  the agent's kill-guard directory — `~/.local/share/agent-gtd-dispatch/kill-guard/pkill`
+  and `~/.local/share/agent-gtd-dispatch/kill-guard/killall` — refuse EVERY invocation
+  with one stderr line and exit 2, and append one line per refusal to the run's
+  `kill-guard.log`. Numeric `kill <pid>` is untouched: an agent stops what it started by
+  recording `$!` or a pidfile.
+
+The guard directory is prepended to every agent, gate and talos PATH by
+`engines.prepend_agent_bin_dirs`, but the value is DELIVERED in the argv inside the sudo
+wrap (`run_tmp.with_tmp_env` emits `/usr/bin/env PATH=...` first): sudoers `secure_path`
+REPLACES the child's PATH and `env_keep` cannot override it, so the argv is the only
+correct carrier. The env-dict prepend stays for single-user mode, which has no sudo hop.
+
+The directory is deliberately a SIBLING of `~/.local/bin` and off `secure_path`, so the
+worker's own `sudo -n -u <agent> pkill -KILL -s <sid>` run-session kill is never shadowed
+— a shim reachable through `secure_path` would not be in the sudoers NOPASSWD list, sudo
+would refuse with "a password is required", and every timeout or cancel would signal only
+the sudo wrapper (the kb-03965 regression). This is a habit guardrail, not an integrity
+control: an agent that rewrites the shims, or calls `/usr/bin/pkill` by absolute path, is
+out of scope.
+

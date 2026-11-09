@@ -114,6 +114,51 @@ def parse_result_envelope(transcript_path: Path) -> ResultEnvelope | None:
 
 AGENT_SAID_MAX_CHARS: int = 300
 
+# Shell convention for a child killed by a signal: 128 + signum.  A negative
+# returncode (what subprocess reports when the process itself was signalled)
+# carries the same information more directly; both are accepted below.
+SIGNAL_EXIT_BASE: int = 128
+# The ONLY source of a signal name.  ``signal.Signals(sig).name`` is
+# deliberately not used: it renders unmapped real-time signals (e.g. 34) as
+# ``SIGRTMIN``, which would make the halt text depend on the host's libc.
+SIGNAL_NAMES: dict[int, str] = {
+    1: "SIGHUP",
+    2: "SIGINT",
+    6: "SIGABRT",
+    9: "SIGKILL",
+    13: "SIGPIPE",
+    15: "SIGTERM",
+}
+
+
+def killed_by_signal(returncode: int | None) -> int | None:
+    """Return the signal number that killed a process, or None.
+
+    A negative return code is ``-signum`` (``subprocess``'s own convention); a
+    return code in ``128 < rc <= 128 + 64`` is the shell's ``128 + signum``.
+    ``0``, ``None``, an unset code and everything else mean "exited normally,
+    not by a signal".
+    """
+    if returncode is None:
+        return None
+    if returncode < 0:
+        return -returncode
+    if SIGNAL_EXIT_BASE < returncode <= SIGNAL_EXIT_BASE + 64:
+        return returncode - SIGNAL_EXIT_BASE
+    return None
+
+
+def signal_halt_text(sig: int) -> str:
+    """Describe a signal-only exit for a failure detail line.
+
+    The name comes from :data:`SIGNAL_NAMES` only; an unmapped signal renders
+    as its number.
+    """
+    name = SIGNAL_NAMES.get(sig)
+    if name is None:
+        return f"killed by signal {sig}"
+    return f"killed by signal {sig} ({name})"
+
 
 def agent_output_summary(transcript_path: Path) -> str:
     """Return the agent's own words from a transcript, for a failure detail.
