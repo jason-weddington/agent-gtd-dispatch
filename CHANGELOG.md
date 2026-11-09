@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.25.1 (2026-11-08)
+
+### Bug Fixes
+
+- **31300e4d**: Keep a tearing-down build run visible to shutdown until its rescue finishes
+  ([`ee03621`](https://github.com/repos/agent-gtd-dispatch/commit/ee03621c232c195e5452ea86b71d44f110b162aa))
+
+
 ## v2.25.0 (2026-11-08)
 
 ### Features
