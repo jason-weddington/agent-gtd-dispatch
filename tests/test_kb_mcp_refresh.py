@@ -1,6 +1,9 @@
 """Tests for scripts/kb-mcp-refresh.sh and its wiring into deploy.sh and
 setup-dispatch-host.sh. Hermetic: a fake argv-recording `claude`, a tmp agent
 home, no root.
+
+The script registers tightbeam_kb and agent-gtd as hosted HTTP /mcp servers and
+unconditionally retires the legacy personal-kb/team-kb servers.
 """
 
 from __future__ import annotations
@@ -26,12 +29,12 @@ SCRIPT = ROOT / "scripts" / "kb-mcp-refresh.sh"
 DEPLOY = ROOT / "deploy.sh"
 PROBE = ROOT / "templates" / "mcp-probe.py"
 SETUP = ROOT / "setup-dispatch-host.sh"
+ENV_TMPL = ROOT / "templates" / "dispatch-env.tmpl"
 
 USER = pwd.getpwuid(os.getuid()).pw_name
 GROUP = grp.getgrgid(os.getgid()).gr_name
 
-PK = "pk-SECRET-1"
-TK = "tk-SECRET-2"
+TBK = "tbk-SECRET-4"
 GK = "gk-SECRET-3"
 
 FAKE_CLAUDE = """#!/usr/bin/env bash
@@ -82,21 +85,17 @@ PY
 """
 
 
-def desired(url: str, helper_var: str, keyfile: str) -> dict[str, str]:
-    return {
-        "type": "http",
-        "url": url,
-        "headersHelper": (
-            'printf \'{"Authorization": "Bearer %s"}\' '
-            f'"${{{helper_var}:-$(cat ~/{keyfile} 2>/dev/null)}}"'
-        ),
-    }
-
-
-D_PERSONAL = desired(
-    "https://kb.example/mcp", "PERSONAL_KB_API_KEY", ".personal_kb_hook_key"
+TIGHTBEAM_HELPER = (
+    'printf \'{"Authorization": "Bearer %s"}\' '
+    '"${TIGHTBEAM_KB_MCP_TOKEN:-$(cat ~/.tightbeam_kb_key 2>/dev/null)}"'
 )
-D_TEAM = desired("https://team.example/mcp", "TEAM_KB_API_KEY", ".team_kb_key")
+
+D_TIGHTBEAM = {
+    "type": "http",
+    "url": "https://kb.example/mcp",
+    "headersHelper": TIGHTBEAM_HELPER,
+}
+
 D_GTD = {
     "type": "http",
     "url": "https://gtd.example/mcp",
@@ -166,184 +165,341 @@ def env(tmp_path: Path) -> Env:
     return Env(tmp_path)
 
 
-def both_env(e: Env) -> None:
+def tightbeam_env(e: Env, url: str = "https://kb.example", token: str = TBK) -> None:
+    text = f"TIGHTBEAM_KB_MCP_TOKEN={token}\n"
+    if url is not None:
+        text = f"TIGHTBEAM_KB_MCP_URL={url}\n" + text
+    e.write_env(text)
+
+
+def gtd_env(e: Env, url: str = "https://gtd.example", key: str | None = None) -> None:
+    text = f"AGENT_GTD_URL={url}\n"
+    if key is not None:
+        text += f"AGENT_GTD_API_KEY={key}\n"
+    e.write_env(text)
+
+
+def all_env(e: Env) -> None:
     e.write_env(
-        f"PERSONAL_KB_URL=https://kb.example\nPERSONAL_KB_API_KEY={PK}\n"
-        f"TEAM_KB_URL=https://team.example/\nTEAM_KB_API_KEY={TK}\n"
+        f"TIGHTBEAM_KB_MCP_URL=https://kb.example\n"
+        f"TIGHTBEAM_KB_MCP_TOKEN={TBK}\n"
+        f"AGENT_GTD_URL=https://gtd.example\nAGENT_GTD_API_KEY={GK}\n"
     )
 
 
-def personal_env(e: Env) -> None:
-    e.write_env(f"PERSONAL_KB_URL=https://kb.example\nPERSONAL_KB_API_KEY={PK}\n")
+# --- tightbeam_kb registration -------------------------------------------
 
 
-def test_unchanged(env: Env) -> None:
-    both_env(env)
-    env.seed({"personal-kb": D_PERSONAL, "team-kb": D_TEAM})
-    pf = env.key_file(".personal_kb_hook_key", PK)
-    tf = env.key_file(".team_kb_key", TK)
-    before = [(p.stat().st_ino, p.stat().st_mtime_ns) for p in (pf, tf)]
-    r = env.run()
-    assert r.returncode == 0, r.stderr
-    assert r.stdout.count("registration up to date") == 2
-    assert (
-        "[OK]   personal-kb registration up to date (https://kb.example/mcp)"
-        in r.stdout
-    )
-    assert env.calls() == []
-    assert before == [(p.stat().st_ino, p.stat().st_mtime_ns) for p in (pf, tf)]
-    assert r.stdout.splitlines()[-1] == (
-        "kb-mcp-refresh: personal-kb=ok team-kb=ok agent-gtd=skipped "
-        "agent-gtd-probe=skipped rc=0"
-    )
-
-
-def test_changed_url(env: Env) -> None:
-    personal_env(env)
-    env.seed({"personal-kb": {**D_PERSONAL, "url": "https://old.example/mcp"}})
+def test_registration_exact_calls(env: Env) -> None:
+    """AC-1: no pre-existing entry -> remove then add-json with the exact helper."""
+    tightbeam_env(env)
     r = env.run()
     assert r.returncode == 0, r.stderr
     assert env.calls() == [
-        ["mcp", "remove", "personal-kb", "--scope", "user"],
-        ["mcp", "add-json", "personal-kb", json.dumps(D_PERSONAL), "--scope", "user"],
+        ["mcp", "remove", "tightbeam_kb", "--scope", "user"],
+        [
+            "mcp",
+            "add-json",
+            "tightbeam_kb",
+            json.dumps(D_TIGHTBEAM),
+            "--scope",
+            "user",
+        ],
     ]
-    assert "reason: url-changed" in r.stdout
-    assert "[SKIP] team-kb:" in r.stdout
-
-
-def test_legacy_stdio(env: Env) -> None:
-    personal_env(env)
-    env.seed(
-        {
-            "personal-kb": {
-                "type": "stdio",
-                "command": "uvx",
-                "env": {"PERSONAL_KB_API_KEY": "old-legacy-key"},
-            }
-        }
+    assert "[CHANGED] tightbeam_kb registered as http https://kb.example/mcp" in (
+        r.stdout
     )
+
+
+def test_key_file_perms(env: Env) -> None:
+    tightbeam_env(env)
     r = env.run()
     assert r.returncode == 0, r.stderr
-    assert [c[1] for c in env.calls()] == ["remove", "add-json"]
-    assert "reason: legacy-stdio" in r.stdout
-
-
-def test_absent_reason_and_helper_changed(env: Env) -> None:
-    personal_env(env)
-    r = env.run()
+    kf = env.home / ".tightbeam_kb_key"
+    assert stat.S_IMODE(kf.stat().st_mode) == 0o600
+    assert kf.read_text() == TBK
     assert "reason: absent" in r.stdout
-    env.seed({"personal-kb": {**D_PERSONAL, "headersHelper": "old"}})
-    r = env.run()
-    assert "reason: helper-changed" in r.stdout
 
 
-def test_missing_key_skip_removes_stale(env: Env) -> None:
-    env.write_env("PERSONAL_KB_URL=https://kb.example\n")
-    env.seed({"personal-kb": D_PERSONAL})
+def test_key_file_mode_repair_without_claude_call(env: Env) -> None:
+    tightbeam_env(env)
+    env.seed({"tightbeam_kb": D_TIGHTBEAM})
+    kf = env.key_file(".tightbeam_kb_key", TBK, 0o644)
     r = env.run()
     assert r.returncode == 0, r.stderr
-    assert any(
-        ln.startswith("[SKIP] personal-kb:") and "PERSONAL_KB_API_KEY" in ln
-        for ln in r.stdout.splitlines()
-    )
-    assert "removed stale personal-kb registration" in r.stdout
-    assert env.calls() == [["mcp", "remove", "personal-kb", "--scope", "user"]]
-
-
-def test_missing_key_no_entry_no_call(env: Env) -> None:
-    env.write_env("PERSONAL_KB_URL=https://kb.example\n")
-    r = env.run()
-    assert r.returncode == 0
-    assert "[SKIP] personal-kb:" in r.stdout
+    assert stat.S_IMODE(kf.stat().st_mode) == 0o600
+    assert f"[CHANGED] {kf} written (mode 0600, reason: mode-644)" in r.stdout
+    assert "registration up to date" in r.stdout
     assert env.calls() == []
 
 
-def test_remove_failure(env: Env) -> None:
-    env.write_env("PERSONAL_KB_URL=https://kb.example\n")
-    env.seed({"personal-kb": D_PERSONAL})
+def test_key_file_content_changed(env: Env) -> None:
+    tightbeam_env(env)
+    env.seed({"tightbeam_kb": D_TIGHTBEAM})
+    kf = env.key_file(".tightbeam_kb_key", "stale\n")
+    r = env.run()
+    assert f"[CHANGED] {kf} written (mode 0600, reason: content-changed)" in r.stdout
+    assert kf.read_text() == TBK
+    assert env.calls() == []
+
+
+def test_unchanged(env: Env) -> None:
+    """Second run is a no-op: key file inode/mtime unchanged, no claude call."""
+    tightbeam_env(env)
+    env.seed({"tightbeam_kb": D_TIGHTBEAM})
+    first = env.run()
+    assert first.returncode == 0, first.stderr
+    kf = env.home / ".tightbeam_kb_key"
+    before = (kf.stat().st_ino, kf.stat().st_mtime_ns)
+    calls_before = len(env.calls())
+
+    second = env.run()
+    assert second.returncode == 0, second.stderr
+    assert f"[OK]   {kf} up to date" in second.stdout
+    assert "[OK]   tightbeam_kb registration up to date (https://kb.example/mcp)" in (
+        second.stdout
+    )
+    assert len(env.calls()) == calls_before
+    assert (kf.stat().st_ino, kf.stat().st_mtime_ns) == before
+    assert second.stdout.splitlines()[-1] == (
+        "kb-mcp-refresh: tightbeam_kb=ok agent-gtd=skipped agent-gtd-probe=skipped rc=0"
+    )
+
+
+def test_tightbeam_and_gtd_unchanged(env: Env) -> None:
+    all_env(env)
+    env.seed({"tightbeam_kb": D_TIGHTBEAM, "agent-gtd": D_GTD})
+    env.key_file(".tightbeam_kb_key", TBK)
+    before = env.cj.read_bytes()
+    r = env.run()
+    assert r.returncode == 0, r.stderr
+    assert (
+        "[OK]   agent-gtd registration up to date (https://gtd.example/mcp)" in r.stdout
+    )
+    assert r.stdout.count("registration up to date") == 2
+    assert env.calls() == []
+    assert env.cj.read_bytes() == before
+    assert r.stdout.splitlines()[-1] == (
+        "kb-mcp-refresh: tightbeam_kb=ok agent-gtd=ok agent-gtd-probe=skipped rc=0"
+    )
+
+
+def test_missing_key_skip_removes_stale(env: Env) -> None:
+    env.write_env("TIGHTBEAM_KB_MCP_URL=https://kb.example\n")
+    env.seed({"tightbeam_kb": D_TIGHTBEAM})
+    kf = env.key_file(".tightbeam_kb_key", "old")
+    r = env.run()
+    assert r.returncode == 0, r.stderr
+    assert (
+        "[SKIP] tightbeam_kb: missing TIGHTBEAM_KB_MCP_TOKEN — not registered"
+        in r.stdout
+    )
+    assert "[CHANGED] removed stale tightbeam_kb registration" in r.stdout
+    assert f"[CHANGED] removed {kf}" in r.stdout
+    assert (
+        "[WARN] tightbeam_kb: registration removed — agents on this host have no "
+        "knowledge base until TIGHTBEAM_KB_MCP_TOKEN is provisioned" in r.stderr
+    )
+    assert not kf.exists()
+    assert env.calls() == [["mcp", "remove", "tightbeam_kb", "--scope", "user"]]
+
+
+def test_missing_key_no_entry_no_call(env: Env) -> None:
+    env.write_env("TIGHTBEAM_KB_MCP_URL=https://kb.example\n")
+    r = env.run()
+    assert r.returncode == 0, r.stderr
+    assert "[SKIP] tightbeam_kb:" in r.stdout
+    assert f"[OK]   {env.home / '.tightbeam_kb_key'} already absent" in r.stdout
+    assert env.calls() == []
+
+
+@pytest.mark.parametrize(
+    "text", ["", f"TIGHTBEAM_KB_MCP_URL=\nTIGHTBEAM_KB_MCP_TOKEN={TBK}\n"]
+)
+def test_missing_url_skip_removes_stale(env: Env, text: str) -> None:
+    """AC-4: the URL has no code default; an unset/empty URL means no registration."""
+    env.write_env(text)
+    if not text:
+        env.write_env(f"TIGHTBEAM_KB_MCP_TOKEN={TBK}\n")
+    env.seed({"tightbeam_kb": D_TIGHTBEAM})
+    r = env.run()
+    assert r.returncode == 0, r.stderr
+    assert (
+        "[SKIP] tightbeam_kb: missing TIGHTBEAM_KB_MCP_URL — not registered" in r.stdout
+    )
+    assert "[CHANGED] removed stale tightbeam_kb registration" in r.stdout
+    assert not (env.home / ".tightbeam_kb_key").exists()
+    assert env.calls() == [["mcp", "remove", "tightbeam_kb", "--scope", "user"]]
+
+
+def test_both_missing_names_both(env: Env) -> None:
+    env.write_env("")
+    r = env.run()
+    assert r.returncode == 0, r.stderr
+    assert (
+        "[SKIP] tightbeam_kb: missing TIGHTBEAM_KB_MCP_URL TIGHTBEAM_KB_MCP_TOKEN "
+        "— not registered" in r.stdout
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://kb.example",
+        "https://kb.example/",
+        "https://kb.example/mcp",
+        "https://kb.example/mcp/",
+    ],
+)
+def test_url_normalization(env: Env, url: str) -> None:
+    tightbeam_env(env, url)
+    r = env.run()
+    assert r.returncode == 0, r.stderr
+    calls = env.calls()
+    assert [c[1] for c in calls] == ["remove", "add-json"]
+    assert json.loads(calls[1][3])["url"] == "https://kb.example/mcp"
+    assert "mcp/mcp" not in calls[1][3]
+
+
+def test_no_key_material_leaks(env: Env) -> None:
+    tightbeam_env(env, token=TBK)
+    r = env.run()
+    assert r.returncode == 0, r.stderr
+    for text in (env.log.read_text(), r.stdout, r.stderr):
+        assert TBK not in text
+    found = sorted(
+        str(p.relative_to(env.home))
+        for p in env.home.rglob("*")
+        if p.is_file() and TBK in p.read_text(errors="ignore")
+    )
+    assert found == [".tightbeam_kb_key"]
+
+
+def test_leak_tripwire(tmp_path: Path) -> None:
+    e = Env(tmp_path, FAKE_CLAUDE_STORING)
+    tightbeam_env(e, token=TBK)
+    r = e.run(extra_env={"FAKE_MODE": "leak", "FAKE_LEAK": TBK})
+    assert r.returncode == 1
+    assert (
+        "[ERR]  tightbeam_kb: API key found in .claude.json — secret leaked into "
+        "registration" in r.stderr
+    )
+
+
+def test_readback_drift(tmp_path: Path) -> None:
+    e = Env(tmp_path, FAKE_CLAUDE_STORING)
+    tightbeam_env(e, token=TBK)
+    r = e.run(extra_env={"FAKE_MODE": "extra"})
+    assert r.returncode == 0, r.stderr
+    assert "[WARN] tightbeam_kb readback differs" in r.stdout
+    assert "extra" in r.stdout
+
+
+def test_env_quoting_last_wins(env: Env) -> None:
+    env.write_env(
+        f'TIGHTBEAM_KB_MCP_URL="https://first.example"\n'
+        f'TIGHTBEAM_KB_MCP_URL="https://kb.example"\n'
+        f"TIGHTBEAM_KB_MCP_TOKEN='{TBK}'\n"
+    )
+    r = env.run()
+    assert r.returncode == 0, r.stderr
+    adds = [c for c in env.calls() if c[1] == "add-json"]
+    assert json.loads(adds[-1][3])["url"] == "https://kb.example/mcp"
+    assert (env.home / ".tightbeam_kb_key").read_text() == TBK
+
+
+def test_ambient_env_ignored(env: Env) -> None:
+    env.write_env("TIGHTBEAM_KB_MCP_URL=https://kb.example\n")
+    r = env.run(extra_env={"TIGHTBEAM_KB_MCP_TOKEN": "ambient-should-not-be-used"})
+    assert "[SKIP] tightbeam_kb:" in r.stdout
+    assert env.calls() == []
+
+
+def test_unparseable_claude_json(env: Env) -> None:
+    tightbeam_env(env)
+    env.cj.write_text("{not json")
+    r = env.run()
+    assert r.returncode == 1
+    assert "[ERR]  cannot parse" in r.stderr
+    assert env.calls() == []
+    assert not (env.home / ".tightbeam_kb_key").exists()
+
+
+# --- personal-kb / team-kb retirement ------------------------------------
+
+
+def _seed_retired(e: Env) -> tuple[Path, Path]:
+    e.seed(
+        {
+            "personal-kb": {"type": "http", "url": "https://old.example/mcp"},
+            "team-kb": {"type": "http", "url": "https://team.example/mcp"},
+        }
+    )
+    return (
+        e.key_file(".personal_kb_hook_key", "old-personal"),
+        e.key_file(".team_kb_key", "old-team"),
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "PERSONAL_KB_URL=https://kb.example\nPERSONAL_KB_API_KEY=pk\n"
+        "TEAM_KB_URL=https://team.example\nTEAM_KB_API_KEY=tk\n",
+        "",
+    ],
+)
+def test_retirement_removes_registrations_and_key_files(env: Env, text: str) -> None:
+    env.write_env(text)
+    pf, tf = _seed_retired(env)
+    r = env.run()
+    assert r.returncode == 0, r.stderr
+    assert "[CHANGED] removed retired personal-kb registration" in r.stdout
+    assert "[CHANGED] removed retired team-kb registration" in r.stdout
+    assert f"[CHANGED] removed {pf}" in r.stdout
+    assert f"[CHANGED] removed {tf}" in r.stdout
+    assert not pf.exists() and not tf.exists()
+    assert env.calls() == [
+        ["mcp", "remove", "personal-kb", "--scope", "user"],
+        ["mcp", "remove", "team-kb", "--scope", "user"],
+    ]
+    assert not any(c[1] == "add-json" for c in env.calls())
+
+
+def test_retirement_with_legacy_kb_vars_present(env: Env) -> None:
+    env.write_env(
+        "PERSONAL_KB_URL=https://kb.example\nPERSONAL_KB_API_KEY=pk\n"
+        "TEAM_KB_URL=https://team.example\nTEAM_KB_API_KEY=tk\n"
+    )
+    r = env.run()
+    assert r.returncode == 0, r.stderr
+    # Legacy vars are never read: no registration is attempted for them.
+    assert "[SKIP] personal-kb:" not in r.stdout
+    assert "[SKIP] team-kb:" not in r.stdout
+    assert env.calls() == []
+
+
+def test_retirement_absent_is_noop(env: Env) -> None:
+    env.write_env("")
+    r = env.run()
+    assert r.returncode == 0, r.stderr
+    assert "[OK]   personal-kb registration already absent" in r.stdout
+    assert "[OK]   team-kb registration already absent" in r.stdout
+    assert f"[OK]   {env.home / '.personal_kb_hook_key'} already absent" in r.stdout
+    assert f"[OK]   {env.home / '.team_kb_key'} already absent" in r.stdout
+    assert env.calls() == []
+
+
+def test_retirement_remove_failure(env: Env) -> None:
+    env.write_env("")
+    env.seed({"personal-kb": {"type": "http", "url": "https://old.example/mcp"}})
     r = env.run(extra_env={"FAKE_CLAUDE_RC": "1"})
     assert r.returncode == 1
     assert "[ERR]  claude mcp remove personal-kb failed (rc=1)" in r.stderr
     assert r.stdout.splitlines()[-1].endswith("rc=1")
 
 
-def test_key_file_perms(env: Env) -> None:
-    personal_env(env)
-    r = env.run()
-    assert r.returncode == 0, r.stderr
-    kf = env.home / ".personal_kb_hook_key"
-    assert stat.S_IMODE(kf.stat().st_mode) == 0o600
-    assert kf.read_text() == PK
-    assert "reason: absent" in r.stdout
-
-
-def test_key_file_mode_repair_without_claude_call(env: Env) -> None:
-    personal_env(env)
-    env.seed({"personal-kb": D_PERSONAL})
-    kf = env.key_file(".personal_kb_hook_key", PK, 0o644)
-    r = env.run()
-    assert r.returncode == 0, r.stderr
-    assert stat.S_IMODE(kf.stat().st_mode) == 0o600
-    assert "reason: mode-644" in r.stdout
-    assert "registration up to date" in r.stdout
-    assert env.calls() == []
-
-
-def test_content_changed_key_file(env: Env) -> None:
-    personal_env(env)
-    env.seed({"personal-kb": D_PERSONAL})
-    kf = env.key_file(".personal_kb_hook_key", "stale\n")
-    r = env.run()
-    assert "reason: content-changed" in r.stdout
-    assert kf.read_text() == PK
-
-
-def test_registration_changed_key_file_current(env: Env) -> None:
-    personal_env(env)
-    env.key_file(".personal_kb_hook_key", PK)
-    r = env.run()
-    assert "[OK]" in r.stdout and "personal_kb_hook_key up to date" in r.stdout
-    assert [c[1] for c in env.calls()] == ["remove", "add-json"]
-
-
-def test_no_key_material_leaks(env: Env) -> None:
-    both_env(env)
-    r = env.run()
-    assert r.returncode == 0, r.stderr
-    for text in (env.log.read_text(), r.stdout, r.stderr):
-        assert PK not in text and TK not in text
-
-
-def test_protected_servers_never_touched(env: Env) -> None:
-    both_env(env)
-    env.seed(
-        {
-            "aws-documentation-mcp-server": {"command": "x"},
-            "personal-kb": {"command": "uvx"},
-        }
-    )
-    env.run()
-    env.write_env("")
-    env.run()
-    log = env.log.read_text()
-    assert "aws-documentation-mcp-server" not in log
-
-
-def test_add_json_failure_keeps_key_file(env: Env) -> None:
-    personal_env(env)
-    r = env.run(extra_env={"FAKE_CLAUDE_RC": "1"})
-    assert r.returncode == 1
-    assert "[ERR]  claude mcp add-json personal-kb failed (rc=1)" in r.stderr
-    kf = env.home / ".personal_kb_hook_key"
-    assert stat.S_IMODE(kf.stat().st_mode) == 0o600
-    assert kf.read_text() == PK
-
-
-def test_team_still_processed_after_personal_failure(env: Env) -> None:
-    both_env(env)
-    r = env.run(extra_env={"FAKE_CLAUDE_RC": "1"})
-    assert r.returncode == 1
-    assert "add-json team-kb failed" in r.stderr
+# --- CLI / static guards --------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -363,7 +519,7 @@ def test_missing_env_file(env: Env) -> None:
 
 
 def test_unknown_agent_user(env: Env) -> None:
-    personal_env(env)
+    tightbeam_env(env)
     r = env.run(
         "--env-file",
         str(env.envfile),
@@ -376,57 +532,12 @@ def test_unknown_agent_user(env: Env) -> None:
 
 
 def test_claude_not_executable(env: Env) -> None:
-    personal_env(env)
+    tightbeam_env(env)
     env.claude.chmod(0o644)
     r = env.run()
     assert r.returncode == 5
     assert env.calls() == []
-    assert not (env.home / ".personal_kb_hook_key").exists()
-
-
-def test_env_quoting_last_wins(env: Env) -> None:
-    env.write_env(
-        f'PERSONAL_KB_URL="https://first.example"\nPERSONAL_KB_URL="https://kb.example"\n'
-        f"PERSONAL_KB_API_KEY='{PK}'\n"
-    )
-    r = env.run()
-    assert r.returncode == 0, r.stderr
-    assert env.calls()[-1][3] == json.dumps(D_PERSONAL)
-    assert (env.home / ".personal_kb_hook_key").read_text() == PK
-
-
-def test_ambient_env_ignored(env: Env) -> None:
-    env.write_env("PERSONAL_KB_URL=https://kb.example\n")
-    r = env.run(extra_env={"PERSONAL_KB_API_KEY": "ambient-should-not-be-used"})
-    assert "[SKIP] personal-kb:" in r.stdout
-    assert env.calls() == []
-
-
-def test_unparseable_claude_json(env: Env) -> None:
-    personal_env(env)
-    env.cj.write_text("{not json")
-    r = env.run()
-    assert r.returncode == 1
-    assert "[ERR]  cannot parse" in r.stderr
-    assert env.calls() == []
-    assert not (env.home / ".personal_kb_hook_key").exists()
-
-
-def test_leak_tripwire(tmp_path: Path) -> None:
-    e = Env(tmp_path, FAKE_CLAUDE_STORING)
-    personal_env(e)
-    r = e.run(extra_env={"FAKE_MODE": "leak", "FAKE_LEAK": PK})
-    assert r.returncode == 1
-    assert "API key found in .claude.json" in r.stderr
-
-
-def test_readback_drift(tmp_path: Path) -> None:
-    e = Env(tmp_path, FAKE_CLAUDE_STORING)
-    personal_env(e)
-    r = e.run(extra_env={"FAKE_MODE": "extra"})
-    assert r.returncode == 0, r.stderr
-    assert "[WARN] personal-kb readback differs" in r.stdout
-    assert "extra" in r.stdout
+    assert not (env.home / ".tightbeam_kb_key").exists()
 
 
 def test_script_syntax_and_executable() -> None:
@@ -454,6 +565,28 @@ def test_script_static() -> None:
         assert bad not in s
     code = "\n".join(ln for ln in s.splitlines() if not ln.lstrip().startswith("#"))
     assert "aws-documentation-mcp-server" not in code
+    for tok in ("PERSONAL_KB_", "TEAM_KB_"):
+        assert tok not in s
+    assert "KB_LEAK_PERSONAL" not in s and "KB_LEAK_TEAM" not in s
+
+
+def test_header_rewritten() -> None:
+    lines = SCRIPT.read_text().splitlines()[3:48]
+    head = "\n".join(lines)
+    assert "personal-kb" not in head and "team-kb" not in head
+    assert (
+        "#   kb-mcp-refresh: tightbeam_kb=<S> agent-gtd=<S> agent-gtd-probe=<P> rc=<N>"
+        in lines
+    )
+    assert "5  --claude path is not an executable file" in head
+
+
+def test_env_template_documents_tightbeam_only() -> None:
+    text = ENV_TMPL.read_text()
+    assert "PERSONAL_KB" not in text
+    assert "TEAM_KB_URL" not in text and "TEAM_KB_API_KEY" not in text
+    assert text.count("TEAM_KB_DATABASE_URL") == 2
+    assert "TIGHTBEAM_KB_MCP_URL=" in text and "TIGHTBEAM_KB_MCP_TOKEN=" in text
 
 
 def test_deploy_wiring() -> None:
@@ -493,21 +626,6 @@ def test_setup_wiring() -> None:
 
 
 # --- agent-gtd (HTTP /mcp, URL-only, env-only bearer) ---
-
-
-def gtd_env(e: Env, url: str = "https://gtd.example", key: str | None = None) -> None:
-    text = f"AGENT_GTD_URL={url}\n"
-    if key is not None:
-        text += f"AGENT_GTD_API_KEY={key}\n"
-    e.write_env(text)
-
-
-def all_env(e: Env) -> None:
-    e.write_env(
-        f"PERSONAL_KB_URL=https://kb.example\nPERSONAL_KB_API_KEY={PK}\n"
-        f"TEAM_KB_URL=https://team.example/\nTEAM_KB_API_KEY={TK}\n"
-        f"AGENT_GTD_URL=https://gtd.example\nAGENT_GTD_API_KEY={GK}\n"
-    )
 
 
 def test_gtd_exact_add_json(env: Env) -> None:
@@ -555,14 +673,36 @@ def test_gtd_helper_literal_in_script() -> None:
     assert "cat" not in line and "~/" not in line and "/." not in line
 
 
+def test_tightbeam_helper_reads_key_file(tmp_path: Path) -> None:
+    e = Env(tmp_path)
+    (e.home / ".tightbeam_kb_key").write_text("TK")
+    run = subprocess.run(
+        ["/bin/sh", "-c", D_TIGHTBEAM["headersHelper"]],
+        env={"PATH": "/usr/bin:/bin", "HOME": str(e.home)},
+        capture_output=True,
+        text=True,
+    )
+    assert run.stdout == '{"Authorization": "Bearer TK"}'
+    # The env form wins when the token is set (manual/interactive escape hatch).
+    run = subprocess.run(
+        ["/bin/sh", "-c", D_TIGHTBEAM["headersHelper"]],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(e.home),
+            "TIGHTBEAM_KB_MCP_TOKEN": "ENV-TOKEN",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert run.stdout == '{"Authorization": "Bearer ENV-TOKEN"}'
+
+
 def test_gtd_url_only_no_key_file(env: Env) -> None:
     gtd_env(env, key=GK)
     r = env.run()
     assert r.returncode == 0, r.stderr
     assert "agent-gtd=changed" in r.stdout.splitlines()[-1]
-    names = [
-        p.name for p in env.home.rglob("*") if p.name != ".claude.json"
-    ]  # fmt: skip
+    names = [p.name for p in env.home.rglob("*") if p.name != ".claude.json"]
     assert not [n for n in names if "agent_gtd" in n or "agent-gtd" in n]
     for text in (env.log.read_text(), r.stdout, r.stderr):
         assert GK not in text
@@ -592,26 +732,6 @@ def test_gtd_leak_tripwire(tmp_path: Path) -> None:
     assert (
         "[ERR]  agent-gtd: API key found in .claude.json — secret leaked into "
         "registration" in r.stderr
-    )
-
-
-def test_unchanged_all_three(env: Env) -> None:
-    all_env(env)
-    env.seed({"personal-kb": D_PERSONAL, "team-kb": D_TEAM, "agent-gtd": D_GTD})
-    env.key_file(".personal_kb_hook_key", PK)
-    env.key_file(".team_kb_key", TK)
-    before = env.cj.read_bytes()
-    r = env.run()
-    assert r.returncode == 0, r.stderr
-    assert (
-        "[OK]   agent-gtd registration up to date (https://gtd.example/mcp)" in r.stdout
-    )
-    assert r.stdout.count("registration up to date") == 3
-    assert env.calls() == []
-    assert env.cj.read_bytes() == before
-    assert r.stdout.splitlines()[-1] == (
-        "kb-mcp-refresh: personal-kb=ok team-kb=ok agent-gtd=ok "
-        "agent-gtd-probe=skipped rc=0"
     )
 
 
@@ -694,27 +814,6 @@ def test_gtd_restore_failure_reported(env: Env) -> None:
         "— agent-gtd is NOT registered" in r.stderr
     )
     assert [c[1] for c in env.calls()] == ["remove", "add-json", "add-json"]
-
-
-def test_gtd_processed_after_kb_failure(env: Env) -> None:
-    all_env(env)
-    r = env.run(extra_env={"FAKE_CLAUDE_RC": "1"})
-    assert r.returncode == 1
-    assert "add-json agent-gtd failed" in r.stderr
-
-
-@pytest.mark.parametrize(
-    ("text", "name", "var"),
-    [
-        ("PERSONAL_KB_URL=https://kb.example\n", "personal-kb", "PERSONAL_KB_API_KEY"),
-        ("TEAM_KB_URL=https://team.example\n", "team-kb", "TEAM_KB_API_KEY"),
-    ],
-)
-def test_kb_missing_key_still_skipped(env: Env, text: str, name: str, var: str) -> None:
-    env.write_env(text + "AGENT_GTD_URL=https://gtd.example\n")
-    r = env.run()
-    assert r.returncode == 0, r.stderr
-    assert f"[SKIP] {name}: missing {var} — not registered" in r.stdout
 
 
 def test_probe_arg_must_be_file(env: Env) -> None:

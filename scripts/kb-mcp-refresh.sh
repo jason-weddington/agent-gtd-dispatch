@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# kb-mcp-refresh.sh — Register personal-kb, team-kb AND agent-gtd as hosted HTTP
+# kb-mcp-refresh.sh — Register tightbeam_kb AND agent-gtd as hosted HTTP
 # /mcp servers for the agent user (user scope, i.e. <agent-home>/.claude.json) and
-# keep the two KB servers' 0600 key files in the agent home in sync. This is the ONLY
-# code that registers these three servers (agent-gtd included); it is called by
+# keep tightbeam_kb's 0600 key file in the agent home in sync. This is the ONLY
+# code that registers these two servers (agent-gtd included); it is called by
 # setup-dispatch-host.sh (Step 4.6) and by deploy.sh (every deploy, non-fatal), so
-# template changes reach existing hosts.
+# template changes reach existing hosts. It also unconditionally retires the legacy
+# KB registrations and their key files from every host.
 #
 # Each server is registered as {"type": "http", "url": "<base>/mcp",
 # "headersHelper": "<shell snippet>"}. The helper reads the API key at connect
-# time, so the key itself never lands in .claude.json. The KB helpers read the env
-# and fall back to the key file. The agent-gtd helper reads ONLY the env
-# (AGENT_GTD_API_KEY, set per run by the dispatch worker to the run's callback
+# time, so the key itself never lands in .claude.json. The tightbeam_kb helper
+# reads the env and falls back to the key file. The agent-gtd helper reads ONLY the
+# env (AGENT_GTD_API_KEY, set per run by the dispatch worker to the run's callback
 # token) and forwards AGENT_GTD_AGENT_NAME as X-Agent-Name when set; there is no
 # agent-gtd key file by design, since a static key would pin every run to one
 # identity. The service URLs and API keys come ONLY from --env-file
-# (PERSONAL_KB_URL, PERSONAL_KB_API_KEY, TEAM_KB_URL, TEAM_KB_API_KEY,
-# AGENT_GTD_URL, AGENT_GTD_API_KEY), never from this script's own process
+# (TIGHTBEAM_KB_MCP_URL, TIGHTBEAM_KB_MCP_TOKEN, AGENT_GTD_URL, AGENT_GTD_API_KEY), never from this script's own process
 # environment. agent-gtd needs only AGENT_GTD_URL; AGENT_GTD_API_KEY is used only
 # for the post-run leak check and the optional --probe.
 #
@@ -44,7 +44,7 @@ set -euo pipefail
 # Checks for 2, 3, 4 and 5 run in that order, before any claude call or file write.
 #
 # The last stdout line (exit 0 and 1 only) is:
-#   kb-mcp-refresh: personal-kb=<S> team-kb=<S> agent-gtd=<S> agent-gtd-probe=<P> rc=<N>
+#   kb-mcp-refresh: tightbeam_kb=<S> agent-gtd=<S> agent-gtd-probe=<P> rc=<N>
 #     S: ok|changed|skipped|err    P: ok|fail|skipped
 
 PROG="$(basename "$0")"
@@ -58,7 +58,7 @@ PROBE_STATUS=skipped
 FAIL=0
 SUMMARY_ON=false
 TMP=""
-declare -A STATUS=([personal-kb]=err [team-kb]=err [agent-gtd]=err)
+declare -A STATUS=([tightbeam_kb]=err [agent-gtd]=err)
 
 usage() {
     cat >&2 <<USAGE
@@ -76,7 +76,7 @@ cleanup() {
     local rc=$?
     if [[ -n "$TMP" ]]; then rm -f "$TMP"; fi
     if $SUMMARY_ON && [[ $rc -le 1 ]]; then
-        echo "kb-mcp-refresh: personal-kb=${STATUS[personal-kb]} team-kb=${STATUS[team-kb]} agent-gtd=${STATUS[agent-gtd]} agent-gtd-probe=${PROBE_STATUS} rc=${rc}"
+        echo "kb-mcp-refresh: tightbeam_kb=${STATUS[tightbeam_kb]} agent-gtd=${STATUS[agent-gtd]} agent-gtd-probe=${PROBE_STATUS} rc=${rc}"
     fi
 }
 trap cleanup EXIT
@@ -129,10 +129,12 @@ read_env_var() {
     printf '%s' "$v"
 }
 
-PERSONAL_KB_URL="$(read_env_var PERSONAL_KB_URL)"
-PERSONAL_KB_API_KEY="$(read_env_var PERSONAL_KB_API_KEY)"
-TEAM_KB_URL="$(read_env_var TEAM_KB_URL)"
-TEAM_KB_API_KEY="$(read_env_var TEAM_KB_API_KEY)"
+# Normalize the Tightbeam URL in the caller: process_server appends `/mcp`, so strip
+# ONE trailing `/` and then ONE trailing `/mcp` here to avoid `/mcp/mcp`.
+TIGHTBEAM_KB_URL="$(read_env_var TIGHTBEAM_KB_MCP_URL)"
+TIGHTBEAM_KB_URL="${TIGHTBEAM_KB_URL%/}"
+TIGHTBEAM_KB_URL="${TIGHTBEAM_KB_URL%/mcp}"
+TIGHTBEAM_KB_MCP_TOKEN="$(read_env_var TIGHTBEAM_KB_MCP_TOKEN)"
 AGENT_GTD_URL="$(read_env_var AGENT_GTD_URL)"
 AGENT_GTD_API_KEY="$(read_env_var AGENT_GTD_API_KEY)"
 
@@ -208,8 +210,7 @@ elif mode == "leak":
     with open(path, "rb") as fh:
         raw = fh.read()
     for name, var in (
-        ("personal-kb", "KB_LEAK_PERSONAL"),
-        ("team-kb", "KB_LEAK_TEAM"),
+        ("tightbeam_kb", "KB_LEAK_TIGHTBEAM"),
         ("agent-gtd", "KB_LEAK_AGENT_GTD"),
     ):
         k = os.environ.get(var, "")
@@ -295,6 +296,16 @@ process_server() {
                 STATUS[$name]=changed
             fi
         fi
+        # A server with a key file is useless without its key: drop the stale key
+        # file and warn loudly, so an unprovisioned host does not look configured.
+        if [[ -n "$keyvar" && -z "$key" ]]; then
+            echo "[WARN] ${name}: registration removed — agents on this host have no knowledge base until ${keyvar} is provisioned" >&2
+            if [[ -e "$keyfile" ]]; then
+                rm -f "$keyfile" && echo "[CHANGED] removed ${keyfile}"
+            else
+                echo "[OK]   ${keyfile} already absent"
+            fi
+        fi
         return 0
     fi
 
@@ -358,22 +369,44 @@ if ! py parse "$CLAUDE_JSON"; then
     fail "cannot parse ${CLAUDE_JSON}"
 fi
 
-HELPER_PERSONAL=$'printf \'{"Authorization": "Bearer %s"}\' "${PERSONAL_KB_API_KEY:-$(cat ~/.personal_kb_hook_key 2>/dev/null)}"'
-HELPER_TEAM=$'printf \'{"Authorization": "Bearer %s"}\' "${TEAM_KB_API_KEY:-$(cat ~/.team_kb_key 2>/dev/null)}"'
+# Unconditional retirement: the legacy KB servers are gone fleet-wide, so their
+# registrations and key files must not survive on any host, regardless of what
+# the env file happens to contain. This runs before the registration phase.
+for _retired in personal-kb team-kb; do
+    if [[ "$(py has "$CLAUDE_JSON" "$_retired")" == "yes" ]]; then
+        rc=0
+        run_claude mcp remove "$_retired" --scope user || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            echo "[ERR]  claude mcp remove ${_retired} failed (rc=${rc})" >&2
+            FAIL=1
+        else
+            echo "[CHANGED] removed retired ${_retired} registration"
+        fi
+    else
+        echo "[OK]   ${_retired} registration already absent"
+    fi
+done
+for _retired_key in "${AGENT_HOME}/.personal_kb_hook_key" "${AGENT_HOME}/.team_kb_key"; do
+    if [[ -e "$_retired_key" ]]; then
+        rm -f "$_retired_key" && echo "[CHANGED] removed ${_retired_key}"
+    else
+        echo "[OK]   ${_retired_key} already absent"
+    fi
+done
+
+HELPER_TIGHTBEAM=$'printf \'{"Authorization": "Bearer %s"}\' "${TIGHTBEAM_KB_MCP_TOKEN:-$(cat ~/.tightbeam_kb_key 2>/dev/null)}"'
 # agent-gtd: env-only bearer (the per-run callback token), no key file by design.
 # AGENT_GTD_AGENT_NAME is forwarded as X-Agent-Name; the board uses it only when the
 # bearer is not a run token.
 HELPER_GTD=$'if [ -n "${AGENT_GTD_AGENT_NAME:-}" ]; then printf \'{"Authorization": "Bearer %s", "X-Agent-Name": "%s"}\' "${AGENT_GTD_API_KEY:-}" "$AGENT_GTD_AGENT_NAME"; else printf \'{"Authorization": "Bearer %s"}\' "${AGENT_GTD_API_KEY:-}"; fi'
 
-process_server personal-kb "$PERSONAL_KB_URL" "$PERSONAL_KB_API_KEY" PERSONAL_KB_URL PERSONAL_KB_API_KEY \
-    "${AGENT_HOME}/.personal_kb_hook_key" "$HELPER_PERSONAL"
-process_server team-kb "$TEAM_KB_URL" "$TEAM_KB_API_KEY" TEAM_KB_URL TEAM_KB_API_KEY \
-    "${AGENT_HOME}/.team_kb_key" "$HELPER_TEAM"
+process_server tightbeam_kb "$TIGHTBEAM_KB_URL" "$TIGHTBEAM_KB_MCP_TOKEN" \
+    TIGHTBEAM_KB_MCP_URL TIGHTBEAM_KB_MCP_TOKEN "${AGENT_HOME}/.tightbeam_kb_key" "$HELPER_TIGHTBEAM"
 process_server agent-gtd "$AGENT_GTD_URL" "" AGENT_GTD_URL "" "" "$HELPER_GTD"
 
 # Post-run readback: secret leak tripwire, then drift warning.
 if [[ -e "$CLAUDE_JSON" ]]; then
-    _leaks="$(KB_LEAK_PERSONAL="$PERSONAL_KB_API_KEY" KB_LEAK_TEAM="$TEAM_KB_API_KEY" \
+    _leaks="$(KB_LEAK_TIGHTBEAM="$TIGHTBEAM_KB_MCP_TOKEN" \
         KB_LEAK_AGENT_GTD="$AGENT_GTD_API_KEY" py leak "$CLAUDE_JSON")" \
         || fail "cannot read ${CLAUDE_JSON} for leak check"
     for _n in $_leaks; do

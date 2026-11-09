@@ -131,7 +131,7 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # CLAUDE_CODE_OAUTH_TOKEN=
 
 # KB_DATABASE_URL — RETIRED and FORBIDDEN. Agents reach the KB only through the
-# hosted KB MCP servers (PERSONAL_KB_URL / PERSONAL_KB_API_KEY below). A
+# tightbeam_kb MCP server (TIGHTBEAM_KB_MCP_URL below). A
 # live-KB DSN here once reached agent subprocesses, where a repo's test suite opened
 # production Postgres. setup-dispatch-host.sh strips it (and TEAM_KB_DATABASE_URL /
 # KB_SERVICE_DATABASE_URL) from the service env on every run. Do not set it.
@@ -144,37 +144,26 @@ DISPATCH_AGENT_SUBPROCESS_USER=dispatch
 # KB_REQUIRE_POSTGRES_TESTS=
 
 # TEAM_KB_DATABASE_URL — RETIRED and FORBIDDEN (stripped by setup-dispatch-host.sh).
-# The team-kb MCP server is a hosted HTTP server; see TEAM_KB_URL / TEAM_KB_API_KEY below.
+# The team-kb MCP server is retired (see TIGHTBEAM_KB_MCP_URL below).
 
-# Anthropic API key for the KB MCP servers' own LLM calls — RETIRED — no longer read
-# by installer Step 4.6. Both KB MCP servers are now thin HTTP clients of a hosted KB
-# web service and make no LLM calls of their own.
+# Anthropic API key for the tightbeam_kb MCP server's own LLM calls — RETIRED — no
+# longer read by installer Step 4.6. tightbeam_kb is a thin HTTP client of a hosted
+# KB web service and makes no LLM calls of its own.
 # KB_ANTHROPIC_API_KEY=
 
-# Hosted personal KB service URL + API key. Read by installer Step 4.6 and deploy.sh
-# (not the service) via scripts/kb-mcp-refresh.sh. PERSONAL_KB_URL is the service base
-# URL; `/mcp` is appended to register personal-kb as an HTTP MCP server. The key is
-# written to `~/.personal_kb_hook_key` (0600) in the agent home and never into
-# `~/.claude.json`. personal-kb is skipped when either is unset. No sudoers env_keep
-# entry is needed: the values are applied at provision/deploy time, not inherited by
-# the agent subprocess at run time.
-# PERSONAL_KB_URL=
-# PERSONAL_KB_API_KEY=
-# KB API key handed to talos runs as PERSONAL_KB_API_KEY (paired with PERSONAL_KB_URL
-# above). Use a key minted for talos. Talos runs get no KB access when it is unset.
-# TALOS_PERSONAL_KB_API_KEY=
+# Tightbeam KB MCP server — hosted HTTP MCP served by the Tightbeam hub, registered
+# as `tightbeam_kb` by installer Step 4.6 and deploy.sh via scripts/kb-mcp-refresh.sh.
+# TIGHTBEAM_KB_MCP_URL is the MCP base URL; `/mcp` is appended after normalizing a
+# trailing `/` or `/mcp`. The bearer token is written to `~/.tightbeam_kb_key` (0600,
+# agent-owned) in the agent home and never into `~/.claude.json`. tightbeam_kb is
+# skipped when either is unset (and any stale registration is removed). No sudoers
+# env_keep entry is needed: the values are applied at provision/deploy time, not
+# inherited by the agent subprocess at run time.
+# TIGHTBEAM_KB_MCP_URL=
+# TIGHTBEAM_KB_MCP_TOKEN=
 # TALOS_MEMORY=off
 # One of off | annotate | deny-once; passed to every talos fleet run as --memory.
-# An unknown value is treated as off. Needs TALOS_PERSONAL_KB_API_KEY to reach a remote KB.
-
-# Hosted team KB service URL + API key. Read by installer Step 4.6 and deploy.sh via
-# scripts/kb-mcp-refresh.sh. TEAM_KB_URL is the service base URL; `/mcp` is appended
-# to register team-kb as an HTTP MCP server. The key is written to `~/.team_kb_key`
-# (0600) in the agent home and never into `~/.claude.json`. team-kb is skipped when
-# either is unset. No sudoers env_keep entry is needed, for the same reason as
-# PERSONAL_KB_URL above.
-# TEAM_KB_URL=
-# TEAM_KB_API_KEY=
+# An unknown value is treated as off.
 
 # Agent identity name — used for GTD comment attribution so comments appear
 # under a specific agent name (e.g. claude-build-abc12345) rather than the

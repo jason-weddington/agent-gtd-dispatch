@@ -154,25 +154,24 @@ You still get the systemd unit, auto-minted `DISPATCH_API_KEY`, MCP registration
 pre-commit template setup, lefthook, the Step 4.9 dev toolchain (rustup +
 cargo-binstall, then `cargo-nextest`, `cargo-llvm-cov`, `cargo-deny`, `cargo-machete`,
 `typos`, `cargo-sort`, `cargo-release`, `cog`, plus a pinned `gitleaks` binary — the tools
-dispatched repos' hooks and gate commands call), and the Step 4.10 `personal-kb-hook`
-wiring (KB mental-map pushes into each dispatched agent's session) for the agent user. The installer guards
-against mixing modes on one host. Full
+dispatched repos' hooks and gate commands call), and the `tightbeam_kb` MCP
+registration (a 0600 token file in the agent home) for the agent user. The installer
+guards against mixing modes on one host. Full
 details: [docs/install.md — Single-user mode](docs/install.md#single-user-mode).
 
 ### MCP servers for the agent user
 
-The installer registers up to four MCP servers for the `dispatch` (agent) user, so that
-dispatched Claude Code agents have tool access to GTD, the knowledge bases,
+The installer registers up to three MCP servers for the `dispatch` (agent) user, so that
+dispatched Claude Code agents have tool access to GTD, the Tightbeam knowledge base,
 and AWS documentation:
 
 | Server | Purpose |
 |---|---|
 | `agent-gtd` | GTD items, comments, and dispatch — lets agents post comments and update items via MCP rather than raw `curl`. The board's hosted HTTP `/mcp` server (`<AGENT_GTD_URL>/mcp`), registered by `scripts/kb-mcp-refresh.sh` whenever `AGENT_GTD_URL` is present in the service `.env` |
-| `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) — a hosted HTTP `/mcp` server (`<PERSONAL_KB_URL>/mcp`) registered by `scripts/kb-mcp-refresh.sh`, only when `PERSONAL_KB_URL` and `PERSONAL_KB_API_KEY` are both present in the service `.env` |
-| `team-kb` | Team knowledge base — a hosted HTTP `/mcp` server (`<TEAM_KB_URL>/mcp`) registered the same way, only when `TEAM_KB_URL` and `TEAM_KB_API_KEY` are both present in the service `.env` |
+| `tightbeam_kb` | Knowledge base lookups (decisions, lessons learned, project conventions) — the Tightbeam hub's hosted HTTP `/mcp` server (`<TIGHTBEAM_KB_MCP_URL>/mcp`) registered by `scripts/kb-mcp-refresh.sh`, only when `TIGHTBEAM_KB_MCP_URL` and `TIGHTBEAM_KB_MCP_TOKEN` are both present in the service `.env` |
 | `aws-documentation-mcp-server` | AWS docs for any AWS-related implementation work |
 
-Registration is **per-host and per-user** (`--scope user`, writes to `/home/dispatch/.claude.json`). Step 4.6 of the installer registers `aws-documentation-mcp-server` from `templates/mcp-servers.sh`. `agent-gtd`, `personal-kb` and `team-kb` are hosted HTTP servers registered by `scripts/kb-mcp-refresh.sh`, which both Step 4.6 and every `./deploy.sh` run. `personal-kb` and `team-kb` are registered as `type: http` with a `headersHelper` that reads the API key at connect time from a mode-0600 key file in the agent home (`~/.personal_kb_hook_key`, `~/.team_kb_key`), so the key never lands in `.claude.json`.
+Registration is **per-host and per-user** (`--scope user`, writes to `/home/dispatch/.claude.json`). Step 4.6 of the installer registers `aws-documentation-mcp-server` from `templates/mcp-servers.sh`. `agent-gtd` and `tightbeam_kb` are hosted HTTP servers registered by `scripts/kb-mcp-refresh.sh`, which both Step 4.6 and every `./deploy.sh` run. `tightbeam_kb` is registered as `type: http` with a `headersHelper` that reads the bearer token at connect time from a mode-0600 file in the agent home (`~/.tightbeam_kb_key`), so the token never lands in `.claude.json`. The retirements are unconditional: every run also removes any surviving `personal-kb`/`team-kb` registrations and their key files (`~/.personal_kb_hook_key`, `~/.team_kb_key`), regardless of what the service `.env` contains.
 
 `agent-gtd` is the board's hosted HTTP `/mcp` server at `<AGENT_GTD_URL>/mcp`, registered by `scripts/kb-mcp-refresh.sh` as `type: http` with an env-only bearer `headersHelper`: it reads `AGENT_GTD_API_KEY` from the agent's env at connect time (the dispatch worker sets it per run to the run's callback token), and there is no key file, by design, because a static key would pin every run to one identity. The helper also forwards `AGENT_GTD_AGENT_NAME` as the `X-Agent-Name` header, which the board uses only when the bearer is not a run token. An existing legacy stdio `uvx` registration is migrated in place, and a failed add restores the previous entry. Step 4.6 dies unless `agent-gtd` ends up registered as `http <AGENT_GTD_URL>/mcp`, and both Step 4.6 and `./deploy.sh` probe it (`templates/mcp-probe.py`, a real `initialize` + `tools/list` handshake over HTTP); the deploy-time probe is non-fatal and prints a `[WARN]` when dispatched agents on that host could not reach the board.
 

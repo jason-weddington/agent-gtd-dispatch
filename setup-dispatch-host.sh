@@ -139,10 +139,6 @@ Environment variables:
                            agent-gtd-dispatch and agent-gtd-dispatch-protocol
   HARNESS_DESIGN_REPO_URL  Git remote for the harness-design repo. REQUIRED with
                            --with-talos; unused otherwise
-  PERSONAL_KB_HOOK_SRC     uv source spec for personal-kb-hook (Step 4.10). Optional:
-                           when it or PERSONAL_KB_URL is unset (in the environment
-                           and in the service env file) Step 4.10 is skipped with a WARN
-  PERSONAL_KB_URL          Hosted personal-KB service URL the hook talks to (Step 4.10)
   DISPATCH_SINGLE_USER   Set to '1' for single-user mode (no sudoers, no user split;
                          see docs/install.md ## Single-user mode for details)
 
@@ -468,7 +464,7 @@ fi
 # Guard: no stray user-level steering in the agent home. Headless runs load
 # ~/.claude/CLAUDE.md and ~/.claude/rules/*.md even when --system-prompt is passed,
 # so a copied-in personal CLAUDE.md silently changes every run on this host.
-# ~/.claude/settings.json (the KB hooks) is legitimate and is not checked.
+# ~/.claude/settings.json is legitimate and is not checked.
 _stray=""
 for _f in "${AGENT_HOME}/.claude/CLAUDE.md" "${AGENT_HOME}/.claude/CLAUDE.local.md"; do
     [[ -e "$_f" ]] && _stray="${_stray} ${_f}"
@@ -1621,9 +1617,9 @@ echo "--- Step 4.6: MCP servers (agent user) ---"
 if ! $DRY_RUN && [[ ! -f "$CLAUDE_SRC" ]]; then
     warn "Claude Code not found at ${CLAUDE_SRC} — skipping MCP server registration (install claude as ${AGENT_USER} first)"
 elif $DRY_RUN; then
-    would "read AGENT_GTD_URL, AGENT_GTD_API_KEY, PERSONAL_KB_URL, PERSONAL_KB_API_KEY, TEAM_KB_URL, TEAM_KB_API_KEY from ${SERVICE_ENV}"
-    would "run scripts/kb-mcp-refresh.sh: register personal-kb/team-kb/agent-gtd as HTTP /mcp servers for ${AGENT_USER} and write the KB key files (mode 0600)"
-    would "GET <PERSONAL_KB_URL>/api/health and <TEAM_KB_URL>/api/health (reachability warn-check)"
+    would "read AGENT_GTD_URL, AGENT_GTD_API_KEY, TIGHTBEAM_KB_MCP_URL, TIGHTBEAM_KB_MCP_TOKEN from ${SERVICE_ENV}"
+    would "run scripts/kb-mcp-refresh.sh: register tightbeam_kb/agent-gtd as HTTP /mcp servers for ${AGENT_USER} and write the tightbeam_kb key file (mode 0600)"
+    would "remove any personal-kb/team-kb MCP registrations and their key files, and any personal-kb-hook blocks in ${AGENT_HOME}/.claude/settings.json"
     would "probe each registered MCP server as ${AGENT_USER} with an MCP initialize + tools/list handshake (timeout ${MCP_PROBE_TIMEOUT}s per server)"
 else
     MCP_CONF="${TMPL_DIR}/mcp-servers.sh"
@@ -1643,57 +1639,32 @@ else
     #     back and dispatch will appear to succeed while the step-4 verification stays
     #     stuck.
     #
-    #   PERSONAL_KB_URL / PERSONAL_KB_API_KEY → hosted personal-KB service URL + API
-    #     key, consumed by scripts/kb-mcp-refresh.sh (HTTP /mcp registration + 0600 key
-    #     file). personal-kb is skipped when either is unset.
-    #   TALOS_PERSONAL_KB_API_KEY → NOT read by this installer. The dispatch service
-    #     reads it at run time and hands it to talos runs as PERSONAL_KB_API_KEY
-    #     (with PERSONAL_KB_URL); talos gets no KB access when it is unset.
-    #   TEAM_KB_URL / TEAM_KB_API_KEY → hosted team-KB service URL + API key, consumed
-    #     by scripts/kb-mcp-refresh.sh the same way. team-kb is skipped when either
-    #     TEAM_KB_URL or TEAM_KB_API_KEY is unset.
+    #   TIGHTBEAM_KB_MCP_URL → MCP base URL for the Tightbeam hub. Passed to
+    #     scripts/kb-mcp-refresh.sh via --env-file (never read into this installer's
+    #     environment); it registers tightbeam_kb as <URL>/mcp after normalizing a
+    #     trailing `/` or `/mcp`. The URL's presence is checked only.
+    #   TIGHTBEAM_KB_MCP_TOKEN → bearer token for tightbeam_kb. Passed via --env-file;
+    #     scripts/kb-mcp-refresh.sh writes it to the agent's ~/.tightbeam_kb_key (0600)
+    #     and never into ~/.claude.json. Only its presence is checked here.
     # The env file wins only where it has a value: a blank or missing line must
     # not wipe out a value the caller passed in (e.g. from an operator env file).
     if [[ -f "$SERVICE_ENV" ]]; then
         _fv="$(_read_env_var AGENT_GTD_URL)"; [[ -n "$_fv" ]] && AGENT_GTD_URL="$_fv"; export AGENT_GTD_URL
         _fv="$(_read_env_var AGENT_GTD_API_KEY)"; [[ -n "$_fv" ]] && AGENT_GTD_API_KEY="$_fv"; export AGENT_GTD_API_KEY
-        _fv="$(_read_env_var PERSONAL_KB_URL)"; [[ -n "$_fv" ]] && PERSONAL_KB_URL="$_fv"; export PERSONAL_KB_URL
-        _fv="$(_read_env_var PERSONAL_KB_API_KEY)"; [[ -n "$_fv" ]] && PERSONAL_KB_API_KEY="$_fv"; export PERSONAL_KB_API_KEY
-        _fv="$(_read_env_var TEAM_KB_URL)"; [[ -n "$_fv" ]] && TEAM_KB_URL="$_fv"; export TEAM_KB_URL
-        _fv="$(_read_env_var TEAM_KB_API_KEY)"; [[ -n "$_fv" ]] && TEAM_KB_API_KEY="$_fv"; export TEAM_KB_API_KEY
         unset _fv
     fi
     # agent-gtd warnings are elevated (LOAD-BEARING for step-4 verification)
     [[ -z "${AGENT_GTD_URL:-}" ]]     && warn "AGENT_GTD_URL not set in ${SERVICE_ENV} — agent-gtd cannot be registered as an HTTP /mcp server; Step 4 verification will fail"
     [[ -z "${AGENT_GTD_API_KEY:-}" ]] && warn "AGENT_GTD_API_KEY not set in ${SERVICE_ENV} — the agent-gtd HTTP /mcp probe will send an empty bearer, and dispatches without a per-run token will be unauthenticated; Step 4 verification will fail"
-    [[ -z "${PERSONAL_KB_URL:-}" ]] && warn "PERSONAL_KB_URL not set in ${SERVICE_ENV} — personal-kb will be skipped"
-    [[ -n "${PERSONAL_KB_URL:-}" && -z "${PERSONAL_KB_API_KEY:-}" ]] && warn "PERSONAL_KB_API_KEY not set in ${SERVICE_ENV} — personal-kb will be skipped (a URL without a key cannot authenticate)"
-    [[ -z "${TEAM_KB_URL:-}" ]] && warn "TEAM_KB_URL not set in ${SERVICE_ENV} — team-kb will be skipped"
-    [[ -n "${TEAM_KB_URL:-}" && -z "${TEAM_KB_API_KEY:-}" ]] && warn "TEAM_KB_API_KEY not set in ${SERVICE_ENV} — team-kb will be skipped (a URL without a key cannot authenticate)"
-
-    # Reachability warn-check: both KB services are LAN-only (no public DNS/ingress),
-    # so a failure here is informational, never fatal — registration continues either way.
-    if [[ -n "${PERSONAL_KB_URL:-}" ]]; then
-        _url="${PERSONAL_KB_URL%/}"
-        rc=0; out="$(curl -sS --max-time 10 -w '\n%{http_code}' "${_url}/api/health" 2>&1)" || rc=$?
-        _http_code="$(printf '%s' "$out" | tail -n1)"
-        _body="$(printf '%s' "$out" | sed '$d')"
-        if [[ "$rc" -eq 0 && "$_http_code" == "200" ]] && printf '%s' "$_body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"'; then
-            info "KB health check passed: ${_url}/api/health"
-        else
-            warn "KB health check failed: ${_url}/api/health http=${_http_code} — both KB services are LAN-only (no public DNS/ingress); registration continues"
-        fi
+    # tightbeam_kb presence-only checks: the values are NEVER read into this
+    # installer's environment (they reach scripts/kb-mcp-refresh.sh via --env-file).
+    # A quoted-empty value (TIGHTBEAM_KB_MCP_TOKEN="") correctly warns. Non-fatal:
+    # kb-mcp-refresh.sh removes any stale registration when either is missing.
+    if ! sed -n 's/^TIGHTBEAM_KB_MCP_TOKEN=//p' "${SERVICE_ENV}" | tail -n1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" | grep -q .; then
+        warn "TIGHTBEAM_KB_MCP_TOKEN not set in ${SERVICE_ENV} — tightbeam_kb will not be registered (any existing registration is removed)"
     fi
-    if [[ -n "${TEAM_KB_URL:-}" ]]; then
-        _url="${TEAM_KB_URL%/}"
-        rc=0; out="$(curl -sS --max-time 10 -w '\n%{http_code}' "${_url}/api/health" 2>&1)" || rc=$?
-        _http_code="$(printf '%s' "$out" | tail -n1)"
-        _body="$(printf '%s' "$out" | sed '$d')"
-        if [[ "$rc" -eq 0 && "$_http_code" == "200" ]] && printf '%s' "$_body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"'; then
-            info "KB health check passed: ${_url}/api/health"
-        else
-            warn "KB health check failed: ${_url}/api/health http=${_http_code} — both KB services are LAN-only (no public DNS/ingress); registration continues"
-        fi
+    if ! sed -n 's/^TIGHTBEAM_KB_MCP_URL=//p' "${SERVICE_ENV}" | tail -n1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" | grep -q .; then
+        warn "TIGHTBEAM_KB_MCP_URL not set in ${SERVICE_ENV} — tightbeam_kb will not be registered (any existing registration is removed)"
     fi
 
     # shellcheck source=templates/mcp-servers.sh
@@ -1701,9 +1672,9 @@ else
 
     # Unconditional de-registration pass over the fixed set of stdio server names —
     # this is what makes a server that's newly skipped actually disappear, instead of
-    # surviving in its stale shape from a previous run. agent-gtd, personal-kb and
-    # team-kb (including stale-entry removal and the legacy stdio agent-gtd migration)
-    # are handled by scripts/kb-mcp-refresh.sh.
+    # surviving in its stale shape from a previous run. agent-gtd and tightbeam_kb
+    # (including stale-entry removal and the legacy stdio agent-gtd migration) are
+    # handled by scripts/kb-mcp-refresh.sh.
     for _known_name in aws-documentation-mcp-server; do
         runuser -l "$AGENT_USER" -c \
             "cd '${AGENT_HOME}' && ${CLAUDE_SRC} mcp remove ${_known_name} --scope user 2>/dev/null || true"
@@ -1724,8 +1695,8 @@ else
         info "Registered MCP server '${mcp_name}' for ${AGENT_USER}"
     done
 
-    # agent-gtd / personal-kb / team-kb: hosted HTTP /mcp servers, registered (and the
-    # KB 0600 key files written) by scripts/kb-mcp-refresh.sh. Non-fatal: a failure
+    # agent-gtd / tightbeam_kb: hosted HTTP /mcp servers, registered (and the
+    # tightbeam_kb 0600 key file written) by scripts/kb-mcp-refresh.sh. Non-fatal: a failure
     # leaves the agent on its current registrations (a failed agent-gtd add restores
     # the previous entry). The agent-gtd gate below is what makes a missing
     # agent-gtd registration fatal.
@@ -1734,9 +1705,22 @@ else
     if [[ -f "$SERVICE_ENV" ]]; then
         "$_kbr" --env-file "$SERVICE_ENV" --agent-user "$AGENT_USER" --agent-home "$AGENT_HOME" --agent-group "$AGENT_GROUP" --claude "$CLAUDE_SRC" \
             --probe "${TMPL_DIR}/mcp-probe.py" \
-            || warn "kb-mcp-refresh.sh failed — agent-gtd/personal-kb/team-kb registrations may be stale"
+            || warn "kb-mcp-refresh.sh failed — agent-gtd/tightbeam_kb registrations may be stale"
     else
         warn "kb-mcp-refresh.sh skipped: ${SERVICE_ENV} not found"
+    fi
+
+    # personal-kb-hook is retired (it no longer has a provisioning step). Prune any
+    # surviving matcher groups from the agent's settings.json, preserving every other
+    # setting. The absent-file branch is required: nothing creates settings.json any
+    # more, so an unconditional chown would abort provisioning under `set -euo pipefail`.
+    if [[ ! -f "${AGENT_HOME}/.claude/settings.json" ]]; then
+        skip "personal-kb-hook retirement: ${AGENT_HOME}/.claude/settings.json not present"
+    elif _prune_out="$(python3 "${TMPL_DIR}/personal-kb-hook-prune.py" "${AGENT_HOME}/.claude/settings.json")"; then
+        chown "${AGENT_USER}:${AGENT_GROUP}" "${AGENT_HOME}/.claude/settings.json"
+        info "personal-kb-hook retirement: ${_prune_out}"
+    else
+        warn "personal-kb-hook retirement failed: ${AGENT_HOME}/.claude/settings.json left unchanged"
     fi
 
     # agent-gtd is LOAD-BEARING: assert the REGISTERED (not just intended) entry is the
@@ -2161,119 +2145,6 @@ fi
 echo "[STATE] cross-toolchain zig=${_st_zig:-MISSING} ${_st_pin_name:-pinned-crate}=${_st_pin_ver:-MISSING} rust_targets_missing=${_st_missing_csv}"
 
 # ===========================================================================
-# Step 4.10: personal-kb-hook (agent user)
-# ===========================================================================
-# The personal-kb-hook pushes KB mental-map rosters into a Claude Code session via
-# hook events. Telemetry finding that motivated this step: 2,067 map-push rows since
-# June with build_engine NULL on every one — no dispatched agent has ever received a
-# map directory, which is exactly the audience that needs one (a build agent landing
-# cold in an unfamiliar repo). This step keeps hand-wiring on existing hosts from
-# being clobbered the next time this script runs, and gets it onto every new host
-# automatically.
-#
-# OPTIONAL: the hook source and KB URL are deployment-specific and have no default.
-# When either is unset (in the environment and in the service env file) the step is
-# skipped with a WARN rather than failing provisioning — the hook is additive.
-#
-# PINNING: pass a PERSONAL_KB_HOOK_SRC pinned to a personal_kb release tag (git+...@vX.Y.Z#subdirectory=...),
-# never a branch. Production hook installs track release tags, and the KB release upgrades
-# them; deploy.sh does not reinstall the binary. `--force` makes a re-run reinstall whatever
-# PERSONAL_KB_HOOK_SRC names.
-#
-# NO SERVICE RESTART: Claude Code reads the agent user's settings.json when each
-# agent launches (unlike a systemd EnvironmentFile var, which is read once at service
-# start), so this wiring takes effect on the very next dispatched run — contrast with
-# service env vars (0542f656).
-# ===========================================================================
-echo ""
-echo "--- Step 4.10: personal-kb-hook (agent user) ---"
-
-HOOK_BIN="${AGENT_HOME}/.local/bin/personal-kb-hook"
-HOOK_KEY_FILE="${AGENT_HOME}/.personal_kb_hook_key"
-HOOK_SETTINGS_DIR="${AGENT_HOME}/.claude"
-HOOK_SETTINGS="${HOOK_SETTINGS_DIR}/settings.json"
-HOOK_MERGE_SCRIPT="${TMPL_DIR}/personal-kb-hook-settings.py"
-
-# A value in the service env file wins; otherwise the caller's environment is kept
-# (an empty read must not clobber a value the operator passed in).
-if [[ -f "$SERVICE_ENV" ]]; then
-    _v="$(_read_env_var PERSONAL_KB_HOOK_SRC)"; [[ -n "$_v" ]] && PERSONAL_KB_HOOK_SRC="$_v"
-    _v="$(_read_env_var PERSONAL_KB_URL)";      [[ -n "$_v" ]] && PERSONAL_KB_URL="$_v"
-    PERSONAL_KB_API_KEY="$(_read_env_var PERSONAL_KB_API_KEY)";   export PERSONAL_KB_API_KEY
-fi
-_hook_src="${PERSONAL_KB_HOOK_SRC:-}"
-_hook_url="${PERSONAL_KB_URL:-}"
-_hook_missing=""
-[[ -z "$_hook_src" ]] && _hook_missing="${_hook_missing} PERSONAL_KB_HOOK_SRC"
-[[ -z "$_hook_url" ]] && _hook_missing="${_hook_missing} PERSONAL_KB_URL"
-
-if [[ -n "$_hook_missing" ]]; then
-    warn "SKIPPING personal-kb-hook: not set in the environment or ${SERVICE_ENV}:${_hook_missing} — dispatched agents on this host get NO KB map push"
-elif $DRY_RUN; then
-    would "runuser -l ${AGENT_USER} -- uv tool install --force --from '${_hook_src}' personal-kb-hook"
-    would "write ${HOOK_KEY_FILE} (owner ${AGENT_USER}, mode 0600) from PERSONAL_KB_API_KEY in ${SERVICE_ENV}"
-    would "merge SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/PostToolUseFailure/Stop/SubagentStop personal-kb-hook blocks into ${HOOK_SETTINGS}, preserving other settings"
-else
-    if [[ ! -f "$HOOK_MERGE_SCRIPT" ]]; then
-        die "personal-kb-hook settings-merge script not found at ${HOOK_MERGE_SCRIPT}"
-    fi
-
-    # Install (also the upgrade path — see the PINNING note above). Non-fatal:
-    # the hook is additive, so a failed install must not abort provisioning of an
-    # otherwise-healthy host.
-    _hook_install_rc=0
-    _hook_install_out="$(runuser -l "$AGENT_USER" -c "uv tool install --force --from '${_hook_src}' personal-kb-hook" 2>&1)" \
-        || _hook_install_rc=$?
-    if [[ "$_hook_install_rc" -ne 0 ]]; then
-        warn "uv tool install --force --from '${_hook_src}' personal-kb-hook failed for ${AGENT_USER} (rc=${_hook_install_rc}) — continuing without the hook: ${_hook_install_out}"
-    else
-        info "Installed personal-kb-hook for ${AGENT_USER} from ${_hook_src}"
-    fi
-
-    # The hook degrades SILENTLY when its key or URL is missing (no roster, no
-    # telemetry, no error) — a broken install is indistinguishable from no install.
-    # Reuse the host's EXISTING PERSONAL_KB_API_KEY (the same key this host already
-    # uses for its KB MCP server) rather than minting a second, hook-specific key —
-    # a second key on a LAN-only KB is toil, not security (maintainer decision, 2026-09-18).
-    if [[ -z "${PERSONAL_KB_API_KEY:-}" ]]; then
-        warn "PERSONAL_KB_API_KEY not set in ${SERVICE_ENV} — personal-kb-hook will be installed but not wired; it degrades SILENTLY (no roster, no telemetry, no error), so this would look exactly like a working install"
-    else
-        _hook_key_tmp="$(mktemp)"
-        printf '%s' "$PERSONAL_KB_API_KEY" > "$_hook_key_tmp"
-        install -m 0600 -o "$AGENT_USER" -g "$AGENT_GROUP" "$_hook_key_tmp" "$HOOK_KEY_FILE"
-        rm -f "$_hook_key_tmp"
-        info "Wrote personal-kb-hook key file for ${AGENT_USER}: ${HOOK_KEY_FILE} (mode 0600)"
-
-        # Read-modify-write of the parsed JSON — never a wholesale overwrite — so any
-        # other settings already in settings.json (or other hook blocks on the same
-        # events) survive. Creates the file as {} when absent. Idempotent: a
-        # pre-existing personal-kb-hook block per event is REPLACED, not appended, so
-        # re-running this step never accumulates duplicate blocks. The API key itself
-        # is referenced via `$(cat ${HOOK_KEY_FILE})` shell indirection inside the
-        # rendered command — the literal key value never lands in settings.json.
-        mkdir -p "$HOOK_SETTINGS_DIR"
-        chown "${AGENT_USER}:${AGENT_GROUP}" "$HOOK_SETTINGS_DIR" 2>/dev/null || true
-        [[ -f "$HOOK_SETTINGS" ]] || { printf '{}' > "$HOOK_SETTINGS"; chown "${AGENT_USER}:${AGENT_GROUP}" "$HOOK_SETTINGS"; }
-        python3 "$HOOK_MERGE_SCRIPT" "$HOOK_SETTINGS" "$HOOK_BIN" "$HOOK_KEY_FILE" "$_hook_url" \
-            || die "Failed to merge personal-kb-hook blocks into ${HOOK_SETTINGS}"
-        chown "${AGENT_USER}:${AGENT_GROUP}" "$HOOK_SETTINGS"
-        info "Wired personal-kb-hook into ${HOOK_SETTINGS} for ${AGENT_USER} (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, Stop, SubagentStop) url=${_hook_url}"
-    fi
-
-    # Verify AS THE AGENT USER, not as root: a binary on root's PATH proves nothing
-    # about the user that actually runs Claude Code (runuser -l gives the agent's own
-    # login PATH, e.g. ~/.local/bin). Non-fatal — the hook is additive, and a failed
-    # hook must never block provisioning a host.
-    _hook_verify_rc=0
-    _hook_verify_out="$(runuser -l "$AGENT_USER" -c "'${HOOK_BIN}' --help" 2>&1)" || _hook_verify_rc=$?
-    if [[ "$_hook_verify_rc" -eq 0 ]]; then
-        info "Verified personal-kb-hook for ${AGENT_USER}: ${HOOK_BIN} --help"
-    else
-        warn "personal-kb-hook --help failed for ${AGENT_USER} (rc=${_hook_verify_rc}): ${_hook_verify_out}"
-    fi
-fi
-
-# ===========================================================================
 # Step 4.11: Playwright browsers (agent user)
 # ===========================================================================
 # WHY: dispatched repos run Playwright e2e suites (camera-profiles apps/desktop,
@@ -2488,12 +2359,14 @@ fi
 echo ""
 echo "--- Step 6.5: Service environment freshness ---"
 
-# Two-consumer warning: the exact set of $SERVICE_ENV keys Step 4.6 reads and
-# feeds into the agent's MCP registration in ${AGENT_HOME}/.claude.json or its KB key files (see the _read_env_var calls in that
-# step). A restart of ${SERVICE_NAME} does NOT refresh that file — only a
-# re-run of Step 4.6 does — so a stale key from this set needs an extra line
-# telling the operator that restarting alone will not fix the agent side.
-STEP46_KEYS=(AGENT_GTD_URL AGENT_GTD_API_KEY PERSONAL_KB_URL PERSONAL_KB_API_KEY TEAM_KB_URL TEAM_KB_API_KEY)
+# Two-consumer warning: the exact set of $SERVICE_ENV keys Step 4.6 hands to
+# scripts/kb-mcp-refresh.sh via --env-file (which registers the agent's MCP servers
+# in ${AGENT_HOME}/.claude.json and writes the tightbeam_kb key file). Step 4.6
+# only presence-checks TIGHTBEAM_KB_MCP_TOKEN. A restart of ${SERVICE_NAME} does
+# NOT refresh that file — only a re-run of Step 4.6 does — so a stale key from this
+# set needs an extra line telling the operator that restarting alone will not fix
+# the agent side.
+STEP46_KEYS=(AGENT_GTD_URL AGENT_GTD_API_KEY TIGHTBEAM_KB_MCP_URL TIGHTBEAM_KB_MCP_TOKEN)
 
 if $DRY_RUN; then
     would "compare ${SERVICE_ENV} against the running ${SERVICE_NAME} process environment (/proc/<MainPID>/environ) and, with --restart-if-stale and zero active runs, restart ${SERVICE_NAME}"

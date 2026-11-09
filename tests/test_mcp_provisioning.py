@@ -54,30 +54,18 @@ def _entry_names(proc: subprocess.CompletedProcess[str]) -> list[str]:
 
 
 class TestMcpServersRender:
-    def test_kb_servers_not_rendered_even_when_configured(self) -> None:
+    def test_tightbeam_kb_servers_not_rendered_even_when_configured(self) -> None:
         proc = _render(
             {
-                "PERSONAL_KB_URL": "https://kb.example",
-                "PERSONAL_KB_API_KEY": "pk-test",
-                "TEAM_KB_URL": "https://team-kb.example",
-                "TEAM_KB_API_KEY": "tk-test",
+                "TIGHTBEAM_KB_MCP_URL": "https://tightbeam.example",
+                "TIGHTBEAM_KB_MCP_TOKEN": "tbk-test",
             }
         )
         assert proc.returncode == 0, proc.stderr
         assert _entry_names(proc) == ["aws-documentation-mcp-server"]
 
-    def test_no_kb_vars_yields_aws_only(self) -> None:
+    def test_no_vars_yields_aws_only(self) -> None:
         proc = _render({})
-        assert proc.returncode == 0, proc.stderr
-        assert _entry_names(proc) == ["aws-documentation-mcp-server"]
-
-    def test_personal_kb_url_without_key_is_skipped(self) -> None:
-        proc = _render({"PERSONAL_KB_URL": "https://kb.example"})
-        assert proc.returncode == 0, proc.stderr
-        assert _entry_names(proc) == ["aws-documentation-mcp-server"]
-
-    def test_team_kb_url_without_key_is_skipped(self) -> None:
-        proc = _render({"TEAM_KB_URL": "https://team-kb.example"})
         assert proc.returncode == 0, proc.stderr
         assert _entry_names(proc) == ["aws-documentation-mcp-server"]
 
@@ -104,27 +92,38 @@ class TestTextGuards:
             "_RETIRED_DSN_RE='^(KB_DATABASE_URL|KB_SERVICE_DATABASE_URL|"
             "TEAM_KB_DATABASE_URL)='" in text
         )
-        assert "_read_env_var PERSONAL_KB_URL" in text
-        assert "_read_env_var PERSONAL_KB_API_KEY" in text
-        assert "_read_env_var TEAM_KB_URL" in text
-        assert "_read_env_var TEAM_KB_API_KEY" in text
+        assert "_read_env_var AGENT_GTD_URL" in text
+        assert "_read_env_var AGENT_GTD_API_KEY" in text
+        assert "LOAD-BEARING: agent-gtd MCP must connect" in text
         assert "MCP_PROBE_TIMEOUT:-600" in text
-        assert "/api/health" in text
         assert (
-            'would "read AGENT_GTD_URL, AGENT_GTD_API_KEY, '
-            "PERSONAL_KB_URL, PERSONAL_KB_API_KEY, TEAM_KB_URL, TEAM_KB_API_KEY "
-            'from ${SERVICE_ENV}"'
+            'would "read AGENT_GTD_URL, AGENT_GTD_API_KEY, TIGHTBEAM_KB_MCP_URL, '
+            'TIGHTBEAM_KB_MCP_TOKEN from ${SERVICE_ENV}"'
+        ) in text
+        assert (
+            'would "run scripts/kb-mcp-refresh.sh: register tightbeam_kb/agent-gtd '
+            "as HTTP /mcp servers for ${AGENT_USER} and write the tightbeam_kb key "
+            'file (mode 0600)"'
+        ) in text
+        assert (
+            'would "remove any personal-kb/team-kb MCP registrations and their key '
+            "files, and any personal-kb-hook blocks in "
+            '${AGENT_HOME}/.claude/settings.json"'
         ) in text
         assert "PERSONAL_KB_MCP_SRC" not in text
         assert 'for entry in "agent-gtd|" "${MCP_SERVERS[@]}"; do' in text
         assert (
-            'would "GET <PERSONAL_KB_URL>/api/health and <TEAM_KB_URL>/api/health '
-            '(reachability warn-check)"'
-        ) in text
-        assert (
             'would "probe each registered MCP server as ${AGENT_USER} with an MCP '
             'initialize + tools/list handshake (timeout ${MCP_PROBE_TIMEOUT}s per server)"'
         ) in text
+        assert "/api/health" not in text
+        guard = (
+            r"""if ! sed -n 's/^TIGHTBEAM_KB_MCP_TOKEN=//p' "${SERVICE_ENV}" | tail """
+            r"""-n1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" | grep -q .; then"""
+        )
+        assert guard in text
+        assert "_read_env_var TIGHTBEAM_KB_MCP_TOKEN" not in text
+        assert "export TIGHTBEAM_KB_MCP_TOKEN" not in text
 
 
 # --- mcp-probe.py end-to-end tests ---------------------------------------
@@ -519,10 +518,8 @@ def _no_ambient_kb_env(monkeypatch: pytest.MonkeyPatch) -> None:
     test process itself — _render() builds its own explicit env dict, so this
     only protects against accidental os.environ leakage elsewhere in this file."""
     for var in (
-        "PERSONAL_KB_URL",
-        "PERSONAL_KB_API_KEY",
-        "TEAM_KB_URL",
-        "TEAM_KB_API_KEY",
+        "TIGHTBEAM_KB_MCP_URL",
+        "TIGHTBEAM_KB_MCP_TOKEN",
         "KB_DATABASE_URL",
     ):
         monkeypatch.delenv(var, raising=False)

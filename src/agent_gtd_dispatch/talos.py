@@ -149,16 +149,9 @@ def talos_env_overlay(engine_name: str) -> dict[str, str]:
       where flash@high had none. Never leave OLLAMA_THINK unset for any of
       these Ollama-cloud engines.
 
-    KB access: talos runs get ``PERSONAL_KB_URL`` + ``PERSONAL_KB_API_KEY``. The
-    key comes from ``TALOS_PERSONAL_KB_API_KEY`` in the service env (a key minted
-    for talos with the autonomous surface, deliberately separate from the
-    claude-code agents' MCP key). Both are omitted when either is unset.
+    talos runs get no knowledge-base access.
     """
-    overlay = _engine_env_overlay(engine_name)
-    if config.PERSONAL_KB_URL and config.TALOS_PERSONAL_KB_API_KEY:
-        overlay["PERSONAL_KB_URL"] = config.PERSONAL_KB_URL
-        overlay["PERSONAL_KB_API_KEY"] = config.TALOS_PERSONAL_KB_API_KEY
-    return overlay
+    return _engine_env_overlay(engine_name)
 
 
 def _engine_env_overlay(engine_name: str) -> dict[str, str]:
@@ -373,9 +366,7 @@ def build_talos_argv(
       JSONL run transcript into that same XDG state dir, next to ``run.sqlite``,
       OUTSIDE the clone; talos's ``--state-retention-days`` (default 30) bounds
       how long those files accumulate.
-    - Passes ``--memory <mode>`` from TALOS_MEMORY when it is not ``off`` (KB
-      access additionally needs PERSONAL_KB_URL plus a talos KB key; see
-      talos_env_overlay).
+    - Passes ``--memory <mode>`` from TALOS_MEMORY when it is not ``off``.
     - Passes ``--wall-clock-secs`` derived from ``timeout_seconds`` (see
       :func:`derive_wall_clock_secs`) so talos winds down and emits a RunSummary
       before the worker's hard kill; omitted (with a WARNING) when the timeout

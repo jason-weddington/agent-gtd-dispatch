@@ -21,9 +21,6 @@ This guide covers bootstrapping a fresh Ubuntu host and migrating an existing si
 > `cargo-binstall`, then `cargo-nextest`, `cargo-llvm-cov`, `cargo-deny`,
 > `cargo-machete`, `typos`, `cargo-sort`, `cargo-release`, `cog`, plus a pinned
 > `gitleaks` release binary — see [Dev toolchain (Step 4.9)](#dev-toolchain-step-49)),
-> and **`personal-kb-hook`** (Step 4.10: `uv tool install`, wired into the agent's
-> `~/.claude/settings.json` — see
-> [personal-kb-hook (Step 4.10)](#personal-kb-hook-step-410)), and
 > **Playwright browsers** (Step 4.11: the Chromium builds dispatched repos' e2e
 > suites need, installed into the agent user's default browser cache — see
 > [Playwright browsers (Step 4.11)](#playwright-browsers-step-411)), and the
@@ -63,7 +60,7 @@ sudo DISPATCH_WHEEL_INDEX=https://<your-index>/simple/ ./setup-dispatch-host.sh 
 sudo DISPATCH_WHEEL_INDEX=https://<your-index>/simple/ ./setup-dispatch-host.sh --env-file /tmp/dispatch.env --smoke
 ```
 
-`DISPATCH_WHEEL_INDEX` is required and has no default: the service is installed as a uv tool from that PEP 503 index (added alongside public PyPI, so only the two `agent-gtd-dispatch*` wheels need to be on it), and the installer exits before touching the host when it is unset. The other deployment-specific inputs are optional and skip their step with a `[WARN]` when absent: `PERSONAL_KB_HOOK_SRC` + `PERSONAL_KB_URL` (Step 4.10, the KB hook) and `HARNESS_DESIGN_REPO_URL`, which is required only with `--with-talos`. The examples below omit `DISPATCH_WHEEL_INDEX` for brevity.
+`DISPATCH_WHEEL_INDEX` is required and has no default: the service is installed as a uv tool from that PEP 503 index (added alongside public PyPI, so only the two `agent-gtd-dispatch*` wheels need to be on it), and the installer exits before touching the host when it is unset. The other deployment-specific input is optional and skips its step with a `[WARN]` when absent: `HARNESS_DESIGN_REPO_URL`, which is required only with `--with-talos`. The examples below omit `DISPATCH_WHEEL_INDEX` for brevity.
 
 The installer is idempotent — re-running it on a configured host prints
 `[SKIP] already configured` for every completed step and exits 0.
@@ -490,14 +487,8 @@ All variables documented in `templates/dispatch-env.tmpl`. Key variables:
 | `DISPATCH_TIMEOUT_SECONDS` | – | Agent subprocess wall-clock timeout in seconds (default: 1800) |
 | `OLLAMA_BASE_URL` | – | Root URL of an Ollama instance for `claude-code-ollama` engine dispatches |
 | `OLLAMA_DEFAULT_MODEL` | – | Default Ollama model (default: `qwen3.6:35b`) |
-| `PERSONAL_KB_URL` | – | Hosted personal KB service URL. Service base URL (`/mcp` is appended). Read by installer Step 4.6 and `deploy.sh` via `scripts/kb-mcp-refresh.sh` (not the service); if unset (or `PERSONAL_KB_API_KEY` is unset), `personal-kb` registration is skipped |
-| `PERSONAL_KB_API_KEY` | – | API key for the hosted personal KB service. Read by `scripts/kb-mcp-refresh.sh`; written to `~/.personal_kb_hook_key` (mode 0600) in the agent home, never into `.claude.json` |
-| `TEAM_KB_URL` | – | Hosted team KB service URL. Service base URL (`/mcp` is appended). Read by installer Step 4.6 and `deploy.sh` via `scripts/kb-mcp-refresh.sh` (not the service); if unset (or `TEAM_KB_API_KEY` is unset), `team-kb` registration is skipped |
-| `TEAM_KB_API_KEY` | – | API key for the hosted team KB service. Read by `scripts/kb-mcp-refresh.sh`; written to `~/.team_kb_key` (mode 0600) in the agent home, never into `.claude.json` |
-
-Both KB services are **LAN-only** (no public DNS or ingress). Mint a dispatch-specific
-API key per host from each KB service's Settings → API Keys pane *before* running the
-installer.
+| `TIGHTBEAM_KB_MCP_URL` | – | MCP base URL for the Tightbeam hub. Read by installer Step 4.6 and `deploy.sh` via `scripts/kb-mcp-refresh.sh` (not the service); `/mcp` is appended after normalizing a trailing `/` or `/mcp`. When unset (or `TIGHTBEAM_KB_MCP_TOKEN` is unset), the `tightbeam_kb` registration is skipped and any stale one is removed |
+| `TIGHTBEAM_KB_MCP_TOKEN` | – | Bearer token for the Tightbeam hub. Read by `scripts/kb-mcp-refresh.sh`; written to `~/.tightbeam_kb_key` (mode 0600, agent-owned) in the agent home, never into `.claude.json`, and no sudoers `env_keep` entry is needed |
 
 The env file is installed at `/home/dispatch-svc/.env` with mode `0600`,
 owned by `dispatch-svc`. In single-user mode it is installed at
@@ -628,31 +619,34 @@ absent (single-user) is skipped, with a `[WARN]` if the service user exists.
 
 ## MCP servers for the agent user
 
-Step 4.6 of the installer registers up to four MCP servers for the `dispatch` (agent)
-user. This gives dispatched Claude Code agents tool access to GTD, the knowledge
-bases, and AWS documentation — enabling proper attribution on GTD comments instead of
-falling back to raw `curl` calls.
+Step 4.6 of the installer registers up to three MCP servers for the `dispatch` (agent)
+user. This gives dispatched Claude Code agents tool access to GTD, the Tightbeam
+knowledge base, and AWS documentation — enabling proper attribution on GTD comments
+instead of falling back to raw `curl` calls.
 
 | Server | Purpose |
 |---|---|
 | `agent-gtd` | GTD items, comments, and dispatch (prevents `created_by="human"` regression) — the board's hosted HTTP `/mcp` server (`<AGENT_GTD_URL>/mcp`), registered by `scripts/kb-mcp-refresh.sh`; **required**: Step 4.6 dies if `AGENT_GTD_URL` is unset or the registration is not in place |
-| `personal-kb` | Knowledge base lookups (decisions, lessons learned, project conventions) — a hosted HTTP `/mcp` server, **conditional**: only registered (by `scripts/kb-mcp-refresh.sh`) when `PERSONAL_KB_URL` and `PERSONAL_KB_API_KEY` are both set in the service `.env` |
-| `team-kb` | Team knowledge base — a hosted HTTP `/mcp` server, **conditional**: only registered when `TEAM_KB_URL` and `TEAM_KB_API_KEY` are both set in the service `.env` |
+| `tightbeam_kb` | Knowledge base lookups (decisions, lessons learned, project conventions) — the Tightbeam hub's hosted HTTP `/mcp` server, **conditional**: only registered (by `scripts/kb-mcp-refresh.sh`) when `TIGHTBEAM_KB_MCP_URL` and `TIGHTBEAM_KB_MCP_TOKEN` are both set in the service `.env`; the token is written to `~/.tightbeam_kb_key` (mode 0600) and never into `.claude.json` |
 | `aws-documentation-mcp-server` | AWS docs for any AWS-related implementation work |
 
-Step 4.6 reads `PERSONAL_KB_URL`, `PERSONAL_KB_API_KEY`, `TEAM_KB_URL` and
-`TEAM_KB_API_KEY` out of the installed service `.env` and passes that file to
-`scripts/kb-mcp-refresh.sh`, which registers `personal-kb` and `team-kb` as `type: http`
-servers at `<URL>/mcp` with a `headersHelper` that reads the key at connect time. The
-keys are written to mode-0600 key files in the agent home (`~/.personal_kb_hook_key`,
-`~/.team_kb_key`) and never into `.claude.json`. Every `./deploy.sh` re-runs the same
-script (non-fatal), so template changes reach existing hosts; the KB servers no longer
-need `uvx` or git-ssh. The script is idempotent and prints `[OK]` / `[CHANGED]` /
+Step 4.6 passes the installed service `.env` to `scripts/kb-mcp-refresh.sh`, which
+registers `tightbeam_kb` as a `type: http` server at `<TIGHTBEAM_KB_MCP_URL>/mcp` (a
+trailing `/` or `/mcp` in the configured URL is normalized away) with a
+`headersHelper` that reads the token at connect time from `~/.tightbeam_kb_key`
+(mode 0600, agent-owned) or from `TIGHTBEAM_KB_MCP_TOKEN` in the agent's env — the
+token never lands in `.claude.json`. Every `./deploy.sh` re-runs the same script
+(non-fatal), so template changes reach existing hosts; the server no longer needs
+`uvx` or git-ssh. The script is idempotent and prints `[OK]` / `[CHANGED]` /
 `[SKIP]` lines plus a final `kb-mcp-refresh:` summary line
-(see the [environment file reference](#environment-file-reference)). If
-a URL is unset the installer prints a `[WARN]` and skips that server entirely; if the
-URL is set but its API key is not, the installer warns that a URL without a key cannot
-authenticate and skips that server too.
+(see the [environment file reference](#environment-file-reference)). If the URL or
+the token is unset the installer prints a `[WARN]`, skips that server entirely, and
+removes any stale `tightbeam_kb` registration.
+
+The legacy `personal-kb` and `team-kb` servers are retired. Every Step 4.6 and
+`./deploy.sh` run removes their registrations and their key files
+(`~/.personal_kb_hook_key`, `~/.team_kb_key`) regardless of what the service `.env`
+contains, so a host provisioned before the retirement cannot keep a stale KB server.
 
 Step 4.6 also reads `AGENT_GTD_URL` and `AGENT_GTD_API_KEY`. agent-gtd is the board's hosted HTTP `/mcp` server at `<AGENT_GTD_URL>/mcp`, registered by the same `scripts/kb-mcp-refresh.sh` as `type: http` with an env-only bearer `headersHelper`: it reads `AGENT_GTD_API_KEY` from the agent's env at connect time, where the dispatch worker sets it per run to the run's callback token. There is no agent-gtd key file and the key is never written into `.claude.json`, by design: a static key would pin every run to one identity. The helper also forwards `AGENT_GTD_AGENT_NAME` as the `X-Agent-Name` header, which the board uses only when the bearer is not a run token. Only `AGENT_GTD_URL` is required to register it; a legacy stdio `uvx` registration is migrated in place, and a failed add restores the previous entry. After the refresh, Step 4.6 dies unless `agent-gtd` is registered as `http <AGENT_GTD_URL>/mcp`, then probes it with `templates/mcp-probe.py` using the host's static `AGENT_GTD_API_KEY` (a real `initialize` + `tools/list` handshake over HTTP, expecting `add_item`). Every `./deploy.sh` re-runs the refresh with `--probe`; a failed deploy-time probe prints a `[WARN]` and is never fatal. The URL must serve `<URL>/mcp` over a TLS certificate Node trusts by default, because Claude Code (Node) connects to it directly, while the probe validates TLS against Python's trust store.
 
@@ -662,10 +656,9 @@ user is your own login account, so `--scope user` writes to YOUR `~/.claude.json
 
 > ⚠️ **Adapt this to your environment.** The entries in `templates/mcp-servers.sh`
 > hardcode environment-specific values: `uvx` sources pointing at
-> `git+ssh://git@<your-git-host>/home/git/repos/...` and KB identities
-> (`KB_CONTRIBUTOR=<you>`, `KB_TEAM=grit-mile`). On any other environment these need
-> your own git host and KB identities (or trim the array to just the servers you
-> need) — Step 4.6 now runs a real MCP `initialize` + `tools/list` handshake against
+> `git+ssh://git@<your-git-host>/home/git/repos/...`. On any other environment these
+> need your own git host (or trim the array to just the servers you need) — Step 4.6
+> now runs a real MCP `initialize` + `tools/list` handshake against
 > each registered server (`templates/mcp-probe.py`), so a misconfigured entry is
 > caught at install time instead of silently registering successfully. Edit
 > `templates/mcp-servers.sh` **before** running the installer.
@@ -710,7 +703,7 @@ Copy `templates/mcp-probe.py` to the host to run this manually, or inspect
 ```bash
 ssh <HOST> 'sudo cat /home/dispatch/.claude.json' | jq '.mcpServers | keys'
 # → ["agent-gtd", "aws-documentation-mcp-server"]
-# → (plus "personal-kb" / "team-kb" where their URL and key were set)
+# → (plus "tightbeam_kb" where its URL and token were set)
 ```
 
 ### Idempotency check
@@ -1026,69 +1019,27 @@ All of them are data in `templates/dev-toolchain.sh` and idempotent (an up-to-da
 
 ---
 
-## personal-kb-hook (Step 4.10)
+## personal-kb-hook retirement
 
-Step 4.10 installs the `personal-kb-hook` Claude Code hook for the `dispatch` (agent) user and wires it into that user's `~/.claude/settings.json`, so every dispatched agent gets a KB mental-map roster pushed into its session.
+The `personal-kb-hook` Claude Code hook is retired fleet-wide and has no provisioning
+step. On every `setup-dispatch-host.sh` Step 4.6 run and every `./deploy.sh`,
+`templates/personal-kb-hook-prune.py` prunes the agent user's
+`~/.claude/settings.json`: it drops every matcher group whose command references
+`personal-kb-hook`, deletes event keys that become empty, and preserves every other
+setting, event and group. It rewrites the file only when it actually removed
+something, so a second run is byte-identical and leaves the file's mtime untouched.
 
-### Why this matters
-
-A dispatched build agent lands cold in an unfamiliar repo, which makes it exactly the audience that most needs a KB map directory — and without this step no dispatched agent receives one. Wiring the hook by hand on a host works until the next re-run of `setup-dispatch-host.sh` clobbers it; this step makes the wiring part of provisioning, so it survives re-runs and reaches every new host automatically.
-
-### What the step does
-
-1. Installs `personal-kb-hook` as the agent user: `uv tool install --force --from '<SRC>' personal-kb-hook`, where `<SRC>` is `PERSONAL_KB_HOOK_SRC` from the service env or the installer's environment (e.g. `git+ssh://git@<your-git-host>/repos/personal_kb@vX.Y.Z#subdirectory=packages/personal-kb-hook`, pinned to a release tag). There is no default: when `PERSONAL_KB_HOOK_SRC` or `PERSONAL_KB_URL` is unset the whole step is skipped with a `[WARN] SKIPPING personal-kb-hook: ...` line naming the missing variable(s). `--force` is both the install and the upgrade path — every run reinstalls from the current source. Non-fatal: a failed install warns and provisioning continues.
-2. Writes the hook's API key file at `/home/dispatch/.personal_kb_hook_key` (owner `dispatch`, mode `0600`) from the **existing** `PERSONAL_KB_API_KEY` in the service env — the same key this host already uses for its `personal-kb` MCP registration (Step 4.6 writes the same key file). No separate hook-specific key is minted, required, or documented.
-3. Merges four hook blocks into `/home/dispatch/.claude/settings.json` — a read-modify-write of the parsed JSON via `templates/personal-kb-hook-settings.py`, never a wholesale overwrite, so any other settings already in that file survive:
-   - `SessionStart`, `UserPromptSubmit`, `Stop` — no matcher.
-   - `PostToolUse` — matcher `mcp__personal-kb__kb_get|mcp__team-kb__team_kb_get`.
-
-   Each block's command has the shape:
-   ```
-   PERSONAL_KB_LISTENER=1 PERSONAL_KB_URL=<url> PERSONAL_KB_API_KEY=$(cat /home/dispatch/.personal_kb_hook_key 2>/dev/null) /home/dispatch/.local/bin/personal-kb-hook --format=claude-json
-   ```
-   The `--format=claude-json` flag and the `PostToolUse` matcher are copied verbatim from a working workstation settings.json. The one deliberate deviation from that copy: the binary is referenced by **absolute path** (`/home/dispatch/.local/bin/personal-kb-hook`), not bare name, so hook execution does not depend on whatever `PATH` the hook process inherits. The key is referenced via `$(cat ...)` shell indirection — the literal key value never appears in `settings.json`.
-4. Re-running the step is idempotent: any pre-existing hook block whose command mentions `personal-kb-hook` is **replaced**, never appended, so a second run still yields exactly four blocks, not eight.
-5. Verifies the install **as the agent user**, not as root: `runuser -l dispatch -c 'personal-kb-hook --help'` (absolute path). A binary on root's `PATH` proves nothing about the user that actually runs Claude Code. Failure only warns — the hook is additive, and a failed hook must never block provisioning a host.
-
-### Why the source is unpinned while the MCP server is pinned
-
-`personal-kb-hook`'s source is **unpinned by design**: it is changing rapidly upstream, is purely additive, and degrades silently rather than breaking a run — so tracking the branch head is the lower-risk choice for it. Do not "fix" this by adding a pin.
-
-### Key reuse — no separate key
-
-The hook reads the same `PERSONAL_KB_API_KEY` this host already has configured for its `personal-kb` MCP registration (Step 4.6). It does not mint, require, or document a second hook-specific key — a second key on a LAN-only KB is toil, not security (maintainer decision, 2026-09-18).
-
-### Silent-degradation warning
-
-The hook degrades **silently** when its key or URL is missing: no roster, no telemetry, no error. A broken install is therefore indistinguishable from no install at all. When `PERSONAL_KB_API_KEY` is absent from the service env, the step does not fail — it installs the binary but skips the key file and the settings wiring, and prints:
-
-```
-[WARN] PERSONAL_KB_API_KEY not set in <SERVICE_ENV> — personal-kb-hook will be installed but not wired; it degrades SILENTLY (no roster, no telemetry, no error), so this would look exactly like a working install
-```
-
-### No restart required
-
-Nothing in this step restarts `dispatch-api` or requires one. Claude Code reads the agent user's `settings.json` when each agent **launches**, so the wiring takes effect on the very next dispatched run — contrast with service env vars, which systemd reads once at service start (`0542f656`).
-
-### Deploy refresh
-
-Every `./deploy.sh` re-applies the `settings.json` wiring (all seven events) through `templates/personal-kb-hook-settings.py`, non-fatally, so a host provisioned before an event was added cannot drift. It does **not** reinstall the hook binary and does **not** restart the service. Hook upgrades are pinned to personal_kb release tags and come from the KB release process, so set `PERSONAL_KB_HOOK_SRC` to a tag-pinned spec (`git+...personal_kb@vX.Y.Z#subdirectory=packages/personal-kb-hook`) when provisioning.
-
-### Verifying
-
-```bash
-# As the dispatch user (the user that actually runs Claude Code):
-sudo -u dispatch -H bash -lc 'personal-kb-hook --help'
-
-# Confirm the key file:
-sudo -u dispatch -H stat -c '%a %U' /home/dispatch/.personal_kb_hook_key
-# → 600 dispatch
-
-# Confirm the wiring (no literal key value should appear):
-sudo -u dispatch -H python3 -c "import json; print(json.load(open('/home/dispatch/.claude/settings.json'))['hooks'].keys())"
-```
-
-The cheapest proof the hook actually **ran** during a dispatched build (not just that it's installed) is `~/.cache/personal_kb/whisper-debug-<session>.log` on the host — its presence after a run confirms the hook fired and reached the KB service, without needing to inspect the agent's own transcript.
+- **No settings.json is created.** If the file is absent the retirement is a
+  `[SKIP]` no-op — `claude mcp add` writes `.claude.json`, not `settings.json`.
+- **Non-fatal.** A parse failure prints
+  `[WARN] personal-kb-hook retirement failed: ... left unchanged` and never aborts
+  provisioning or a deploy.
+- **Rollback a host that still has the binary and key file:**
+  ```bash
+  sudo -u dispatch -H bash -lc 'uv tool uninstall personal-kb-hook'
+  sudo rm -f /home/dispatch/.personal_kb_hook_key
+  sudo python3 templates/personal-kb-hook-prune.py /home/dispatch/.claude/settings.json
+  ```
 
 ---
 
@@ -1233,7 +1184,7 @@ This exists because **a restart looks like run completion to the status poller**
 
 ### Two-consumer model: process env vs. `.claude.json`
 
-Some keys written to `$SERVICE_ENV` are consumed twice: once by the `dispatch-api` **process environment** (this step's concern), and once applied to the agent's `${AGENT_HOME}/.claude.json` registrations or KB key files by [Step 4.6 — MCP servers](#mcp-servers-for-the-agent-user), which re-reads `$SERVICE_ENV` fresh on every run. For any stale key that is also one of Step 4.6's inputs (`AGENT_GTD_URL`, `AGENT_GTD_API_KEY`, `PERSONAL_KB_URL`, `PERSONAL_KB_API_KEY`, `TEAM_KB_URL`, `TEAM_KB_API_KEY`), Step 6.5's banner adds a line reminding the operator that Step 4.6 already refreshed the `.claude.json` registration or key file this invocation, and that restarting `dispatch-api` does **not** refresh it — the two consumers are independent and need independent thinking about, not just a restart.
+Some keys written to `$SERVICE_ENV` are consumed twice: once by the `dispatch-api` **process environment** (this step's concern), and once applied to the agent's `${AGENT_HOME}/.claude.json` registrations or the `tightbeam_kb` key file by [Step 4.6 — MCP servers](#mcp-servers-for-the-agent-user), which re-reads `$SERVICE_ENV` fresh on every run. For any stale key that is also one of Step 4.6's inputs (`AGENT_GTD_URL`, `AGENT_GTD_API_KEY`, `TIGHTBEAM_KB_MCP_URL`, `TIGHTBEAM_KB_MCP_TOKEN`), Step 6.5's banner adds a line reminding the operator that Step 4.6 already refreshed the `.claude.json` registration or key file this invocation, and that restarting `dispatch-api` does **not** refresh it — the two consumers are independent and need independent thinking about, not just a restart.
 
 ### `scripts/env-staleness-check.sh`
 
@@ -1298,23 +1249,13 @@ sudo rm -f /etc/sudoers.d/dispatch-svc /etc/sudoers.d/dispatch-svc.bak.*
 sudo rm /usr/local/bin/claude
 ```
 
-### Step 4.10 — personal-kb-hook
+### personal-kb-hook retirement
 ```bash
 sudo -u dispatch -H bash -lc 'uv tool uninstall personal-kb-hook'
 sudo rm -f /home/dispatch/.personal_kb_hook_key
+sudo python3 templates/personal-kb-hook-prune.py /home/dispatch/.claude/settings.json
 ```
-Then remove the four `personal-kb-hook` blocks from `/home/dispatch/.claude/settings.json` (SessionStart, UserPromptSubmit, Stop, PostToolUse) — either by hand or by re-running the merge script against an emptied file:
-```bash
-sudo -u dispatch -H python3 -c "
-import json
-p = '/home/dispatch/.claude/settings.json'
-d = json.load(open(p))
-for event, entries in list(d.get('hooks', {}).items()):
-    d['hooks'][event] = [e for e in entries if not any('personal-kb-hook' in h.get('command', '') for h in e.get('hooks', []))]
-json.dump(d, open(p, 'w'), indent=2)
-"
-```
-(Same `bash -lc` requirement as Steps 4.7–4.9 — `uv` is not on sudo's search path.)
+The prune script drops the hook's matcher groups and leaves every other setting intact.
 
 ### Step 4.9 — Dev toolchain
 ```bash
@@ -1353,15 +1294,13 @@ the `bash -lc` login shell is required, same as the installer itself uses.)
 
 ### Step 4.6 — MCP servers
 ```bash
-# Per server (agent-gtd, personal-kb, aws-documentation-mcp-server, and team-kb if registered):
+# Per server (agent-gtd, tightbeam_kb, aws-documentation-mcp-server):
 sudo -u dispatch -H bash -lc 'claude mcp remove <name> --scope user'
 # Or remove all registrations at once:
 sudo rm /home/dispatch/.claude.json
-# Team KB key file written by scripts/kb-mcp-refresh.sh:
-sudo rm -f /home/dispatch/.team_kb_key
+# tightbeam_kb key file written by scripts/kb-mcp-refresh.sh:
+sudo rm -f /home/dispatch/.tightbeam_kb_key
 ```
-
-`/home/dispatch/.personal_kb_hook_key` is shared with Step 4.10 (personal-kb-hook); remove it only when uninstalling that step too.
 
 ### Step 4.5 — Claude Code
 No separate rollback — Step 4's removal of `/home/dispatch/.local` also deletes the
@@ -1413,10 +1352,9 @@ sudo systemctl daemon-reload
 
 # MCP registrations (Step 4.6) — registered in YOUR ~/.claude.json
 claude mcp remove agent-gtd --scope user
-claude mcp remove personal-kb --scope user
+claude mcp remove tightbeam_kb --scope user
 claude mcp remove aws-documentation-mcp-server --scope user
-claude mcp remove team-kb --scope user   # only if it was registered
-rm -f ~/.team_kb_key
+rm -f ~/.tightbeam_kb_key
 
 # Pre-commit template (Step 4.7)
 git config --global --unset init.templateDir

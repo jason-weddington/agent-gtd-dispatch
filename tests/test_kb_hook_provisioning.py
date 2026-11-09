@@ -1,16 +1,12 @@
-"""Tests for the personal-kb-hook provisioning step (setup-dispatch-host.sh Step 4.10).
+"""Tests for the personal-kb-hook RETIREMENT path.
 
 Two concerns:
-  1. Text guards over setup-dispatch-host.sh: the step is present, follows the
-     documented idiom, references the hook binary by absolute path, carries the
-     exact PostToolUse matcher and --format=claude-json flag, uses $(cat ...)
-     key indirection, reads PERSONAL_KB_HOOK_SRC from the service env, and is
-     deliberately unpinned.
-  2. A hermetic exercise of the settings-merge logic in
-     templates/personal-kb-hook-settings.py: all seven events are wired with the
-     canonical matchers/timeouts, pre-existing settings survive, re-running is
-     byte-identical (exactly seven personal-kb-hook blocks, never fourteen), and
-     deploy.sh re-applies the wiring on every host it deploys.
+  1. templates/personal-kb-hook-prune.py: it drops matcher groups whose command
+     references personal-kb-hook while preserving every other setting, event and
+     group; it deletes only event keys it empties; it is idempotent and only
+     writes when something was removed; and it fails cleanly on bad input.
+  2. Text guards over deploy.sh and setup-dispatch-host.sh: both stage/invoke the
+     prune script and no longer reference Step 4.10 or the old merge script.
 """
 
 from __future__ import annotations
@@ -23,336 +19,198 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent.parent
 SETUP_SCRIPT = REPO_ROOT / "setup-dispatch-host.sh"
 DEPLOY_SCRIPT = REPO_ROOT / "deploy.sh"
-MERGE_SCRIPT = REPO_ROOT / "templates" / "personal-kb-hook-settings.py"
+PRUNE_SCRIPT = REPO_ROOT / "templates" / "personal-kb-hook-prune.py"
 
-POST_TOOL_USE_MATCHER = "mcp__personal-kb__kb_get|mcp__team-kb__team_kb_get"
-HOOK_BIN = "/home/dispatch/.local/bin/personal-kb-hook"
-KEY_FILE = "/home/dispatch/.personal_kb_hook_key"
-KB_URL = "https://kb.example.com"
-# The seven wired events with their canonical matcher and timeout
-# (upstream personal-kb-hook wiring; None means no "timeout" key).
-EXPECTED_EVENTS: dict[str, tuple[str, int | None]] = {
-    "SessionStart": ("", None),
-    "UserPromptSubmit": ("", None),
-    "PreToolUse": ("Bash", 5),
-    "PostToolUse": (POST_TOOL_USE_MATCHER, None),
-    "PostToolUseFailure": ("", 5),
-    "Stop": ("", None),
-    "SubagentStop": ("", None),
-}
+HOOK_COMMAND = (
+    "PERSONAL_KB_LISTENER=1 PERSONAL_KB_URL=https://kb.example.com "
+    "PERSONAL_KB_API_KEY=$(cat /home/dispatch/.personal_kb_hook_key 2>/dev/null) "
+    "/home/dispatch/.local/bin/personal-kb-hook --format=claude-json"
+)
+FOREIGN = {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo hi"}]}
 
 
-def _hook_blocks(data: dict) -> list[tuple[str, dict]]:
-    """Return (event, block) pairs whose command mentions personal-kb-hook."""
-    blocks = []
-    for event, entries in data.get("hooks", {}).items():
-        for entry in entries:
-            if any(
-                "personal-kb-hook" in h.get("command", "")
-                for h in entry.get("hooks", [])
-            ):
-                blocks.append((event, entry))
-    return blocks
-
-
-def _run_merge(settings_path: Path, url: str = KB_URL) -> None:
-    proc = subprocess.run(
-        [
-            sys.executable,
-            str(MERGE_SCRIPT),
-            str(settings_path),
-            HOOK_BIN,
-            KEY_FILE,
-            url,
-        ],
+def _run(settings_path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(PRUNE_SCRIPT), str(settings_path)],
         capture_output=True,
         text=True,
     )
-    assert proc.returncode == 0, proc.stderr
-    assert "kb_realsecretvalue12345" not in settings_path.read_text()
+
+
+def _hook_group(matcher: str = "") -> dict:
+    return {"matcher": matcher, "hooks": [{"type": "command", "command": HOOK_COMMAND}]}
 
 
 class TestTextGuards:
-    def test_setup_script_has_step_4_10(self) -> None:
-        text = SETUP_SCRIPT.read_text()
-        assert 'echo "--- Step 4.10: personal-kb-hook (agent user) ---"' in text
+    def test_deploy_stages_and_invokes_prune(self) -> None:
+        d = DEPLOY_SCRIPT.read_text()
+        assert "personal-kb-hook-prune.py" in d
+        assert "personal-kb-hook-settings.py" not in d
+        assert "_kb_url" not in d
+        assert "_kb_key" not in d
+        assert "PERSONAL_KB_URL" not in d
+        assert "[SKIP] personal-kb-hook retirement: " in d
+        assert "[OK]   personal-kb-hook retirement: " in d
+        assert "[WARN] personal-kb-hook retirement failed: " in d
+        assert "KB hooks" not in d
 
-    def test_install_is_unpinned_and_forced(self) -> None:
-        text = SETUP_SCRIPT.read_text()
-        assert "uv tool install --force --from '${_hook_src}' personal-kb-hook" in text
-        # No baked-in source: the deployment supplies it (and pins nothing).
-        assert "PERSONAL_KB_HOOK_SRC_DEFAULT" not in text
-        assert '_hook_src="${PERSONAL_KB_HOOK_SRC:-}"' in text
+    def test_setup_retires_prune_step_4_10(self) -> None:
+        setup = SETUP_SCRIPT.read_text()
+        assert "personal-kb-hook-prune.py" in setup
+        assert "personal-kb-hook-settings.py" not in setup
+        assert "Step 4.10" not in setup
+        assert "PERSONAL_KB_HOOK_SRC" not in setup
+        assert "HOOK_BIN" not in setup
+        assert "HOOK_KEY_FILE" not in setup
+        assert "HOOK_MERGE_SCRIPT" not in setup
+        assert 'skip "personal-kb-hook retirement:' in setup
+        assert 'info "personal-kb-hook retirement: ${_prune_out}"' in setup
+        assert 'warn "personal-kb-hook retirement failed:' in setup
+        assert "_read_env_var PERSONAL_KB" not in setup
+        assert "_read_env_var TEAM_KB" not in setup
 
-    def test_hook_src_read_from_service_env(self) -> None:
-        text = SETUP_SCRIPT.read_text()
-        assert '_v="$(_read_env_var PERSONAL_KB_HOOK_SRC)"' in text
 
-    def test_step_skipped_loudly_when_unconfigured(self) -> None:
-        text = SETUP_SCRIPT.read_text()
-        assert '_hook_missing="${_hook_missing} PERSONAL_KB_HOOK_SRC"' in text
-        assert '_hook_missing="${_hook_missing} PERSONAL_KB_URL"' in text
-        assert 'warn "SKIPPING personal-kb-hook:' in text
-
-    def test_absolute_binary_path(self) -> None:
-        text = SETUP_SCRIPT.read_text()
-        assert 'HOOK_BIN="${AGENT_HOME}/.local/bin/personal-kb-hook"' in text
-
-    def test_key_file_path_and_permissions(self) -> None:
-        text = SETUP_SCRIPT.read_text()
-        assert 'HOOK_KEY_FILE="${AGENT_HOME}/.personal_kb_hook_key"' in text
-        assert "install -m 0600" in text
-
-    def test_silent_degradation_warning_verbatim(self) -> None:
-        text = SETUP_SCRIPT.read_text()
-        assert (
-            'warn "PERSONAL_KB_API_KEY not set in ${SERVICE_ENV} — personal-kb-hook '
-            "will be installed but not wired; it degrades SILENTLY (no roster, no "
-            "telemetry, no error), so this would look exactly like a working "
-            'install"' in text
+class TestPruneScript:
+    def test_preserves_everything_else(self, tmp_path: Path) -> None:
+        settings_path = tmp_path / "settings.json"
+        original = {
+            "theme": "dark",
+            "permissions": {"allow": ["Bash(git status)"]},
+            "hooks": {
+                "PreToolUse": [_hook_group("Bash"), FOREIGN],
+                "PostToolUse": [_hook_group("mcp__personal-kb__kb_get"), FOREIGN],
+            },
+        }
+        settings_path.write_text(json.dumps(original))
+        proc = _run(settings_path)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == (
+            "personal-kb-hook-prune: removed 2 matcher group(s) from 2 event(s)"
         )
+        data = json.loads(settings_path.read_text())
+        expected = {
+            "theme": "dark",
+            "permissions": {"allow": ["Bash(git status)"]},
+            "hooks": {
+                "PreToolUse": [FOREIGN],
+                "PostToolUse": [FOREIGN],
+            },
+        }
+        assert data == expected
 
-    def test_no_separate_hook_key_minted(self) -> None:
-        text = SETUP_SCRIPT.read_text()
-        # The hook must reuse PERSONAL_KB_API_KEY, never mint its own var.
-        assert "PERSONAL_KB_HOOK_API_KEY" not in text
-        assert "PERSONAL_KB_API_KEY" in text
-
-    def test_verification_runs_as_agent_user(self) -> None:
-        text = SETUP_SCRIPT.read_text()
-        assert 'runuser -l "$AGENT_USER" -c "\'${HOOK_BIN}\' --help"' in text
-
-    def test_dry_run_would_lines(self) -> None:
-        text = SETUP_SCRIPT.read_text()
-        assert 'would "runuser -l ${AGENT_USER} -- uv tool install --force' in text
-        assert 'would "write ${HOOK_KEY_FILE}' in text
-        assert (
-            'would "merge SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/'
-            "PostToolUseFailure/Stop/SubagentStop personal-kb-hook blocks into "
-            "${HOOK_SETTINGS}, preserving other settings" in text
-        )
-
-    def test_no_restart_in_step(self) -> None:
-        # Step 4.10 spans from its own banner to the Step 5a banner; nothing in
-        # between may restart the service.
-        text = SETUP_SCRIPT.read_text()
-        start = text.index("Step 4.10: personal-kb-hook (agent user)")
-        end = text.index("Step 5a: Claude symlink")
-        step_text = text[start:end]
-        assert "systemctl restart" not in step_text
-
-    def test_wired_info_line_names_seven_events(self) -> None:
-        text = SETUP_SCRIPT.read_text()
-        assert (
-            "Wired personal-kb-hook into ${HOOK_SETTINGS} for ${AGENT_USER} "
-            "(SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, "
-            "PostToolUseFailure, Stop, SubagentStop) url=${_hook_url}" in text
-        )
-
-    def test_deploy_script_refresh(self) -> None:
-        text = DEPLOY_SCRIPT.read_text()
-        # Deploy never reinstalls the hook binary: production installs are pinned
-        # to a release tag by the KB release, and a branch reinstall would undo it.
-        assert "--from '${PERSONAL_KB_HOOK_SRC}'" not in text
-        assert "PERSONAL_KB_HOOK_SRC" not in text
-        # Deploy re-applies the wiring on every host it deploys — provision is
-        # not the only writer, so hosts cannot drift.
-        assert "personal-kb-hook-settings.py" in text
-        assert "[OK]   personal-kb-hook wiring: 7 events" in text
-        assert "[WARN] personal-kb-hook wiring skipped:" in text
-        assert "Does NOT touch settings.json" not in text
-        assert "sudo python3" in text
-
-
-class TestSettingsMerge:
-    def test_preserves_other_settings(self, tmp_path: Path) -> None:
+    def test_drops_emptied_event_keys_only(self, tmp_path: Path) -> None:
         settings_path = tmp_path / "settings.json"
         settings_path.write_text(
             json.dumps(
                 {
-                    "theme": "dark",
                     "hooks": {
-                        "PostToolUse": [
-                            {
-                                "matcher": "SomeOtherTool",
-                                "hooks": [{"type": "command", "command": "echo hi"}],
-                            }
-                        ]
-                    },
+                        "SessionStart": [_hook_group()],
+                        "Stop": [_hook_group(), FOREIGN],
+                        "AlreadyEmpty": [],
+                    }
                 }
             )
         )
-        _run_merge(settings_path)
+        proc = _run(settings_path)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == (
+            "personal-kb-hook-prune: removed 2 matcher group(s) from 2 event(s)"
+        )
         data = json.loads(settings_path.read_text())
-        assert data["theme"] == "dark"
-        post_tool_use = data["hooks"]["PostToolUse"]
-        assert any(e.get("matcher") == "SomeOtherTool" for e in post_tool_use)
+        assert "SessionStart" not in data["hooks"]
+        assert data["hooks"]["Stop"] == [FOREIGN]
+        assert data["hooks"]["AlreadyEmpty"] == []
 
-    def test_creates_file_as_empty_object_when_absent(self, tmp_path: Path) -> None:
+    def test_mixed_group_is_dropped_whole(self, tmp_path: Path) -> None:
         settings_path = tmp_path / "settings.json"
+        mixed = {
+            "matcher": "Bash",
+            "hooks": [
+                {"type": "command", "command": "echo foreign"},
+                {"type": "command", "command": HOOK_COMMAND},
+            ],
+        }
+        settings_path.write_text(json.dumps({"hooks": {"PreToolUse": [mixed]}}))
+        proc = _run(settings_path)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == (
+            "personal-kb-hook-prune: removed 1 matcher group(s) from 1 event(s)"
+        )
+        data = json.loads(settings_path.read_text())
+        assert data["hooks"] == {}
+
+    def test_second_run_is_byte_identical(self, tmp_path: Path) -> None:
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text(
+            json.dumps({"theme": "dark", "hooks": {"Stop": [_hook_group(), FOREIGN]}})
+        )
+        first = _run(settings_path)
+        assert first.returncode == 0, first.stderr
+        raw = settings_path.read_bytes()
+        stamp = settings_path.stat().st_mtime_ns
+        second = _run(settings_path)
+        assert second.returncode == 0, second.stderr
+        assert second.stdout.strip() == (
+            "personal-kb-hook-prune: removed 0 matcher group(s) from 0 event(s)"
+        )
+        assert settings_path.read_bytes() == raw
+        assert settings_path.stat().st_mtime_ns == stamp
+
+    def test_tolerates_malformed_shapes(self, tmp_path: Path) -> None:
+        settings_path = tmp_path / "settings.json"
+        original = {
+            "hooks": "not-a-dict",
+            "other": [1, 2, 3],
+        }
+        settings_path.write_text(json.dumps(original))
+        proc = _run(settings_path)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == (
+            "personal-kb-hook-prune: removed 0 matcher group(s) from 0 event(s)"
+        )
+        assert json.loads(settings_path.read_text()) == original
+
+        # Non-list event value and non-dict list elements survive untouched.
+        original = {
+            "hooks": {
+                "Stop": "not-a-list",
+                "PreToolUse": ["a-string", 7, None, {"hooks": "nope"}],
+            }
+        }
+        settings_path.write_text(json.dumps(original))
+        proc = _run(settings_path)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == (
+            "personal-kb-hook-prune: removed 0 matcher group(s) from 0 event(s)"
+        )
+        assert json.loads(settings_path.read_text()) == original
+
+    def test_invalid_json_left_untouched(self, tmp_path: Path) -> None:
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text("{not json")
+        proc = _run(settings_path)
+        assert proc.returncode == 1
+        assert proc.stderr == (
+            f"[ERR]  personal-kb-hook-prune: cannot parse {settings_path} — "
+            "file left unchanged\n"
+        )
+        assert settings_path.read_text() == "{not json"
+
+    def test_wrong_argc_usage(self, tmp_path: Path) -> None:
+        for args in ([], [str(tmp_path / "a.json"), "extra"]):
+            proc = subprocess.run(
+                [sys.executable, str(PRUNE_SCRIPT), *args],
+                capture_output=True,
+                text=True,
+            )
+            assert proc.returncode == 2
+            assert proc.stderr == "usage: personal-kb-hook-prune.py <settings.json>\n"
+
+    def test_missing_file_is_noop(self, tmp_path: Path) -> None:
+        settings_path = tmp_path / "absent.json"
+        proc = _run(settings_path)
+        assert proc.returncode == 0, proc.stderr
         assert not settings_path.exists()
-        _run_merge(settings_path)
-        data = json.loads(settings_path.read_text())
-        assert "hooks" in data
-
-    # --- AC-7(a): from {} the merge produces exactly the seven canonical events ---
-
-    def test_seven_blocks_after_one_run(self, tmp_path: Path) -> None:
-        settings_path = tmp_path / "settings.json"
-        settings_path.write_text("{}")
-        _run_merge(settings_path)
-        data = json.loads(settings_path.read_text())
-        blocks = _hook_blocks(data)
-        assert len(blocks) == 7
-        assert sorted(event for event, _ in blocks) == sorted(EXPECTED_EVENTS)
-        for event, entry in blocks:
-            matcher, timeout = EXPECTED_EVENTS[event]
-            assert entry["matcher"] == matcher, event
-            assert "timeout" not in entry, event  # never at entry level
-            (hook,) = entry["hooks"]
-            if timeout is None:
-                assert "timeout" not in hook, event
-            else:
-                assert hook["timeout"] == timeout, event
-
-    def test_no_async_key_anywhere(self, tmp_path: Path) -> None:
-        # PreToolUse must stay synchronous so it can deny; PostToolUseFailure must
-        # stay synchronous so its additionalContext lands on the same turn.
-        settings_path = tmp_path / "settings.json"
-        settings_path.write_text("{}")
-        _run_merge(settings_path)
-        rendered = settings_path.read_text()
-        assert "async" not in rendered
-
-    # --- AC-7(b): only PostToolUseFailure carries the failure-cue prefix ---
-
-    def test_failure_context_prefix_on_post_tool_use_failure_only(
-        self, tmp_path: Path
-    ) -> None:
-        settings_path = tmp_path / "settings.json"
-        settings_path.write_text("{}")
-        _run_merge(settings_path)
-        data = json.loads(settings_path.read_text())
-        for event, entry in _hook_blocks(data):
-            command = entry["hooks"][0]["command"]
-            if event == "PostToolUseFailure":
-                assert command.startswith("KB_FAILURE_CONTEXT=1 ")
-                assert "PERSONAL_KB_LISTENER=1 PERSONAL_KB_URL=" in command
-            else:
-                assert "KB_FAILURE_CONTEXT" not in command
-                assert command.startswith("PERSONAL_KB_LISTENER=1 PERSONAL_KB_URL=")
-
-    # --- AC-7(c): old four-event wiring + hand-added blocks collapses to seven ---
-
-    def test_replaces_old_wiring_and_hand_added_blocks(self, tmp_path: Path) -> None:
-        def hook_command() -> str:
-            return (
-                f"PERSONAL_KB_LISTENER=1 PERSONAL_KB_URL={KB_URL} "
-                f"PERSONAL_KB_API_KEY=$(cat {KEY_FILE} 2>/dev/null) "
-                f"{HOOK_BIN} --format=claude-json"
-            )
-
-        settings_path = tmp_path / "settings.json"
-        settings_path.write_text(
-            json.dumps(
-                {
-                    "theme": "dark",
-                    "hooks": {
-                        "SessionStart": [
-                            {"hooks": [{"type": "command", "command": hook_command()}]}
-                        ],
-                        "UserPromptSubmit": [
-                            {"hooks": [{"type": "command", "command": hook_command()}]}
-                        ],
-                        "Stop": [
-                            {"hooks": [{"type": "command", "command": hook_command()}]}
-                        ],
-                        "PostToolUse": [
-                            {
-                                "matcher": POST_TOOL_USE_MATCHER,
-                                "hooks": [
-                                    {"type": "command", "command": hook_command()}
-                                ],
-                            }
-                        ],
-                        # A hand-added PreToolUse block with a different shape.
-                        "PreToolUse": [
-                            {
-                                "matcher": "Bash",
-                                "hooks": [
-                                    {
-                                        "type": "command",
-                                        "command": hook_command() + " extra-arg",
-                                    }
-                                ],
-                            },
-                            # An unrelated, non-hook PreToolUse block: must survive.
-                            {
-                                "matcher": "Bash",
-                                "hooks": [{"type": "command", "command": "echo other"}],
-                            },
-                        ],
-                    },
-                }
-            )
+        assert proc.stdout.strip() == (
+            "personal-kb-hook-prune: removed 0 matcher group(s) from 0 event(s)"
         )
-        _run_merge(settings_path)
-        data = json.loads(settings_path.read_text())
-        blocks = _hook_blocks(data)
-        assert len(blocks) == 7
-        assert sorted(event for event, _ in blocks) == sorted(EXPECTED_EVENTS)
-        assert any(
-            h.get("command") == "echo other"
-            for e in data["hooks"]["PreToolUse"]
-            for h in e.get("hooks", [])
-        )
-        assert data["theme"] == "dark"
-
-    # --- AC-7(d): running the merge twice is byte-identical ---
-
-    def test_two_runs_are_byte_identical(self, tmp_path: Path) -> None:
-        settings_path = tmp_path / "settings.json"
-        settings_path.write_text("{}")
-        _run_merge(settings_path)
-        first = settings_path.read_bytes()
-        _run_merge(settings_path)
-        second = settings_path.read_bytes()
-        assert first == second
-        data = json.loads(second)
-        assert len(_hook_blocks(data)) == 7
-        for event in EXPECTED_EVENTS:
-            assert len(data["hooks"][event]) == 1
-
-    # --- Command shape guards ---
-
-    def test_post_tool_use_matcher_exact(self, tmp_path: Path) -> None:
-        settings_path = tmp_path / "settings.json"
-        settings_path.write_text("{}")
-        _run_merge(settings_path)
-        data = json.loads(settings_path.read_text())
-        matchers = [e.get("matcher") for e in data["hooks"]["PostToolUse"]]
-        assert matchers == [POST_TOOL_USE_MATCHER]
-
-    def test_key_indirection_no_literal_key_value(self, tmp_path: Path) -> None:
-        settings_path = tmp_path / "settings.json"
-        settings_path.write_text("{}")
-        # The merge script never receives the literal key — only a path — but
-        # assert the rendered command uses $(cat ...) indirection and that a
-        # plausible key-shaped literal never appears in the file.
-        _run_merge(settings_path)
-        rendered = settings_path.read_text()
-        assert "$(cat" in rendered
-        assert "kb_realsecretvalue12345" not in rendered
-
-    def test_command_uses_absolute_binary_path_and_format_flag(
-        self, tmp_path: Path
-    ) -> None:
-        settings_path = tmp_path / "settings.json"
-        settings_path.write_text("{}")
-        _run_merge(settings_path)
-        data = json.loads(settings_path.read_text())
-        command = data["hooks"]["Stop"][0]["hooks"][0]["command"]
-        assert command.startswith("PERSONAL_KB_LISTENER=1 PERSONAL_KB_URL=")
-        assert HOOK_BIN in command
-        assert command.endswith("--format=claude-json")
-        assert f"$(cat {KEY_FILE} 2>/dev/null)" in command

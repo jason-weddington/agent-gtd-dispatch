@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -39,6 +40,24 @@ def _isolate_git_env() -> Iterator[None]:
     removed = strip_git_env()
     yield
     os.environ.update(removed)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_inherited_agent_path() -> Iterator[None]:
+    # A build agent's shell exports the dispatch kill-guard shim dir (and the
+    # agent's ~/.local/bin, ~/.cargo/bin) on PATH. Leaving it there makes the
+    # suite non-hermetic in two ways: the guard dir is no longer "prepended
+    # first" by prepend_agent_bin_dirs (so PATH-order assertions fail), and
+    # real-process kill tests resolve `pkill` to the shim, which refuses every
+    # pattern kill by design. Strip only the kill-guard dir — the one entry that
+    # changes behavior — so the suite behaves the same on a build agent host as
+    # on a clean CI runner. Restored by hand, like _isolate_git_env.
+    guard = Path.home() / ".local" / "share" / "agent-gtd-dispatch" / "kill-guard"
+    saved = os.environ.get("PATH", "")
+    entries = [entry for entry in saved.split(":") if entry and entry != str(guard)]
+    os.environ["PATH"] = ":".join(entries)
+    yield
+    os.environ["PATH"] = saved
 
 
 @pytest.fixture(autouse=True)

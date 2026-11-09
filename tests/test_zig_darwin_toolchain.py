@@ -108,7 +108,7 @@ class TestConsumers:
                 assert needle not in text, (script.name, needle)
 
     def test_setup_zig_block_order(self) -> None:
-        block = _block(SETUP.read_text(), "# Sub-action D: zig", "# Step 4.10")
+        block = _block(SETUP.read_text(), "# Sub-action D: zig", "# Step 4.11")
         assert (
             block.index("sha256sum")
             < block.index("--strip-components")

@@ -28,10 +28,10 @@
 #   signal. Fix agent-gtd first. It is registered by scripts/kb-mcp-refresh.sh, and
 #   setup-dispatch-host.sh Step 4.6 dies if that registration is not in place.
 #
-# agent-gtd, personal-kb and team-kb are NOT defined here. Like personal-kb and team-kb,
-# agent-gtd is a hosted HTTP /mcp server (<AGENT_GTD_URL>/mcp), registered by
+# agent-gtd and tightbeam_kb are NOT defined here. Both are hosted HTTP /mcp servers
+# (<AGENT_GTD_URL>/mcp and <TIGHTBEAM_KB_MCP_URL>/mcp), registered by
 # scripts/kb-mcp-refresh.sh, which setup-dispatch-host.sh Step 4.6 and deploy.sh both
-# run (deploy.sh also probes agent-gtd). None of them needs uvx or git-ssh any more.
+# run (deploy.sh also probes agent-gtd). Neither needs uvx or git-ssh any more.
 #
 # No AGENT_GTD_API_KEY and no agent-gtd key file is baked into the registration. Its
 # headersHelper reads AGENT_GTD_API_KEY from the agent's env at connect time, where

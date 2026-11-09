@@ -160,7 +160,7 @@ Every filesystem read of an agent-created path and every git invocation added he
 This repo is mirrored publicly, so it carries no home-lab specifics: no host names, LAN addresses, private domains or private git URLs (the maintainer's gitignored `release.guard.local.sh` scans what each release would publish to github and aborts on a hit; `./release.sh` refuses to run without it when a `github` remote exists, unless `--no-guard`). Deploy and publish glue for the maintainer's fleet lives outside this repo and is invoked through the gitignored `release.local.sh` hook.
 
 - `./release.sh` calls `./release.local.sh <version> <absolute-dist-dir>` after the version bump and both wheel builds, and before any push. Exit 0 = published (and deployed), exit 10 = published but deploy incomplete (tags are pushed, the release exits 3), anything else = nothing published (the local tag and release commit are dropped). With no hook the release aborts unless `--no-publish` is given. An optional `release.post.local.sh <version>` runs after the push.
-- The scripts in this repo take hosts, the wheel index and URLs from env vars and have no lab defaults: `deploy.sh` requires `DISPATCH_INDEX` (it never reinstalls personal-kb-hook, whose production installs are pinned to release tags by the KB release), `talos-update.sh` requires `TALOS_ARTIFACT_BASE`, and `setup-dispatch-host.sh` requires `DISPATCH_WHEEL_INDEX` (plus `HARNESS_DESIGN_REPO_URL` with `--with-talos`). Fleet hosts come from `DISPATCH_HOSTS` / `DISPATCH_HOST` or the GTD host registry (`scripts/fleet-hosts.sh`).
+- The scripts in this repo take hosts, the wheel index and URLs from env vars and have no lab defaults: `deploy.sh` requires `DISPATCH_INDEX`, `talos-update.sh` requires `TALOS_ARTIFACT_BASE`, and `setup-dispatch-host.sh` requires `DISPATCH_WHEEL_INDEX` (plus `HARNESS_DESIGN_REPO_URL` with `--with-talos`). Fleet hosts come from `DISPATCH_HOSTS` / `DISPATCH_HOST` or the GTD host registry (`scripts/fleet-hosts.sh`).
 
 ## Coverage
 
@@ -179,21 +179,22 @@ runs as **`dispatch-svc`**; it launches the Claude Code agent as **`dispatch`** 
   `docs/install.md#single-user-mode`.) It is the systemd
   `EnvironmentFile` (→ the service's `os.environ`; `config.py` reads `os.environ` only,
   no dotenv) *and* the file `setup-dispatch-host.sh` and `deploy.sh` read (via
-  `scripts/kb-mcp-refresh.sh`) to register the agent-gtd and KB MCP servers and write the KB key files.
+  `scripts/kb-mcp-refresh.sh`) to register the agent-gtd and tightbeam_kb MCP servers and write the tightbeam_kb key file.
 - **`/home/dispatch/.env` is vestigial** (pre-split leftover) — nothing reads it. Don't
   put vars there; safe to delete where it lingers.
 - **`setup-dispatch-host.sh` runs as ROOT** (`sudo`, asserts `EUID==0`), not as
   `dispatch-svc`. It creates both users, installs the unit + sudoers, and reads
   `/home/dispatch-svc/.env` to register MCP servers (Step 4.6: `aws-documentation-mcp-server` from
-  `templates/mcp-servers.sh`; agent-gtd, personal-kb and team-kb via `scripts/kb-mcp-refresh.sh`).
-- **KB MCP secrets** live in `/home/dispatch-svc/.env` as `PERSONAL_KB_URL` /
-  `PERSONAL_KB_API_KEY` / `TEAM_KB_URL` / `TEAM_KB_API_KEY`. `personal-kb` and `team-kb`
-  are hosted HTTP `/mcp` servers (`<URL>/mcp`), registered for the agent user by
+  `templates/mcp-servers.sh`; agent-gtd and tightbeam_kb via `scripts/kb-mcp-refresh.sh`).
+- **Tightbeam KB MCP secrets** live in `/home/dispatch-svc/.env` as
+  `TIGHTBEAM_KB_MCP_URL` / `TIGHTBEAM_KB_MCP_TOKEN`. `tightbeam_kb` is the Tightbeam
+  hub's hosted HTTP `/mcp` server, registered for the agent user by
   `scripts/kb-mcp-refresh.sh` (run by setup Step 4.6 and every `deploy.sh`) with a
-  `headersHelper` that reads the key at connect time from a mode-0600 key file in the
-  agent home (`~/.personal_kb_hook_key`, `~/.team_kb_key`). The key is never written
-  into `~/.claude.json`, and no `ANTHROPIC_API_KEY` is injected (that name would reach
-  the agent's env and flip Claude Code off Max/OAuth billing).
+  `headersHelper` that reads the token at connect time from `~/.tightbeam_kb_key`
+  (mode 0600, agent-owned). The token is never written into `~/.claude.json`, and no
+  `ANTHROPIC_API_KEY` is injected (that name would reach the agent's env and flip
+  Claude Code off Max/OAuth billing). The legacy `personal-kb`/`team-kb` registrations
+  and their key files are removed unconditionally on every setup/deploy run.
 - **agent-gtd MCP** is the board's hosted HTTP `/mcp` server at `<AGENT_GTD_URL>/mcp`, registered for the agent user by `scripts/kb-mcp-refresh.sh` (setup Step 4.6 and every `deploy.sh`, which also probes it) as `type: http` with an env-only bearer `headersHelper`: it reads `AGENT_GTD_API_KEY` from the agent's env at connect time (the run's callback token, set by `engines.build_env`) and forwards `AGENT_GTD_AGENT_NAME` as `X-Agent-Name`, which the board uses only when the bearer is not a run token. There is no agent-gtd key file, by design: a static key would pin every run to one identity. Only `AGENT_GTD_URL` is required to register it.
 
 Full references: **`kb-01598`** (env-file + provisioning model — which var goes where),

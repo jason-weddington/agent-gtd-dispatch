@@ -9,10 +9,10 @@ set -euo pipefail
 # DISPATCH_INDEX; no working copy on the host, no source-tree state.
 # It also refreshes /etc/sudoers.d/dispatch-svc via scripts/sudoers-refresh.sh
 # before the wheel install.
-# It also refreshes the agent user's agent-gtd/personal-kb/team-kb registrations via scripts/kb-mcp-refresh.sh and probes agent-gtd with templates/mcp-probe.py (non-fatal).
-# It also re-applies the agent user's personal-kb-hook settings.json wiring via
-# templates/personal-kb-hook-settings.py after refreshing the hook binary
-# (non-fatal), so hosts provisioned before an event was added cannot drift.
+# It also refreshes the agent user's agent-gtd/tightbeam_kb registrations via scripts/kb-mcp-refresh.sh and probes agent-gtd with templates/mcp-probe.py (non-fatal).
+# It also retires the agent user's legacy personal-kb-hook settings.json blocks via
+# templates/personal-kb-hook-prune.py (non-fatal), so hosts provisioned before the
+# hook was dropped cannot keep loading it.
 #
 # The private index is passed via `--index` (NOT `--index-url`) so it is
 # ADDED to the default PyPI list; uv resolves fastapi/uvicorn/anthropic/etc.
@@ -132,21 +132,21 @@ deploy_one() {
     local _stage
     _stage=$(ssh "${host}" mktemp -d) || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
     [[ "$_stage" == /tmp/* ]] || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
-    scp -q "${SCRIPT_DIR}/scripts/sudoers-refresh.sh" "${SCRIPT_DIR}/scripts/kb-mcp-refresh.sh" "${SCRIPT_DIR}/templates/mcp-probe.py" "${SCRIPT_DIR}/templates/sudoers-dispatch-svc.tmpl" "${SCRIPT_DIR}/templates/personal-kb-hook-settings.py" "${SCRIPT_DIR}/templates/agent-gtd-kill-guard/pkill" "${SCRIPT_DIR}/templates/agent-gtd-kill-guard/killall" "${host}:${_stage}/" || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
+    scp -q "${SCRIPT_DIR}/scripts/sudoers-refresh.sh" "${SCRIPT_DIR}/scripts/kb-mcp-refresh.sh" "${SCRIPT_DIR}/templates/mcp-probe.py" "${SCRIPT_DIR}/templates/sudoers-dispatch-svc.tmpl" "${SCRIPT_DIR}/templates/personal-kb-hook-prune.py" "${SCRIPT_DIR}/templates/agent-gtd-kill-guard/pkill" "${SCRIPT_DIR}/templates/agent-gtd-kill-guard/killall" "${host}:${_stage}/" || { echo "[ERR]  could not stage sudoers refresh on ${host}" >&2; return 1; }
 
     ssh "${host}" bash -s <<EOF
 set -euo pipefail
 if ! sudo bash "${_stage}/sudoers-refresh.sh" --template "${_stage}/sudoers-dispatch-svc.tmpl" --service-user ${SERVICE_USER} --agent-user ${AGENT_USER} 2>&1 | sed "s/^/[${host}] /"; then rm -rf "${_stage}"; echo "[ERR]  sudoers refresh failed on ${host} — host left untouched" >&2; exit 1; fi
 if sudo test -f /home/${SERVICE_USER}/.env; then if ! sudo bash "${_stage}/kb-mcp-refresh.sh" --env-file /home/${SERVICE_USER}/.env --agent-user ${AGENT_USER} --probe "${_stage}/mcp-probe.py" 2>&1 | sed "s/^/[${host}] /"; then echo "[WARN] MCP refresh failed on ${host} — agent-gtd/KB registrations may be stale" >&2; fi; else echo "[SKIP] MCP refresh: /home/${SERVICE_USER}/.env not present on ${host}"; fi
-# _stage stays alive until the personal-kb-hook wiring below has run — it holds
-# templates/personal-kb-hook-settings.py alongside the refresh scripts above and
-# is removed together with the rest of _stage after the wiring step.
+# _stage stays alive until the personal-kb-hook retirement below has run — it holds
+# templates/personal-kb-hook-prune.py (staged above) and is removed with the rest of
+# _stage afterwards.
 
 # Refuse stray user-level steering BEFORE installing anything: headless runs load
 # ~/.claude/CLAUDE.md and ~/.claude/rules/*.md even with --system-prompt, so a
 # copied-in personal CLAUDE.md silently changes every run on this host. Dispatch
-# steering lives in the dispatch prompt. ~/.claude/settings.json (the KB hooks) is
-# legitimate and is deliberately not checked.
+# steering lives in the dispatch prompt. ~/.claude/settings.json is legitimate and is
+# deliberately not checked.
 _stray=""
 for _f in /home/${AGENT_USER}/.claude/CLAUDE.md /home/${AGENT_USER}/.claude/CLAUDE.local.md; do
     if sudo test -e "\$_f"; then _stray="\${_stray} \$_f"; fi
@@ -464,35 +464,14 @@ else
     done
 fi
 
-# personal-kb-hook's BINARY is deliberately not reinstalled here. Production hook
-# installs are pinned to a personal_kb release tag by the KB release's own
-# post-release step; reinstalling from a branch on every deploy would ship
-# unreleased code and undo that pin. Deploy only re-applies the settings.json
-# wiring below, so hosts cannot drift. Does NOT restart the service.
-# Re-apply the personal-kb-hook wiring into the agent user's settings.json
-# (setup-dispatch-host.sh Step 4.10 writes it at provision time; deploy re-merges
-# it so hosts provisioned before an event was added cannot drift). The merge is a
-# read-modify-write that replaces only personal-kb-hook blocks and preserves every
-# other setting, and is idempotent, so re-running it on every deploy is safe.
-# PERSONAL_KB_URL is read from the service env file (root-readable only) the same
-# way the heredoc already reaches that file — via sudo. Non-fatal throughout: a
-# skipped or failed wiring prints a WARN and must never abort the deploy.
+# personal-kb-hook is retired: its settings.json wiring must not survive on any
+# host. Prune matcher groups whose command references personal-kb-hook, preserving
+# every other setting, and drop event keys the prune empties. Idempotent, so
+# re-running it on every deploy is safe. Non-fatal throughout: the heredoc runs
+# under `set -euo pipefail`, so the elif/else form keeps a failed prune from
+# aborting the deploy — it prints a WARN and settings.json is left unchanged.
 _kb_settings="/home/${AGENT_USER}/.claude/settings.json"
-_kb_key="/home/${AGENT_USER}/.personal_kb_hook_key"
-_kb_url="\$(sudo sed -n 's/^PERSONAL_KB_URL=//p' /home/${SERVICE_USER}/.env 2>/dev/null | tail -n1 || true)"
-_kb_url="\${_kb_url%\"}"; _kb_url="\${_kb_url#\"}"; _kb_url="\${_kb_url%\'}"; _kb_url="\${_kb_url#\'}"
-if ! sudo test -f "\$_kb_key"; then
-    echo "[WARN] personal-kb-hook wiring skipped: \$_kb_key missing on this host" >&2
-elif [ -z "\$_kb_url" ]; then
-    echo "[WARN] personal-kb-hook wiring skipped: PERSONAL_KB_URL not set in /home/${SERVICE_USER}/.env" >&2
-elif ! sudo test -f "\$_kb_settings"; then
-    echo "[WARN] personal-kb-hook wiring skipped: \$_kb_settings missing on this host" >&2
-elif sudo python3 "${_stage}/personal-kb-hook-settings.py" "\$_kb_settings" /home/${AGENT_USER}/.local/bin/personal-kb-hook "\$_kb_key" "\$_kb_url"; then
-    sudo chown ${AGENT_USER}:${AGENT_USER} "\$_kb_settings"
-    echo "[OK]   personal-kb-hook wiring: 7 events"
-else
-    echo "[WARN] personal-kb-hook wiring skipped: merge into \$_kb_settings failed — settings.json left unchanged" >&2
-fi
+if ! sudo test -f "\$_kb_settings"; then echo "[SKIP] personal-kb-hook retirement: \$_kb_settings not present on this host"; elif _prune_out="\$(sudo python3 "${_stage}/personal-kb-hook-prune.py" "\$_kb_settings")"; then sudo chown ${AGENT_USER}:${AGENT_USER} "\$_kb_settings"; echo "[OK]   personal-kb-hook retirement: \${_prune_out}"; else echo "[WARN] personal-kb-hook retirement failed: \$_kb_settings left unchanged" >&2; fi
 
 # Kill guard (setup-dispatch-host.sh Step 4.12): refresh the pkill/killall shims
 # so a host on the routine channel is not left unguarded between provisionings.
