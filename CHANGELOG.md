@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.25.2 (2026-11-08)
+
+### Bug Fixes
+
+- **885ad1e6**: Keep prompts out of argv and block pattern pkill/killall in dispatched runs, so one
+  run cannot kill another run on a shared host
+  ([`5ac0418`](https://github.com/repos/agent-gtd-dispatch/commit/5ac0418ab09afe14b67d12a81ee287082682c3d6))
+
+
 ## v2.25.1 (2026-11-08)
 
 ### Bug Fixes
