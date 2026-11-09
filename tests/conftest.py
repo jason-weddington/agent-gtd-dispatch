@@ -72,6 +72,24 @@ def _isolate_run_tmp_root(tmp_path_factory: pytest.TempPathFactory) -> Iterator[
 
 
 @pytest.fixture(autouse=True)
+def _isolate_teardown_registries() -> Iterator[None]:
+    # `_tearing_down_tasks` / `_teardown_started` are process globals read by
+    # every /info, /health and _restart_blocking_counts() call, so a single
+    # leaked entry would make `restart_blocking_runs` order-dependent across the
+    # suite.  Restored by hand rather than through `monkeypatch`, for the same
+    # teardown-order reason documented on _isolate_git_env above.
+    from agent_gtd_dispatch import main
+
+    saved_tasks = main._tearing_down_tasks
+    saved_started = main._teardown_started
+    main._tearing_down_tasks = {}
+    main._teardown_started = {}
+    yield
+    main._tearing_down_tasks = saved_tasks
+    main._teardown_started = saved_started
+
+
+@pytest.fixture(autouse=True)
 def _isolate_evidence_root(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     # Gate logs land under config.EVIDENCE_ROOT; keep them off the real home.
     # Restored by hand, like _isolate_run_tmp_root.

@@ -18,6 +18,7 @@ as a subprocess, streams its transcript to disk, and reports status back via the
                         │  asyncio event loop                   │
                         │  _dispatch_worker (Task per run)      │
                         │  _active_processes: dict[id, Task]    │
+                        │  _tearing_down_tasks: dict[id, Task]  │
                         │  _pending_queue: list[_PendingDispatch]│
                         └──────────────────┬───────────────────┘
                                            │ run_in_executor
@@ -65,6 +66,16 @@ _active_processes[run_id] = task
 
 When a running task finishes (in its `finally` block), it calls `_try_start_pending()` to
 promote the oldest queued item to a running task without any intervening `await`.
+
+A run leaves `_active_processes` for `_tearing_down_tasks` at the very top of its teardown
+`finally` — in one await-free straight line, so at every await point it is in exactly one of
+the two registries (or in neither, once its teardown has returned) — and leaves
+`_tearing_down_tasks` only when evidence capture, work rescue, the leaked-process reap and
+the workspace cleanup are all done.  Slot accounting (`_counted_active_runs`,
+`_slot_holding_count`, `_restart_blocking_counts`) keeps reading `_active_processes` only, so
+the slot frees the instant teardown starts; `restart_blocking_runs` and retention's
+live-workspace exclusion set read both, so a rescue in flight still counts as work a restart
+would lose and its workspace cannot be pruned out from under it.
 
 ### ThreadPoolExecutor for Subprocess Isolation
 
@@ -583,8 +594,12 @@ uvicorn start
   → yield  (service accepting requests)
   → lifespan.__aexit__
       → cancel the retention and re-adoption tasks
-      → cancel all _active_processes tasks
+      → cancel only `_active_processes` tasks (never a run already in teardown), then wait on both registries for up to `SHUTDOWN_GRACE_SECONDS` with `asyncio.wait`
 ```
+
+The bound this shutdown respects applies to that `await`, not to process exit: a rescue
+thread already inside `dispatch._executor` still holds interpreter exit, so systemd's
+`TimeoutStopSec` remains the outer bound on the whole stop.
 
 ---
 

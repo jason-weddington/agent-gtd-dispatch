@@ -101,6 +101,8 @@ class TestRestartBlockingRuns:
         if state is not None:
             states[loop or "orphan"] = state
         monkeypatch.setattr(main, "_active_processes", active)
+        monkeypatch.setattr(main, "_tearing_down_tasks", {})
+        monkeypatch.setattr(main, "_teardown_started", {})
         monkeypatch.setattr(main, "_loop_run_ids", loop_ids)
         monkeypatch.setattr(main, "_rollout_loop_states", states)
         monkeypatch.setattr(main, "_pending_queue", list(queue))
@@ -168,6 +170,7 @@ class TestRestartBlockingRuns:
             "queued_runs",
             "reviews_in_flight",
             "lease_holding_lands",
+            "tearing_down_runs",
         ]
         for k, v in comp.items():
             assert info["restart_blocking"][k] == v
@@ -251,6 +254,30 @@ class TestRestartBlockingRuns:
             main._log_shutdown_restart_blocking()
         recs = [r for r in caplog.records if "shutdown: restart_blocking" in r.message]
         assert recs[0].levelno == logging.INFO
+        assert "restart_blocking_runs=0" in recs[0].message
+        assert "tearing_down_runs=0" in recs[0].message
+
+    def test_shutdown_log_counts_tearing_down_runs(self, monkeypatch, caplog) -> None:
+        import logging
+        from unittest.mock import MagicMock
+
+        from agent_gtd_dispatch import main
+
+        self._setup(monkeypatch)
+        monkeypatch.setattr(main, "_tearing_down_tasks", {"rid": MagicMock()})
+        with caplog.at_level(logging.INFO):
+            main._log_shutdown_restart_blocking()
+        recs = [r for r in caplog.records if "shutdown: restart_blocking" in r.message]
+        assert recs[0].levelno == logging.WARNING
+        assert "tearing_down_runs=1" in recs[0].message
+        assert "restart_blocking_runs=1" in recs[0].message
+        caplog.clear()
+        self._setup(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            main._log_shutdown_restart_blocking()
+        recs = [r for r in caplog.records if "shutdown: restart_blocking" in r.message]
+        assert recs[0].levelno == logging.INFO
+        assert "tearing_down_runs=0" in recs[0].message
         assert "restart_blocking_runs=0" in recs[0].message
 
 

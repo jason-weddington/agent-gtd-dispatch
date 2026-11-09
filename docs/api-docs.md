@@ -19,7 +19,7 @@ Invalid or missing credentials return **401 Unauthorized**.
 
 **Auth**: None required.
 
-Returns the service health status and the count of currently active (running) dispatches. `active_runs` excludes rollout loops parked behind a host drain, so a draining host reads 0 once its loops park and its other runs finish. `restart_blocking_runs` is the work a restart would lose (slot-holding runs, host-queued runs, rollout reviews in flight, lease-holding lands); it is always present as a JSON integer, and `active_runs` is unchanged.
+Returns the service health status and the count of currently active (running) dispatches. `active_runs` excludes rollout loops parked behind a host drain, so a draining host reads 0 once its loops park and its other runs finish. `restart_blocking_runs` is the work a restart would lose (slot-holding runs, host-queued runs, rollout reviews in flight, lease-holding lands, `tearing_down_runs` — runs whose teardown, i.e. evidence capture and work rescue, is still in flight, so a restart would kill that rescue); it is always present as a JSON integer, and `active_runs` is unchanged.
 
 **Response 200:**
 ```json
@@ -74,7 +74,7 @@ separate round-trip to `/agents`.
 | `parked_rollout_loops` | `int` | Rollout loops parked behind a host drain (informational). `active_runs` is unchanged; `restart_blocking_runs` is the restart-safety idle signal |
 | `slot_runs` | `int` | Runs charged against `max_concurrent_runs` (build and plan runs; never rollout loops or the reviews they run, which are reported in restart_blocking.reviews_in_flight). The router's capacity input: free slots = `max_concurrent_runs - slot_runs`. Absent on old hosts (routers fall back to `max_concurrent_runs - active_runs - parked_rollout_loops`) |
 | `restart_blocking_runs` | `int` | Work a restart would lose; equals the sum of `restart_blocking` values. Drain-and-deploy tooling should wait on this being 0 |
-| `restart_blocking` | `object` | Components: `slot_runs` (build and plan runs holding a slot), `queued_runs` (host-queued dispatches), `reviews_in_flight` (live rollout reviewer tasks), `lease_holding_lands` (lands that hold, held or are requesting the land lease, or whose state is unknown) |
+| `restart_blocking` | `object` | Components: `slot_runs` (build and plan runs holding a slot), `queued_runs` (host-queued dispatches), `reviews_in_flight` (live rollout reviewer tasks), `lease_holding_lands` (lands that hold, held or are requesting the land lease, or whose state is unknown), `tearing_down_runs` (runs whose teardown — evidence capture and work rescue — is still in flight; a restart would kill that rescue). `tearing_down_runs` is appended last, so `restart_blocking_runs` still equals the sum of these components |
 | `active_loops` | `int` | Live rollout loops (informational). Loops never count against `max_concurrent_runs` and are never queued |
 | `queued_runs` | `int` | Dispatches waiting in the host queue (informational) |
 

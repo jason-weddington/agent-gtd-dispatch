@@ -143,6 +143,22 @@ async def _ollama_health_check() -> tuple[bool, str]:
 
 # Track running subprocesses for cancellation
 _active_processes: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
+# Runs whose teardown `finally` has started and has NOT yet returned.  Two
+# invariants:
+#
+# (a) membership means the run's teardown `finally` has started and has not yet
+#     returned: it is still capturing evidence, rescuing abandoned work, reaping
+#     leaked processes or removing its workspace, so shutdown, the restart-block
+#     accounting and retention's live-workspace set must treat it as live.
+# (b) a run crosses from `_active_processes` to `_tearing_down_tasks` in one
+#     await-free straight line at the top of that `finally`, so at every await
+#     point it is in exactly one of them (or in neither, once teardown has
+#     finished).
+#
+# `_teardown_started` records when each teardown began (monotonic) so shutdown
+# can report how long the oldest one has been running.
+_tearing_down_tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
+_teardown_started: dict[str, float] = {}
 _active_subprocesses: dict[str, subprocess.Popen[bytes]] = {}
 _run_event_queues: dict[str, asyncio.Queue[dict]] = {}  # type: ignore[type-arg]
 
@@ -493,50 +509,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     #
     # The wait is load-bearing and its absence was a real hole. Each run's
     # `finally` block captures evidence and then rescues abandoned work —
-    # committing and pushing whatever the agent left to the run's own branch — and
-    # both of those are `await`s that shell out to git. Cancelling and returning
-    # immediately ends the lifespan, the event loop tears down, and those awaits
-    # never get to run. So on every service restart the rescue silently did not
-    # fire, which is precisely the case it exists for: a deploy is the most common
-    # reason a run dies part-way through real work.
+    # committing and pushing whatever the agent left to the run's own branch —
+    # and both of those are `await`s that shell out to git. Cancelling and
+    # returning immediately ends the lifespan, the event loop tears down, and
+    # those awaits never get to run. So on every service restart the rescue
+    # silently did not fire, which is precisely the case it exists for: a deploy
+    # is the most common reason a run dies part-way through real work.
     #
-    # Bounded, because systemd will SIGKILL us at its stop timeout regardless and
-    # a rescue that cannot finish in time must not take the shutdown down with it.
-    # `return_exceptions=True` so one run's failed teardown cannot strand the rest.
+    # Two registries, two rules. `_active_processes` holds runs still doing work,
+    # so those are cancelled here. A run that has entered its teardown `finally`
+    # has already moved to `_tearing_down_tasks` and is NEVER cancelled: a second
+    # `CancelledError` would land inside that finally and abort the rescue it is
+    # there to run. The wait covers BOTH registries, so a tearing-down run stays
+    # visible to shutdown until its teardown has fully returned.
+    #
+    # `asyncio.wait`, not `wait_for(gather(...))`: on 3.12+ `wait_for` cancels the
+    # task it is waiting on when the timeout expires and then awaits it, which
+    # would re-cancel a teardown and let a shielded rescue stretch the bound.
+    #
+    # The bound is on this await, NOT on process exit: a rescue thread already in
+    # `dispatch._executor` still holds interpreter exit, so systemd's
+    # TimeoutStopSec is the outer bound on the whole stop.
     _log_shutdown_restart_blocking()
-    _in_flight = []
-    for task in list(_active_processes.values()):
-        task.cancel()
-        # Gather only real futures belonging to THIS loop. In production every
-        # value here is an asyncio.Task on the running loop, so this keeps all of
-        # them. It guards two things that are not worth failing a shutdown over:
-        # a test double, which is not a future at all, and a task left in this
-        # module-level dict by a previous event loop, which gather() rejects with
-        # "future belongs to a different loop".
-        if asyncio.isfuture(task):
-            try:
-                if task.get_loop() is asyncio.get_running_loop():
-                    _in_flight.append(task)
-            except RuntimeError:  # no running loop — nothing to wait on
-                pass
-    if _in_flight:
-        logger.info(
-            "shutdown: cancelled %d in-flight run(s), waiting up to %ss for"
-            " evidence capture and work rescue to finish",
-            len(_in_flight),
-            config.SHUTDOWN_GRACE_SECONDS,
-        )
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*_in_flight, return_exceptions=True),
-                timeout=config.SHUTDOWN_GRACE_SECONDS,
-            )
-        except TimeoutError:
-            logger.warning(
-                "shutdown: teardown did not finish within %ss — some work may be"
-                " unrescued in its workspace",
-                config.SHUTDOWN_GRACE_SECONDS,
-            )
+    await _shutdown_active_runs()
 
 
 app = FastAPI(title="Agent GTD Dispatch", lifespan=lifespan)
@@ -598,6 +593,39 @@ def start() -> None:  # pragma: no cover
 # --- Background dispatch worker ---
 
 
+def _live_workspace_run_ids() -> frozenset[str]:
+    """Run ids whose workspace/tmp/evidence must survive retention pruning.
+
+    A run in `_active_processes` still owns its workspace, and so does one in
+    `_tearing_down_tasks`: its teardown is mid-rescue, and pruning the tree out
+    from under it would delete the very work the rescue is pushing.
+    """
+    return frozenset(_active_processes) | frozenset(_tearing_down_tasks)
+
+
+async def _retention_tick() -> None:
+    """One retention sweep: age-prune workspaces/evidence, then orphan rt- dirs.
+
+    Kept separate from :func:`_retention_loop` so a test can drive exactly one
+    sweep without waiting out ``RETENTION_INTERVAL_SECONDS``.
+    """
+    await asyncio.get_running_loop().run_in_executor(
+        None, retention.prune, _live_workspace_run_ids()
+    )
+    # Snapshot on the event loop; any rt- dir not owned by an
+    # in-flight run and older than the min age is a missed teardown.
+    live = run_tmp.live_paths()
+    await asyncio.get_running_loop().run_in_executor(
+        None,
+        functools.partial(
+            run_tmp.sweep_orphans,
+            live,
+            config.RUN_TMP_ORPHAN_MIN_AGE_SECONDS,
+            context="periodic",
+        ),
+    )
+
+
 async def _retention_loop() -> None:
     """Background coroutine: age-prune workspaces and retained run evidence.
 
@@ -606,21 +634,7 @@ async def _retention_loop() -> None:
     while True:
         await asyncio.sleep(config.RETENTION_INTERVAL_SECONDS)
         try:
-            await asyncio.get_event_loop().run_in_executor(
-                None, retention.prune, frozenset(_active_processes)
-            )
-            # Snapshot on the event loop; any rt- dir not owned by an
-            # in-flight run and older than the min age is a missed teardown.
-            live = run_tmp.live_paths()
-            await asyncio.get_running_loop().run_in_executor(
-                None,
-                functools.partial(
-                    run_tmp.sweep_orphans,
-                    live,
-                    config.RUN_TMP_ORPHAN_MIN_AGE_SECONDS,
-                    context="periodic",
-                ),
-            )
+            await _retention_tick()
         except Exception:
             logger.exception("Retention sweep failed — continuing")
 
@@ -1724,6 +1738,53 @@ async def _reap_leaked_processes(
         logger.exception("reaping leaked processes failed for run %s", run.id)
 
 
+async def _await_uninterruptible[T](
+    awaitable: Awaitable[T], *, run_id: str, stage: str
+) -> T:
+    """Await ``awaitable`` so a ``CancelledError`` cannot abort it.
+
+    Shutdown, a manual cancel and systemd all arrive as ``CancelledError`` at the
+    task's current await point, which inside a teardown ``finally`` would abort
+    the very work the teardown exists to do.  ``asyncio.shield`` keeps the work
+    running through the cancellation; this loop re-arms the shield for as many
+    cancellations as arrive and logs each one, so a second ``cancel()`` (or a
+    ``wait_for`` expiry cancelling its inner future) is absorbed too.
+
+    An inner cancellation is NOT absorbed: if the awaited work itself is
+    cancelled, ``asyncio.CancelledError`` is raised at the call site exactly as a
+    bare ``await`` would.
+    """
+    fut = asyncio.ensure_future(awaitable)
+    _ignored = 0
+    _started = time.monotonic()
+    while not fut.done():
+        try:
+            await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            if fut.cancelled():
+                raise
+            _ignored += 1
+            logger.warning(
+                "teardown: cancellation ignored while an uninterruptible await is"
+                " in flight run_id=%s stage=%s cancels_ignored=%d elapsed_s=%.2f",
+                run_id,
+                stage,
+                _ignored,
+                time.monotonic() - _started,
+            )
+            continue
+    if _ignored:
+        logger.info(
+            "teardown: uninterruptible await finished run_id=%s stage=%s"
+            " cancels_ignored=%d elapsed_s=%.2f",
+            run_id,
+            stage,
+            _ignored,
+            time.monotonic() - _started,
+        )
+    return await fut
+
+
 async def _rescue_before_teardown(
     run: Run,
     repos: list[tuple[str, Path, str | None]],
@@ -2201,6 +2262,9 @@ def _restart_blocking_counts() -> dict[str, int]:
         "queued_runs": len(_pending_queue),
         "reviews_in_flight": reviews,
         "lease_holding_lands": lands,
+        # Appended LAST so the reported key order is stable and
+        # `sum(restart_blocking.values())` still equals `restart_blocking_runs`.
+        "tearing_down_runs": len(_tearing_down_tasks),
     }
 
 
@@ -2210,14 +2274,109 @@ def _log_shutdown_restart_blocking() -> None:
     total = sum(rb.values())
     (logger.warning if total > 0 else logger.info)(
         "shutdown: restart_blocking_runs=%d slot_runs=%d queued_runs=%d"
-        " reviews_in_flight=%d lease_holding_lands=%d active_runs=%d",
+        " reviews_in_flight=%d lease_holding_lands=%d tearing_down_runs=%d"
+        " active_runs=%d",
         total,
         rb["slot_runs"],
         rb["queued_runs"],
         rb["reviews_in_flight"],
         rb["lease_holding_lands"],
+        rb["tearing_down_runs"],
         _counted_active_runs(),
     )
+
+
+def _on_this_loop(candidate: object) -> bool:
+    """True when *candidate* is a real future belonging to THIS event loop.
+
+    In production every value in ``_active_processes`` and
+    ``_tearing_down_tasks`` is an ``asyncio.Task`` on the running loop, so this
+    keeps all of them. It guards two things that are not worth failing a
+    shutdown over: a test double, which is not a future at all, and a task left
+    in this module-level dict by a previous event loop, which ``asyncio.wait``
+    rejects with "future belongs to a different loop".
+    """
+    if not asyncio.isfuture(candidate):
+        return False
+    try:
+        return candidate.get_loop() is asyncio.get_running_loop()
+    except RuntimeError:  # no running loop — nothing to wait on
+        return False
+
+
+async def _shutdown_active_runs() -> None:
+    """Cancel in-flight runs, then wait for every teardown to finish.
+
+    Cancels ONLY ``_active_processes`` (never a run already in its teardown — a
+    second ``CancelledError`` would land inside that ``finally`` and abort the
+    rescue), then waits on both registries for up to
+    ``config.SHUTDOWN_GRACE_SECONDS`` with ``asyncio.wait``.  Teardowns still
+    running when the grace expires are reported, recorded on the run and left
+    alone.  See the comment at the call site in ``lifespan`` for why each part is
+    shaped this way.
+    """
+    for task in list(_active_processes.values()):
+        task.cancel()
+    # `_on_this_loop` filters out test doubles and tasks from a previous loop,
+    # which `asyncio.wait` would reject outright.
+    _in_flight = [t for t in _active_processes.values() if _on_this_loop(t)]
+    _teardown_snapshot = {
+        rid: t for rid, t in list(_tearing_down_tasks.items()) if _on_this_loop(t)
+    }
+    waiting = set(_in_flight) | set(_teardown_snapshot.values())
+    if not waiting:
+        # `asyncio.wait(set(), timeout=...)` raises "Set of Tasks/Futures is
+        # empty", and every idle shutdown takes this path.
+        return
+    _oldest = (
+        max(0.0, time.monotonic() - min(_teardown_started.values()))
+        if _teardown_started
+        else 0.0
+    )
+    logger.info(
+        "shutdown: cancelling %d in-flight run(s) and waiting up to %ss for"
+        " evidence capture and work rescue, including %d run(s) already in"
+        " teardown (oldest_s=%.1f)",
+        len(_in_flight),
+        config.SHUTDOWN_GRACE_SECONDS,
+        len(_teardown_snapshot),
+        _oldest,
+    )
+    done, _pending = await asyncio.wait(waiting, timeout=config.SHUTDOWN_GRACE_SECONDS)
+    # What `gather(return_exceptions=True)` used to do for us: a teardown that
+    # raised is reported here instead of vanishing.
+    for _t in done:
+        if _t.cancelled():
+            continue
+        _exc = _t.exception()
+        if _exc is not None:
+            logger.warning("shutdown: run teardown raised %r", _exc)
+    _pending_ids = sorted(rid for rid, t in _teardown_snapshot.items() if not t.done())
+    if _pending_ids:
+        logger.error(
+            "shutdown: teardown did not finish within %ss run_ids=%s - those"
+            " rescues are abandoned with the process; evidence is under %s",
+            config.SHUTDOWN_GRACE_SECONDS,
+            ",".join(_pending_ids) or None,
+            config.EVIDENCE_ROOT,
+        )
+        for _rid in _pending_ids:
+            try:
+                _existing = await db.get_run(_rid)
+                _prefix = (
+                    (_existing.error + " | ") if _existing and _existing.error else ""
+                )
+                await db.update_run(
+                    _rid,
+                    error=(
+                        _prefix + "teardown_interrupted: dispatch shutdown grace"
+                        " expired while this run's teardown (evidence capture /"
+                        " work rescue) was still running"
+                    )[:ERROR_TEXT_MAX_CHARS],
+                )
+            except Exception:
+                logger.exception("could not record teardown interruption run=%s", _rid)
+    _audit_teardown_registry()
 
 
 def _restart_blocking_runs() -> int:
@@ -2245,6 +2404,27 @@ def _audit_run_slots() -> None:
         (_loop_run_ids & _active_processes.keys()) - _rollout_loop_states.keys()
     ):
         logger.error("rollout-loop state missing run=%s", rid)
+
+
+def _audit_teardown_registry() -> None:
+    """Log (never repair) teardown-registry violations.
+
+    A run visible in both registries means the await-free crossing was broken,
+    and a done task still in ``_tearing_down_tasks`` means its teardown never
+    popped its entry — which silently inflates ``restart_blocking_runs`` and the
+    retention exclusion set forever.  Repairing either here would hide the bug,
+    so this only reports.
+    """
+    for rid in sorted(set(_active_processes) & set(_tearing_down_tasks)):
+        logger.error("audit: run in both registries run=%s", rid)
+    for rid in sorted(_tearing_down_tasks):
+        if _tearing_down_tasks[rid].done():
+            logger.error(
+                "audit: teardown registry leak run=%s - teardown finished but the"
+                " entry was never popped (restart_blocking_runs and prune"
+                " protection stay inflated)",
+                rid,
+            )
 
 
 def _parked_step(drain: str) -> str:
@@ -9976,68 +10156,112 @@ async def _dispatch_worker(
         if mode == DispatchMode.MANAGE:
             should_cleanup = False
     finally:
-        _active_processes.pop(run.id, None)
-        _release_engine_slot(run.id)  # before _try_start_pending: visible next tick
-        _try_start_pending()  # wake up a queued dispatch now that a slot freed
-        _active_subprocesses.pop(run.id, None)
-        _run_event_queues.pop(run.id, None)
-        if run.mode == DispatchMode.MANAGE and run.rollout_id:
-            logger.info(
-                "manage: exit rollout_id=%s run_id=%s exit_code=%s human_cancelled=%s",
-                run.rollout_id,
-                run.id,
-                _exit_code,
-                _human_cancelled,
-            )
-        # Evidence capture is verdict-free and runs on EVERY terminal path —
-        # success, gate failure, push-verification failure, zero-commit, agent
-        # non-zero exit, timeout, cancellation and the generic exception — and
-        # always BEFORE the workspace is torn down.
-        _evidence_repos: list[tuple[str, Path, str | None]] = [
-            (_n, _p, _b) for _n, _p, _b in (_verify_repos or [])
-        ]
+        # The run's teardown has started.  Enter `_tearing_down_tasks` and leave
+        # `_active_processes` on one await-free straight line, so from here on it
+        # stays visible to shutdown, to `restart_blocking_runs` and to retention's
+        # live-workspace set — while slot accounting and `_try_start_pending` see
+        # exactly what they saw before (the slot is free).  Nothing that could
+        # let another coroutine observe the run in both dicts runs in between.
+        _task = asyncio.current_task()
+        if _task is not None:
+            _tearing_down_tasks[run.id] = _task
+            _teardown_started[run.id] = time.monotonic()
+        # Bound on every teardown path, including one that raises before the
+        # rescue runs; the record at the end of the body reads it unconditionally.
+        _rescued: _RescueOutcome | None = None
         try:
-            retention.capture_evidence(run.id, workspace, _evidence_repos)
-        except Exception:
-            logger.exception("evidence capture raised for run %s — continuing", run.id)
+            _active_processes.pop(run.id, None)
+            _release_engine_slot(run.id)  # before _try_start_pending: visible next tick
+            _try_start_pending()  # wake up a queued dispatch now that a slot freed
+            _active_subprocesses.pop(run.id, None)
+            _run_event_queues.pop(run.id, None)
+            if run.mode == DispatchMode.MANAGE and run.rollout_id:
+                logger.info(
+                    "manage: exit rollout_id=%s run_id=%s exit_code=%s human_cancelled=%s",
+                    run.rollout_id,
+                    run.id,
+                    _exit_code,
+                    _human_cancelled,
+                )
+            # Evidence capture is verdict-free and runs on EVERY terminal path —
+            # success, gate failure, push-verification failure, zero-commit, agent
+            # non-zero exit, timeout, cancellation and the generic exception — and
+            # always BEFORE the workspace is torn down.
+            _evidence_repos: list[tuple[str, Path, str | None]] = [
+                (_n, _p, _b) for _n, _p, _b in (_verify_repos or [])
+            ]
+            try:
+                retention.capture_evidence(run.id, workspace, _evidence_repos)
+            except Exception:
+                logger.exception(
+                    "evidence capture raised for run %s — continuing", run.id
+                )
 
-        # Rescue: commit and push anything the agent left behind, BEFORE the
-        # clone is deleted. Teardown is irreversible, so this is the last moment
-        # the work exists anywhere. Runs regardless of the recorded terminal —
-        # a failed run is exactly the case where unpushed work is most likely.
-        _rescued = await _rescue_before_teardown(
-            run,
-            _evidence_repos,
-            attribution=attribution,
-            branch_by_repo={
-                _n: _branch_by_repo.get(_n, _dispatched_branch)
-                for _n, _p, _b in _evidence_repos
-            },
-        )
-        if _rescued is not None and not _rescued.ok:
-            # Rescue could not get the work to origin. The workspace is the only
-            # copy left, so keep it and say so where an operator will see it.
-            should_cleanup = False
-
-        # Reap daemons the agent left running from this workspace (detached,
-        # own session, so killing the agent tree missed them). After the rescue,
-        # before deletion, and even when the workspace is kept.
-        dirs = [d for d in (workspace, run_tmp_dir) if d is not None]
-        if dirs:
-            await _reap_leaked_processes(
-                run, *dirs, marker=run_tmp.run_marker(run_tmp_dir)
+            # Rescue: commit and push anything the agent left behind, BEFORE the
+            # clone is deleted. Teardown is irreversible, so this is the last moment
+            # the work exists anywhere. Runs regardless of the recorded terminal —
+            # a failed run is exactly the case where unpushed work is most likely.
+            # Shielded: a cancel arriving here (a second shutdown cancel, a manual
+            # /runs/{id}/cancel, a `wait_for` expiry) must not abort the rescue —
+            # its executor thread has to be waited to completion.
+            _rescued = await _await_uninterruptible(
+                _rescue_before_teardown(
+                    run,
+                    _evidence_repos,
+                    attribution=attribution,
+                    branch_by_repo={
+                        _n: _branch_by_repo.get(_n, _dispatched_branch)
+                        for _n, _p, _b in _evidence_repos
+                    },
+                ),
+                run_id=run.id,
+                stage="rescue",
             )
+            if _rescued is not None and not _rescued.ok:
+                # Rescue could not get the work to origin. The workspace is the only
+                # copy left, so keep it and say so where an operator will see it.
+                should_cleanup = False
 
-        # Independent of should_cleanup: a retained workspace keeps the work,
-        # never the run's temp files.
-        if run_tmp_dir is not None:
-            await asyncio.get_running_loop().run_in_executor(
-                None,
-                functools.partial(run_tmp.remove_run_tmp, run_tmp_dir, kind="build"),
+            # Reap daemons the agent left running from this workspace (detached,
+            # own session, so killing the agent tree missed them). After the rescue,
+            # before deletion, and even when the workspace is kept.
+            dirs = [d for d in (workspace, run_tmp_dir) if d is not None]
+            if dirs:
+                await _reap_leaked_processes(
+                    run, *dirs, marker=run_tmp.run_marker(run_tmp_dir)
+                )
+
+            # Independent of should_cleanup: a retained workspace keeps the work,
+            # never the run's temp files.
+            if run_tmp_dir is not None:
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    functools.partial(
+                        run_tmp.remove_run_tmp, run_tmp_dir, kind="build"
+                    ),
+                )
+
+            if workspace is not None and should_cleanup:
+                dispatch.cleanup_workspace(workspace)
+
+            # Last statement of the body: one line per teardown, so a rescue that
+            # ate a cancel is visible in the journal. `cancels_ignored` reads
+            # `Task.cancelling()`, which stays at 1 after a suppressed request.
+            logger.info(
+                "teardown: run_id=%s duration_s=%.1f cancels_ignored=%d"
+                " rescue_ok=%s workspace_kept=%s",
+                run.id,
+                time.monotonic() - _teardown_started[run.id],
+                (_task.cancelling() if _task is not None else 0),
+                (None if _rescued is None else _rescued.ok),
+                not should_cleanup,
             )
-
-        if workspace is not None and should_cleanup:
-            dispatch.cleanup_workspace(workspace)
+        finally:
+            # Only now is the run no longer tearing, whatever path got here:
+            # return, raise or suppression.  Leaving the entry behind would keep
+            # `restart_blocking_runs` inflated and keep prune off its workspace.
+            _tearing_down_tasks.pop(run.id, None)
+            _teardown_started.pop(run.id, None)
 
 
 # --- Endpoints ---
@@ -10079,6 +10303,7 @@ async def info() -> InfoResponse:
     load_avg_1m, cpu_count = _host_load()
     _audit_engine_slots()
     _audit_run_slots()
+    _audit_teardown_registry()
     rb_counts = _restart_blocking_counts()
     return InfoResponse(
         engine=ENGINE_NAME,

@@ -38,7 +38,9 @@ class InfoResponse(BaseModel):
     drained host reads idle once its loops park; those loops are reported in
     ``parked_rollout_loops``.  ``restart_blocking_runs`` is the restart-safety
     idle signal (the work a restart would lose: slot-holding runs, host-queued
-    runs, rollout reviews in flight and lease-holding lands); ``active_runs`` is
+    runs, rollout reviews in flight, lease-holding lands and ``tearing_down_runs``
+    — runs whose teardown, i.e. evidence capture and work rescue, is still
+    running on this host, so a restart would kill that rescue); ``active_runs`` is
     unchanged in value and kept for older consumers.
 
     Rollout loops never count against ``max_concurrent_runs`` and are never
