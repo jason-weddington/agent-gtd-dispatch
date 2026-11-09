@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v2.26.0 (2026-11-09)
+
+### Features
+
+- **4b6eafdf**: Register the Tightbeam KB MCP server for dispatch agents and retire the legacy
+  personal-kb/team-kb wiring
+  ([`677df47`](https://github.com/repos/agent-gtd-dispatch/commit/677df47f811c218ce5f8df68173ceaab5a989261))
+
+
 ## v2.25.2 (2026-11-08)
 
 ### Bug Fixes
